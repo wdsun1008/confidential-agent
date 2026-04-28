@@ -19,10 +19,37 @@ BUILD_TIMESTAMP=$(date +%Y%m%d%H%M)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$SCRIPT_DIR/output"
-CUSTOMIZE_DIR="$SCRIPT_DIR/customize"
+
+# BUILD_PROFILE controls which image variant to build.
+# - "openclaw" (default): OpenClaw AI Agent image
+# - "mcp": Confidential MCP Server image
+BUILD_PROFILE="${BUILD_PROFILE:-openclaw}"
+
+export BUILD_PROFILE
+
+COMMON_DIR="$SCRIPT_DIR/customize"
+PROFILE_DIR="$SCRIPT_DIR/profiles/$BUILD_PROFILE"
+
+if [[ ! -d "$PROFILE_DIR" ]]; then
+    echo "ERROR: Unknown BUILD_PROFILE: $BUILD_PROFILE (no directory at $PROFILE_DIR)"
+    echo "Available profiles: $(ls -1 "$SCRIPT_DIR/profiles/" 2>/dev/null | tr '\n' ' ')"
+    exit 1
+fi
+
+case "$BUILD_PROFILE" in
+    openclaw) IMAGE_PREFIX="cai" ;;
+    *)        IMAGE_PREFIX="cai-${BUILD_PROFILE}" ;;
+esac
 
 # Base image URL (Alibaba Cloud Linux 3 base image)
 BASE_IMAGE_URL="https://alinux3.oss-cn-hangzhou.aliyuncs.com/aliyun_3_x64_20G_nocloud_alibase_20251215.qcow2"
+
+# cai-pep sandbox base image is prepared on the build host and imported into the
+# guest Docker cache on boot, so the runtime never needs an online pull.
+CAI_PEP_BASE_IMAGE="${CAI_PEP_BASE_IMAGE:-alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest}"
+CAI_PEP_DOCKER_NETWORK_MODE="${CAI_PEP_DOCKER_NETWORK_MODE:-none}"
+CAI_PEP_BASE_IMAGE_ARCHIVE="${SCRIPT_DIR}/../target/cai-pep/base-image.tar"
+CAI_PEP_BASE_IMAGE_REF_FILE="${SCRIPT_DIR}/../target/cai-pep/base-image.ref"
 
 # Root password for the image
 ROOT_PASSWORD_FOR_INTERMEDIATE_IMAGE="cai2026!"
@@ -218,14 +245,18 @@ cleanup_all() {
         cleanup_chroot_mounts "$CHROOT_MOUNT_POINT" 2>/dev/null || true
     fi
     
-    # Disconnect NBD device with retry mechanism
+    # Disconnect NBD devices
     if [[ -n "$NBD_DEVICE" && -b "$NBD_DEVICE" ]]; then
-        # Try graceful disconnect first
-        if ! qemu-nbd --disconnect "$NBD_DEVICE" >/dev/null 2>&1; then
-            # Force disconnect if graceful fails
-            echo 1 > "/sys/block/${NBD_DEVICE#/dev/}/device/delete" 2>/dev/null || true
-        fi
+        qemu-nbd --disconnect "$NBD_DEVICE" >/dev/null 2>&1 || true
     fi
+    # Clean up any stale NBD/DM mappings (Phase 2/3 tools may use separate nbd devices)
+    for dev in /dev/nbd[0-9] /dev/nbd[1-9][0-9]; do
+        [[ -b "$dev" ]] || continue
+        qemu-nbd --disconnect "$dev" >/dev/null 2>&1 || true
+    done
+    dmsetup ls 2>/dev/null | awk '/osprober-linux-nbd/ {print $1}' | while read -r dm_name; do
+        [[ -n "$dm_name" ]] && dmsetup remove -f "$dm_name" >/dev/null 2>&1 || true
+    done
         
     # Reset global variables after chroot cleanup
     reset_global_state
@@ -284,22 +315,123 @@ prepare_chroot_environment() {
     return 0
 }
 
-# Copy customization files to chroot environment
+# Copy customization files to chroot environment.
+# All common scripts come from customize/script/. The profile-specific
+# 50-install-app.sh (and optional files/) come from profiles/<PROFILE>/.
 copy_customization_files() {
     local chroot_path="$1"
     
-    log_info "Copying customization files to chroot environment..."
+    log_info "Copying customization files to chroot environment (profile=$BUILD_PROFILE)..."
     
-    # Create customize directory structure
-    mkdir -p "$chroot_path/tmp"
+    mkdir -p "$chroot_path/tmp/script" "$chroot_path/tmp/files"
     
-    # Copy customize scripts
-    if [[ -d "$CUSTOMIZE_DIR" ]]; then
-        cp -r "$CUSTOMIZE_DIR/." "$chroot_path/tmp/"
-        log_info "Copied customization files from: $CUSTOMIZE_DIR"
-    else
-        log_warn "Customize directory not found: $CUSTOMIZE_DIR"
+    # 1. Copy all common scripts
+    cp "$COMMON_DIR/script"/*.sh "$chroot_path/tmp/script/" 2>/dev/null || true
+    log_info "Copied common scripts from: $COMMON_DIR/script/"
+    
+    # 2. Copy common files
+    if [[ -d "$COMMON_DIR/files" ]]; then
+        cp -r "$COMMON_DIR/files/." "$chroot_path/tmp/files/" 2>/dev/null || true
+        log_info "Copied common files from: $COMMON_DIR/files/"
     fi
+    
+    # 3. Copy profile-specific app script (50-install-app.sh)
+    if [[ -f "$PROFILE_DIR/50-install-app.sh" ]]; then
+        cp "$PROFILE_DIR/50-install-app.sh" "$chroot_path/tmp/script/"
+        log_info "Copied profile app script from: $PROFILE_DIR/50-install-app.sh"
+    else
+        log_warn "No 50-install-app.sh found in $PROFILE_DIR"
+    fi
+    
+    # 4. Overlay profile-specific files (if any)
+    if [[ -d "$PROFILE_DIR/files" ]]; then
+        cp -r "$PROFILE_DIR/files/." "$chroot_path/tmp/files/" 2>/dev/null || true
+        log_info "Copied profile files from: $PROFILE_DIR/files/"
+    fi
+    
+    # 5. Copy profile.json (used by 90-configure-service.sh to generate TNG egress + manifest)
+    if [[ -f "$PROFILE_DIR/profile.json" ]]; then
+        cp "$PROFILE_DIR/profile.json" "$chroot_path/tmp/files/profile.json"
+        log_info "Copied profile.json from: $PROFILE_DIR/profile.json"
+    fi
+
+    # 6. Copy custom binaries used by decentralized injection flow.
+    if [[ -d "$SCRIPT_DIR/../hack_bin" ]]; then
+        mkdir -p "$chroot_path/tmp/files/hack_bin"
+        cp -a "$SCRIPT_DIR/../hack_bin/." "$chroot_path/tmp/files/hack_bin/" 2>/dev/null || true
+        log_info "Copied custom binaries from: $SCRIPT_DIR/../hack_bin/"
+    fi
+
+    # 7. Copy host-built Rust cai-pep binary when available.
+    if [[ -f "$SCRIPT_DIR/../target/cai-pep/release/cai-pep" ]]; then
+        mkdir -p "$chroot_path/tmp/files/cai-pep-bin"
+        cp "$SCRIPT_DIR/../target/cai-pep/release/cai-pep" "$chroot_path/tmp/files/cai-pep-bin/cai-pep"
+        chmod +x "$chroot_path/tmp/files/cai-pep-bin/cai-pep"
+        log_info "Copied host-built cai-pep binary from: $SCRIPT_DIR/../target/cai-pep/release/cai-pep"
+    else
+        log_warn "Host-built cai-pep binary not found at $SCRIPT_DIR/../target/cai-pep/release/cai-pep"
+    fi
+
+    # 8. Copy the preloaded cai-pep sandbox base image archive and rewrite the
+    #    policy template to use the exact same image tag.
+    if ! prepare_cai_pep_base_image_archive; then
+        return 1
+    fi
+
+    mkdir -p "$chroot_path/tmp/files/cai-pep-base-image"
+    cp "$CAI_PEP_BASE_IMAGE_ARCHIVE" "$chroot_path/tmp/files/cai-pep-base-image/cai-pep-base-image.tar"
+    cp "$CAI_PEP_BASE_IMAGE_REF_FILE" "$chroot_path/tmp/files/cai-pep-base-image/cai-pep-base-image.ref"
+    log_info "Copied preloaded cai-pep base image archive for: $CAI_PEP_BASE_IMAGE"
+
+    python3 - "$chroot_path/tmp/files/cai-pep-default-policy.json" "$CAI_PEP_BASE_IMAGE" "$CAI_PEP_DOCKER_NETWORK_MODE" <<'PY'
+import json
+import pathlib
+import sys
+
+policy_path = pathlib.Path(sys.argv[1])
+image_ref = sys.argv[2]
+network_mode = sys.argv[3]
+data = json.loads(policy_path.read_text())
+data["docker_image"] = image_ref
+data["docker_network_mode"] = network_mode
+policy_path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+    log_info "Rewrote cai-pep default policy docker_image to: $CAI_PEP_BASE_IMAGE"
+    log_info "Rewrote cai-pep default policy docker_network_mode to: $CAI_PEP_DOCKER_NETWORK_MODE"
+}
+
+prepare_cai_pep_base_image_archive() {
+    mkdir -p "$(dirname "$CAI_PEP_BASE_IMAGE_ARCHIVE")"
+
+    if [[ -f "$CAI_PEP_BASE_IMAGE_ARCHIVE" && -f "$CAI_PEP_BASE_IMAGE_REF_FILE" ]]; then
+        local cached_ref
+        cached_ref="$(tr -d '[:space:]' < "$CAI_PEP_BASE_IMAGE_REF_FILE")"
+        if [[ "$cached_ref" == "$CAI_PEP_BASE_IMAGE" ]]; then
+            log_info "Reusing cached cai-pep base image archive for: $CAI_PEP_BASE_IMAGE"
+            return 0
+        fi
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "docker is required to preload the cai-pep sandbox base image"
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        log_error "docker daemon is not available on the build host"
+        return 1
+    fi
+
+    if ! docker image inspect "$CAI_PEP_BASE_IMAGE" >/dev/null 2>&1; then
+        log_info "Pulling cai-pep sandbox base image on build host: $CAI_PEP_BASE_IMAGE"
+        docker pull "$CAI_PEP_BASE_IMAGE"
+    else
+        log_info "Found cai-pep sandbox base image in host Docker cache: $CAI_PEP_BASE_IMAGE"
+    fi
+
+    log_info "Saving cai-pep sandbox base image archive: $CAI_PEP_BASE_IMAGE_ARCHIVE"
+    docker save -o "$CAI_PEP_BASE_IMAGE_ARCHIVE" "$CAI_PEP_BASE_IMAGE"
+    printf '%s\n' "$CAI_PEP_BASE_IMAGE" > "$CAI_PEP_BASE_IMAGE_REF_FILE"
 }
 
 # Log file path
@@ -357,12 +489,16 @@ main() {
     check_tools
 
     
-    # Image paths
-    local full_image="$OUTPUT_DIR/cai-intermediate-full.qcow2"
-    local hardened_prod="$OUTPUT_DIR/cai-intermediate-hardened-prod.qcow2"
-    local hardened_debug="$OUTPUT_DIR/cai-intermediate-hardened-debug.qcow2"
-    local final_prod="$OUTPUT_DIR/cai-final-prod-${BUILD_TIMESTAMP}.qcow2"
-    local final_debug="$OUTPUT_DIR/cai-final-debug-${BUILD_TIMESTAMP}.qcow2"
+    log_info "Build profile: $BUILD_PROFILE (prefix=$IMAGE_PREFIX)"
+    log_info "Common dir: $COMMON_DIR"
+    log_info "Profile dir: $PROFILE_DIR"
+
+    # Image paths (prefixed by IMAGE_PREFIX for different profiles)
+    local full_image="$OUTPUT_DIR/${IMAGE_PREFIX}-intermediate-full.qcow2"
+    local hardened_prod="$OUTPUT_DIR/${IMAGE_PREFIX}-intermediate-hardened-prod.qcow2"
+    local hardened_debug="$OUTPUT_DIR/${IMAGE_PREFIX}-intermediate-hardened-debug.qcow2"
+    local final_prod="$OUTPUT_DIR/${IMAGE_PREFIX}-final-prod-${BUILD_TIMESTAMP}.qcow2"
+    local final_debug="$OUTPUT_DIR/${IMAGE_PREFIX}-final-debug-${BUILD_TIMESTAMP}.qcow2"
     
     # Check if full image already exists (can be reused)
     local use_cached_full=false
@@ -390,7 +526,7 @@ main() {
         fi
         
         # Create working copy (temporary name during Phase 1)
-        local temp_phase1="$OUTPUT_DIR/cai-intermediate-phase1.qcow2"
+        local temp_phase1="$OUTPUT_DIR/${IMAGE_PREFIX}-intermediate-phase1.qcow2"
         log_info "Creating intermediate phase1 image from Base image..."
         qemu-img create -f qcow2 -F qcow2 -b "$cached_image" "$temp_phase1"
 
@@ -428,8 +564,8 @@ main() {
         copy_customization_files "$CHROOT_MOUNT_POINT"
         log_info "Running installation scripts in alphabetical order..."
         
-        # Execute all scripts in customize/script directory in alphabetical order
-        for script in "$CUSTOMIZE_DIR/script"/*.sh; do
+        # Execute all scripts from the merged chroot script directory
+        for script in "$CHROOT_MOUNT_POINT/tmp/script"/*.sh; do
             if [ -f "$script" ]; then
                 script_name=$(basename "$script")
                 log_info "Executing script: $script_name"
@@ -508,14 +644,26 @@ main() {
     # Phase 3: dm-verity Processing (convert)
     # ========================================
     log_info "=== Phase 3/3: dm-verity Processing ==="
-    
+
+    # Profile-specific UKI kernel cmdline (e.g. CC GPU needs swiotlb)
+    local uki_extra_args=()
+    local profile_json="$PROFILE_DIR/profile.json"
+    if [[ -f "$profile_json" ]]; then
+        local uki_cmdline
+        uki_cmdline=$(jq -r '.deploy.uki_append_cmdline // empty' "$profile_json" 2>/dev/null)
+        if [[ -n "$uki_cmdline" ]]; then
+            uki_extra_args+=(--uki-append-cmdline "$uki_cmdline")
+            log_info "UKI append cmdline: $uki_cmdline"
+        fi
+    fi
+
     log_info "Converting PROD image..."
     cryptpilot-convert \
         --in "$hardened_prod" \
         --out "$final_prod" \
         --config-dir "$SCRIPT_DIR/disk-crypt" \
         --rootfs-no-encryption \
-        --uki
+        --uki "${uki_extra_args[@]}"
     cp "/tmp/.cryptpilot-convert.log" "$OUTPUT_DIR/$(basename "$final_prod" .qcow2).log"
     
     log_info "Converting DEBUG image..."
@@ -524,7 +672,7 @@ main() {
         --out "$final_debug" \
         --config-dir "$SCRIPT_DIR/disk-crypt" \
         --rootfs-no-encryption \
-        --uki
+        --uki "${uki_extra_args[@]}"
     cp "/tmp/.cryptpilot-convert.log" "$OUTPUT_DIR/$(basename "$final_debug" .qcow2).log"
 
     log_success "Phase 3 completed"
@@ -559,6 +707,93 @@ main() {
     echo
 
     # ========================================
+    # Upload Reference Values to Rekor (optional)
+    # ========================================
+    local profile_json="$PROFILE_DIR/profile.json"
+    local rekor_enabled
+    rekor_enabled=$(jq -r '.rekor.enabled // false' "$profile_json" 2>/dev/null)
+
+    COSIGN_KEY="${COSIGN_KEY:-$SCRIPT_DIR/../secrets/cosign.key}"
+    REKOR_URL="${REKOR_URL:-https://rekor.sigstore.dev}"
+    SLSA_GENERATOR="${SLSA_GENERATOR:-$SCRIPT_DIR/../tools/slsa/slsa-generator}"
+
+    if [[ "$rekor_enabled" == "true" ]]; then
+        if [[ ! -f "$COSIGN_KEY" ]]; then
+            log_error "Rekor enabled but cosign key not found at $COSIGN_KEY"
+            log_error "Run 'make generate-secrets' to create cosign keys"
+            exit 1
+        elif [[ ! -x "$SLSA_GENERATOR" ]]; then
+            log_error "Rekor enabled but slsa-generator not found at $SLSA_GENERATOR"
+            log_error "Run 'make install-deps' first to install slsa-generator"
+            exit 1
+        else
+            log_info "=== Uploading Reference Values to Rekor ==="
+
+            local artifact_id artifact_type
+            artifact_id=$(jq -r '.rekor.artifact_id // ""' "$profile_json")
+            artifact_type=$(jq -r '.rekor.artifact_type // "uki"' "$profile_json")
+            local artifact_version="$BUILD_TIMESTAMP"
+
+            if [[ -z "$artifact_id" ]]; then
+                artifact_id="$IMAGE_PREFIX"
+                log_info "No rekor.artifact_id in profile, using default: $artifact_id"
+            fi
+
+            local rv_name
+            rv_name=$(jq -r 'keys[0]' "$PROD_REFERENCE_FILE")
+
+            for rv_file in "$PROD_REFERENCE_FILE" "$DEBUG_REFERENCE_FILE"; do
+                local rv_basename
+                rv_basename=$(basename "$rv_file" .json)
+                local img_type="prod"
+                if [[ "$rv_basename" == *"-debug-"* ]]; then
+                    img_type="debug"
+                fi
+                local this_artifact_id="${artifact_id}-${img_type}"
+                local rekor_meta_file="$OUTPUT_DIR/${rv_basename}.rekor-meta.json"
+
+                log_info "Uploading $img_type RV to Rekor (artifact_id=$this_artifact_id, version=$artifact_version)..."
+
+                local slsa_output_dir
+                if COSIGN_PASSWORD="" "$SLSA_GENERATOR" \
+                    --artifact-type "$artifact_type" \
+                    --artifact "$rv_file" \
+                    --artifact-id "$this_artifact_id" \
+                    --artifact-version "$artifact_version" \
+                    --sign-key "$COSIGN_KEY" \
+                    --rekor-url "$REKOR_URL" 2>&1 | tee /dev/stderr; then
+
+                    slsa_output_dir=$(ls -dt "$PWD"/slsa-output-${this_artifact_id}-* 2>/dev/null | head -1)
+
+                    jq -n \
+                        --arg artifact_id "$this_artifact_id" \
+                        --arg artifact_version "$artifact_version" \
+                        --arg artifact_type "$artifact_type" \
+                        --arg rekor_url "$REKOR_URL" \
+                        --arg rv_name "$rv_name" \
+                        '{artifact_id:$artifact_id, artifact_version:$artifact_version,
+                          artifact_type:$artifact_type, rekor_url:$rekor_url, rv_name:$rv_name}' \
+                        > "$rekor_meta_file"
+
+                    log_success "Rekor metadata saved: $rekor_meta_file"
+
+                    if [[ -n "$slsa_output_dir" ]]; then
+                        mv "$slsa_output_dir" "$OUTPUT_DIR/"
+                        log_info "SLSA output moved to: $OUTPUT_DIR/$(basename "$slsa_output_dir")"
+                    fi
+                else
+                    log_error "Failed to upload $img_type RV to Rekor"
+                    exit 1
+                fi
+            done
+        fi
+    else
+        log_info "Rekor upload not enabled for profile $BUILD_PROFILE (set rekor.enabled=true in profile.json)"
+    fi
+
+    echo
+
+    # ========================================
     # Summary
     # ========================================
     log_success "=========================================="
@@ -577,8 +812,16 @@ main() {
     echo "Final images (deploy these):"
     echo -e "  cai-final-prod-${BUILD_TIMESTAMP}.qcow2\t- Production (dm-verity, no SSH)"
     echo -e "    ↳ $(basename $PROD_REFERENCE_FILE)\t- Reference values file for prod image"
+    local prod_rekor_meta="$OUTPUT_DIR/$(basename "$PROD_REFERENCE_FILE" .json).rekor-meta.json"
+    if [[ -f "$prod_rekor_meta" ]]; then
+        echo -e "    ↳ $(basename "$prod_rekor_meta")\t- Rekor transparency log metadata"
+    fi
     echo -e "  cai-final-debug-${BUILD_TIMESTAMP}.qcow2\t- Debug (dm-verity, SSH key auth)"
     echo -e "    ↳ $(basename $DEBUG_REFERENCE_FILE)\t- Reference values file for debug image"
+    local debug_rekor_meta="$OUTPUT_DIR/$(basename "$DEBUG_REFERENCE_FILE" .json).rekor-meta.json"
+    if [[ -f "$debug_rekor_meta" ]]; then
+        echo -e "    ↳ $(basename "$debug_rekor_meta")\t- Rekor transparency log metadata"
+    fi
     echo -e "    ↳ $(realpath $SCRIPT_DIR/../secrets/ssh_client_key)\t- SSH key for debug image"
     echo
 }

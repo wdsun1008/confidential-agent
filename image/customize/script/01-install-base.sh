@@ -23,6 +23,16 @@ yum install -y $YUM_OPTS \
     bind-utils \
     tar \
     gzip \
-    git
+    git \
+    python38
+
+# Python JWT dependencies (used by cai-local-trustee-sync for RVPS auth)
+python3.8 -m pip install --quiet -i "$PIP_INDEX_URL" pyjwt cryptography
+
+# Use /tmp (tmpfs) for dracut temp files instead of /var/tmp.
+# cryptpilot-convert shrinks rootfs before running dracut for UKI generation;
+# /var/tmp on the minimized rootfs may not have enough space.
+mkdir -p /etc/dracut.conf.d
+echo 'tmpdir="/tmp"' > /etc/dracut.conf.d/tmpdir.conf
 
 echo "=== Base packages installation completed ==="

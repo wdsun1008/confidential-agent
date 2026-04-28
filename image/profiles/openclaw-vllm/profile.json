@@ -1,0 +1,37 @@
+{
+  "service_id": "openclaw-vllm",
+  "service_type": "agent",
+  "deploy": {
+    "ip": "10.0.1.21",
+    "instance_type": "ecs.gn8v-tee.4xlarge",
+    "tdx": true,
+    "disk_size": 512,
+    "security_group_ports": ["22/22", "18789/18789"],
+    "uki_append_cmdline": "swiotlb=4194304,any"
+  },
+  "endpoints": {
+    "gateway": {
+      "port": 18789,
+      "local_port": 18789,
+      "protocol": "rats-tls",
+      "description": "OpenClaw AI Gateway"
+    }
+  },
+  "custom_resources": {
+    "openclaw_config": {
+      "source": "secrets/openclaw-vllm.json",
+      "kbs_path": "default/local-resources/openclaw_vllm_config",
+      "dest": "/home/openclaw/.openclaw/openclaw.json"
+    }
+  },
+  "rekor": {
+    "enabled": true,
+    "artifact_id": "cai-openclaw-vllm",
+    "artifact_type": "uki"
+  },
+  "metadata": {
+    "vllm_port": 8090,
+    "modelscope_model": "Qwen/Qwen3.6-35B-A3B",
+    "model_dir": "/opt/models/Qwen3.6-35B-A3B"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "service_id": "openclaw",
+  "service_type": "agent",
+  "deploy": {
+    "ip": "10.0.1.20",
+    "instance_type": "ecs.g8i.xlarge",
+    "tdx": true,
+    "disk_size": 200,
+    "security_group_ports": ["22/22", "18789/18789"]
+  },
+  "endpoints": {
+    "gateway": {
+      "port": 18789,
+      "local_port": 18789,
+      "protocol": "rats-tls",
+      "description": "OpenClaw AI Gateway"
+    }
+  },
+  "custom_resources": {
+    "openclaw_config": {
+      "source": "secrets/openclaw.json",
+      "kbs_path": "default/local-resources/openclaw_config",
+      "dest": "/home/openclaw/.openclaw/openclaw.json"
+    }
+  },
+  "rekor": {
+    "enabled": true,
+    "artifact_id": "cai-openclaw",
+    "artifact_type": "uki"
+  },
+  "metadata": {}
+}

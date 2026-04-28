@@ -1,0 +1,26 @@
+{
+  "service_id": "mcp-server",
+  "service_type": "mcp",
+  "deploy": {
+    "ip": "10.0.1.30",
+    "instance_type": "ecs.g8i.xlarge",
+    "tdx": true,
+    "disk_size": 200,
+    "security_group_ports": ["22/22", "3001/3001"]
+  },
+  "endpoints": {
+    "mcp": {
+      "port": 3001,
+      "local_port": 3001,
+      "protocol": "rats-tls",
+      "description": "MCP Server (Streamable HTTP)"
+    }
+  },
+  "custom_resources": {},
+  "rekor": {
+    "enabled": true,
+    "artifact_id": "cai-mcp-server",
+    "artifact_type": "uki"
+  },
+  "metadata": {}
+}

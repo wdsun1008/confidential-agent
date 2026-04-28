@@ -37,15 +37,13 @@ resource "alicloud_security_group_rule" "trustee_as_vpc" {
 
 # Local values for secrets - read from files and encode as base64
 locals {
-  # Derive image reference value path from image path
-  image_reference_value_path = "${regex("^(.*)\\.qcow2$", var.image_file_path)[0]}.json"
-
   user_data_vars = {
-    disk_passphrase_base64       = filebase64("${path.root}/../secrets/disk_passphrase")
-    sshd_server_key_base64       = filebase64("${path.root}/../secrets/sshd_server_key")
-    sshd_server_pub_base64       = filebase64("${path.root}/../secrets/sshd_server_key.pub")
-    openclaw_config_base64       = filebase64("${path.root}/../secrets/openclaw.json")
-    image_reference_value_base64 = filebase64(local.image_reference_value_path)
+    disk_passphrase_base64  = filebase64("${path.root}/../secrets/disk_passphrase")
+    sshd_server_key_base64  = filebase64("${path.root}/../secrets/sshd_server_key")
+    sshd_server_pub_base64  = filebase64("${path.root}/../secrets/sshd_server_key.pub")
+    kbs_auth_pubkey_base64  = filebase64("${path.root}/../secrets/kbs-auth-public.pub")
+    # Same OPA policy as per-node local Trustee (image/customize/files/trustee-opa-default.rego)
+    opa_default_rego_base64 = filebase64("${path.root}/../image/customize/files/trustee-opa-default.rego")
   }
   user_data_content = templatefile("${path.module}/user-data.sh.tftpl", local.user_data_vars)
 }

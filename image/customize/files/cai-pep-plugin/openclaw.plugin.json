@@ -1,0 +1,8 @@
+{
+  "id": "cai-pep",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}

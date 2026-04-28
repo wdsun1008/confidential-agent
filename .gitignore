@@ -8,6 +8,7 @@ packer_cache/
 # Build outputs
 image/output/
 image/packer/output/
+target/
 
 # Terraform
 terraform/.terraform/
@@ -15,6 +16,7 @@ terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/.terraform.lock.hcl
 terraform/terraform.tfvars
+terraform/services.auto.tfvars.json
 # Custom terraform provider
 terraform-provider-alicloud/
 
@@ -23,6 +25,9 @@ terraform-provider-alicloud/
 *.swp
 *.swo
 *~
+
+# Downloaded tools
+tools/slsa/
 
 # Secrets
 secrets/

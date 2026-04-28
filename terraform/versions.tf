@@ -17,6 +17,6 @@ provider "alicloud" {
   region = "cn-beijing"
 
   endpoints {
-    oss = "cn-beijing.oss.aliyuncs.com"
+    oss = "oss-cn-beijing.aliyuncs.com"
   }
 }

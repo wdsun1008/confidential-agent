@@ -36,7 +36,3 @@ variable "security_group_allowed_cidr" {
   description = "Security Group Allowed CIDR for Trustee SSH (port 22) and API (port 8081)"
 }
 
-variable "image_file_path" {
-  type        = string
-  description = "Path to the VM image file (qcow2). Image reference value JSON will be derived by changing suffix to .json"
-}

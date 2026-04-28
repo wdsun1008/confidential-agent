@@ -1,0 +1,73 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "local-vllm": {
+        "baseUrl": "http://127.0.0.1:8090/v1",
+        "apiKey": "local-unused",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "Qwen3.6-35B-A3B",
+            "name": "Qwen3.6-35B-A3B",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 262144, // reduce this if got OOM in vLLM: https://huggingface.co/Qwen/Qwen3.6-35B-A3B#serving-qwen36
+            "maxTokens": 16384
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "local-vllm/Qwen3.6-35B-A3B"
+      }
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "plugins": {
+    "enabled": true,
+    "allow": ["dingtalk", "cai-pep"],
+    "entries": {
+      "cai-pep": {
+        "enabled": true,
+        "config": {
+          "socketPath": "/run/cai/pep.sock",
+          "pepRequired": true,
+          "defaultWorkdir": "/workspace"
+        }
+      }
+    }
+  },
+  "channels": {
+    "dingtalk": {
+      "enabled": true,
+      "clientId": "<DINGTALK_BOT_CLIENT_ID>",
+      "clientSecret": "<DINGTALK_BOT_CLIENT_SECRET>",
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
+      "groupPolicy": "open",
+      "debug": false,
+      "messageType": "markdown"
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "bind": "lan", // It is safe to expose this gateway to 0.0.0.0, since it is behind the trusted-network-gateway.
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "<GATEWAY_TOKEN>"
+    },
+    "controlUi": {
+      "enabled": true,
+      "basePath": "/openclaw",
+      "dangerouslyAllowHostHeaderOriginFallback": true, // Required when bind=lan
+      "dangerouslyDisableDeviceAuth": true // Disable device auth since we do not always provide SSH access
+    }
+  }
+}

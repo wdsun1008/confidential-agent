@@ -1,0 +1,81 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "bailian": {
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "apiKey": "<DASHSCOPE_API_KEY>",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "qwen3-max-2026-01-23",
+            "name": "qwen3-max-2026-01-23",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 262144,
+            "maxTokens": 65536
+          },
+          {
+            "id": "qwen3-coder-plus",
+            "name": "qwen3-coder-plus",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 131072,
+            "maxTokens": 32768
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "bailian/qwen3-max-2026-01-23"
+      }
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "plugins": {
+    "enabled": true,
+    "allow": ["dingtalk", "cai-pep"],
+    "entries": {
+      "cai-pep": {
+        "enabled": true,
+        "config": {
+          "socketPath": "/run/cai/pep.sock",
+          "pepRequired": true,
+          "defaultWorkdir": "/workspace"
+        }
+      }
+    }
+  },
+  "channels": {
+    "dingtalk": {
+      "enabled": true,
+      "clientId": "<DINGTALK_BOT_CLIENT_ID>",
+      "clientSecret": "<DINGTALK_BOT_CLIENT_SECRET>",
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
+      "groupPolicy": "open",
+      "debug": false,
+      "messageType": "markdown"
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "bind": "lan", // It is safe to expose this gateway to 0.0.0.0, since it is behind the trusted-network-gateway.
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "<GATEWAY_TOKEN>"
+    },
+    "controlUi": {
+      "enabled": true,
+      "basePath": "/openclaw",
+      "dangerouslyAllowHostHeaderOriginFallback": true, // Required when bind=lan
+      "dangerouslyDisableDeviceAuth": true // Disable device auth since we do not always provide SSH access
+    }
+  }
+}

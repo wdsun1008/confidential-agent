@@ -12,6 +12,12 @@ echo "=== Cleaning up image ==="
 yum clean all
 rm -rf /var/cache/yum
 
+# Remove build-time npm/git proxy settings that should not persist in the image
+npm config delete registry 2>/dev/null || true
+git config --global --unset-all url.https://gh-proxy.org/https://github.com/.insteadOf 2>/dev/null || true
+git config --global --unset-all url.https://gh-proxy.org/https://github.com//.insteadOf 2>/dev/null || true
+rm -f /root/.gitconfig 2>/dev/null || true
+
 # Clear bash history
 history -c
 rm -f /root/.bash_history
