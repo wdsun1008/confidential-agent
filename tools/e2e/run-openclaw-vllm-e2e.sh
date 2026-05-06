@@ -236,6 +236,11 @@ write_spec_and_config() {
   local cosign_key="$3"
   mkdir -p "$WORK_DIR/openclaw-vllm"
   cp "$ROOT_DIR/examples/openclaw-vllm/install-openclaw-vllm.sh" "$WORK_DIR/openclaw-vllm/"
+<<<<<<< HEAD
+=======
+  cp "$ROOT_DIR/examples/openclaw-vllm/cai-nvidia-cc-stack-install.sh" "$WORK_DIR/openclaw-vllm/"
+  cp "$ROOT_DIR/examples/openclaw-vllm/nvidia-persistenced.service" "$WORK_DIR/openclaw-vllm/"
+>>>>>>> df2d5bb (test: add end-to-end workflows)
 
   python3 - "$ROOT_DIR/examples/openclaw-vllm/openclaw-vllm.json" "$WORK_DIR/openclaw-vllm/openclaw-vllm.json" "$token" <<'PY'
 import json
@@ -284,9 +289,15 @@ service:
 build:
 $base_image_yaml
   image_name: openclaw-vllm-agent
+<<<<<<< HEAD
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
   packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel-5.10.134-19.1.al8, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+=======
+  kernel_cmdline_append: swiotlb=4194304,any
+  resize: 80G
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, pciutils, tar, wget, xz]
+>>>>>>> df2d5bb (test: add end-to-end workflows)
   scripts: [./install-openclaw-vllm.sh]
   variants:
     release:
@@ -383,6 +394,7 @@ guest_check() {
   record_file_as_block "$label stderr:" "$WORK_DIR/$label.stderr" text
 }
 
+<<<<<<< HEAD
 guest_wait() {
   local host="$1"
   local key="$2"
@@ -427,6 +439,22 @@ start_connect() {
     cleanup_connect "${CONNECT_PID:-}"
     CONNECT_PID=""
     sleep 30
+=======
+start_connect() {
+  record_cmd "${CA_ARGS[*]} connect"
+  setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+    "${CA_ARGS[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
+  CONNECT_PID=$!
+  for _ in $(seq 1 120); do
+    if curl -fsS "http://127.0.0.1:18789/openclaw" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$CONNECT_PID" >/dev/null 2>&1; then
+      record_file_as_block "Connect log:" "$WORK_DIR/connect.log" text
+      return 1
+    fi
+    sleep 2
+>>>>>>> df2d5bb (test: add end-to-end workflows)
   done
   record_file_as_block "Connect log:" "$WORK_DIR/connect.log" text
   return 1
@@ -509,11 +537,19 @@ main() {
   local host="${ssh_lines[0]}"
   local key="${ssh_lines[1]}"
   wait_for_ssh "$host" "$key"
+<<<<<<< HEAD
   guest_wait "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi" 1800
   guest_wait "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service" 1800
   guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 3600
   guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:8090/v1/models" 1800
   guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 1800
+=======
+  guest_check "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi"
+  guest_check "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service"
+  guest_check "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service"
+  guest_check "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:8090/v1/models"
+  guest_check "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html"
+>>>>>>> df2d5bb (test: add end-to-end workflows)
 
   start_connect
   record_cmd "node tools/e2e/openclaw-chat-probe.mjs --url ws://127.0.0.1:18789 --token <redacted> --message '$CHAT_MESSAGE'"
