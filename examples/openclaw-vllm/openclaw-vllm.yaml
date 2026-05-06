@@ -1,0 +1,71 @@
+schema: confidential-agent/v1
+
+service:
+  id: openclaw-vllm
+  ports:
+    - 18789
+  connect:
+    - 18789
+
+build:
+  image_name: openclaw-vllm-agent
+  kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
+  resize: 80G
+  packages:
+    - binutils
+    - ca-certificates
+    - curl
+    - dracut
+    - elfutils-libelf-devel
+    - gcc
+    - git
+    - glibc-devel
+    - jq
+    - kernel-devel-5.10.134-19.1.al8
+    - kernel-headers
+    - kmod
+    - make
+    - nodejs
+    - npm
+    - openssl3
+    - pciutils
+    - pkgconf-pkg-config
+    - python3.11
+    - python3.11-devel
+    - python3.11-pip
+    - rpm
+    - tar
+    - wget
+    - xz
+    - zlib-devel
+  scripts:
+    - ./install-openclaw-vllm.sh
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.gn8v-tee.4xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  disk_gb: 512
+  security:
+    allowed_cidr: 203.0.113.0/24
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+
+resources:
+  openclaw_config:
+    source: ./openclaw-vllm.json
+    target: /home/openclaw/.openclaw/openclaw.json
+    owner: openclaw
+    group: openclaw
+    mode: "0600"
+    required: true
