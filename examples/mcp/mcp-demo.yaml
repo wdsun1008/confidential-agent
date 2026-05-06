@@ -1,0 +1,38 @@
+schema: confidential-agent/v1
+
+service:
+  id: mcp
+  ports:
+    - 3001
+  connect: []
+
+build:
+  image_name: mcp-agent
+  resize: 30G
+  packages:
+    - ca-certificates
+    - curl
+    - nodejs
+    - npm
+  scripts:
+    - ./install-mcp.sh
+  variants:
+    release:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  disk_gb: 200
+  security:
+    allowed_cidr: 203.0.113.0/24
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+
+resources: {}
