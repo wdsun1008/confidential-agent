@@ -1,0 +1,6 @@
+/target
+/.state
+/.tmp
+/.confidential-agent
+*.log
+/env.sh
