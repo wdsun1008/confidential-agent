@@ -1,0 +1,48 @@
+schema: confidential-agent/v1
+
+service:
+  id: openclaw
+  ports:
+    - 18789
+  connect:
+    - 18789
+
+build:
+  image_name: openclaw-agent
+  resize: 30G
+  packages:
+    - ca-certificates
+    - curl
+    - git
+    - jq
+    - nodejs
+    - npm
+    - tar
+    - xz
+  scripts:
+    - ./install-openclaw.sh
+  variants:
+    release:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  disk_gb: 200
+  security:
+    allowed_cidr: 203.0.113.0/24
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+
+resources:
+  openclaw_config:
+    source: ./openclaw.json
+    target: /root/.openclaw/openclaw.json
+    mode: "0600"
+    required: true
