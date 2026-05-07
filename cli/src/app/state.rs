@@ -111,7 +111,11 @@ pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
         .with_context(|| format!("failed to execute '{}'", cli.shelter_bin.display()))?;
 
     if !status.success() {
-        bail!("shelter exited with status {}", status);
+        bail!(
+            "shelter exited with status {}; check rendered Shelter work directories under '{}'",
+            status,
+            cli.state_dir.display()
+        );
     }
     Ok(())
 }

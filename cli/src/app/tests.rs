@@ -155,6 +155,26 @@ fn state_dir_lock_serializes_concurrent_writers() {
 }
 
 #[test]
+fn json_atomic_write_replaces_local_state_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("services/openclaw/state.json");
+
+    write_json_atomic(&path, &serde_json::json!({"generation": 1})).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    write_json_atomic(&path, &serde_json::json!({"generation": 2})).unwrap();
+
+    let content = fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    assert_eq!(parsed["generation"], 2);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(!path.with_extension("confidential-agent.tmp").exists());
+}
+
+#[test]
 fn local_state_reader_rejects_schema_before_full_parse() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.json");

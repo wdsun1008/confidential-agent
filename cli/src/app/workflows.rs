@@ -1,5 +1,8 @@
 use super::*;
 
+const REKOR_RV_SET_ATTEMPTS: usize = 5;
+const REKOR_RV_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 pub(super) fn inject_resources(
     cli: &Cli,
     state_dir: &Path,
@@ -210,8 +213,7 @@ pub(super) fn write_local_service_state(state_dir: &Path, state: &LocalServiceSt
     let paths = context_paths(state_dir, &state.service_id);
     fs::create_dir_all(&paths.service_dir)
         .with_context(|| format!("failed to create '{}'", paths.service_dir.display()))?;
-    fs::write(&paths.service_state, serde_json::to_string_pretty(&state)?)
-        .with_context(|| format!("failed to write '{}'", paths.service_state.display()))?;
+    write_json_atomic(&paths.service_state, state)?;
     Ok(())
 }
 
@@ -405,10 +407,7 @@ pub(super) fn sync_mesh_for_services(
     let generation = next_mesh_generation(state_dir, &services);
     let bundle = render_mesh_bundle(&services, &reference_values, generation);
     let bundle_path = state_dir.join("mesh-bundle.json");
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
-    fs::write(&bundle_path, serde_json::to_string_pretty(&bundle)?)
-        .with_context(|| format!("failed to write '{}'", bundle_path.display()))?;
+    write_json_atomic(&bundle_path, &bundle)?;
 
     let mut delivered = Vec::new();
     for service in services
@@ -804,8 +803,7 @@ pub(super) fn prepare_challenge_reference_values(
             fs::create_dir_all(&paths.service_dir)
                 .with_context(|| format!("failed to create '{}'", paths.service_dir.display()))?;
             let rv_list_path = paths.service_dir.join("rekor-rv-list.json");
-            fs::write(&rv_list_path, serde_json::to_string_pretty(&rv_list)?)
-                .with_context(|| format!("failed to write '{}'", rv_list_path.display()))?;
+            write_json_atomic(&rv_list_path, &rv_list)?;
             set_rekor_reference_value_list(cli, state_dir, &rv_list_path)
         }
         other => bail!(
@@ -842,18 +840,43 @@ pub(super) fn set_rekor_reference_value_list(
     state_dir: &Path,
     rv_list: &Path,
 ) -> Result<()> {
-    run_attestation_client(
-        cli,
-        state_dir,
-        vec![
-            OsString::from("set-reference-value-list"),
-            OsString::from("--rv-list"),
-            rv_list.as_os_str().to_os_string(),
-        ],
-        vec![rv_list.to_path_buf()],
-        inherited_proxy_envs(None),
-        true,
-    )
+    let mut last_error = None;
+    for attempt in 1..=REKOR_RV_SET_ATTEMPTS {
+        let result = run_attestation_client(
+            cli,
+            state_dir,
+            vec![
+                OsString::from("set-reference-value-list"),
+                OsString::from("--rv-list"),
+                rv_list.as_os_str().to_os_string(),
+            ],
+            vec![rv_list.to_path_buf()],
+            inherited_proxy_envs(None),
+            true,
+        );
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt == REKOR_RV_SET_ATTEMPTS {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to set Rekor reference value list after {} attempts",
+                            REKOR_RV_SET_ATTEMPTS
+                        )
+                    });
+                }
+                eprintln!(
+                    "[ca] set Rekor reference value list failed on attempt {}/{}: {err:#}; retrying in {}s",
+                    attempt,
+                    REKOR_RV_SET_ATTEMPTS,
+                    REKOR_RV_SET_RETRY_DELAY.as_secs()
+                );
+                last_error = Some(err);
+                thread::sleep(REKOR_RV_SET_RETRY_DELAY);
+            }
+        }
+    }
+    Err(last_error.expect("at least one Rekor RV set attempt must run"))
 }
 
 pub(super) fn render_mesh_bundle(

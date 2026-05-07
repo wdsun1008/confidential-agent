@@ -1,5 +1,6 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -8,6 +9,13 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn parses_octal_modes() {
     assert_eq!(parse_mode("0600").unwrap(), 0o600);
     assert_eq!(parse_mode("0o644").unwrap(), 0o644);
+}
+
+#[test]
+fn rejects_excessive_octal_modes() {
+    assert!(parse_mode("0o7777").is_ok());
+    let err = parse_mode("0o10000").unwrap_err();
+    assert!(err.to_string().contains("exceeds maximum 0o7777"));
 }
 
 #[test]
@@ -375,6 +383,33 @@ fn resource_apply_is_idempotent() {
 }
 
 #[test]
+fn resource_apply_removes_stale_tmp_before_replace() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    let stale_tmp = target.with_extension("confidential-agent.tmp");
+    fs::write(&source, "managed").unwrap();
+    fs::write(&stale_tmp, "stale").unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let resource = GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        sha256: Some(digest.clone()),
+    };
+
+    let outcome = apply_resource_once(&resource, &source, &digest).unwrap();
+
+    assert_eq!(outcome, ApplyOutcome::Updated);
+    assert_eq!(fs::read_to_string(target).unwrap(), "managed");
+    assert!(!stale_tmp.exists());
+}
+
+#[test]
 fn resource_apply_supports_numeric_owner_and_group() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
@@ -451,6 +486,110 @@ fn bootstrap_reapplies_resource_when_target_content_drifted() {
     apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
 
     assert_eq!(fs::read_to_string(target).unwrap(), "managed-v1");
+}
+
+#[test]
+fn bootstrap_rejects_oversized_resource() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let file = fs::File::create(&source).unwrap();
+    file.set_len(MAX_RESOURCE_BYTES + 1).unwrap();
+    drop(file);
+    let bootstrap = BootstrapConfig {
+        schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
+        generation: 1,
+        service_id: "openclaw".to_string(),
+        mode: "challenge".to_string(),
+        ports: Vec::new(),
+        connect: Vec::new(),
+        resources: vec![GuestResource {
+            id: "config".to_string(),
+            resource_path: "default/local-resources/config".to_string(),
+            target,
+            owner: None,
+            group: None,
+            mode: "0600".to_string(),
+            required: true,
+            sha256: None,
+        }],
+        app_service: None,
+    };
+    let args = RunArgs {
+        cdh_root,
+        bootstrap_resource: "default/local-resources/cagent_bootstrap_config".to_string(),
+        mesh_resource: "default/local-resources/cagent_mesh_bundle".to_string(),
+        poll_interval_sec: 5,
+        status_listen: "127.0.0.1:0".to_string(),
+    };
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    assert!(err.to_string().contains("exceeding maximum"));
+}
+
+#[test]
+fn bootstrap_rejects_non_regular_resource_even_when_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&source).unwrap();
+    let bootstrap = BootstrapConfig {
+        schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
+        generation: 1,
+        service_id: "openclaw".to_string(),
+        mode: "challenge".to_string(),
+        ports: Vec::new(),
+        connect: Vec::new(),
+        resources: vec![GuestResource {
+            id: "config".to_string(),
+            resource_path: "default/local-resources/config".to_string(),
+            target,
+            owner: None,
+            group: None,
+            mode: "0600".to_string(),
+            required: true,
+            sha256: None,
+        }],
+        app_service: None,
+    };
+    let args = RunArgs {
+        cdh_root,
+        bootstrap_resource: "default/local-resources/cagent_bootstrap_config".to_string(),
+        mesh_resource: "default/local-resources/cagent_mesh_bundle".to_string(),
+        poll_interval_sec: 5,
+        status_listen: "127.0.0.1:0".to_string(),
+    };
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    drop(listener);
+    assert!(err.to_string().contains("not a regular file"));
+}
+
+#[test]
+fn json_atomic_write_replaces_content_without_tmp_leftover() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    write_json_atomic(&path, &json!({"generation": 1})).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    write_json_atomic(&path, &json!({"generation": 2})).unwrap();
+
+    let content = fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    assert_eq!(parsed["generation"], 2);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(!path.with_extension("confidential-agent.tmp").exists());
 }
 
 #[test]
