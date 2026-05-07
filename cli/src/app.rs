@@ -24,7 +24,10 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
+use std::os::unix::{
+    fs::{chown, MetadataExt, PermissionsExt},
+    io::AsRawFd,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -132,12 +135,41 @@ fn lock_state_dir(state_dir: &Path) -> Result<StateDirLock> {
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("failed to open '{}'", lock_path.display()))?;
-    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to lock '{}'", lock_path.display()));
+    loop {
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err).with_context(|| format!("failed to lock '{}'", lock_path.display()));
     }
     Ok(StateDirLock { file })
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let content = serde_json::to_vec_pretty(value)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let existing_metadata = path.metadata().ok();
+    let tmp = path.with_extension("confidential-agent.tmp");
+    fs::write(&tmp, content).with_context(|| format!("failed to write '{}'", tmp.display()))?;
+    if let Some(metadata) = existing_metadata {
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(metadata.mode() & 0o7777))
+            .with_context(|| format!("failed to preserve mode on '{}'", tmp.display()))?;
+        let tmp_metadata = tmp
+            .metadata()
+            .with_context(|| format!("failed to stat '{}'", tmp.display()))?;
+        if tmp_metadata.uid() != metadata.uid() || tmp_metadata.gid() != metadata.gid() {
+            chown(&tmp, Some(metadata.uid()), Some(metadata.gid()))
+                .with_context(|| format!("failed to preserve owner on '{}'", tmp.display()))?;
+        }
+    }
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace '{}'", path.display()))
 }
 
 impl Default for PrepareOptions {

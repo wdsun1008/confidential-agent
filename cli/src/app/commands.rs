@@ -133,13 +133,10 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         )?;
         let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
         active_state.mesh_generation = mesh_generation;
-        let mut active_services = read_service_states(&cli.state_dir)?;
-        active_services.retain(|service| service.service_id != active_state.service_id);
-        active_services.push(active_state.clone());
-        active_services.sort_by(|left, right| left.service_id.cmp(&right.service_id));
+        write_local_service_state(&cli.state_dir, &active_state)?;
+        let active_services = read_service_states(&cli.state_dir)?;
         println!("[ca] refreshing active Shelter deploys for public mesh rules...");
         refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
-        write_local_service_state(&cli.state_dir, &active_state)?;
         println!(
             "[ca] deploy completed: service={} public_ip={} private_ip={} mesh_generation={}",
             active_state.service_id,
@@ -196,12 +193,10 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     }
     let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
     active_state.mesh_generation = mesh_generation;
-    let mut active_services = read_service_states(&cli.state_dir)?;
-    active_services.retain(|service| service.service_id != active_state.service_id);
-    active_services.push(active_state.clone());
-    active_services.sort_by(|left, right| left.service_id.cmp(&right.service_id));
+    write_local_service_state(&cli.state_dir, &active_state)?;
+    let active_services = read_service_states(&cli.state_dir)?;
     refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
-    write_local_service_state(&cli.state_dir, &active_state)
+    Ok(())
 }
 
 pub(super) fn cmd_mesh(cli: &Cli, args: &MeshArgs) -> Result<()> {

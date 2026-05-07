@@ -11,6 +11,7 @@ PYPI_INDEX_URL="${OPENCLAW_VLLM_PYPI_INDEX_URL:-https://mirrors.aliyun.com/pypi/
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-550.144.03}"
 NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://cn.download.nvidia.cn/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run}"
 NVIDIA_DRIVER_REFERER="${NVIDIA_DRIVER_REFERER:-https://www.nvidia.cn/}"
+NVIDIA_DRIVER_SHA256="${NVIDIA_DRIVER_SHA256:-}"
 
 ensure_build_dependencies() {
   local missing=()
@@ -77,7 +78,7 @@ After=nvidia-fabricmanager.service
 [Service]
 Type=forking
 ExecStart=/usr/bin/nvidia-persistenced --user root
-ExecStartPost=/usr/bin/nvidia-smi conf-compute -srs 1
+ExecStartPost=-/usr/bin/nvidia-smi conf-compute -srs 1
 ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
 TimeoutStartSec=900
 TimeoutStopSec=60
@@ -97,6 +98,7 @@ BUILD_INPUTS_ROOT=/opt/confidential-agent/openclaw-vllm
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-550.144.03}"
 NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://cn.download.nvidia.cn/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run}"
 NVIDIA_DRIVER_REFERER="${NVIDIA_DRIVER_REFERER:-https://www.nvidia.cn/}"
+NVIDIA_DRIVER_SHA256="${NVIDIA_DRIVER_SHA256:-}"
 NVIDIA_RUNFILE="$STATE_DIR/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run"
 mkdir -p "$STATE_DIR"
 exec >>/var/log/cai-nvidia-cc-install.log 2>&1
@@ -152,8 +154,23 @@ restore_driver_build_inputs() {
   fi
 }
 
+verify_driver_checksum() {
+  if [[ -z "$NVIDIA_DRIVER_SHA256" ]]; then
+    log "WARN: NVIDIA_DRIVER_SHA256 is not set; skipping driver checksum verification."
+    return 0
+  fi
+  local actual
+  actual="$(sha256sum "$NVIDIA_RUNFILE" | awk '{print $1}')"
+  if [[ "$actual" != "$NVIDIA_DRIVER_SHA256" ]]; then
+    log "ERROR: NVIDIA driver checksum mismatch: expected $NVIDIA_DRIVER_SHA256 got $actual"
+    rm -f "$NVIDIA_RUNFILE"
+    exit 1
+  fi
+}
+
 download_driver() {
   if [[ -s "$NVIDIA_RUNFILE" ]]; then
+    verify_driver_checksum
     return 0
   fi
   command -v wget >/dev/null 2>&1 || {
@@ -174,6 +191,7 @@ download_driver() {
     log "ERROR: failed to download NVIDIA driver after retries."
     exit 1
   fi
+  verify_driver_checksum
   chmod 0755 "$NVIDIA_RUNFILE"
 }
 
@@ -227,14 +245,20 @@ load_driver() {
 
 wait_persistenced_active() {
   for _ in $(seq 1 300); do
-    if systemctl is-active --quiet nvidia-persistenced.service 2>/dev/null; then
+    if systemctl is-active --quiet nvidia-persistenced.service 2>/dev/null && nvidia-smi >/dev/null 2>&1; then
       systemctl status nvidia-persistenced.service 2>/dev/null | grep "Active: " || true
       nvidia-smi
       return 0
     fi
     sleep 2
   done
-  log "ERROR: nvidia-persistenced did not become active."
+  if [[ ! -f "$STATE_DIR/post-install-reboot.done" ]]; then
+    log "WARN: NVIDIA driver installed but GPU is not ready; scheduling one reboot."
+    touch "$STATE_DIR/post-install-reboot.done"
+    systemctl reboot --no-block
+    exit 0
+  fi
+  log "ERROR: nvidia-persistenced or nvidia-smi did not become ready after reboot."
   systemctl status nvidia-persistenced.service --no-pager -l || true
   journalctl -u nvidia-persistenced.service --no-pager -n 120 || true
   exit 1
@@ -270,10 +294,12 @@ Description=CAI NVIDIA CC GPU driver bootstrap
 After=local-fs.target network-online.target
 Wants=network-online.target
 Before=cai-vllm.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=7200
 ExecStart=/usr/local/sbin/cai-nvidia-cc-stack-install.sh
 
 [Install]
@@ -328,6 +354,32 @@ done
 exit 1
 EOF
 chmod 0755 /usr/local/bin/cai-modelscope-fetch.sh
+
+cat >/usr/local/bin/cai-vllm-wait-deps.sh <<EOF
+#!/bin/bash
+set -euo pipefail
+MODEL_DIR="$MODEL_DIR"
+
+for svc in cai-nvidia-cc-bootstrap.service nvidia-persistenced.service cai-modelscope-fetch.service; do
+  systemctl reset-failed "\$svc" 2>/dev/null || true
+  systemctl start --no-block "\$svc"
+done
+
+for _ in \$(seq 1 1440); do
+  if systemctl is-active --quiet cai-nvidia-cc-bootstrap.service &&
+     systemctl is-active --quiet nvidia-persistenced.service &&
+     systemctl is-active --quiet cai-modelscope-fetch.service &&
+     [[ -e /dev/nvidia0 && ( -f "\$MODEL_DIR/config.json" || -f "\$MODEL_DIR/configuration.json" ) ]]; then
+    exit 0
+  fi
+  sleep 5
+done
+
+systemctl status cai-nvidia-cc-bootstrap.service nvidia-persistenced.service cai-modelscope-fetch.service --no-pager -l || true
+ls -la "\$MODEL_DIR" 2>/dev/null || true
+exit 1
+EOF
+chmod 0755 /usr/local/bin/cai-vllm-wait-deps.sh
 
 cat >/usr/local/bin/cai-vllm-run.sh <<EOF
 #!/bin/bash
@@ -427,10 +479,14 @@ cat >/etc/systemd/system/cai-modelscope-fetch.service <<'EOF'
 Description=CAI download OpenClaw vLLM model from ModelScope
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=7200
+Restart=on-failure
+RestartSec=60
 ExecStart=/usr/local/bin/cai-modelscope-fetch.sh
 StandardOutput=journal+console
 StandardError=journal+console
@@ -444,15 +500,15 @@ cat >/etc/systemd/system/cai-vllm.service <<'EOF'
 [Unit]
 Description=CAI vLLM OpenAI server
 After=network-online.target cai-nvidia-cc-bootstrap.service cai-modelscope-fetch.service nvidia-persistenced.service
-Wants=network-online.target
-Requires=cai-nvidia-cc-bootstrap.service cai-modelscope-fetch.service nvidia-persistenced.service
-ConditionPathExists=/dev/nvidia0
+Wants=network-online.target cai-nvidia-cc-bootstrap.service cai-modelscope-fetch.service nvidia-persistenced.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 Restart=on-failure
 RestartSec=20
-TimeoutStartSec=1800
+TimeoutStartSec=10800
+ExecStartPre=/usr/local/bin/cai-vllm-wait-deps.sh
 ExecStartPre=/usr/local/bin/cai-vllm-setup.sh
 ExecStart=/usr/local/bin/cai-vllm-run.sh
 StandardOutput=journal+console
@@ -478,12 +534,31 @@ exit 1
 EOF
 chmod 0755 /usr/local/bin/cai-openclaw-vllm-bootstrap
 
+cat >/usr/local/bin/cai-openclaw-gateway-wait-deps.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+for _ in $(seq 1 1440); do
+  if systemctl is-active --quiet cai-openclaw-vllm-runtime-bootstrap.service &&
+     systemctl is-active --quiet cai-vllm.service &&
+     curl -fsS --max-time 5 http://127.0.0.1:8090/v1/models >/dev/null; then
+    exit 0
+  fi
+  sleep 5
+done
+
+systemctl status cai-openclaw-vllm-runtime-bootstrap.service cai-vllm.service --no-pager -l || true
+curl -fsS --max-time 5 http://127.0.0.1:8090/v1/models || true
+exit 1
+EOF
+chmod 0755 /usr/local/bin/cai-openclaw-gateway-wait-deps.sh
+
 cat >/etc/systemd/system/cai-openclaw-gateway.service <<'EOF'
 [Unit]
 Description=CAI OpenClaw Gateway
 After=network-online.target cai-openclaw-vllm-runtime-bootstrap.service cai-vllm.service
 Wants=network-online.target cai-openclaw-vllm-runtime-bootstrap.service cai-vllm.service
-Requires=cai-openclaw-vllm-runtime-bootstrap.service cai-vllm.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -496,6 +571,8 @@ Environment=PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin
 Environment=OPENCLAW_CONFIG_PATH=/home/openclaw/.openclaw/openclaw.json
 Environment=OPENCLAW_NO_RESPAWN=1
 Environment=OPENCLAW_DISABLE_BONJOUR=1
+TimeoutStartSec=10800
+ExecStartPre=/usr/local/bin/cai-openclaw-gateway-wait-deps.sh
 ExecStartPre=/usr/local/bin/cai-openclaw-vllm-bootstrap
 ExecStart=/usr/local/bin/openclaw gateway run --port 18789 --bind lan
 Restart=always

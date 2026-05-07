@@ -25,4 +25,3 @@ serde_yaml = "=0.9.31"
 sha2 = "=0.10.8"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 tempfile = "=3.10.1"
-tokio = { version = "=1.35.1", features = ["full"] }

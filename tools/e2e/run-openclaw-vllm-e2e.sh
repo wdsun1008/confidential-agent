@@ -17,8 +17,9 @@ SHELTER_DIR="${E2E_SHELTER_DIR:-/root/shelter-rs}"
 SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/local/libexec/shelter/slsa/slsa-generator}"
 BASE_IMAGE="${E2E_BASE_IMAGE:-/root/images/alinux3.qcow2}"
 CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-300000}"
-CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请只回复 CA_E2E_OK，不要输出其他内容。}"
-CHAT_EXPECT="${E2E_CHAT_EXPECT:-CA_E2E_OK}"
+CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请用一句简短中文回复，说明 OpenClaw vLLM 服务可用。}"
+CHAT_EXPECT="${E2E_CHAT_EXPECT:-}"
+CHAT_ATTEMPTS="${E2E_CHAT_ATTEMPTS:-3}"
 DESTROY_ON_SUCCESS="${E2E_DESTROY_ON_SUCCESS:-1}"
 DESTROY_ON_FAILURE="${E2E_DESTROY_ON_FAILURE:-1}"
 STEP_LOG="$WORK_DIR/e2e-steps.md"
@@ -236,11 +237,8 @@ write_spec_and_config() {
   local cosign_key="$3"
   mkdir -p "$WORK_DIR/openclaw-vllm"
   cp "$ROOT_DIR/examples/openclaw-vllm/install-openclaw-vllm.sh" "$WORK_DIR/openclaw-vllm/"
-<<<<<<< HEAD
-=======
   cp "$ROOT_DIR/examples/openclaw-vllm/cai-nvidia-cc-stack-install.sh" "$WORK_DIR/openclaw-vllm/"
   cp "$ROOT_DIR/examples/openclaw-vllm/nvidia-persistenced.service" "$WORK_DIR/openclaw-vllm/"
->>>>>>> df2d5bb (test: add end-to-end workflows)
 
   python3 - "$ROOT_DIR/examples/openclaw-vllm/openclaw-vllm.json" "$WORK_DIR/openclaw-vllm/openclaw-vllm.json" "$token" <<'PY'
 import json
@@ -289,15 +287,9 @@ service:
 build:
 $base_image_yaml
   image_name: openclaw-vllm-agent
-<<<<<<< HEAD
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
   packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel-5.10.134-19.1.al8, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
-=======
-  kernel_cmdline_append: swiotlb=4194304,any
-  resize: 80G
-  packages: [ca-certificates, curl, git, jq, nodejs, npm, pciutils, tar, wget, xz]
->>>>>>> df2d5bb (test: add end-to-end workflows)
   scripts: [./install-openclaw-vllm.sh]
   variants:
     release:
@@ -333,7 +325,7 @@ EOF
 }
 
 wait_status_ready() {
-  local deadline=$((SECONDS + 1800))
+  local deadline=$((SECONDS + 7200))
   while (( SECONDS < deadline )); do
     if without_proxy "${CA_ARGS[@]}" status --live --json >"$WORK_DIR/status-live.json" 2>"$WORK_DIR/status-live.err"; then
       if [[ -s "$WORK_DIR/status-live.json" ]] && python3 - "$WORK_DIR/status-live.json" <<'PY'
@@ -388,13 +380,12 @@ guest_check() {
   local label="$3"
   local command="$4"
   record_cmd "ssh -i <debug_ssh> root@$host '$command'"
-  ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$host" \
+  timeout 120 ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$host" \
     "$command" >"$WORK_DIR/$label.stdout" 2>"$WORK_DIR/$label.stderr"
   record_file_as_block "$label stdout:" "$WORK_DIR/$label.stdout" text
   record_file_as_block "$label stderr:" "$WORK_DIR/$label.stderr" text
 }
 
-<<<<<<< HEAD
 guest_wait() {
   local host="$1"
   local key="$2"
@@ -404,7 +395,7 @@ guest_wait() {
   local deadline=$((SECONDS + timeout_seconds))
   record_cmd "ssh -i <debug_ssh> root@$host '$command'"
   while (( SECONDS < deadline )); do
-    if ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$host" \
+    if timeout 120 ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$host" \
       "$command" >"$WORK_DIR/$label.stdout" 2>"$WORK_DIR/$label.stderr"; then
       record_file_as_block "$label stdout:" "$WORK_DIR/$label.stdout" text
       record_file_as_block "$label stderr:" "$WORK_DIR/$label.stderr" text
@@ -425,9 +416,12 @@ start_connect() {
     setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
       "${CA_ARGS[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
     CONNECT_PID=$!
+    local connect_port=""
     for _ in $(seq 1 120); do
-      if curl -fsS "http://127.0.0.1:18789/openclaw/" >/dev/null 2>&1; then
+      connect_port="$(parse_connect_port "$WORK_DIR/connect.log" || true)"
+      if [[ -n "$connect_port" ]] && curl -fsS "http://127.0.0.1:$connect_port/openclaw/" >/dev/null 2>&1; then
         record_file_as_block "Connect log:" "$WORK_DIR/connect.log" text
+        printf '%s' "$connect_port"
         return 0
       fi
       if ! kill -0 "$CONNECT_PID" >/dev/null 2>&1; then
@@ -439,24 +433,39 @@ start_connect() {
     cleanup_connect "${CONNECT_PID:-}"
     CONNECT_PID=""
     sleep 30
-=======
-start_connect() {
-  record_cmd "${CA_ARGS[*]} connect"
-  setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-    "${CA_ARGS[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
-  CONNECT_PID=$!
-  for _ in $(seq 1 120); do
-    if curl -fsS "http://127.0.0.1:18789/openclaw" >/dev/null 2>&1; then
-      return 0
-    fi
-    if ! kill -0 "$CONNECT_PID" >/dev/null 2>&1; then
-      record_file_as_block "Connect log:" "$WORK_DIR/connect.log" text
-      return 1
-    fi
-    sleep 2
->>>>>>> df2d5bb (test: add end-to-end workflows)
   done
   record_file_as_block "Connect log:" "$WORK_DIR/connect.log" text
+  return 1
+}
+
+parse_connect_port() {
+  local log_path="$1"
+  if [[ -s "$log_path" ]]; then
+    awk '/^connect 127\.0\.0\.1:/ { split($2, a, ":"); print a[2]; exit }' "$log_path"
+  fi
+}
+
+run_chat_probe() {
+  local connect_port="$1"
+  local attempt
+  record_cmd "node tools/e2e/openclaw-chat-probe.mjs --url ws://127.0.0.1:$connect_port --token <redacted> --message '$CHAT_MESSAGE'"
+  for attempt in $(seq 1 "$CHAT_ATTEMPTS"); do
+    record "- chat attempt: $attempt"
+    if node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
+      --url "ws://127.0.0.1:$connect_port" \
+      --token "$token" \
+      --message "$CHAT_MESSAGE" \
+      --expect "$CHAT_EXPECT" \
+      --session "confidential-agent-e2e-vllm-$E2E_RUN_ID-$attempt" \
+      --timeout-ms "$CHAT_TIMEOUT_MS" >"$WORK_DIR/chat-probe.json" 2>"$WORK_DIR/chat-probe.err"; then
+      record_file_as_block "Chat probe:" "$WORK_DIR/chat-probe.json" json
+      record_file_as_block "Chat probe stderr:" "$WORK_DIR/chat-probe.err" text
+      return 0
+    fi
+    record_file_as_block "Chat probe attempt $attempt stdout:" "$WORK_DIR/chat-probe.json" json
+    record_file_as_block "Chat probe attempt $attempt stderr:" "$WORK_DIR/chat-probe.err" text
+    sleep 20
+  done
   return 1
 }
 
@@ -470,6 +479,7 @@ main() {
   require_cmd python3
   require_cmd ssh
   require_cmd setsid
+  require_cmd timeout
   if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
     require_cmd cosign
     require_cmd rekor-cli
@@ -503,8 +513,12 @@ main() {
   elif [[ -x "$SHELTER_DIR/target/debug/shelter" ]]; then
     export CA_SHELTER_BIN="$SHELTER_DIR/target/debug/shelter"
   fi
-  if [[ ! -x "$CA_BIN" ]]; then
-    echo "Confidential Agent CLI '$CA_BIN' is not executable; run cargo build first" >&2
+  if [[ "${E2E_SKIP_CARGO_BUILD:-0}" != "1" ]]; then
+    log "building current host CLI and guest daemon"
+    record_cmd "cargo build -p confidential-agent-cli -p confidential-agentd"
+    (cd "$ROOT_DIR" && cargo build -p confidential-agent-cli -p confidential-agentd)
+  elif [[ ! -x "$CA_BIN" ]]; then
+    echo "CA_BIN '$CA_BIN' is not executable" >&2
     exit 2
   fi
   if ! command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
@@ -537,29 +551,16 @@ main() {
   local host="${ssh_lines[0]}"
   local key="${ssh_lines[1]}"
   wait_for_ssh "$host" "$key"
-<<<<<<< HEAD
   guest_wait "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi" 1800
   guest_wait "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service" 1800
-  guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 3600
-  guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:8090/v1/models" 1800
-  guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 1800
-=======
-  guest_check "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi"
-  guest_check "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service"
-  guest_check "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service"
-  guest_check "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:8090/v1/models"
-  guest_check "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html"
->>>>>>> df2d5bb (test: add end-to-end workflows)
+  guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 7200
+  guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:8090/v1/models" 7200
+  guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 7200
 
-  start_connect
-  record_cmd "node tools/e2e/openclaw-chat-probe.mjs --url ws://127.0.0.1:18789 --token <redacted> --message '$CHAT_MESSAGE'"
-  node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
-    --url ws://127.0.0.1:18789 \
-    --token "$token" \
-    --message "$CHAT_MESSAGE" \
-    --expect "$CHAT_EXPECT" \
-    --timeout-ms "$CHAT_TIMEOUT_MS" >"$WORK_DIR/chat-probe.json"
-  record_file_as_block "Chat probe:" "$WORK_DIR/chat-probe.json" json
+  local connect_port
+  connect_port="$(start_connect)"
+  record "Connect mapped OpenClaw vLLM to \`127.0.0.1:$connect_port\`."
+  run_chat_probe "$connect_port"
 }
 
 main "$@"

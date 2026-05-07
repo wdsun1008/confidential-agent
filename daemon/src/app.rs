@@ -31,6 +31,7 @@ const DEBUG_SSH_MARKER_PATH: &str = "/etc/confidential-agent/debug-ssh-enabled";
 const DEBUG_AUTHORIZED_KEYS_PATH: &str = "/root/.ssh/authorized_keys";
 const DEBUG_SSHD_DROPIN_DIR: &str = "/etc/systemd/system/sshd.service.d";
 const DEBUG_SSHD_RUN_DIR: &str = "/run/sshd";
+const MAX_RESOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
@@ -368,7 +369,32 @@ fn apply_bootstrap(
         .retain(|resource_id, _| resource_ids.contains(resource_id));
     for resource in &bootstrap.resources {
         let source = args.cdh_root.join(&resource.resource_path);
-        if !source.exists() || source.metadata()?.len() == 0 {
+        let metadata = match source.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if fail_missing || resource.required {
+                    missing_required.push(resource.id.clone());
+                }
+                eprintln!(
+                    "waiting for resource '{}' at '{}'",
+                    resource.id,
+                    source.display()
+                );
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat resource '{}'", source.display()));
+            }
+        };
+        if !metadata.is_file() {
+            bail!(
+                "resource '{}' at '{}' is not a regular file",
+                resource.id,
+                source.display()
+            );
+        }
+        if metadata.len() == 0 {
             if fail_missing || resource.required {
                 missing_required.push(resource.id.clone());
             }
@@ -378,6 +404,15 @@ fn apply_bootstrap(
                 source.display()
             );
             continue;
+        }
+        if metadata.len() > MAX_RESOURCE_BYTES {
+            bail!(
+                "resource '{}' at '{}' is {} bytes, exceeding maximum {} bytes",
+                resource.id,
+                source.display(),
+                metadata.len(),
+                MAX_RESOURCE_BYTES
+            );
         }
 
         let digest = sha256_file(&source)?;
@@ -490,6 +525,10 @@ fn apply_resource_once(
         .with_context(|| format!("failed to create '{}'", parent.display()))?;
 
     let tmp = resource.target.with_extension("confidential-agent.tmp");
+    if tmp.exists() {
+        fs::remove_file(&tmp)
+            .with_context(|| format!("failed to remove stale '{}'", tmp.display()))?;
+    }
     fs::copy(source, &tmp).with_context(|| {
         format!(
             "failed to copy resource '{}' to '{}'",
@@ -785,9 +824,7 @@ fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
         }
     }
 
-    let tmp = path.with_extension("confidential-agent.tmp");
-    fs::write(&tmp, new_content).with_context(|| format!("failed to write '{}'", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace '{}'", path.display()))?;
+    write_file_atomic(path, new_content.as_bytes())?;
     Ok(true)
 }
 
@@ -803,22 +840,39 @@ fn read_daemon_state() -> Result<DaemonState> {
 
 fn write_daemon_state(state: &DaemonState) -> Result<()> {
     let path = Path::new(DAEMON_STATE_PATH);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_string_pretty(state)?)
-        .with_context(|| format!("failed to write '{}'", path.display()))
+    write_json_atomic(path, state)
 }
 
 fn write_status(status: DaemonStatus) -> Result<()> {
     let path = Path::new(DAEMON_STATUS_PATH);
+    write_json_atomic(path, &status)
+}
+
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    let content = serde_json::to_vec_pretty(value)?;
+    write_file_atomic(path, &content)
+}
+
+fn write_file_atomic(path: &Path, content: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
-    fs::write(path, serde_json::to_string_pretty(&status)?)
-        .with_context(|| format!("failed to write '{}'", path.display()))
+    let existing_metadata = path.metadata().ok();
+    let tmp = path.with_extension("confidential-agent.tmp");
+    fs::write(&tmp, content).with_context(|| format!("failed to write '{}'", tmp.display()))?;
+    if let Some(metadata) = existing_metadata {
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(metadata.mode() & 0o7777))
+            .with_context(|| format!("failed to preserve mode on '{}'", tmp.display()))?;
+        let tmp_metadata = tmp
+            .metadata()
+            .with_context(|| format!("failed to stat '{}'", tmp.display()))?;
+        if tmp_metadata.uid() != metadata.uid() || tmp_metadata.gid() != metadata.gid() {
+            chown(&tmp, Some(metadata.uid()), Some(metadata.gid()))
+                .with_context(|| format!("failed to preserve owner on '{}'", tmp.display()))?;
+        }
+    }
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace '{}'", path.display()))
 }
 
 fn status_for(
@@ -1068,13 +1122,19 @@ fn restart_service(service: &str) -> Result<()> {
 fn parse_mode(mode: &str) -> Result<u32> {
     let trimmed = mode.trim();
     let trimmed = trimmed.strip_prefix("0o").unwrap_or(trimmed);
-    u32::from_str_radix(trimmed, 8).with_context(|| format!("invalid file mode '{}'", mode))
+    let parsed =
+        u32::from_str_radix(trimmed, 8).with_context(|| format!("invalid file mode '{}'", mode))?;
+    if parsed > 0o7777 {
+        bail!("file mode '{}' exceeds maximum 0o7777", mode);
+    }
+    Ok(parsed)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hex_encode(&hasher.finalize())
+    let digest = hasher.finalize();
+    hex_encode(digest.as_ref())
 }
 
 #[cfg(test)]
