@@ -1,8 +1,11 @@
 use super::commands::{
-    cmd_destroy, cmd_inject, debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from,
+    cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries, collect_live_status,
+    debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from, live_status_table_columns,
+    status_table_columns, status_views, validate_build_start, validate_deploy_start,
+    wait_for_daemon_status_from,
 };
 use super::*;
-use crate::cli::StatusArgs;
+use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
 use clap::CommandFactory;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
 use std::ffi::OsStr;
@@ -45,6 +48,227 @@ fn build_help_requires_explicit_spec_and_hides_runtime_overrides() {
     assert!(!help.contains("--agentd-bin"));
     assert!(!help.contains("--guest-tng-bin"));
     assert!(!help.contains("--libtdx-verify-rpm"));
+}
+
+#[test]
+fn image_help_exposes_local_image_lifecycle_commands() {
+    let mut command = Cli::command();
+    let image = command.find_subcommand_mut("image").unwrap();
+    let help = image.render_long_help().to_string();
+
+    assert!(help.contains("list"));
+    assert!(help.contains("rm"));
+}
+
+#[test]
+fn human_status_tables_hide_internal_generations() {
+    let status_columns = status_table_columns();
+    assert!(!status_columns.contains(&"MESH"));
+    assert!(!status_columns.contains(&"MESH_GEN"));
+
+    let live_columns = live_status_table_columns();
+    assert!(!live_columns.contains(&"BOOTSTRAP"));
+    assert!(!live_columns.contains(&"MESH_ID"));
+}
+
+#[test]
+fn timestamped_build_id_adds_run_id_without_changing_service_identity() {
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        timestamped_shelter_build_id(&spec, "20260508123045123"),
+        "openclaw-agent-release-20260508123045123"
+    );
+    assert_eq!(shelter_build_id(&spec), "openclaw-agent-release");
+}
+
+#[test]
+fn build_start_rejects_active_and_deployed_services() {
+    let active = local_state("openclaw", vec![18789], vec![18789]);
+    let mut deployed = active.clone();
+    deployed.phase = "deployed".to_string();
+    let mut deleted = active.clone();
+    deleted.phase = "deleted".to_string();
+
+    assert!(validate_build_start(Some(&active)).is_err());
+    assert!(validate_build_start(Some(&deployed)).is_err());
+    validate_build_start(Some(&deleted)).unwrap();
+    validate_build_start(None).unwrap();
+}
+
+#[test]
+fn deploy_start_only_accepts_built_or_deleted_current_builds() {
+    let mut built = local_state("openclaw", vec![18789], vec![18789]);
+    built.phase = "built".to_string();
+    let mut deleted = built.clone();
+    deleted.phase = "deleted".to_string();
+    let mut active = built.clone();
+    active.phase = "active".to_string();
+
+    validate_deploy_start(Some(&built)).unwrap();
+    validate_deploy_start(Some(&deleted)).unwrap();
+    assert!(validate_deploy_start(Some(&active)).is_err());
+    assert!(validate_deploy_start(None).is_err());
+}
+
+#[test]
+fn image_rm_removes_local_service_state_for_deleted_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut service = local_state("openclaw", vec![18789], vec![18789]);
+    service.phase = "deleted".to_string();
+    write_state(temp.path(), &service);
+    let service_dir = temp.path().join("services/openclaw");
+    fs::write(
+        service_dir.join("shelter.yaml"),
+        "deploy:\n  name: openclaw\n",
+    )
+    .unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+
+    cmd_image(
+        &cli,
+        &ImageArgs {
+            command: ImageCommands::Rm {
+                service: "openclaw".to_string(),
+                force: false,
+            },
+        },
+    )
+    .unwrap();
+
+    assert!(!service_dir.exists());
+    assert!(read_service_states(temp.path()).unwrap().is_empty());
+}
+
+#[test]
+fn image_rm_rejects_active_service_even_with_force() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = local_state("openclaw", vec![18789], vec![18789]);
+    write_state(temp.path(), &service);
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+
+    let err = cmd_image(
+        &cli,
+        &ImageArgs {
+            command: ImageCommands::Rm {
+                service: "openclaw".to_string(),
+                force: true,
+            },
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("destroy it before removing"));
+    assert!(temp.path().join("services/openclaw/state.json").exists());
+}
+
+#[test]
+fn image_rm_rejects_unknown_service_phase() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut service = local_state("openclaw", vec![18789], vec![18789]);
+    service.phase = "failed".to_string();
+    write_state(temp.path(), &service);
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+
+    let err = cmd_image(
+        &cli,
+        &ImageArgs {
+            command: ImageCommands::Rm {
+                service: "openclaw".to_string(),
+                force: true,
+            },
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("unsupported phase"));
+    assert!(temp.path().join("services/openclaw/state.json").exists());
+}
+
+#[test]
+fn image_list_marks_current_build_and_local_image_presence() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.build_id = "openclaw-agent-release-20260508123045123".to_string();
+    let paths = context_paths(temp.path(), "openclaw");
+    state.build.image_path = paths
+        .shelter_work_dir
+        .join("images")
+        .join(&state.build.build_id)
+        .join("image.qcow2");
+    write_state(temp.path(), &state);
+    fs::create_dir_all(state.build.image_path.parent().unwrap()).unwrap();
+    fs::write(&state.build.image_path, "image").unwrap();
+    let result_path = shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id);
+    fs::write(
+        &result_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": state.build.build_id,
+            "image_path": state.build.image_path,
+            "reference_value": null,
+            "rekor_value": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let entries = collect_image_entries(temp.path()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].service_id, "openclaw");
+    assert_eq!(entries[0].phase.as_deref(), Some("built"));
+    assert!(entries[0].current);
+    assert!(entries[0].image_present);
+    assert_eq!(entries[0].image_size, Some(5));
+}
+
+#[test]
+fn status_view_separates_phase_from_local_image_presence() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "deleted".to_string();
+    state.deploy.public_ip = None;
+    state.deploy.private_ip = None;
+    write_state(temp.path(), &state);
+
+    let views = status_views(temp.path(), &[state]);
+
+    assert_eq!(views[0].phase, "deleted");
+    assert!(!views[0].local_image.present);
+    assert!(!views[0].cloud.present);
+    assert_eq!(views[0].cloud.run_id, None);
+    assert_eq!(views[0].cloud.resource_name, None);
+    assert_eq!(views[0].cloud.public_ip, None);
+    assert_eq!(views[0].cloud.tee, None);
 }
 
 fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<u16>) -> LocalServiceState {
@@ -242,6 +466,69 @@ fn fetch_daemon_status_reads_readonly_status_endpoint() {
     assert_eq!(status.phase, "running");
     assert!(status.app_ready);
     assert!(status.mesh_ready);
+    server.join().unwrap();
+}
+
+#[test]
+fn wait_for_daemon_status_retries_until_status_is_ready() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if attempt == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{{\"error\":\"not ready\"}}"
+                )
+                .unwrap();
+            } else {
+                let body = serde_json::to_string(&DaemonStatus {
+                    schema: DAEMON_STATUS_SCHEMA_VERSION.to_string(),
+                    service_id: "openclaw".to_string(),
+                    phase: "resources-applied".to_string(),
+                    bootstrap_generation: 1,
+                    applied_resources: BTreeMap::new(),
+                    mesh_fingerprint: None,
+                    app_ready: false,
+                    mesh_ready: false,
+                    debug_ssh_ready: false,
+                })
+                .unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            stream.flush().unwrap();
+        }
+    });
+
+    let status = wait_for_daemon_status_from(
+        "127.0.0.1",
+        port,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+
+    assert_eq!(status.service_id, "openclaw");
+    assert_eq!(status.phase, "resources-applied");
     server.join().unwrap();
 }
 
@@ -455,35 +742,6 @@ fn cryptpilot_fde_config_matches_current_schema() {
 }
 
 #[test]
-fn deploy_args_do_not_override_cloud_image_id_when_importing_local_image() {
-    let prepared = PreparedConfig {
-        rendered_config: PathBuf::from("/state/shelter.yaml"),
-        shelter_build_id: "cai-e2e-agent-release".to_string(),
-        shelter_work_dir: PathBuf::from("/state/shelter-work"),
-        build_result: PathBuf::from(
-            "/state/shelter-work/images/cai-e2e-agent-release/build-result.json",
-        ),
-        deploy_result: PathBuf::from(
-            "/state/shelter-work/deploy/cai-e2e-agent-release/deploy-result.json",
-        ),
-        deploy_names: None,
-        image_source: Some(PathBuf::from("/images/final.qcow2")),
-        terraform_dir: None,
-        debug_ssh: None,
-    };
-
-    let args = deploy_shelter_args(&prepared, true);
-
-    assert_eq!(args[0], OsStr::new("--work-dir"));
-    assert_eq!(args[1], OsStr::new("/state/shelter-work"));
-    assert_eq!(args[2], OsStr::new("deploy"));
-    assert_eq!(args[3], OsStr::new("cai-e2e-agent-release"));
-    assert!(!args.iter().any(|arg| arg == OsStr::new("--image-id")));
-    assert!(!args.iter().any(|arg| arg == OsStr::new("--cloud-image-id")));
-    assert!(args.iter().any(|arg| arg == OsStr::new("--auto-approve")));
-}
-
-#[test]
 fn deploy_args_use_positional_build_id_without_cloud_image_override() {
     let prepared = PreparedConfig {
         rendered_config: PathBuf::from("/state/shelter.yaml"),
@@ -496,12 +754,11 @@ fn deploy_args_use_positional_build_id_without_cloud_image_override() {
             "/state/shelter-work/deploy/cai-e2e-agent-release/deploy-result.json",
         ),
         deploy_names: None,
-        image_source: None,
         terraform_dir: None,
         debug_ssh: None,
     };
 
-    let args = deploy_shelter_args(&prepared, false);
+    let args = deploy_shelter_args(&prepared);
 
     assert_eq!(args[0], OsStr::new("--work-dir"));
     assert_eq!(args[1], OsStr::new("/state/shelter-work"));
@@ -525,14 +782,13 @@ fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
             "/state/services/openclaw/terraform/20260506130000/deploy-result.json",
         ),
         deploy_names: None,
-        image_source: None,
         terraform_dir: Some(PathBuf::from(
             "/state/services/openclaw/terraform/20260506130000",
         )),
         debug_ssh: None,
     };
 
-    let args = deploy_shelter_args(&prepared, false);
+    let args = deploy_shelter_args(&prepared);
 
     let terraform_dir = args
         .windows(2)
@@ -603,6 +859,66 @@ resources: {}
 }
 
 #[test]
+fn latest_built_image_uses_current_state_build_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    let build_id = "openclaw-agent-release-20260508123045123";
+    let paths = context_paths(temp.path(), "openclaw");
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.build_id = build_id.to_string();
+    state.build.image_path =
+        PathBuf::from("/state/shelter/images/openclaw-agent-release-20260508123045123/image.qcow2");
+    write_state(temp.path(), &state);
+    let result_path = shelter_build_result_path(&paths.shelter_work_dir, build_id);
+    fs::create_dir_all(result_path.parent().unwrap()).unwrap();
+    fs::write(
+        &result_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": build_id,
+            "image_path": state.build.image_path,
+            "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+            "rekor_value": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let image = latest_built_image(temp.path(), &spec).unwrap();
+
+    assert_eq!(
+        image,
+        PathBuf::from("/state/shelter/images/openclaw-agent-release-20260508123045123/image.qcow2")
+    );
+}
+
+#[test]
 fn materialize_build_artifacts_reads_manifest_result_path() {
     let temp = tempfile::tempdir().unwrap();
     let paths = context_paths(temp.path(), "openclaw");
@@ -667,7 +983,6 @@ fn resolve_deploy_observation_reads_shelter_deploy_result_json() {
             .join("shelter/images/openclaw-agent-release/build-result.json"),
         deploy_result,
         deploy_names: None,
-        image_source: None,
         terraform_dir: None,
         debug_ssh: None,
     };
@@ -764,7 +1079,6 @@ resources: {}
         build_result,
         deploy_result: shelter_deploy_result_path(&paths.service_dir.join("terraform/active")),
         deploy_names: Some(names.clone()),
-        image_source: None,
         terraform_dir: Some(paths.service_dir.join("terraform/active")),
         debug_ssh: None,
     };
@@ -1086,7 +1400,7 @@ resources: {}
     .unwrap();
 
     let names = DeployNames::from_run_id(&spec, "20260429103011");
-    let bucket = shelter_default_image_bucket(&names.resource_name);
+    let bucket = format!("{}{}", names.resource_name, SHELTER_IMAGE_BUCKET_SUFFIX);
 
     assert!(bucket.len() <= MAX_SHELTER_IMAGE_BUCKET_LEN);
     assert!(bucket.ends_with("-images"));
@@ -1141,6 +1455,167 @@ fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
 }
 
 #[test]
+fn destroy_keeps_local_build_artifacts_after_shelter_destroy_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut service = local_state("openclaw", vec![18789], vec![18789]);
+    let service_dir = temp.path().join("services/openclaw");
+    service.deploy.terraform_dir = Some(service_dir.join("terraform/active"));
+    service.deploy.instance_id = Some("i-test".to_string());
+    service.deploy.security_group_id = Some("sg-test".to_string());
+    service.build.image_path =
+        service_dir.join("shelter/images/openclaw-agent-release/image.qcow2");
+    service.build.sample_rv = Some(service_dir.join("shelter-reference-values.json"));
+    service.build.rekor_meta = Some(service_dir.join("shelter-rekor-meta.json"));
+    service.build.debug_ssh = Some(LocalDebugSshKey {
+        private_key: service_dir.join("debug/id_ed25519"),
+        public_key: service_dir.join("debug/id_ed25519.pub"),
+    });
+    write_state(temp.path(), &service);
+    write_manifest(temp.path(), "openclaw", &service.build.build_id);
+    fs::write(
+        service_dir.join("shelter.yaml"),
+        "deploy:\n  name: openclaw\n",
+    )
+    .unwrap();
+    fs::create_dir_all(service.build.image_path.parent().unwrap()).unwrap();
+    fs::write(&service.build.image_path, "image").unwrap();
+    let build_result =
+        shelter_build_result_path(&service_dir.join("shelter"), &service.build.build_id);
+    fs::create_dir_all(build_result.parent().unwrap()).unwrap();
+    fs::write(
+        &build_result,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": service.build.build_id,
+            "image_path": service.build.image_path,
+            "reference_value": {"sample": true},
+            "rekor_value": {"rekor": true}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(service.build.sample_rv.as_ref().unwrap(), "{}").unwrap();
+    fs::write(service.build.rekor_meta.as_ref().unwrap(), "{}").unwrap();
+    fs::create_dir_all(
+        service
+            .build
+            .debug_ssh
+            .as_ref()
+            .unwrap()
+            .private_key
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &service.build.debug_ssh.as_ref().unwrap().private_key,
+        "private",
+    )
+    .unwrap();
+    fs::write(
+        &service.build.debug_ssh.as_ref().unwrap().public_key,
+        "public",
+    )
+    .unwrap();
+    let shelter = temp.path().join("shelter-ok");
+    let argv = temp.path().join("shelter-argv");
+    write_script(
+        &shelter,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+            argv.display()
+        ),
+    );
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+    cli.shelter_bin = shelter;
+
+    cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "openclaw".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(service_dir.exists());
+    assert!(service.build.image_path.exists());
+    assert!(build_result.exists());
+    assert!(service.build.sample_rv.as_ref().unwrap().exists());
+    assert!(service.build.rekor_meta.as_ref().unwrap().exists());
+    assert!(service
+        .build
+        .debug_ssh
+        .as_ref()
+        .unwrap()
+        .private_key
+        .exists());
+    let state = read_service_state_file(&service_dir.join("state.json"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.phase, "deleted");
+    assert_eq!(state.generation, 2);
+    assert_eq!(state.deploy.public_ip, None);
+    assert_eq!(state.deploy.private_ip, None);
+    assert_eq!(state.deploy.instance_id, None);
+    assert_eq!(state.deploy.security_group_id, None);
+    assert_eq!(state.deploy.terraform_dir, None);
+    assert_eq!(state.deploy.run_id, "");
+    assert_eq!(state.deploy.resource_name, "");
+    assert_eq!(state.deploy.image_source, None);
+    assert_eq!(state.deploy.image_import_name, None);
+    assert_eq!(state.deploy.bucket, None);
+    assert_eq!(state.deploy.tee, "");
+}
+
+#[test]
+fn destroy_is_idempotent_for_deleted_service_without_cloud_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut service = local_state("openclaw", vec![18789], vec![18789]);
+    service.phase = "deleted".to_string();
+    service.deploy.run_id.clear();
+    service.deploy.resource_name.clear();
+    service.deploy.terraform_dir = None;
+    service.deploy.image_source = None;
+    service.deploy.image_import_name = None;
+    service.deploy.bucket = None;
+    service.deploy.instance_id = None;
+    service.deploy.security_group_id = None;
+    service.deploy.private_ip = None;
+    service.deploy.public_ip = None;
+    service.deploy.tee.clear();
+    write_state(temp.path(), &service);
+    let shelter = temp.path().join("shelter-should-not-run");
+    write_script(&shelter, "#!/bin/sh\nexit 42\n");
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+    cli.shelter_bin = shelter;
+
+    cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "openclaw".to_string(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn live_status_skips_deleted_services() {
+    let mut service = local_state("openclaw", vec![18789], vec![18789]);
+    service.phase = "deleted".to_string();
+    service.deploy.public_ip = Some("127.0.0.1".to_string());
+
+    let temp = tempfile::tempdir().unwrap();
+    let live = collect_live_status(temp.path(), &[service]);
+
+    assert!(live[0].daemon.is_none());
+    assert_eq!(
+        live[0].live_error.as_deref(),
+        Some("service is not active or deployed")
+    );
+}
+
+#[test]
 fn inject_requires_existing_managed_state() {
     let temp = tempfile::tempdir().unwrap();
     let spec = temp.path().join("confidential-agent.yaml");
@@ -1184,6 +1659,122 @@ resources: {}
     .unwrap_err();
 
     assert!(err.to_string().contains("run deploy first"));
+}
+
+#[test]
+fn deploy_requires_existing_local_build_before_prepare() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+
+    let err = cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec,
+            skip_inject: false,
+            render_only: false,
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("run build first"));
+}
+
+#[test]
+fn deploy_rejects_missing_current_local_image_before_shelter() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.image_path = temp.path().join("missing.qcow2");
+    write_state(temp.path(), &state);
+    write_manifest(temp.path(), "openclaw", &state.build.build_id);
+    let build_result = shelter_build_result_path(
+        &temp.path().join("services/openclaw/shelter"),
+        &state.build.build_id,
+    );
+    fs::create_dir_all(build_result.parent().unwrap()).unwrap();
+    fs::write(
+        &build_result,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": state.build.build_id,
+            "image_path": state.build.image_path,
+            "reference_value": null,
+            "rekor_value": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+
+    let err = cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec,
+            skip_inject: false,
+            render_only: false,
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("local image"));
+    assert!(err.to_string().contains("run build first"));
 }
 
 #[test]
