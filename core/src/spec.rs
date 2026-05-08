@@ -622,6 +622,44 @@ resources:
     }
 
     #[test]
+    fn example_specs_build_debug_and_release_with_rekor_reference_values() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("core crate has a repo root parent");
+        for relative in [
+            "examples/mcp/mcp-demo.yaml",
+            "examples/openclaw/openclaw.yaml",
+            "examples/openclaw-vllm/openclaw-vllm.yaml",
+        ] {
+            let path = repo_root.join(relative);
+            let spec = AgentSpec::from_path(&path)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {err:?}", path.display()));
+
+            assert!(
+                spec.build.variants.release.enabled,
+                "{relative} must enable release builds"
+            );
+            assert!(
+                spec.build
+                    .variants
+                    .debug
+                    .as_ref()
+                    .is_some_and(|debug| debug.enabled),
+                "{relative} must enable debug builds"
+            );
+            assert_eq!(
+                spec.attestation.reference_values,
+                ReferenceValueMode::Rekor,
+                "{relative} must use Rekor reference values"
+            );
+            assert!(
+                spec.attestation.rekor.is_some(),
+                "{relative} must include attestation.rekor config"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_legacy_endpoint_backend_port_spec() {
         let yaml = r#"
 schema: confidential-agent/v1

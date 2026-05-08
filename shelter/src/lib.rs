@@ -30,6 +30,7 @@ pub struct GuestFileAsset {
 
 #[derive(Debug, Clone, Default)]
 pub struct ShelterRenderOptions {
+    pub build_id: Option<String>,
     pub images_dir: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub terraform_dir: Option<PathBuf>,
@@ -71,7 +72,7 @@ pub fn render_build_config(
             }))
             .collect(),
         services: shelter_services(spec),
-        rekor: render_rekor_config(spec),
+        rekor: render_rekor_config(spec, options.build_id.as_deref()),
         tools: ShelterTools::host_defaults(),
         security: ShelterSecurity::challenge_defaults(assets, spec),
         initrd: ShelterInitrd {
@@ -249,16 +250,17 @@ pub fn shelter_build_id(spec: &AgentSpec) -> String {
     format!("{}-{}", spec.image_id(), spec.image_variant())
 }
 
-fn render_rekor_config(spec: &AgentSpec) -> Option<ShelterRekorConfig> {
+fn render_rekor_config(spec: &AgentSpec, build_id: Option<&str>) -> Option<ShelterRekorConfig> {
     if spec.attestation.reference_values != ReferenceValueMode::Rekor {
         return None;
     }
 
     spec.attestation.rekor.as_ref().map(|rekor| {
-        let artifact_id = rekor
-            .artifact_id
-            .clone()
-            .unwrap_or_else(|| shelter_build_id(spec));
+        let artifact_id = rekor.artifact_id.clone().unwrap_or_else(|| {
+            build_id
+                .map(str::to_string)
+                .unwrap_or_else(|| shelter_build_id(spec))
+        });
         ShelterRekorConfig::from_spec(artifact_id, rekor)
     })
 }

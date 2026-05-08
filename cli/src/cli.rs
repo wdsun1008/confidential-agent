@@ -38,6 +38,7 @@ pub(crate) enum Commands {
     #[command(hide = true)]
     Mesh(MeshArgs),
     Connect(ConnectArgs),
+    Image(ImageArgs),
     Status(StatusArgs),
     Destroy(DestroyArgs),
 }
@@ -54,8 +55,6 @@ pub(crate) struct BuildArgs {
 pub(crate) struct DeployArgs {
     #[arg(long)]
     pub(crate) spec: PathBuf,
-    #[arg(long, hide = true)]
-    pub(crate) image_source: Option<PathBuf>,
     #[arg(long, hide = true)]
     pub(crate) skip_inject: bool,
     #[arg(long, hide = true)]
@@ -88,6 +87,25 @@ pub(crate) enum MeshCommands {
 pub(crate) struct ConnectArgs {
     #[arg(long, hide = true)]
     pub(crate) render_only: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ImageArgs {
+    #[command(subcommand)]
+    pub(crate) command: ImageCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ImageCommands {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Rm {
+        service: String,
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Args)]

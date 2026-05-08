@@ -1,6 +1,6 @@
 use crate::cli::{
-    BuildArgs, Cli, Commands, ConnectArgs, DeployArgs, DestroyArgs, InjectArgs, MeshArgs,
-    MeshCommands, StatusArgs,
+    BuildArgs, Cli, Commands, ConnectArgs, DeployArgs, DestroyArgs, ImageArgs, ImageCommands,
+    InjectArgs, MeshArgs, MeshCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -82,14 +82,13 @@ struct PreparedConfig {
     build_result: PathBuf,
     deploy_result: PathBuf,
     deploy_names: Option<DeployNames>,
-    image_source: Option<PathBuf>,
     terraform_dir: Option<PathBuf>,
     debug_ssh: Option<LocalDebugSshKey>,
 }
 
 #[derive(Debug, Clone)]
 struct PrepareOptions {
-    image_source: Option<PathBuf>,
+    build_id: Option<String>,
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
 }
@@ -175,7 +174,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 impl Default for PrepareOptions {
     fn default() -> Self {
         Self {
-            image_source: None,
+            build_id: None,
             deploy_names: None,
             mesh_peer_cidrs: Vec::new(),
         }
@@ -259,11 +258,80 @@ struct ShelterBuildArtifacts {
 
 #[derive(Debug, Serialize)]
 struct LiveStatusView {
-    local: LocalServiceState,
+    local: StatusView,
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon: Option<DaemonStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusView {
+    service_id: String,
+    phase: String,
+    build: StatusBuildView,
+    local_image: StatusLocalImageView,
+    cloud: StatusCloudView,
+    service: LocalServiceNetwork,
+    resources: BTreeMap<String, LocalResourceState>,
+    mesh_generation: u64,
+    reference_values: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusBuildView {
+    build_id: String,
+    image_name: String,
+    variant: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug_ssh: Option<LocalDebugSshKey>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusLocalImageView {
+    present: bool,
+    path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    build_result: PathBuf,
+    build_result_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusCloudView {
+    present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terraform_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_import_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tee: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImageListEntry {
+    service_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    build_id: String,
+    current: bool,
+    image_path: PathBuf,
+    image_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_size: Option<u64>,
+    build_result: PathBuf,
 }
 
 const MAX_SHELTER_IMAGE_BUCKET_LEN: usize = 63;
@@ -323,14 +391,19 @@ fn prepare(
     }
     let deploy_names = options.deploy_names.clone();
     let terraform_dir = deploy_terraform_dir(&paths, None, deploy_names.as_ref());
+    let build_id = options
+        .build_id
+        .clone()
+        .unwrap_or_else(|| shelter_build_id(&spec));
     let rendered = render_build_config(
         &spec,
         &assets,
         &ShelterRenderOptions {
+            build_id: Some(build_id.clone()),
             images_dir: Some(paths.artifacts_dir.clone()),
             cache_dir: Some(paths.cache_dir.clone()),
             terraform_dir: terraform_dir.clone(),
-            local_image_source: options.image_source.clone(),
+            local_image_source: None,
             deploy_resource_name: options
                 .deploy_names
                 .as_ref()
@@ -348,7 +421,6 @@ fn prepare(
     fs::write(&paths.rendered_config, rendered)
         .with_context(|| format!("failed to write '{}'", paths.rendered_config.display()))?;
 
-    let build_id = shelter_build_id(&spec);
     let build_result = shelter_build_result_path(&paths.shelter_work_dir, &build_id);
     let deploy_result =
         shelter_deploy_result_path(terraform_dir.as_deref().context(
@@ -386,7 +458,6 @@ fn prepare(
         build_result,
         deploy_result,
         deploy_names,
-        image_source: options.image_source,
         terraform_dir,
         debug_ssh,
     })
@@ -443,6 +514,27 @@ fn current_run_id() -> String {
     output.unwrap_or_else(|| unix_timestamp().to_string())
 }
 
+fn current_build_run_id() -> String {
+    let output = Command::new("date")
+        .arg("+%Y%m%d%H%M%S%3N")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| value.len() == 17 && value.chars().all(|ch| ch.is_ascii_digit()));
+    output.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string()
+    })
+}
+
+fn timestamped_shelter_build_id(spec: &AgentSpec, run_id: &str) -> String {
+    format!("{}-{run_id}", shelter_build_id(spec))
+}
+
 fn sanitize_cloud_name_component(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -480,10 +572,6 @@ fn timestamped_resource_name(service: &str, run_id: &str) -> String {
         service = "svc".to_string();
     }
     format!("{service}{suffix}")
-}
-
-fn shelter_default_image_bucket(resource_name: &str) -> String {
-    format!("{resource_name}{SHELTER_IMAGE_BUCKET_SUFFIX}")
 }
 
 fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapConfig> {

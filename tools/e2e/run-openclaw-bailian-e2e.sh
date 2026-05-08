@@ -283,9 +283,18 @@ except Exception:
 PY
 )"
     if [[ -n "$existing_token" ]]; then
+      if [[ "$existing_token" == "<redacted>" ]]; then
+        echo "existing OpenClaw token is redacted; set OPENCLAW_GATEWAY_TOKEN when reusing a deployed guest" >&2
+        exit 2
+      fi
       printf '%s' "$existing_token"
       return
     fi
+  fi
+
+  if [[ "${E2E_SKIP_DEPLOY:-0}" == "1" ]]; then
+    echo "OPENCLAW_GATEWAY_TOKEN is required when reusing a deployed guest without a readable local token" >&2
+    exit 2
   fi
 
   openssl rand -hex 20
@@ -302,6 +311,10 @@ resolve_cosign_key() {
   require_cmd cosign
   mkdir -p "$WORK_DIR/secrets"
   local prefix="$WORK_DIR/secrets/cosign"
+  if [[ -f "$prefix.key" ]]; then
+    printf '%s' "$prefix.key"
+    return
+  fi
   record_cmd "COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix $prefix"
   COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null
   printf '%s' "$prefix.key"
@@ -539,7 +552,8 @@ service = sys.argv[2]
 for state in states:
     if state.get("service_id") != service:
         continue
-    ip = ((state.get("deploy") or {}).get("public_ip") or "").strip()
+    cloud = state.get("cloud") or {}
+    ip = (cloud.get("public_ip") or "").strip()
     key = (((state.get("build") or {}).get("debug_ssh") or {}).get("private_key") or "").strip()
     if not ip or not key:
         raise SystemExit(f"{service} state is missing public_ip or debug ssh key")
@@ -728,7 +742,7 @@ with open(sys.argv[1], encoding="utf-8") as f:
     states = json.load(f)
 with open(sys.argv[2], "w", encoding="utf-8") as f:
     for state in states:
-        ip = (state.get("deploy") or {}).get("public_ip")
+        ip = (state.get("cloud") or {}).get("public_ip")
         service_id = state.get("service_id")
         debug_ssh = 1 if ((state.get("build") or {}).get("debug_ssh") or {}).get("private_key") else 0
         if ip and service_id:
@@ -897,7 +911,16 @@ main() {
   fi
 
   without_proxy "${ca[@]}" status --json >"$WORK_DIR/status-local.json"
-  wait_for_live_statuses "$WORK_DIR/status-local.json" 180
+  if ! wait_for_live_statuses "$WORK_DIR/status-local.json" 180; then
+    record ""
+    record "Live daemon status check failed after deploy."
+    if [[ "$DEPLOY_ATTEMPTED" == "1" && "$DESTROY_ON_FAILURE" == "1" ]]; then
+      record "Attempting cloud resource cleanup after live status failure."
+      destroy_managed_resources "live status failure cleanup" || true
+      DEPLOY_ATTEMPTED=0
+    fi
+    exit 1
+  fi
 
   log "checking local and live status"
   record_cmd "${ca[*]} status --live"

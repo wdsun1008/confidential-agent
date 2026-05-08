@@ -19,6 +19,8 @@ build:
   variants:
     release:
       enabled: true
+    debug:
+      enabled: true
 
 deploy:
   provider: aliyun
@@ -33,6 +35,10 @@ deploy:
 attestation:
   tee: tdx
   mode: challenge
-  reference_values: sample
+  reference_values: rekor
+  rekor:
+    cosign_key: ./cosign.key
+    slsa_generator: /usr/local/libexec/shelter/slsa/slsa-generator
+    required: true
 
 resources: {}

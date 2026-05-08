@@ -119,10 +119,6 @@ pub(super) fn build_service_state(
         .deploy_names
         .clone()
         .context("deploy names are required when writing service state")?;
-    let managed_bucket = prepared
-        .image_source
-        .as_ref()
-        .map(|_| shelter_default_image_bucket(&names.resource_name));
     let artifacts = materialize_shelter_build_artifacts(
         &paths,
         &prepared.build_result,
@@ -153,9 +149,9 @@ pub(super) fn build_service_state(
             run_id: names.run_id,
             resource_name: names.resource_name,
             terraform_dir: prepared.terraform_dir.clone(),
-            image_source: prepared.image_source.clone(),
+            image_source: None,
             image_import_name: Some(names.image_import_name),
-            bucket: managed_bucket,
+            bucket: None,
             instance_id: observation.instance_id.clone(),
             security_group_id: observation.security_group_id.clone(),
             private_ip: observation
@@ -307,11 +303,10 @@ pub(super) fn refresh_active_shelter_deploys(
                     format!("{}-{}", service.build.image_name, service.deploy.run_id)
                 }),
             }),
-            image_source: service.deploy.image_source.clone(),
             terraform_dir: service.deploy.terraform_dir.clone(),
             debug_ssh: service.build.debug_ssh.clone(),
         };
-        let mut args = deploy_shelter_args(&prepared, service.deploy.image_source.is_some());
+        let mut args = deploy_shelter_args(&prepared);
         run_shelter(cli, &mut args)?;
     }
     Ok(())
@@ -346,10 +341,11 @@ pub(super) fn render_service_config_from_state(
         &spec,
         &assets,
         &ShelterRenderOptions {
+            build_id: Some(state.build.build_id.clone()),
             images_dir: Some(images_dir),
             cache_dir: Some(cache_dir),
             terraform_dir: state.deploy.terraform_dir.clone(),
-            local_image_source: state.deploy.image_source.clone(),
+            local_image_source: None,
             deploy_resource_name: Some(state.deploy.resource_name.clone()),
             local_image_import_name: state.deploy.image_import_name.clone(),
             mesh_peer_cidrs,
@@ -767,7 +763,9 @@ pub(super) fn collect_reference_values_from_state(
 
 pub(super) fn latest_built_image(state_dir: &Path, spec: &AgentSpec) -> Result<PathBuf> {
     let paths = context_paths(state_dir, &spec.service.id);
-    let build_id = shelter_build_id(spec);
+    let build_id = read_service_state_file(&paths.service_state)?
+        .map(|state| state.build.build_id)
+        .unwrap_or_else(|| shelter_build_id(spec));
     let result_path = shelter_build_result_path(&paths.shelter_work_dir, &build_id);
     let result = read_shelter_build_result(&result_path, &build_id)?;
     Ok(result.image_path)
