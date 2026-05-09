@@ -126,7 +126,7 @@ pub(super) fn ed25519_keypair_from_seed(seed: &[u8; 32]) -> ([u8; 32], [u8; 64])
     scalar_bytes[31] |= 64;
 
     let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
-    let public_key = (&ED25519_BASEPOINT_POINT * &scalar).compress().to_bytes();
+    let public_key = (ED25519_BASEPOINT_POINT * scalar).compress().to_bytes();
     let mut private_key = [0_u8; 64];
     private_key[..32].copy_from_slice(seed);
     private_key[32..].copy_from_slice(&public_key);
