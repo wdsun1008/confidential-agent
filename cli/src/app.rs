@@ -86,7 +86,7 @@ struct PreparedConfig {
     debug_ssh: Option<LocalDebugSshKey>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct PrepareOptions {
     build_id: Option<String>,
     deploy_names: Option<DeployNames>,
@@ -169,16 +169,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         }
     }
     fs::rename(&tmp, path).with_context(|| format!("failed to replace '{}'", path.display()))
-}
-
-impl Default for PrepareOptions {
-    fn default() -> Self {
-        Self {
-            build_id: None,
-            deploy_names: None,
-            mesh_peer_cidrs: Vec::new(),
-        }
-    }
 }
 
 impl DeployNames {
@@ -378,6 +368,13 @@ fn prepare(
     let debug_ssh = ensure_debug_ssh_key(&paths, &mut spec)?;
 
     let mut assets = prepare_guest_assets(cli, &paths.guest_staging_dir)?;
+    assets
+        .extra_files
+        .extend(spec.build.files.iter().map(|file| GuestFileAsset {
+            source: file.source.clone(),
+            destination: file.target.clone(),
+            executable: file.executable,
+        }));
     if spec.build.base_image.is_none() {
         stage_mkosi_debug_ssh_authorized_keys(
             &mut assets,
