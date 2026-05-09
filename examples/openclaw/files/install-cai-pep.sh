@@ -1,0 +1,74 @@
+#!/bin/bash
+set -euo pipefail
+
+COMMAND="${1:?usage: install-cai-pep.sh <setup-runtime|install-openclaw-plugin> <openclaw-user> <openclaw-home>}"
+OPENCLAW_USER="${2:?missing openclaw user}"
+OPENCLAW_HOME="${3:?missing OpenClaw home}"
+CAI_SHARE_DIR="/usr/local/share/confidential-agent/openclaw"
+PEP_POLICY_DIR="/etc/cai/pep"
+PEP_SOCKET_DIR="/run/cai"
+PEP_IMAGE="alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest"
+
+ensure_container_runtime() {
+    if command -v docker >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v podman >/dev/null 2>&1; then
+        ln -sf "$(command -v podman)" /usr/local/bin/docker
+        return 0
+    fi
+    echo "cai-pep requires docker or podman; add podman to build.packages" >&2
+    exit 1
+}
+
+setup_runtime() {
+    ensure_container_runtime
+    getent group openclaw >/dev/null 2>&1 || groupadd -r openclaw
+    id -u "$OPENCLAW_USER" >/dev/null 2>&1 || useradd -r -g openclaw -d "$OPENCLAW_HOME" -m -s /bin/bash "$OPENCLAW_USER"
+    install -d -m 0750 -o root -g openclaw /etc/cai "$PEP_POLICY_DIR"
+    install -d -m 0770 -o root -g openclaw "$PEP_SOCKET_DIR" /var/lib/cai/pep /var/lib/attestation
+    install -m 0640 -o root -g openclaw "$CAI_SHARE_DIR/cai-pep-default-policy.json" "$PEP_POLICY_DIR/policy.json"
+
+    cat >/etc/systemd/system/cai-pep.service <<EOF
+[Unit]
+Description=CAI Policy Enforcement Point
+After=network-online.target confidential-agentd.service attestation-agent.service trustiflux-api-server.service
+Wants=network-online.target attestation-agent.service trustiflux-api-server.service
+
+[Service]
+Type=simple
+User=root
+Group=openclaw
+WorkingDirectory=/var/lib/cai/pep
+RuntimeDirectory=cai
+RuntimeDirectoryMode=0770
+ExecStartPre=/bin/bash -lc 'command -v docker >/dev/null && (docker image inspect ${PEP_IMAGE} >/dev/null 2>&1 || docker pull ${PEP_IMAGE})'
+ExecStart=/usr/local/bin/cai-pep serve --config /etc/cai/pep/policy.json --socket /run/cai/pep.sock
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload || true
+    systemctl enable cai-pep.service
+}
+
+install_openclaw_plugin() {
+    local extensions_dir="$OPENCLAW_HOME/extensions"
+    install -d -m 0755 "$extensions_dir"
+    rm -rf "$extensions_dir/cai-pep"
+    cp -a "$CAI_SHARE_DIR/cai-pep-plugin" "$extensions_dir/cai-pep"
+    node "$CAI_SHARE_DIR/patch-openclaw-cai-pep.js"
+    chown -R "$OPENCLAW_USER:openclaw" "$extensions_dir/cai-pep" "$OPENCLAW_HOME/skills" 2>/dev/null || true
+}
+
+case "$COMMAND" in
+    setup-runtime) setup_runtime ;;
+    install-openclaw-plugin) install_openclaw_plugin ;;
+    *) echo "unknown cai-pep install command: $COMMAND" >&2; exit 1 ;;
+esac

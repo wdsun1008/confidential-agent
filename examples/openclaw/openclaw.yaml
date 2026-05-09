@@ -13,12 +13,28 @@ build:
   packages:
     - ca-certificates
     - curl
-    - git
     - jq
     - nodejs
     - npm
+    - podman
     - tar
     - xz
+  files:
+    - source: ../../target/debug/cai-pep
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ./files/tdx-remote-attestation.SKILL.md
+      target: /root/.openclaw/skills/tdx-remote-attestation/SKILL.md
+    - source: ./files/install-cai-pep.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/cai-pep-default-policy.json
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
+    - source: ./files/cai-pep-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/patch-openclaw-cai-pep.js
+      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
+      executable: true
   scripts:
     - ./install-openclaw.sh
   variants:

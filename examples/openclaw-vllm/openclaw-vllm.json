@@ -30,8 +30,18 @@
     "profile": "full"
   },
   "plugins": {
-    "enabled": false,
-    "allow": []
+    "enabled": true,
+    "allow": ["cai-pep"],
+    "entries": {
+      "cai-pep": {
+        "enabled": true,
+        "config": {
+          "socketPath": "/run/cai/pep.sock",
+          "pepRequired": true,
+          "defaultWorkdir": "/workspace"
+        }
+      }
+    }
   },
   "channels": {},
   "gateway": {
