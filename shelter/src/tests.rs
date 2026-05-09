@@ -214,6 +214,31 @@ fn renders_guest_tng_overwrite_and_hack_rpm_setup() {
 }
 
 #[test]
+fn renders_extra_guest_files_with_destination_and_executable_flag() {
+    let mut assets = assets();
+    assets.extra_files.push(GuestFileAsset {
+        source: PathBuf::from("/project/files/cai-pep"),
+        destination: "/usr/local/bin/cai-pep".to_string(),
+        executable: true,
+    });
+    assets.extra_files.push(GuestFileAsset {
+        source: PathBuf::from("/project/files/cai-pep-plugin"),
+        destination: "/usr/local/share/confidential-agent/openclaw/cai-pep-plugin".to_string(),
+        executable: false,
+    });
+
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let rendered = render_build_config(&spec, &assets, &ShelterRenderOptions::default()).unwrap();
+
+    assert!(rendered.contains("source: /project/files/cai-pep"));
+    assert!(rendered.contains("destination: /usr/local/bin/cai-pep"));
+    assert!(rendered.contains("executable: true"));
+    assert!(rendered.contains("source: /project/files/cai-pep-plugin"));
+    assert!(rendered
+        .contains("destination: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin"));
+}
+
+#[test]
 fn renders_rekor_config_from_attestation() {
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();

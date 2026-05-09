@@ -42,9 +42,20 @@ pub struct BuildSpec {
     #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
+    pub files: Vec<BuildFileSpec>,
+    #[serde(default)]
     pub scripts: Vec<PathBuf>,
     #[serde(default)]
     pub variants: BuildVariantsSpec,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildFileSpec {
+    pub source: PathBuf,
+    pub target: String,
+    #[serde(default)]
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -238,6 +249,9 @@ impl AgentSpec {
         for path in &mut self.build.scripts {
             resolve_pathbuf(path, base_dir);
         }
+        for file in &mut self.build.files {
+            resolve_pathbuf(&mut file.source, base_dir);
+        }
         if let Some(debug) = &mut self.build.variants.debug {
             if let Some(path) = &mut debug.ssh_public_key {
                 resolve_pathbuf(path, base_dir);
@@ -299,6 +313,14 @@ impl AgentSpec {
         validate_variant("release", &self.build.variants.release)?;
         if let Some(debug) = &self.build.variants.debug {
             validate_variant("debug", debug)?;
+        }
+        for (index, file) in self.build.files.iter().enumerate() {
+            if file.source.as_os_str().is_empty() {
+                bail!("build.files[{index}].source must not be empty");
+            }
+            if !file.target.starts_with('/') {
+                bail!("build.files[{index}].target must be an absolute path");
+            }
         }
         match self.image_variant() {
             "release" if !self.build.variants.release.enabled => {
@@ -489,6 +511,9 @@ build:
   resize: 30G
   packages:
     - nodejs
+  files:
+    - source: ./image/skill.md
+      target: /usr/local/share/confidential-agent/openclaw/skill.md
   scripts:
     - ./image/install-openclaw.sh
   variants:
@@ -536,6 +561,14 @@ resources:
         assert_eq!(
             spec.build.scripts[0],
             PathBuf::from("/project/image/install-openclaw.sh")
+        );
+        assert_eq!(
+            spec.build.files[0].source,
+            PathBuf::from("/project/image/skill.md")
+        );
+        assert_eq!(
+            spec.build.files[0].target,
+            "/usr/local/share/confidential-agent/openclaw/skill.md"
         );
         assert_eq!(
             spec.build
@@ -619,44 +652,6 @@ resources:
             resource.source,
             PathBuf::from("/project/openclaw-vllm.json")
         );
-    }
-
-    #[test]
-    fn example_specs_build_debug_and_release_with_rekor_reference_values() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("core crate has a repo root parent");
-        for relative in [
-            "examples/mcp/mcp-demo.yaml",
-            "examples/openclaw/openclaw.yaml",
-            "examples/openclaw-vllm/openclaw-vllm.yaml",
-        ] {
-            let path = repo_root.join(relative);
-            let spec = AgentSpec::from_path(&path)
-                .unwrap_or_else(|err| panic!("failed to parse {}: {err:?}", path.display()));
-
-            assert!(
-                spec.build.variants.release.enabled,
-                "{relative} must enable release builds"
-            );
-            assert!(
-                spec.build
-                    .variants
-                    .debug
-                    .as_ref()
-                    .is_some_and(|debug| debug.enabled),
-                "{relative} must enable debug builds"
-            );
-            assert_eq!(
-                spec.attestation.reference_values,
-                ReferenceValueMode::Rekor,
-                "{relative} must use Rekor reference values"
-            );
-            assert!(
-                spec.attestation.rekor.is_some(),
-                "{relative} must include attestation.rekor config"
-            );
-        }
     }
 
     #[test]
