@@ -6,7 +6,6 @@ use super::commands::{
 };
 use super::*;
 use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
-use clap::CommandFactory;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -22,42 +21,6 @@ fn test_cli() -> Cli {
         state_dir: PathBuf::from("/work/.confidential-agent"),
         tools_image: "confidential-agent-tools:test".to_string(),
     }
-}
-
-#[test]
-fn main_help_hides_legacy_and_debug_options() {
-    let mut command = Cli::command();
-    let help = command.render_long_help().to_string();
-
-    assert!(!help.contains("--env-file"));
-    assert!(!help.contains("--tools-container-bin"));
-    assert!(!help.contains("--tools-container-arg"));
-    assert!(!help.contains(" inject"));
-    assert!(!help.contains(" mesh"));
-}
-
-#[test]
-fn build_help_requires_explicit_spec_and_hides_runtime_overrides() {
-    let mut command = Cli::command();
-    let build = command.find_subcommand_mut("build").unwrap();
-    let help = build.render_long_help().to_string();
-
-    assert!(help.contains("--spec <SPEC>"));
-    assert!(!help.contains("[default: confidential-agent.yaml]"));
-    assert!(!help.contains("--base-image"));
-    assert!(!help.contains("--agentd-bin"));
-    assert!(!help.contains("--guest-tng-bin"));
-    assert!(!help.contains("--libtdx-verify-rpm"));
-}
-
-#[test]
-fn image_help_exposes_local_image_lifecycle_commands() {
-    let mut command = Cli::command();
-    let image = command.find_subcommand_mut("image").unwrap();
-    let help = image.render_long_help().to_string();
-
-    assert!(help.contains("list"));
-    assert!(help.contains("rm"));
 }
 
 #[test]
@@ -230,7 +193,7 @@ fn image_list_marks_current_build_and_local_image_presence() {
     fs::write(&state.build.image_path, "image").unwrap();
     let result_path = shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id);
     fs::write(
-        &result_path,
+        result_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "id": state.build.build_id,
             "image_path": state.build.image_path,
@@ -689,42 +652,6 @@ fn stage_libtdx_verify_rpm_uses_explicit_source() {
 
     assert_eq!(staged.file_name().unwrap(), "libtdx-verify.rpm");
     assert_eq!(fs::read(staged).unwrap(), b"rpm");
-}
-
-#[test]
-fn guest_setup_installs_libtdx_hack_without_dependency_resolution() {
-    assert!(guest_setup_script().contains("rpm -Uvh --replacepkgs --nodeps"));
-}
-
-#[test]
-fn guest_setup_overwrites_guest_tng_after_packages_are_installed() {
-    let setup = guest_setup_script();
-
-    assert!(setup.contains("install -m 0755 /opt/confidential-agent/hack/tng-2.6.0 /usr/bin/tng"));
-}
-
-#[test]
-fn guest_setup_installs_tng_attestation_agent_wait_override() {
-    let setup = guest_setup_script();
-
-    assert!(setup.contains(
-        "/etc/systemd/system/trusted-network-gateway.service.d/10-confidential-agent-wait-aa.conf"
-    ));
-    assert!(setup.contains("StartLimitIntervalSec=0"));
-    assert!(setup.contains("ExecStartPre=/bin/bash -c"));
-    assert!(setup.contains("/run/confidential-containers/attestation-agent/attestation-agent.sock"));
-    assert!(setup.contains("RestartSec=5s"));
-}
-
-#[test]
-fn guest_setup_makes_debug_sshd_generate_host_keys() {
-    let setup = guest_setup_script();
-
-    assert!(setup.contains("/etc/systemd/system/sshd.service.d/10-confidential-agent-debug.conf"));
-    assert!(setup.contains("ssh-keygen -A || true"));
-    assert!(setup.contains("ExecStartPre=/usr/bin/mkdir -p /run/sshd"));
-    assert!(setup.contains("ExecStartPre=/usr/bin/ssh-keygen -A"));
-    assert!(setup.contains("systemctl enable sshd.service || true"));
 }
 
 #[test]

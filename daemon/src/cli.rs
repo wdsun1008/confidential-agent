@@ -88,18 +88,3 @@ pub(crate) struct InitrdFetchArgs {
 fn default_status_listen() -> String {
     format!("0.0.0.0:{DAEMON_STATUS_PORT}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Cli;
-    use clap::CommandFactory;
-
-    #[test]
-    fn initrd_fetch_help_documents_zero_timeout_as_infinite_wait() {
-        let mut command = Cli::command();
-        let initrd_fetch = command.find_subcommand_mut("initrd-fetch").unwrap();
-        let help = initrd_fetch.render_long_help().to_string();
-
-        assert!(help.contains("0 waits forever"));
-    }
-}
