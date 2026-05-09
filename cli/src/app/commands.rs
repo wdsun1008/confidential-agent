@@ -58,7 +58,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
         &prepared,
         "built",
     )?;
-    if let Some(image) = latest_built_image(&cli.state_dir, &spec).ok() {
+    if let Ok(image) = latest_built_image(&cli.state_dir, &spec) {
         println!(
             "[ca] build completed: service={} image={}",
             state.service_id,
@@ -250,13 +250,11 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
             spec.service.id
         )
     })?;
-    if state.phase != "active" {
-        if state.phase != "deployed" {
-            bail!(
-                "inject requires service '{}' to be active or deployed in local state",
-                spec.service.id
-            );
-        }
+    if state.phase != "active" && state.phase != "deployed" {
+        bail!(
+            "inject requires service '{}' to be active or deployed in local state",
+            spec.service.id
+        );
     }
     let manifest = read_build_manifest(&paths.manifest).with_context(|| {
         format!(
@@ -470,8 +468,8 @@ fn print_image_table(entries: &[ImageListEntry]) {
     }
     println!("Confidential Agent Local Images");
     println!(
-        "{:<18} {:<9} {:<7} {:<30} {:<12} {}",
-        "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE", "IMAGE"
+        "{:<18} {:<9} {:<7} {:<30} {:<12} IMAGE",
+        "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE"
     );
     for entry in entries {
         println!(

@@ -20,6 +20,7 @@ CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-300000}"
 CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请用一句简短中文回复，说明 OpenClaw vLLM 服务可用。}"
 CHAT_EXPECT="${E2E_CHAT_EXPECT:-}"
 CHAT_ATTEMPTS="${E2E_CHAT_ATTEMPTS:-3}"
+VLLM_PORT="${OPENCLAW_VLLM_PORT:-8090}"
 DESTROY_ON_SUCCESS="${E2E_DESTROY_ON_SUCCESS:-1}"
 DESTROY_ON_FAILURE="${E2E_DESTROY_ON_FAILURE:-1}"
 STEP_LOG="$WORK_DIR/e2e-steps.md"
@@ -66,6 +67,38 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 2
   }
+}
+
+use_aliyun_cli_profile() {
+  command -v aliyun >/dev/null 2>&1 || return 1
+  aliyun sts GetCallerIdentity >/dev/null 2>&1 || return 1
+  if [[ -n "${ALICLOUD_PROFILE:-}" || -n "${ALIBABA_CLOUD_PROFILE:-}" ]]; then
+    return
+  fi
+  local profile_line profile
+  profile_line="$(aliyun configure get profile 2>/dev/null || true)"
+  profile_line="${profile_line%%$'\n'*}"
+  [[ "$profile_line" == profile=* ]] || return 1
+  profile="${profile_line#profile=}"
+  profile="${profile%$'\r'}"
+  [[ -n "$profile" ]] || return 1
+  export ALICLOUD_PROFILE="$profile"
+}
+
+require_aliyun_credentials() {
+  if [[ -n "${ALICLOUD_ACCESS_KEY:-}" && -n "${ALICLOUD_SECRET_KEY:-}" ]]; then
+    return
+  fi
+  if [[ -n "${ALIBABA_CLOUD_ACCESS_KEY_ID:-}" && -n "${ALIBABA_CLOUD_ACCESS_KEY_SECRET:-}" ]]; then
+    return
+  fi
+  if use_aliyun_cli_profile; then
+    return
+  fi
+  echo "Aliyun credentials are required before E2E build/deploy." >&2
+  echo "Set ALICLOUD_ACCESS_KEY/ALICLOUD_SECRET_KEY or ALIBABA_CLOUD_ACCESS_KEY_ID/ALIBABA_CLOUD_ACCESS_KEY_SECRET in the current shell." >&2
+  echo "Alternatively, configure a usable Aliyun CLI profile so 'aliyun sts GetCallerIdentity' and 'aliyun configure get profile' succeed." >&2
+  exit 2
 }
 
 without_proxy() {
@@ -135,8 +168,8 @@ destroy_managed_resources() {
   return "$rc"
 }
 
-cleanup_on_exit() {
-  local status=$?
+finish_e2e() {
+  local status="$1"
   if [[ "$EXIT_CLEANUP_STARTED" == "1" ]]; then
     exit "$status"
   fi
@@ -160,6 +193,18 @@ cleanup_on_exit() {
     record "Result: FAIL ($status)"
   fi
   exit "$status"
+}
+
+cleanup_on_exit() {
+  finish_e2e "$?"
+}
+
+cleanup_on_int() {
+  finish_e2e 130
+}
+
+cleanup_on_term() {
+  finish_e2e 143
 }
 
 resolve_allowed_cidr() {
@@ -197,7 +242,9 @@ resolve_cosign_key() {
   mkdir -p "$WORK_DIR/secrets"
   local prefix="$WORK_DIR/secrets/cosign"
   record_cmd "COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix $prefix"
-  COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null
+  if ! COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null; then
+    return 1
+  fi
   printf '%s' "$prefix.key"
 }
 
@@ -239,6 +286,8 @@ write_spec_and_config() {
   cp "$ROOT_DIR/examples/openclaw-vllm/install-openclaw-vllm.sh" "$WORK_DIR/openclaw-vllm/"
   cp "$ROOT_DIR/examples/openclaw-vllm/cai-nvidia-cc-stack-install.sh" "$WORK_DIR/openclaw-vllm/"
   cp "$ROOT_DIR/examples/openclaw-vllm/nvidia-persistenced.service" "$WORK_DIR/openclaw-vllm/"
+  rm -rf "$WORK_DIR/openclaw-vllm/files"
+  cp -a "$ROOT_DIR/examples/openclaw/files" "$WORK_DIR/openclaw-vllm/files"
 
   python3 - "$ROOT_DIR/examples/openclaw-vllm/openclaw-vllm.json" "$WORK_DIR/openclaw-vllm/openclaw-vllm.json" "$token" <<'PY'
 import json
@@ -254,7 +303,10 @@ if os.environ.get("OPENCLAW_ENABLE_DINGTALK") == "1":
     client_secret = os.environ.get("DINGTALK_BOT_CLIENT_SECRET", "")
     if not client_id or not client_secret:
         raise SystemExit("DingTalk requested but DINGTALK_BOT_CLIENT_ID/SECRET is missing")
-    config["plugins"] = {"enabled": True, "allow": ["dingtalk"]}
+    plugins = config.setdefault("plugins", {})
+    plugins["enabled"] = True
+    allow = list(dict.fromkeys([*(plugins.get("allow") or []), "cai-pep", "dingtalk"]))
+    plugins["allow"] = allow
     config["channels"] = {
         "dingtalk": {
             "enabled": True,
@@ -289,7 +341,28 @@ $base_image_yaml
   image_name: openclaw-vllm-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
-  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel-5.10.134-19.1.al8, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, glibc-devel, jq, kernel-devel-5.10.134-19.1.al8, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  files:
+    - source: ./nvidia-persistenced.service
+      target: /usr/local/share/cai/nvidia-persistenced.service
+    - source: ./cai-nvidia-cc-stack-install.sh
+      target: /usr/local/sbin/cai-nvidia-cc-stack-install.sh
+      executable: true
+    - source: $(yaml_quote "$ROOT_DIR/target/debug/cai-pep")
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ./files/tdx-remote-attestation.SKILL.md
+      target: /home/openclaw/.openclaw/skills/tdx-remote-attestation/SKILL.md
+    - source: ./files/install-cai-pep.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/cai-pep-default-policy.json
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
+    - source: ./files/cai-pep-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/patch-openclaw-cai-pep.js
+      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
+      executable: true
   scripts: [./install-openclaw-vllm.sh]
   variants:
     release:
@@ -355,7 +428,8 @@ ssh_info() {
 import json
 import sys
 item = json.load(open(sys.argv[1], encoding="utf-8"))[0]["local"]
-print(item["deploy"]["public_ip"])
+cloud = item.get("cloud") or item.get("deploy") or {}
+print(cloud["public_ip"])
 print(item["build"]["debug_ssh"]["private_key"])
 PY
 }
@@ -492,6 +566,7 @@ main() {
     sample | rekor) ;;
     *) echo "E2E_REFERENCE_VALUES must be sample or rekor" >&2; exit 2 ;;
   esac
+  require_aliyun_credentials
 
   mkdir -p "$WORK_DIR"
   {
@@ -506,6 +581,8 @@ main() {
     printf '%s\n' "- instance_type: \`$INSTANCE_TYPE\`"
   } >"$STEP_LOG"
   trap cleanup_on_exit EXIT ERR
+  trap cleanup_on_int INT
+  trap cleanup_on_term TERM
 
   export CA_SHELTER_BIN="${CA_SHELTER_BIN:-shelter}"
   if [[ -x "$SHELTER_DIR/target/release/shelter" ]]; then
@@ -514,11 +591,14 @@ main() {
     export CA_SHELTER_BIN="$SHELTER_DIR/target/debug/shelter"
   fi
   if [[ "${E2E_SKIP_CARGO_BUILD:-0}" != "1" ]]; then
-    log "building current host CLI and guest daemon"
-    record_cmd "cargo build -p confidential-agent-cli -p confidential-agentd"
-    (cd "$ROOT_DIR" && cargo build -p confidential-agent-cli -p confidential-agentd)
+    log "building current host CLI, guest daemon and PEP binary"
+    record_cmd "cargo build -p confidential-agent-cli -p confidential-agentd -p cai-pep"
+    (cd "$ROOT_DIR" && cargo build -p confidential-agent-cli -p confidential-agentd -p cai-pep)
   elif [[ ! -x "$CA_BIN" ]]; then
     echo "CA_BIN '$CA_BIN' is not executable" >&2
+    exit 2
+  elif [[ ! -x "$ROOT_DIR/target/debug/cai-pep" ]]; then
+    echo "target/debug/cai-pep is not executable; build it or unset E2E_SKIP_CARGO_BUILD" >&2
     exit 2
   fi
   if ! command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
@@ -531,9 +611,9 @@ main() {
   CA_ARGS=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$STATE_DIR")
 
   local allowed_cidr token cosign_key
-  allowed_cidr="$(resolve_allowed_cidr)"
-  token="$(resolve_token)"
-  cosign_key="$(resolve_cosign_key)"
+  allowed_cidr="$(resolve_allowed_cidr)" || finish_e2e "$?"
+  token="$(resolve_token)" || finish_e2e "$?"
+  cosign_key="$(resolve_cosign_key)" || finish_e2e "$?"
   write_spec_and_config "$allowed_cidr" "$token" "$cosign_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- OpenClaw gateway token generated but not printed."
@@ -554,7 +634,7 @@ main() {
   guest_wait "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi" 1800
   guest_wait "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service" 1800
   guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 7200
-  guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:8090/v1/models" 7200
+  guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:$VLLM_PORT/v1/models" 7200
   guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 7200
 
   local connect_port
@@ -563,4 +643,6 @@ main() {
   run_chat_probe "$connect_port"
 }
 
-main "$@"
+if [[ "${CA_E2E_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi

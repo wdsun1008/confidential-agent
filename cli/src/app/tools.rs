@@ -187,9 +187,7 @@ where
         if PROXY_KEYS.contains(&key) {
             envs.push((key.to_string(), value.clone()));
         }
-        if key == "no_proxy" && current_no_proxy.is_empty() {
-            current_no_proxy = value.clone();
-        } else if key == "NO_PROXY" && current_no_proxy.is_empty() {
+        if (key == "no_proxy" || key == "NO_PROXY") && current_no_proxy.is_empty() {
             current_no_proxy = value.clone();
         }
     }
@@ -223,9 +221,7 @@ where
     for (key, value) in source {
         let key = key.as_ref();
         let value = value.into();
-        if key == "no_proxy" && current_no_proxy.is_empty() {
-            current_no_proxy = value;
-        } else if key == "NO_PROXY" && current_no_proxy.is_empty() {
+        if (key == "no_proxy" || key == "NO_PROXY") && current_no_proxy.is_empty() {
             current_no_proxy = value;
         }
     }
@@ -318,6 +314,7 @@ pub(super) fn challenge_inject(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_challenge_inject_once(
     cli: &Cli,
     state_dir: &Path,
