@@ -47,6 +47,7 @@ record_file_as_block() {
   local title="$1"
   local path="$2"
   local lang="${3:-text}"
+  [[ -f "$path" ]] || return 0
   record ""
   record "$title"
   record "\`\`\`$lang"
@@ -77,6 +78,46 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 2
   }
+}
+
+use_aliyun_cli_profile() {
+  command -v aliyun >/dev/null 2>&1 || return 1
+  aliyun sts GetCallerIdentity >/dev/null 2>&1 || return 1
+  if [[ -n "${ALICLOUD_PROFILE:-}" || -n "${ALIBABA_CLOUD_PROFILE:-}" ]]; then
+    return
+  fi
+  local profile_line profile
+  profile_line="$(aliyun configure get profile 2>/dev/null || true)"
+  profile_line="${profile_line%%$'\n'*}"
+  [[ "$profile_line" == profile=* ]] || return 1
+  profile="${profile_line#profile=}"
+  profile="${profile%$'\r'}"
+  [[ -n "$profile" ]] || return 1
+  export ALICLOUD_PROFILE="$profile"
+}
+
+require_aliyun_credentials() {
+  if [[ -n "${ALICLOUD_ACCESS_KEY:-}" && -n "${ALICLOUD_SECRET_KEY:-}" ]]; then
+    return
+  fi
+  if [[ -n "${ALIBABA_CLOUD_ACCESS_KEY_ID:-}" && -n "${ALIBABA_CLOUD_ACCESS_KEY_SECRET:-}" ]]; then
+    return
+  fi
+  if use_aliyun_cli_profile; then
+    return
+  fi
+  echo "Aliyun credentials are required before E2E build/deploy." >&2
+  echo "Set ALICLOUD_ACCESS_KEY/ALICLOUD_SECRET_KEY or ALIBABA_CLOUD_ACCESS_KEY_ID/ALIBABA_CLOUD_ACCESS_KEY_SECRET in the current shell." >&2
+  echo "Alternatively, configure a usable Aliyun CLI profile so 'aliyun sts GetCallerIdentity' and 'aliyun configure get profile' succeed." >&2
+  exit 2
+}
+
+require_bailian_credentials() {
+  if [[ -n "${DASHSCOPE_API_KEY:-}" || -n "${BAILIAN_API_KEY:-}" ]]; then
+    return
+  fi
+  echo "DASHSCOPE_API_KEY or BAILIAN_API_KEY is required in the current shell." >&2
+  exit 2
 }
 
 without_proxy() {
@@ -169,8 +210,8 @@ destroy_managed_resources() {
   return "$rc"
 }
 
-cleanup_on_exit() {
-  local status=$?
+finish_e2e() {
+  local status="$1"
   if [[ "$EXIT_CLEANUP_STARTED" == "1" ]]; then
     exit "$status"
   fi
@@ -183,7 +224,26 @@ cleanup_on_exit() {
     destroy_managed_resources "failure cleanup" || true
   fi
   redact_e2e_artifacts
+  if (( status == 0 )); then
+    record ""
+    record "Result: PASS"
+  else
+    record ""
+    record "Result: FAIL ($status)"
+  fi
   exit "$status"
+}
+
+cleanup_on_exit() {
+  finish_e2e "$?"
+}
+
+cleanup_on_int() {
+  finish_e2e 130
+}
+
+cleanup_on_term() {
+  finish_e2e 143
 }
 
 ensure_shelter_installed() {
@@ -316,7 +376,9 @@ resolve_cosign_key() {
     return
   fi
   record_cmd "COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix $prefix"
-  COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null
+  if ! COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null; then
+    return 1
+  fi
   printf '%s' "$prefix.key"
 }
 
@@ -373,6 +435,8 @@ write_specs() {
   local cosign_key="$4"
   mkdir -p "$WORK_DIR/openclaw" "$WORK_DIR/mcp"
   cp "$ROOT_DIR/examples/openclaw/install-openclaw.sh" "$WORK_DIR/openclaw/install-openclaw.sh"
+  rm -rf "$WORK_DIR/openclaw/files"
+  cp -a "$ROOT_DIR/examples/openclaw/files" "$WORK_DIR/openclaw/files"
   cp "$ROOT_DIR/examples/mcp/install-mcp.sh" "$WORK_DIR/mcp/install-mcp.sh"
 
   python3 - "$WORK_DIR/openclaw/openclaw.json" "$dashscope_key" "$token" <<'PY'
@@ -402,7 +466,20 @@ config = {
         },
     },
     "agents": {"defaults": {"model": {"primary": "bailian/qwen3-max-2026-01-23"}}},
-    "plugins": {"enabled": False, "allow": []},
+    "plugins": {
+        "enabled": True,
+        "allow": ["cai-pep"],
+        "entries": {
+            "cai-pep": {
+                "enabled": True,
+                "config": {
+                    "socketPath": "/run/cai/pep.sock",
+                    "pepRequired": True,
+                    "defaultWorkdir": "/workspace",
+                }
+            }
+        },
+    },
     "channels": {},
     "gateway": {
         "mode": "local",
@@ -489,7 +566,23 @@ build:
 $base_image_yaml
   image_name: openclaw-agent
   resize: 30G
-  packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
+  packages: [ca-certificates, curl, jq, nodejs, npm, podman, tar, xz]
+  files:
+    - source: $(yaml_quote "$ROOT_DIR/target/debug/cai-pep")
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ./files/tdx-remote-attestation.SKILL.md
+      target: /root/.openclaw/skills/tdx-remote-attestation/SKILL.md
+    - source: ./files/install-cai-pep.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/cai-pep-default-policy.json
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
+    - source: ./files/cai-pep-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/patch-openclaw-cai-pep.js
+      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
+      executable: true
   scripts: [./install-openclaw.sh]
   variants:
     release:
@@ -825,6 +918,8 @@ main() {
     require_cmd cosign
     require_cmd rekor-cli
   fi
+  require_aliyun_credentials
+  require_bailian_credentials
 
   mkdir -p "$WORK_DIR"
   {
@@ -847,6 +942,8 @@ main() {
     printf '%s\n' "- destroy_on_failure: \`$DESTROY_ON_FAILURE\`"
   } >"$STEP_LOG"
   trap cleanup_on_exit EXIT ERR
+  trap cleanup_on_int INT
+  trap cleanup_on_term TERM
 
   export CA_SHELTER_BIN="${CA_SHELTER_BIN:-shelter}"
   ensure_shelter_installed
@@ -865,9 +962,9 @@ main() {
   local allowed_cidr
   allowed_cidr="$(resolve_allowed_cidr)"
   local token
-  token="$(resolve_openclaw_token)"
+  token="$(resolve_openclaw_token)" || finish_e2e "$?"
   local cosign_key
-  cosign_key="$(resolve_cosign_key)"
+  cosign_key="$(resolve_cosign_key)" || finish_e2e "$?"
   write_specs "$allowed_cidr" "$token" "$dashscope_key" "$cosign_key"
   record ""
   record "Generated per-run OpenClaw/MCP specs under \`$WORK_DIR\`; secrets are not printed."
@@ -879,11 +976,14 @@ main() {
   fi
 
   if [[ "${E2E_SKIP_CARGO_BUILD:-0}" != "1" ]]; then
-    log "building current host CLI and guest daemon"
-    record_cmd "cargo build -p confidential-agent-cli -p confidential-agentd"
-    (cd "$ROOT_DIR" && cargo build -p confidential-agent-cli -p confidential-agentd)
+    log "building current host CLI, guest daemon and PEP binary"
+    record_cmd "cargo build -p confidential-agent-cli -p confidential-agentd -p cai-pep"
+    (cd "$ROOT_DIR" && cargo build -p confidential-agent-cli -p confidential-agentd -p cai-pep)
   elif [[ ! -x "$CA_BIN" ]]; then
     echo "CA_BIN '$CA_BIN' is not executable" >&2
+    exit 2
+  elif [[ ! -x "$ROOT_DIR/target/debug/cai-pep" ]]; then
+    echo "target/debug/cai-pep is not executable; build it or unset E2E_SKIP_CARGO_BUILD" >&2
     exit 2
   fi
 
@@ -910,7 +1010,7 @@ main() {
     without_proxy "${ca[@]}" deploy --spec "$WORK_DIR/openclaw/openclaw.yaml"
   fi
 
-  without_proxy "${ca[@]}" status --json >"$WORK_DIR/status-local.json"
+  without_proxy "${ca[@]}" status --json >"$WORK_DIR/status-local.json" || finish_e2e "$?"
   if ! wait_for_live_statuses "$WORK_DIR/status-local.json" 180; then
     record ""
     record "Live daemon status check failed after deploy."
@@ -919,7 +1019,7 @@ main() {
       destroy_managed_resources "live status failure cleanup" || true
       DEPLOY_ATTEMPTED=0
     fi
-    exit 1
+    finish_e2e 1
   fi
 
   log "checking local and live status"

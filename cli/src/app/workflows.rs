@@ -493,8 +493,8 @@ pub(super) fn render_connect_config(state_dir: &Path) -> Result<serde_json::Valu
             })?;
             used_local_ports.insert(local_port);
             eprintln!(
-                "connect {}:{} -> {}:{} ({})",
-                "127.0.0.1", local_port, host, remote_port, service.service_id
+                "connect 127.0.0.1:{} -> {}:{} ({})",
+                local_port, host, remote_port, service.service_id
             );
             ingress.push(serde_json::json!({
                 "mapping": {
@@ -684,7 +684,7 @@ pub(super) fn collect_reference_values_from_dir(
                 service.service_id
             )
         })?;
-        let content = fs::read_to_string(&path)
+        let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
         let parsed = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse '{}'", path.display()))?;
@@ -699,7 +699,7 @@ pub(super) fn collect_reference_values_from_dir(
                         service.service_id
                     )
                 })?;
-                let content = fs::read_to_string(&path)
+                let content = fs::read_to_string(path)
                     .with_context(|| format!("failed to read '{}'", path.display()))?;
                 let parsed = serde_json::from_str(&content)
                     .with_context(|| format!("failed to parse '{}'", path.display()))?;
@@ -730,7 +730,7 @@ pub(super) fn collect_reference_values_from_state(
                 service.service_id
             )
         })?;
-        let content = fs::read_to_string(&path)
+        let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
         let parsed = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse '{}'", path.display()))?;
@@ -745,7 +745,7 @@ pub(super) fn collect_reference_values_from_state(
                         service.service_id
                     )
                 })?;
-                let content = fs::read_to_string(&path)
+                let content = fs::read_to_string(path)
                     .with_context(|| format!("failed to read '{}'", path.display()))?;
                 let parsed = serde_json::from_str(&content)
                     .with_context(|| format!("failed to parse '{}'", path.display()))?;
@@ -787,12 +787,12 @@ pub(super) fn prepare_challenge_reference_values(
                     service_id
                 )
             })?;
-            set_sample_reference_value(cli, state_dir, &path)
+            set_sample_reference_value(cli, state_dir, path)
         }
         "rekor" => {
             let path = rekor_meta
                 .with_context(|| format!("missing Rekor metadata for service '{}'", service_id))?;
-            let content = fs::read_to_string(&path)
+            let content = fs::read_to_string(path)
                 .with_context(|| format!("failed to read '{}'", path.display()))?;
             let metadata: serde_json::Value = serde_json::from_str(&content)
                 .with_context(|| format!("failed to parse '{}'", path.display()))?;
