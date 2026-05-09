@@ -4,7 +4,7 @@
     "providers": {
       "bailian": {
         "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "apiKey": "<DASHSCOPE_API_KEY>",
+        "apiKey": "replace-with-bailian-api-key",
         "api": "openai-completions",
         "models": [
           {
@@ -36,7 +36,17 @@
   },
   "plugins": {
     "enabled": true,
-    "allow": ["dingtalk"]
+    "allow": ["dingtalk", "cai-pep"],
+    "entries": {
+      "cai-pep": {
+        "enabled": true,
+        "config": {
+          "socketPath": "/run/cai/pep.sock",
+          "pepRequired": true,
+          "defaultWorkdir": "/workspace"
+        }
+      }
+    }
   },
   "channels": {
     "dingtalk": {

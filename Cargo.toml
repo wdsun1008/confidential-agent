@@ -1,11 +1,12 @@
 [workspace]
 members = [
+    "cai-pep",
     "core",
     "shelter",
     "cli",
     "daemon",
 ]
-default-members = ["core", "shelter", "cli", "daemon"]
+default-members = ["cai-pep", "core", "shelter", "cli", "daemon"]
 resolver = "2"
 
 [workspace.package]

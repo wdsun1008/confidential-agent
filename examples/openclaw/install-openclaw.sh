@@ -5,10 +5,14 @@ echo "installing OpenClaw service"
 
 mkdir -p /root/.openclaw
 
+/usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh setup-runtime root /root/.openclaw
+install -d -m 0775 -o root -g openclaw /workspace
+
 cat >/usr/local/bin/cai-openclaw-bootstrap <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
+OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.5.7}"
 npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com}"
 ensure_node22() {
     if command -v node >/dev/null 2>&1 && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' >/dev/null 2>&1; then
@@ -32,7 +36,7 @@ ensure_node22() {
 
 ensure_node22
 if ! command -v openclaw >/dev/null 2>&1; then
-    npm install -g openclaw@latest --no-audit --no-fund
+    npm install -g "openclaw@$OPENCLAW_VERSION" --no-audit --no-fund
 fi
 
 preinstall_openclaw_bundled_runtime_deps() {
@@ -58,6 +62,7 @@ preinstall_openclaw_bundled_runtime_deps() {
 }
 
 preinstall_openclaw_bundled_runtime_deps
+/usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh install-openclaw-plugin root /root/.openclaw
 npm cache clean --force || true
 EOF
 chmod 0755 /usr/local/bin/cai-openclaw-bootstrap

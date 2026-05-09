@@ -1,0 +1,36 @@
+{
+  "socket_path": "/run/cai/pep.sock",
+  "docker_image": "alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest",
+  "workspace_host_path": "/workspace",
+  "workspace_mount_target": "/workspace",
+  "allowed_workspace_prefixes": ["/workspace"],
+  "denied_path_prefixes": [
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/root",
+    "/run",
+    "/var/run",
+    "/home/openclaw/.openclaw"
+  ],
+  "denied_command_patterns": [
+    "curl ",
+    "wget ",
+    "nc ",
+    "ncat ",
+    "ssh ",
+    "scp ",
+    "sftp ",
+    "telnet ",
+    "docker ",
+    "podman "
+  ],
+  "timeout_secs": 30,
+  "stdout_max_bytes": 65536,
+  "stderr_max_bytes": 32768,
+  "memory_mb": 512,
+  "cpus": 1.0,
+  "pids_limit": 128,
+  "docker_network_mode": "none"
+}

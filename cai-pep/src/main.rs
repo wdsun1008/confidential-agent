@@ -1,0 +1,1080 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::env;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_CONFIG_PATH: &str = "/etc/cai/pep/policy.json";
+const DEFAULT_SOCKET_PATH: &str = "/run/cai/pep.sock";
+
+fn main() {
+    if let Err(err) = run_main() {
+        eprintln!("cai-pep fatal: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> Result<(), String> {
+    let args: Vec<String> = env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("serve") => run_serve(&args[2..]),
+        Some("submit") => run_submit(&args[2..]),
+        Some("attest") => run_attest(&args[2..]),
+        _ => Err(usage()),
+    }
+}
+
+fn usage() -> String {
+    [
+        "usage:",
+        "  cai-pep serve [--config /etc/cai/pep/policy.json] [--socket /run/cai/pep.sock]",
+        "  cai-pep submit --command '<cmd>' [--workdir /workspace] [--socket /run/cai/pep.sock]",
+        "  cai-pep attest collect-and-verify [--aa-url http://localhost:8006] [--tee tdx] [--policy default] [--claims]",
+    ]
+    .join("\n")
+}
+
+fn run_serve(args: &[String]) -> Result<(), String> {
+    let mut config_path = DEFAULT_CONFIG_PATH.to_string();
+    let mut socket_override: Option<String> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--config" => {
+                idx += 1;
+                config_path = args
+                    .get(idx)
+                    .ok_or_else(|| "--config requires a value".to_string())?
+                    .clone();
+            }
+            "--socket" => {
+                idx += 1;
+                socket_override = Some(
+                    args.get(idx)
+                        .ok_or_else(|| "--socket requires a value".to_string())?
+                        .clone(),
+                );
+            }
+            other => return Err(format!("unknown serve argument: {other}")),
+        }
+        idx += 1;
+    }
+
+    let mut config = PepConfig::load(Path::new(&config_path))?;
+    if let Some(socket) = socket_override {
+        config.socket_path = socket;
+    }
+    serve(config)
+}
+
+fn run_submit(args: &[String]) -> Result<(), String> {
+    let mut socket_path = DEFAULT_SOCKET_PATH.to_string();
+    let mut command: Option<String> = None;
+    let mut workdir = "/workspace".to_string();
+    let mut run_id = format!("manual-{}", now_ms());
+    let mut session_key = "manual:cli".to_string();
+    let mut agent_id = "manual".to_string();
+    let mut skill_id = "cai-pep-cli".to_string();
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--socket" => {
+                idx += 1;
+                socket_path = args
+                    .get(idx)
+                    .ok_or_else(|| "--socket requires a value".to_string())?
+                    .clone();
+            }
+            "--command" => {
+                idx += 1;
+                command = Some(
+                    args.get(idx)
+                        .ok_or_else(|| "--command requires a value".to_string())?
+                        .clone(),
+                );
+            }
+            "--workdir" => {
+                idx += 1;
+                workdir = args
+                    .get(idx)
+                    .ok_or_else(|| "--workdir requires a value".to_string())?
+                    .clone();
+            }
+            "--run-id" => {
+                idx += 1;
+                run_id = args
+                    .get(idx)
+                    .ok_or_else(|| "--run-id requires a value".to_string())?
+                    .clone();
+            }
+            "--session-key" => {
+                idx += 1;
+                session_key = args
+                    .get(idx)
+                    .ok_or_else(|| "--session-key requires a value".to_string())?
+                    .clone();
+            }
+            "--agent-id" => {
+                idx += 1;
+                agent_id = args
+                    .get(idx)
+                    .ok_or_else(|| "--agent-id requires a value".to_string())?
+                    .clone();
+            }
+            "--skill-id" => {
+                idx += 1;
+                skill_id = args
+                    .get(idx)
+                    .ok_or_else(|| "--skill-id requires a value".to_string())?
+                    .clone();
+            }
+            other => return Err(format!("unknown submit argument: {other}")),
+        }
+        idx += 1;
+    }
+
+    let request = IntentEnvelope {
+        method: "submit_intent".to_string(),
+        id: format!("req-{}", now_ms()),
+        params: IntentParams {
+            version: 1,
+            run_id,
+            session_key,
+            agent_id,
+            tool_name: "exec".to_string(),
+            skill_id,
+            params: ExecParams {
+                command: command.ok_or_else(|| "--command is required".to_string())?,
+                workdir,
+            },
+            request_context: Some(json!({
+                "provider": "manual-cli",
+            })),
+            security_profile_ref: None,
+            issued_at_ms: now_ms(),
+        },
+    };
+
+    let raw = send_request(&socket_path, &request)?;
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|err| format!("invalid response JSON: {err}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&parsed)
+            .map_err(|err| format!("failed to format response: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_attest(args: &[String]) -> Result<(), String> {
+    let request = parse_attestation_args(args)?;
+    let result = execute_attestation_request(&request, 256 * 1024, 128 * 1024, 60)?;
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    if result.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "attestation helper failed with exit code {}",
+            result.exit_code
+        ))
+    }
+}
+
+fn serve(config: PepConfig) -> Result<(), String> {
+    let socket_path = PathBuf::from(&config.socket_path);
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create socket parent {:?}: {err}", parent))?;
+    }
+    if socket_path.exists() {
+        fs::remove_file(&socket_path)
+            .map_err(|err| format!("failed to remove stale socket {:?}: {err}", socket_path))?;
+    }
+
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|err| format!("failed to bind {:?}: {err}", socket_path))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660))
+        .map_err(|err| format!("failed to chmod {:?}: {err}", socket_path))?;
+
+    let shared = Arc::new(config);
+    eprintln!(
+        "{}",
+        json!({
+            "component": "cai-pep",
+            "event": "pep_started",
+            "socket_path": shared.socket_path,
+            "docker_image": shared.docker_image,
+            "workspace_host_path": shared.workspace_host_path,
+            "allowed_workspace_prefixes": shared.allowed_workspace_prefixes,
+        })
+    );
+
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(stream) => {
+                let cfg = Arc::clone(&shared);
+                thread::spawn(move || {
+                    if let Err(err) = handle_stream(stream, cfg) {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "component": "cai-pep",
+                                "event": "connection_error",
+                                "message": err,
+                            })
+                        );
+                    }
+                });
+            }
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "component": "cai-pep",
+                        "event": "accept_error",
+                        "message": err.to_string(),
+                    })
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_stream(mut stream: UnixStream, config: Arc<PepConfig>) -> Result<(), String> {
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|err| format!("failed to read request: {err}"))?;
+    let request: IntentEnvelope =
+        serde_json::from_str(&raw).map_err(|err| format!("failed to parse request: {err}"))?;
+    let response = match handle_intent(&request, &config) {
+        Ok(result) => IntentResponse::ok(request.id.clone(), result),
+        Err(PepError::PolicyDeny {
+            rule_id,
+            message,
+            detail,
+            audit_id,
+        }) => IntentResponse::deny(request.id.clone(), rule_id, message, detail, audit_id),
+        Err(PepError::BadRequest(message)) => {
+            IntentResponse::bad_request(request.id.clone(), message)
+        }
+        Err(PepError::Execution {
+            message,
+            audit_id,
+            detail,
+        }) => IntentResponse::exec_failed(request.id.clone(), message, detail, audit_id),
+    };
+    let payload = serde_json::to_vec(&response)
+        .map_err(|err| format!("failed to encode response JSON: {err}"))?;
+    stream
+        .write_all(&payload)
+        .map_err(|err| format!("failed to write response: {err}"))?;
+    Ok(())
+}
+
+fn handle_intent(
+    request: &IntentEnvelope,
+    config: &PepConfig,
+) -> Result<IntentSuccessResult, PepError> {
+    if request.method != "submit_intent" {
+        return Err(PepError::BadRequest(format!(
+            "unsupported method: {}",
+            request.method
+        )));
+    }
+    if request.params.tool_name != "exec" {
+        return Err(PepError::BadRequest(format!(
+            "unsupported tool_name: {}",
+            request.params.tool_name
+        )));
+    }
+
+    let audit_id = format!("audit-{}", now_ms());
+    let started = Instant::now();
+    let canonical_workdir =
+        canonicalize_existing_dir(&request.params.params.workdir).map_err(|err| {
+            PepError::PolicyDeny {
+                rule_id: "fs.invalid_workdir".to_string(),
+                message: format!("workdir is invalid: {err}"),
+                detail: json!({ "workdir": request.params.params.workdir }),
+                audit_id: audit_id.clone(),
+            }
+        })?;
+
+    ensure_allowed_workdir(&canonical_workdir, config, &audit_id)?;
+    ensure_command_policy(&request.params.params.command, config, &audit_id)?;
+
+    let (backend, sandbox_profile, exec) = if let Some(attestation) =
+        try_parse_attestation_shell_command(&request.params.params.command, &audit_id)?
+    {
+        (
+            "host-attestation".to_string(),
+            "attestation-helper".to_string(),
+            execute_attestation_request(
+                &attestation,
+                config.stdout_max_bytes,
+                config.stderr_max_bytes,
+                config.timeout_secs.max(60),
+            )
+            .map_err(|message| PepError::Execution {
+                message,
+                audit_id: audit_id.clone(),
+                detail: json!({
+                    "workdir": canonical_workdir.display().to_string(),
+                    "mode": "host-attestation",
+                }),
+            })?,
+        )
+    } else {
+        (
+            "docker".to_string(),
+            "default-docker".to_string(),
+            run_exec_in_docker(config, &canonical_workdir, &request.params.params.command)
+                .map_err(|message| PepError::Execution {
+                    message,
+                    audit_id: audit_id.clone(),
+                    detail: json!({
+                        "workdir": canonical_workdir.display().to_string(),
+                        "mode": "docker",
+                    }),
+                })?,
+        )
+    };
+
+    let result = IntentSuccessResult {
+        status: "ok".to_string(),
+        decision: "allow".to_string(),
+        backend,
+        sandbox_profile,
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        exit_code: exec.exit_code,
+        duration_ms: started.elapsed().as_millis() as u64,
+        audit_id: audit_id.clone(),
+    };
+
+    eprintln!(
+        "{}",
+        json!({
+            "component": "cai-pep",
+            "event": "intent_allow",
+            "audit_id": audit_id,
+            "tool_name": request.params.tool_name,
+            "run_id": request.params.run_id,
+            "session_key": request.params.session_key,
+            "agent_id": request.params.agent_id,
+            "skill_id": request.params.skill_id,
+            "command": summarize_command(&request.params.params.command),
+            "workdir": canonical_workdir.display().to_string(),
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+        })
+    );
+
+    Ok(result)
+}
+
+fn ensure_allowed_workdir(
+    workdir: &Path,
+    config: &PepConfig,
+    audit_id: &str,
+) -> Result<(), PepError> {
+    for allowed in &config.allowed_workspace_prefixes {
+        if let Ok(prefix) = canonicalize_existing_dir(allowed) {
+            if workdir.starts_with(&prefix) {
+                return Ok(());
+            }
+        }
+    }
+    Err(PepError::PolicyDeny {
+        rule_id: "fs.workdir_prefix".to_string(),
+        message: "workdir is outside allowed workspace prefixes".to_string(),
+        detail: json!({
+            "workdir": workdir.display().to_string(),
+            "allowed_prefixes": config.allowed_workspace_prefixes,
+        }),
+        audit_id: audit_id.to_string(),
+    })
+}
+
+fn ensure_command_policy(
+    command: &str,
+    config: &PepConfig,
+    audit_id: &str,
+) -> Result<(), PepError> {
+    let lowered = command.to_ascii_lowercase();
+    for pattern in &config.denied_command_patterns {
+        if lowered.contains(&pattern.to_ascii_lowercase()) {
+            return Err(PepError::PolicyDeny {
+                rule_id: "command.deny_pattern".to_string(),
+                message: format!("command contains denied pattern: {pattern}"),
+                detail: json!({ "pattern": pattern }),
+                audit_id: audit_id.to_string(),
+            });
+        }
+    }
+    for prefix in &config.denied_path_prefixes {
+        if lowered.contains(&prefix.to_ascii_lowercase()) {
+            return Err(PepError::PolicyDeny {
+                rule_id: "fs.deny_prefix".to_string(),
+                message: format!("requested path is not allowed: {prefix}"),
+                detail: json!({ "path_prefix": prefix }),
+                audit_id: audit_id.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn try_parse_attestation_shell_command(
+    command: &str,
+    audit_id: &str,
+) -> Result<Option<AttestationRequest>, PepError> {
+    if !command.contains("cai-pep attest") && !command.contains("/cai-pep attest") {
+        return Ok(None);
+    }
+    let parts = shlex::split(command).ok_or_else(|| PepError::PolicyDeny {
+        rule_id: "command.attest_parse".to_string(),
+        message: "failed to parse cai-pep attest command".to_string(),
+        detail: json!({ "command": summarize_command(command) }),
+        audit_id: audit_id.to_string(),
+    })?;
+    if parts.len() < 2 {
+        return Ok(None);
+    }
+    let binary = &parts[0];
+    if !(binary == "cai-pep" || binary.ends_with("/cai-pep")) || parts[1] != "attest" {
+        return Ok(None);
+    }
+
+    let args: Vec<String> = parts[2..].to_vec();
+    parse_attestation_args(&args)
+        .map(Some)
+        .map_err(|message| PepError::PolicyDeny {
+            rule_id: "command.attest_invalid".to_string(),
+            message,
+            detail: json!({ "command": summarize_command(command) }),
+            audit_id: audit_id.to_string(),
+        })
+}
+
+fn parse_attestation_args(args: &[String]) -> Result<AttestationRequest, String> {
+    let mut aa_url = "http://localhost:8006".to_string();
+    let mut tee = "tdx".to_string();
+    let mut policy = "default".to_string();
+    let mut claims = false;
+
+    let mut idx = 0;
+    let subcommand = args
+        .first()
+        .ok_or_else(|| "attest requires a subcommand".to_string())?;
+    if subcommand != "collect-and-verify" {
+        return Err(format!("unsupported attest subcommand: {subcommand}"));
+    }
+    idx += 1;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--aa-url" => {
+                idx += 1;
+                aa_url = args
+                    .get(idx)
+                    .ok_or_else(|| "--aa-url requires a value".to_string())?
+                    .clone();
+            }
+            "--tee" => {
+                idx += 1;
+                tee = args
+                    .get(idx)
+                    .ok_or_else(|| "--tee requires a value".to_string())?
+                    .clone();
+            }
+            "--policy" => {
+                idx += 1;
+                policy = args
+                    .get(idx)
+                    .ok_or_else(|| "--policy requires a value".to_string())?
+                    .clone();
+            }
+            "--claims" => {
+                claims = true;
+            }
+            other => return Err(format!("unknown attest argument: {other}")),
+        }
+        idx += 1;
+    }
+
+    Ok(AttestationRequest {
+        aa_url,
+        tee,
+        policy,
+        claims,
+    })
+}
+
+fn execute_attestation_request(
+    request: &AttestationRequest,
+    stdout_max_bytes: usize,
+    stderr_max_bytes: usize,
+    timeout_secs: u64,
+) -> Result<ExecOutput, String> {
+    let evidence_path = format!(
+        "/tmp/cai-pep-attestation-{}-{}.json",
+        now_ms(),
+        std::process::id()
+    );
+
+    let mut get_evidence = Command::new("/usr/bin/attestation-challenge-client");
+    get_evidence
+        .arg("get-evidence")
+        .arg("--aa-url")
+        .arg(&request.aa_url)
+        .arg("--output")
+        .arg(&evidence_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let get_output = run_command_and_capture(
+        &mut get_evidence,
+        stdout_max_bytes,
+        stderr_max_bytes,
+        timeout_secs,
+    )?;
+    if get_output.exit_code != 0 {
+        let _ = fs::remove_file(&evidence_path);
+        return Ok(get_output);
+    }
+
+    let mut verify = Command::new("/usr/bin/attestation-challenge-client");
+    verify
+        .arg("verify")
+        .arg("--evidence")
+        .arg(&evidence_path)
+        .arg("--tee")
+        .arg(&request.tee)
+        .arg("--policy")
+        .arg(&request.policy);
+    if request.claims {
+        verify.arg("--claims");
+    }
+    verify.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let verify_output = run_command_and_capture(
+        &mut verify,
+        stdout_max_bytes,
+        stderr_max_bytes,
+        timeout_secs,
+    )?;
+    let _ = fs::remove_file(&evidence_path);
+
+    let stderr = match (
+        get_output.stderr.trim_end(),
+        verify_output.stderr.trim_end(),
+    ) {
+        ("", "") => String::new(),
+        ("", right) => format!("{right}\n"),
+        (left, "") => format!("{left}\n"),
+        (left, right) => format!("{left}\n{right}\n"),
+    };
+
+    Ok(ExecOutput {
+        stdout: verify_output.stdout,
+        stderr,
+        exit_code: verify_output.exit_code,
+    })
+}
+
+fn run_exec_in_docker(
+    config: &PepConfig,
+    canonical_workdir: &Path,
+    command: &str,
+) -> Result<ExecOutput, String> {
+    let workspace_root = canonicalize_existing_dir(&config.workspace_host_path)?;
+    let container_workdir = host_to_container_path(canonical_workdir, &workspace_root, config)?;
+    let metadata = fs::metadata(canonical_workdir)
+        .map_err(|err| format!("failed to stat workdir {:?}: {err}", canonical_workdir))?;
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+
+    let mut child = Command::new("docker");
+    child
+        .arg("run")
+        .arg("--rm")
+        .arg("--init")
+        .arg("--read-only")
+        .arg("--network")
+        .arg(&config.docker_network_mode)
+        .arg("--cap-drop")
+        .arg("ALL")
+        .arg("--security-opt")
+        .arg("no-new-privileges")
+        .arg("--pids-limit")
+        .arg(config.pids_limit.to_string())
+        .arg("--memory")
+        .arg(format!("{}m", config.memory_mb))
+        .arg("--cpus")
+        .arg(config.cpus.to_string())
+        .arg("--tmpfs")
+        .arg("/tmp:rw,noexec,nosuid,nodev,size=64m")
+        .arg("--tmpfs")
+        .arg("/run:rw,noexec,nosuid,nodev,size=16m")
+        .arg("--user")
+        .arg(format!("{uid}:{gid}"))
+        .arg("-v")
+        .arg(format!(
+            "{}:{}:rw",
+            workspace_root.display(),
+            config.workspace_mount_target
+        ))
+        .arg("--workdir")
+        .arg(container_workdir)
+        .arg(&config.docker_image)
+        .arg("/bin/sh")
+        .arg("-lc")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    run_command_and_capture(
+        &mut child,
+        config.stdout_max_bytes,
+        config.stderr_max_bytes,
+        config.timeout_secs,
+    )
+}
+
+fn run_command_and_capture(
+    child: &mut Command,
+    stdout_max_bytes: usize,
+    stderr_max_bytes: usize,
+    timeout_secs: u64,
+) -> Result<ExecOutput, String> {
+    let mut child = child
+        .spawn()
+        .map_err(|err| format!("failed to spawn command: {err}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture stderr".to_string())?;
+
+    let stdout_reader = spawn_capped_reader(stdout, stdout_max_bytes);
+    let stderr_reader = spawn_capped_reader(stderr, stderr_max_bytes);
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().map_err(|err| err.to_string())?;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let (stdout_buf, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| "stdout reader thread panicked".to_string())?;
+    let (stderr_buf, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| "stderr reader thread panicked".to_string())?;
+
+    let mut stdout_text = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let mut stderr_text = String::from_utf8_lossy(&stderr_buf).into_owned();
+    if stdout_truncated {
+        stdout_text.push_str("\n[truncated by cai-pep]");
+    }
+    if stderr_truncated {
+        stderr_text.push_str("\n[truncated by cai-pep]");
+    }
+    if timed_out {
+        if !stderr_text.is_empty() {
+            stderr_text.push('\n');
+        }
+        stderr_text.push_str("[timed out by cai-pep]");
+    }
+
+    Ok(ExecOutput {
+        stdout: stdout_text,
+        stderr: stderr_text,
+        exit_code: status.code().unwrap_or(if timed_out { 124 } else { 137 }),
+    })
+}
+
+fn host_to_container_path(
+    workdir: &Path,
+    workspace_root: &Path,
+    config: &PepConfig,
+) -> Result<String, String> {
+    let relative = workdir
+        .strip_prefix(workspace_root)
+        .map_err(|_| "workdir is outside workspace root".to_string())?;
+    if relative.as_os_str().is_empty() {
+        return Ok(config.workspace_mount_target.clone());
+    }
+    Ok(format!(
+        "{}/{}",
+        config.workspace_mount_target.trim_end_matches('/'),
+        relative.display()
+    ))
+}
+
+fn spawn_capped_reader<R>(mut reader: R, max_bytes: usize) -> thread::JoinHandle<(Vec<u8>, bool)>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 8192];
+        let mut truncated = false;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let remaining = max_bytes.saturating_sub(buf.len());
+                    if remaining > 0 {
+                        let take = remaining.min(n);
+                        buf.extend_from_slice(&tmp[..take]);
+                        if take < n {
+                            truncated = true;
+                        }
+                    } else {
+                        truncated = true;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        (buf, truncated)
+    })
+}
+
+fn canonicalize_existing_dir(path: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(path);
+    if !candidate.exists() {
+        return Err(format!("path does not exist: {path}"));
+    }
+    let canonical =
+        fs::canonicalize(candidate).map_err(|err| format!("canonicalize failed: {err}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("path is not a directory: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn send_request(socket_path: &str, request: &IntentEnvelope) -> Result<String, String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|err| format!("failed to connect to {socket_path}: {err}"))?;
+    let body =
+        serde_json::to_vec(request).map_err(|err| format!("failed to encode request: {err}"))?;
+    stream
+        .write_all(&body)
+        .map_err(|err| format!("failed to write request: {err}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|err| format!("failed to close request stream: {err}"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|err| format!("failed to read response: {err}"))?;
+    Ok(raw)
+}
+
+fn summarize_command(command: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.len() <= 120 {
+        return trimmed.to_string();
+    }
+    format!("{}...", &trimmed[..120])
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PepConfig {
+    #[serde(default = "default_socket_path")]
+    socket_path: String,
+    #[serde(default = "default_docker_image")]
+    docker_image: String,
+    #[serde(default = "default_workspace_host_path")]
+    workspace_host_path: String,
+    #[serde(default = "default_workspace_mount_target")]
+    workspace_mount_target: String,
+    #[serde(default = "default_allowed_workspace_prefixes")]
+    allowed_workspace_prefixes: Vec<String>,
+    #[serde(default = "default_denied_path_prefixes")]
+    denied_path_prefixes: Vec<String>,
+    #[serde(default = "default_denied_command_patterns")]
+    denied_command_patterns: Vec<String>,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: u64,
+    #[serde(default = "default_stdout_max_bytes")]
+    stdout_max_bytes: usize,
+    #[serde(default = "default_stderr_max_bytes")]
+    stderr_max_bytes: usize,
+    #[serde(default = "default_memory_mb")]
+    memory_mb: u64,
+    #[serde(default = "default_cpus")]
+    cpus: f64,
+    #[serde(default = "default_pids_limit")]
+    pids_limit: u64,
+    #[serde(default = "default_docker_network_mode")]
+    docker_network_mode: String,
+}
+
+impl PepConfig {
+    fn load(path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|err| format!("failed to read config {:?}: {err}", path))?;
+        serde_json::from_str(&content)
+            .map_err(|err| format!("failed to parse config {:?}: {err}", path))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct IntentEnvelope {
+    method: String,
+    id: String,
+    params: IntentParams,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct IntentParams {
+    version: u32,
+    run_id: String,
+    session_key: String,
+    agent_id: String,
+    tool_name: String,
+    skill_id: String,
+    params: ExecParams,
+    #[serde(default)]
+    request_context: Option<Value>,
+    #[serde(default)]
+    security_profile_ref: Option<String>,
+    issued_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ExecParams {
+    command: String,
+    workdir: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IntentResponse {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<IntentSuccessResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<IntentErrorResult>,
+}
+
+impl IntentResponse {
+    fn ok(id: String, result: IntentSuccessResult) -> Self {
+        Self {
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn deny(id: String, rule_id: String, message: String, detail: Value, audit_id: String) -> Self {
+        Self {
+            id,
+            result: None,
+            error: Some(IntentErrorResult {
+                code: "POLICY_DENY".to_string(),
+                message,
+                rule_id: Some(rule_id),
+                detail: Some(detail),
+                audit_id: Some(audit_id),
+            }),
+        }
+    }
+
+    fn bad_request(id: String, message: String) -> Self {
+        Self {
+            id,
+            result: None,
+            error: Some(IntentErrorResult {
+                code: "BAD_REQUEST".to_string(),
+                message,
+                rule_id: None,
+                detail: None,
+                audit_id: None,
+            }),
+        }
+    }
+
+    fn exec_failed(id: String, message: String, detail: Value, audit_id: String) -> Self {
+        Self {
+            id,
+            result: None,
+            error: Some(IntentErrorResult {
+                code: "EXECUTION_FAILED".to_string(),
+                message,
+                rule_id: None,
+                detail: Some(detail),
+                audit_id: Some(audit_id),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct IntentSuccessResult {
+    status: String,
+    decision: String,
+    backend: String,
+    sandbox_profile: String,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    duration_ms: u64,
+    audit_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IntentErrorResult {
+    code: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum PepError {
+    PolicyDeny {
+        rule_id: String,
+        message: String,
+        detail: Value,
+        audit_id: String,
+    },
+    BadRequest(String),
+    Execution {
+        message: String,
+        audit_id: String,
+        detail: Value,
+    },
+}
+
+struct ExecOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+#[derive(Debug, Clone)]
+struct AttestationRequest {
+    aa_url: String,
+    tee: String,
+    policy: String,
+    claims: bool,
+}
+
+fn default_socket_path() -> String {
+    DEFAULT_SOCKET_PATH.to_string()
+}
+
+fn default_docker_image() -> String {
+    "alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest".to_string()
+}
+
+fn default_workspace_host_path() -> String {
+    "/workspace".to_string()
+}
+
+fn default_workspace_mount_target() -> String {
+    "/workspace".to_string()
+}
+
+fn default_allowed_workspace_prefixes() -> Vec<String> {
+    vec!["/workspace".to_string()]
+}
+
+fn default_denied_path_prefixes() -> Vec<String> {
+    vec![
+        "/etc".to_string(),
+        "/proc".to_string(),
+        "/sys".to_string(),
+        "/dev".to_string(),
+        "/root".to_string(),
+        "/run".to_string(),
+        "/var/run".to_string(),
+        "/home/openclaw/.openclaw".to_string(),
+    ]
+}
+
+fn default_denied_command_patterns() -> Vec<String> {
+    vec![
+        "curl ".to_string(),
+        "wget ".to_string(),
+        "nc ".to_string(),
+        "ncat ".to_string(),
+        "ssh ".to_string(),
+        "scp ".to_string(),
+        "sftp ".to_string(),
+        "telnet ".to_string(),
+        "docker ".to_string(),
+        "podman ".to_string(),
+    ]
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+
+fn default_stdout_max_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_stderr_max_bytes() -> usize {
+    32 * 1024
+}
+
+fn default_memory_mb() -> u64 {
+    512
+}
+
+fn default_cpus() -> f64 {
+    1.0
+}
+
+fn default_pids_limit() -> u64 {
+    128
+}
+
+fn default_docker_network_mode() -> String {
+    "none".to_string()
+}
