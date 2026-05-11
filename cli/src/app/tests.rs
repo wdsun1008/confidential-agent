@@ -920,6 +920,67 @@ resources: {}
 }
 
 #[test]
+fn build_render_only_keeps_selected_variant_rendered_config() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+
+    cmd_build(
+        &cli,
+        &BuildArgs {
+            spec,
+            render_only: true,
+        },
+    )
+    .unwrap();
+    std::env::set_var("PATH", old_path);
+
+    let rendered =
+        fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("name: openclaw-agent-release-"));
+    assert!(!rendered.contains("name: openclaw-agent-debug-"));
+}
+
+#[test]
 fn deploy_uses_requested_variant_from_multi_variant_manifest() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
