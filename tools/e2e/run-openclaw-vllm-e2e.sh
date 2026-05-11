@@ -62,6 +62,28 @@ record_file_as_block() {
   record '```'
 }
 
+record_manifest_variants() {
+  local service="$1"
+  local manifest="$STATE_DIR/services/$service/manifest.json"
+  [[ -f "$manifest" ]] || return 0
+  local summary="$WORK_DIR/$service-variants.txt"
+  python3 - "$manifest" >"$summary" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+
+print(f"selected_build_id={manifest.get('shelter_build_id', '')}")
+variants = manifest.get("variants") or {}
+print("variants=" + ",".join(sorted(variants)))
+for name in sorted(variants):
+    entry = variants[name] or {}
+    print(f"{name}.build_id={entry.get('shelter_build_id', '')}")
+PY
+  record_file_as_block "$service build variants:" "$summary" text
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "missing required command: $1" >&2
@@ -620,6 +642,7 @@ main() {
 
   record_cmd "${CA_ARGS[*]} build --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
   without_proxy "${CA_ARGS[@]}" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+  record_manifest_variants openclaw-vllm
   DEPLOY_ATTEMPTED=1
   record_cmd "${CA_ARGS[*]} deploy --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
   without_proxy "${CA_ARGS[@]}" deploy --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"

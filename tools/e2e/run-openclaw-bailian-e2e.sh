@@ -73,6 +73,28 @@ record_connect_diagnostics() {
   fi
 }
 
+record_manifest_variants() {
+  local service="$1"
+  local manifest="$STATE_DIR/services/$service/manifest.json"
+  [[ -f "$manifest" ]] || return 0
+  local summary="$WORK_DIR/$service-variants.txt"
+  python3 - "$manifest" >"$summary" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+
+print(f"selected_build_id={manifest.get('shelter_build_id', '')}")
+variants = manifest.get("variants") or {}
+print("variants=" + ",".join(sorted(variants)))
+for name in sorted(variants):
+    entry = variants[name] or {}
+    print(f"{name}.build_id={entry.get('shelter_build_id', '')}")
+PY
+  record_file_as_block "$service build variants:" "$summary" text
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "missing required command: $1" >&2
@@ -992,12 +1014,14 @@ main() {
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     record ""
     record "Build commands run with proxy environment cleared so mkosi/DNF can use the selected internal repo directly."
-    log "building MCP debug image"
+    log "building MCP enabled image variants (deploy target: debug)"
     record_cmd "${ca[*]} build --spec $WORK_DIR/mcp/mcp-demo.yaml"
     without_proxy "${ca[@]}" build --spec "$WORK_DIR/mcp/mcp-demo.yaml"
-    log "building OpenClaw debug image"
+    record_manifest_variants mcp
+    log "building OpenClaw enabled image variants (deploy target: debug)"
     record_cmd "${ca[*]} build --spec $WORK_DIR/openclaw/openclaw.yaml"
     without_proxy "${ca[@]}" build --spec "$WORK_DIR/openclaw/openclaw.yaml"
+    record_manifest_variants openclaw
   fi
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
