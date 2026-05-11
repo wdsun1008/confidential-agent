@@ -1,14 +1,16 @@
 use super::commands::{
-    cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries, collect_live_status,
-    debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from, live_status_table_columns,
-    status_table_columns, status_views, validate_build_start, validate_deploy_start,
-    wait_for_daemon_status_from,
+    cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries,
+    collect_live_status, debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from,
+    live_status_table_columns, status_table_columns, status_views, validate_build_start,
+    validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
 use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
 use std::ffi::OsStr;
 use std::io::Write;
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn test_cli() -> Cli {
     Cli {
@@ -312,6 +314,7 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
         guest_setup_script: None,
         extra_files: Vec::new(),
         debug_ssh: None,
+        variants: BTreeMap::new(),
     };
     fs::write(
         service_dir.join("manifest.json"),
@@ -512,6 +515,118 @@ fn write_fake_tng(path: &Path, version: &str) {
 fn write_script(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
     set_mode(path, 0o755).unwrap();
+}
+
+fn write_fake_shelter(path: &Path, log: &Path) {
+    write_script(
+        path,
+        &format!(
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open("{log}", "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\n")
+
+def arg_after(flag):
+    try:
+        return args[args.index(flag) + 1]
+    except (ValueError, IndexError):
+        return ""
+
+work_dir = arg_after("--work-dir")
+if "build" in args:
+    image_id = arg_after("--image-id")
+    image_dir = os.path.join(work_dir, "images", image_id)
+    os.makedirs(image_dir, exist_ok=True)
+    image_path = os.path.join(image_dir, f"image-{{image_id}}.qcow2")
+    with open(image_path, "w", encoding="utf-8") as fh:
+        fh.write("image")
+    with open(os.path.join(image_dir, "build-result.json"), "w", encoding="utf-8") as fh:
+        json.dump({{
+            "id": image_id,
+            "image_path": image_path,
+            "reference_value": {{"measurement.uki.SHA-384": [image_id]}},
+            "rekor_value": None,
+        }}, fh)
+    sys.exit(0)
+
+if "deploy" in args:
+    image_id = args[args.index("deploy") + 1]
+    terraform_dir = arg_after("--terraform-dir")
+    os.makedirs(terraform_dir, exist_ok=True)
+    with open(os.path.join(terraform_dir, "deploy-result.json"), "w", encoding="utf-8") as fh:
+        json.dump({{
+            "id": image_id,
+            "deploy": {{
+                "instance_id": "i-test",
+                "public_ip": "203.0.113.42",
+                "private_ip": "10.0.1.20",
+                "outputs": {{"security_group_id": "sg-test"}},
+            }},
+        }}, fh)
+    sys.exit(0)
+
+sys.exit(0)
+"#,
+            log = log.display()
+        ),
+    );
+}
+
+fn write_fake_prepare_tools(temp: &Path) -> PathBuf {
+    let current = std::env::current_exe().unwrap();
+    let agentd = current.parent().unwrap().join("confidential-agentd");
+    if !agentd.exists() {
+        fs::write(&agentd, "#!/bin/sh\nexit 0\n").unwrap();
+        set_mode(&agentd, 0o755).unwrap();
+    }
+    let bin_dir = temp.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let docker = bin_dir.join("docker");
+    write_script(
+        &docker,
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  --version)
+    echo "Docker version test"
+    exit 0
+    ;;
+  create)
+    echo "container-test"
+    exit 0
+    ;;
+  cp)
+    dest="$3"
+    case "$dest" in
+      *tng-2.6.0)
+        cat > "$dest" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  echo "tng 2.6.0"
+else
+  echo "tng 2.6.0"
+fi
+EOF
+        chmod 755 "$dest"
+        ;;
+      *)
+        printf 'asset\n' > "$dest"
+        ;;
+    esac
+    exit 0
+    ;;
+  rm)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+    );
+    bin_dir
 }
 
 fn write_mesh_bundle(
@@ -727,6 +842,223 @@ fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
             "/state/services/openclaw/terraform/20260506130000"
         ))
     );
+}
+
+#[test]
+fn build_runs_all_enabled_variants_and_records_manifest_entries() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let shelter = temp.path().join("fake-shelter");
+    let log = temp.path().join("shelter.log");
+    write_fake_shelter(&shelter, &log);
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+    cli.shelter_bin = shelter;
+
+    cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false,
+        },
+    )
+    .unwrap();
+    std::env::set_var("PATH", old_path);
+
+    let invocations = fs::read_to_string(&log).unwrap();
+    assert!(invocations.contains("openclaw-agent-release-"));
+    assert!(invocations.contains("openclaw-agent-debug-"));
+    let manifest_path = cli.state_dir.join("services/openclaw/manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+    assert!(manifest["variants"]["release"]["shelter_build_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("openclaw-agent-release-"));
+    assert!(manifest["variants"]["debug"]["shelter_build_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("openclaw-agent-debug-"));
+}
+
+#[test]
+fn deploy_uses_requested_variant_from_multi_variant_manifest() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let service_dir = temp.path().join("state/services/openclaw");
+    let shelter_dir = service_dir.join("shelter");
+    let release_id = "openclaw-agent-release-20260511130000";
+    let debug_id = "openclaw-agent-debug-20260511130000";
+    let release_image = shelter_dir
+        .join("images")
+        .join(release_id)
+        .join("image.qcow2");
+    let debug_image = shelter_dir
+        .join("images")
+        .join(debug_id)
+        .join("image.qcow2");
+    fs::create_dir_all(release_image.parent().unwrap()).unwrap();
+    fs::create_dir_all(debug_image.parent().unwrap()).unwrap();
+    fs::write(&release_image, "release").unwrap();
+    fs::write(&debug_image, "debug").unwrap();
+    for (id, image) in [(release_id, &release_image), (debug_id, &debug_image)] {
+        let result = shelter_build_result_path(&shelter_dir, id);
+        fs::create_dir_all(result.parent().unwrap()).unwrap();
+        fs::write(
+            result,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": id,
+                "image_path": image,
+                "reference_value": {"measurement.uki.SHA-384": [id]},
+                "rekor_value": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.build_id = release_id.to_string();
+    state.build.variant = "release".to_string();
+    state.build.image_path = release_image.clone();
+    write_state(&temp.path().join("state"), &state);
+    fs::create_dir_all(&service_dir).unwrap();
+    fs::write(
+        service_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "service_id": "openclaw",
+            "shelter_build_id": release_id,
+            "shelter_work_dir": shelter_dir,
+            "build_result": shelter_build_result_path(&shelter_dir, release_id),
+            "deploy_result": shelter_deploy_result_path(&service_dir.join("terraform/unused")),
+            "shelter_config": service_dir.join("shelter.yaml"),
+            "agentd_bin": "/bin/confidential-agentd",
+            "agentd_service": "/etc/systemd/system/confidential-agentd.service",
+            "initrd_secret_fetch_module": "/build/99confidential-agent-secret-fetch",
+            "fde_config_file": "/build/fde.toml",
+            "policy_default": "/build/default.rego",
+            "policy_local_dev": "/build/local-dev.rego",
+            "images_dir": service_dir.join("artifacts"),
+            "cache_dir": service_dir.join("cache"),
+            "variants": {
+                "release": {
+                    "shelter_build_id": release_id,
+                    "build_result": shelter_build_result_path(&shelter_dir, release_id),
+                    "extra_files": []
+                },
+                "debug": {
+                    "shelter_build_id": debug_id,
+                    "build_result": shelter_build_result_path(&shelter_dir, debug_id),
+                    "extra_files": []
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let shelter = temp.path().join("fake-shelter");
+    let log = temp.path().join("shelter.log");
+    write_fake_shelter(&shelter, &log);
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+    cli.shelter_bin = shelter;
+
+    cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec,
+            skip_inject: true,
+            render_only: false,
+        },
+    )
+    .unwrap();
+    std::env::set_var("PATH", old_path);
+
+    let invocations = fs::read_to_string(log).unwrap();
+    assert!(invocations.contains(&format!("\"deploy\", \"{debug_id}\"")));
+    assert!(!invocations.contains(&format!("\"deploy\", \"{release_id}\"")));
+    let deployed = read_service_state_file(&service_dir.join("state.json"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(deployed.build.build_id, debug_id);
+    assert_eq!(deployed.build.variant, "debug");
+    assert_eq!(deployed.build.image_path, debug_image);
 }
 
 #[test]

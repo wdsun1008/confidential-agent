@@ -47,7 +47,7 @@ struct ContextPaths {
     service_state: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BuildManifest {
     service_id: String,
     shelter_build_id: String,
@@ -73,6 +73,18 @@ struct BuildManifest {
     extra_files: Vec<GuestFileAsset>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug_ssh: Option<LocalDebugSshKey>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    variants: BTreeMap<String, BuildManifestVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildManifestVariant {
+    shelter_build_id: String,
+    build_result: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_files: Vec<GuestFileAsset>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug_ssh: Option<LocalDebugSshKey>,
 }
 
 struct PreparedConfig {
@@ -89,8 +101,34 @@ struct PreparedConfig {
 #[derive(Debug, Clone, Default)]
 struct PrepareOptions {
     build_id: Option<String>,
+    image_variant: Option<String>,
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
+}
+
+impl BuildManifest {
+    fn fallback_variant(&self) -> BuildManifestVariant {
+        BuildManifestVariant {
+            shelter_build_id: self.shelter_build_id.clone(),
+            build_result: self.build_result.clone(),
+            extra_files: self.extra_files.clone(),
+            debug_ssh: self.debug_ssh.clone(),
+        }
+    }
+
+    fn variant(&self, name: &str, fallback_name: Option<&str>) -> Result<BuildManifestVariant> {
+        if let Some(variant) = self.variants.get(name) {
+            return Ok(variant.clone());
+        }
+        if self.variants.is_empty() && fallback_name == Some(name) {
+            return Ok(self.fallback_variant());
+        }
+        bail!("local build for variant '{name}' is missing; run build first")
+    }
+}
+
+fn manifest_variant_from(manifest: &BuildManifest) -> BuildManifestVariant {
+    manifest.fallback_variant()
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +395,9 @@ fn prepare(
     options: PrepareOptions,
 ) -> Result<PreparedConfig> {
     let mut spec = AgentSpec::from_path(spec_path)?;
+    if let Some(variant) = options.image_variant.as_ref() {
+        spec.deploy.image_variant = Some(variant.clone());
+    }
     spec.ensure_mvp_supported()?;
     warn_public_allowed_cidr(&spec);
 
@@ -444,6 +485,7 @@ fn prepare(
         guest_setup_script: assets.guest_setup_script,
         extra_files: assets.extra_files,
         debug_ssh: debug_ssh.clone(),
+        variants: BTreeMap::new(),
     };
     fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
@@ -528,8 +570,39 @@ fn current_build_run_id() -> String {
     })
 }
 
+#[cfg(test)]
 fn timestamped_shelter_build_id(spec: &AgentSpec, run_id: &str) -> String {
     format!("{}-{run_id}", shelter_build_id(spec))
+}
+
+fn shelter_build_id_for_variant(spec: &AgentSpec, variant: &str) -> String {
+    format!("{}-{variant}", spec.image_id())
+}
+
+fn timestamped_shelter_build_id_for_variant(
+    spec: &AgentSpec,
+    variant: &str,
+    run_id: &str,
+) -> String {
+    format!("{}-{run_id}", shelter_build_id_for_variant(spec, variant))
+}
+
+fn enabled_build_variants(spec: &AgentSpec) -> Vec<String> {
+    let mut variants = Vec::new();
+    if spec.build.variants.release.enabled {
+        variants.push("release".to_string());
+    }
+    if spec
+        .build
+        .variants
+        .debug
+        .as_ref()
+        .map(|debug| debug.enabled)
+        .unwrap_or(false)
+    {
+        variants.push("debug".to_string());
+    }
+    variants
 }
 
 fn sanitize_cloud_name_component(value: &str) -> String {

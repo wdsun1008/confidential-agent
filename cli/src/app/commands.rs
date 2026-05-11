@@ -21,35 +21,65 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let existing_state = read_service_state_file(&paths.service_state)?;
     validate_build_start(existing_state.as_ref())?;
-    let build_id = timestamped_shelter_build_id(&spec, &current_build_run_id());
-    let prepared = prepare(
-        cli,
-        &cli.state_dir,
-        &args.spec,
-        PrepareOptions {
-            build_id: Some(build_id),
-            deploy_names: Some(DeployNames::new(&spec)),
-            ..PrepareOptions::default()
-        },
-    )?;
+    let run_id = current_build_run_id();
+    let selected_variant = spec.image_variant().to_string();
+    let mut selected_prepared = None;
+    let mut selected_manifest = None;
+    let mut variants = BTreeMap::new();
+
+    for variant in enabled_build_variants(&spec) {
+        let build_id = timestamped_shelter_build_id_for_variant(&spec, &variant, &run_id);
+        let mut variant_spec = spec.clone();
+        variant_spec.deploy.image_variant = Some(variant.clone());
+        let prepared = prepare(
+            cli,
+            &cli.state_dir,
+            &args.spec,
+            PrepareOptions {
+                build_id: Some(build_id),
+                image_variant: Some(variant.clone()),
+                deploy_names: Some(DeployNames::new(&variant_spec)),
+                ..PrepareOptions::default()
+            },
+        )?;
+        let prepared_manifest = read_build_manifest(&paths.manifest)?;
+        variants.insert(variant.clone(), manifest_variant_from(&prepared_manifest));
+        if !args.render_only {
+            println!("[ca] building {variant} image with Shelter...");
+            let mut shelter_args = vec![
+                OsString::from("--work-dir"),
+                prepared.shelter_work_dir.as_os_str().to_os_string(),
+                OsString::from("build"),
+                OsString::from("--config"),
+                prepared.rendered_config.as_os_str().to_os_string(),
+                OsString::from("--image-id"),
+                OsString::from(prepared.shelter_build_id.clone()),
+                OsString::from("--image-type"),
+                OsString::from("disk"),
+            ];
+            run_shelter(cli, &mut shelter_args)?;
+        }
+        if variant == selected_variant {
+            selected_manifest = Some(prepared_manifest);
+            selected_prepared = Some(prepared);
+        }
+    }
+
+    let prepared = selected_prepared.with_context(|| {
+        format!("deploy.image_variant '{selected_variant}' is not enabled under build.variants")
+    })?;
+    let mut manifest = selected_manifest.with_context(|| {
+        format!("build manifest for variant '{selected_variant}' was not prepared")
+    })?;
+    manifest.variants = variants;
+    fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
+
     if args.render_only {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
     }
 
-    println!("[ca] building image with Shelter...");
-    let mut shelter_args = vec![
-        OsString::from("--work-dir"),
-        prepared.shelter_work_dir.as_os_str().to_os_string(),
-        OsString::from("build"),
-        OsString::from("--config"),
-        prepared.rendered_config.as_os_str().to_os_string(),
-        OsString::from("--image-id"),
-        OsString::from(prepared.shelter_build_id.clone()),
-        OsString::from("--image-type"),
-        OsString::from("disk"),
-    ];
-    run_shelter(cli, &mut shelter_args)?;
     let state = write_service_state(
         &cli.state_dir,
         &args.spec,
@@ -103,27 +133,26 @@ pub(super) fn validate_deploy_start(existing: Option<&LocalServiceState>) -> Res
     }
 }
 
-fn ensure_current_build_present(state: &LocalServiceState, manifest: &BuildManifest) -> Result<()> {
-    if manifest.shelter_build_id != state.build.build_id {
-        bail!(
-            "local build manifest for service '{}' points to build '{}', but current state points to '{}'; run build again",
-            state.service_id,
-            manifest.shelter_build_id,
-            state.build.build_id
-        );
-    }
+fn ensure_build_variant_present(
+    state: &LocalServiceState,
+    variant: &str,
+    manifest: &BuildManifestVariant,
+) -> Result<()> {
     if !manifest.build_result.exists() {
         bail!(
-            "local build result for service '{}' is missing at '{}'; run build first",
+            "local build result for service '{}' variant '{}' is missing at '{}'; run build first",
             state.service_id,
+            variant,
             manifest.build_result.display()
         );
     }
-    if !state.build.image_path.exists() {
+    let result = read_shelter_build_result(&manifest.build_result, &manifest.shelter_build_id)?;
+    if !result.image_path.exists() {
         bail!(
-            "local image for service '{}' was removed at '{}'; run build first",
+            "local image for service '{}' variant '{}' was removed at '{}'; run build first",
             state.service_id,
-            state.build.image_path.display()
+            variant,
+            result.image_path.display()
         );
     }
     Ok(())
@@ -146,7 +175,10 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             spec.service.id
         )
     })?;
-    ensure_current_build_present(&current_state, &current_manifest)?;
+    let deploy_variant = spec.image_variant().to_string();
+    let build_variant =
+        current_manifest.variant(&deploy_variant, Some(&current_state.build.variant))?;
+    ensure_build_variant_present(&current_state, &deploy_variant, &build_variant)?;
     validate_mesh_port_conflicts(
         &read_service_states(&cli.state_dir)?,
         &spec.service.id,
@@ -160,11 +192,19 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         &cli.state_dir,
         &args.spec,
         PrepareOptions {
-            build_id: Some(current_state.build.build_id.clone()),
+            build_id: Some(build_variant.shelter_build_id.clone()),
+            image_variant: Some(deploy_variant.clone()),
             deploy_names: Some(deploy_names.clone()),
             mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
         },
     )?;
+    let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
+    deploy_manifest.variants = current_manifest.variants.clone();
+    fs::write(
+        &paths.manifest,
+        serde_json::to_string_pretty(&deploy_manifest)?,
+    )
+    .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
     if args.render_only {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
@@ -262,13 +302,14 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
             spec.service.id
         )
     })?;
+    let build_variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
 
     inject_resources(
         cli,
         &cli.state_dir,
         &spec,
-        &manifest.build_result,
-        &manifest.shelter_build_id,
+        &build_variant.build_result,
+        &build_variant.shelter_build_id,
         &args.target_ip,
     )?;
     let mut active_state = activate_existing_service_state(&args.spec, &spec, state)?;

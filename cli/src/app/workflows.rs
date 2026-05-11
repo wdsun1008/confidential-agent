@@ -290,11 +290,12 @@ pub(super) fn refresh_active_shelter_deploys(
         )?;
         let paths = context_paths(state_dir, &service.service_id);
         let manifest = read_build_manifest(&paths.manifest)?;
+        let variant = manifest.variant(&service.build.variant, Some(&service.build.variant))?;
         let prepared = PreparedConfig {
             rendered_config: paths.rendered_config,
-            shelter_build_id: manifest.shelter_build_id,
+            shelter_build_id: variant.shelter_build_id,
             shelter_work_dir: manifest.shelter_work_dir,
-            build_result: manifest.build_result,
+            build_result: variant.build_result,
             deploy_result: manifest.deploy_result,
             deploy_names: Some(DeployNames {
                 run_id: service.deploy.run_id.clone(),
@@ -304,7 +305,7 @@ pub(super) fn refresh_active_shelter_deploys(
                 }),
             }),
             terraform_dir: service.deploy.terraform_dir.clone(),
-            debug_ssh: service.build.debug_ssh.clone(),
+            debug_ssh: variant.debug_ssh,
         };
         let mut args = deploy_shelter_args(&prepared);
         run_shelter(cli, &mut args)?;
@@ -320,9 +321,11 @@ pub(super) fn render_service_config_from_state(
     let mut spec = AgentSpec::from_path(&state.spec.path)?;
     let paths = context_paths(state_dir, &state.service_id);
     let manifest = read_build_manifest(&paths.manifest)?;
-    if let Some(debug_ssh) = manifest.debug_ssh.as_ref() {
+    let variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
+    if let Some(debug_ssh) = variant.debug_ssh.as_ref() {
         apply_debug_ssh_public_key(&mut spec, &debug_ssh.public_key)?;
     }
+    spec.deploy.image_variant = Some(state.build.variant.clone());
     let images_dir = manifest.images_dir.clone();
     let cache_dir = manifest.cache_dir.clone();
     let assets = GuestAssets {
@@ -335,7 +338,7 @@ pub(super) fn render_service_config_from_state(
         guest_tng_bin: manifest.guest_tng_bin,
         libtdx_verify_rpm: manifest.libtdx_verify_rpm,
         guest_setup_script: manifest.guest_setup_script,
-        extra_files: manifest.extra_files,
+        extra_files: variant.extra_files,
     };
     let rendered = render_build_config(
         &spec,
