@@ -25,6 +25,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let selected_variant = spec.image_variant().to_string();
     let mut selected_prepared = None;
     let mut selected_manifest = None;
+    let mut selected_rendered = None;
     let mut variants = BTreeMap::new();
 
     for variant in enabled_build_variants(&spec) {
@@ -60,6 +61,9 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
             run_shelter(cli, &mut shelter_args)?;
         }
         if variant == selected_variant {
+            selected_rendered = Some(fs::read_to_string(&prepared.rendered_config).with_context(
+                || format!("failed to read '{}'", prepared.rendered_config.display()),
+            )?);
             selected_manifest = Some(prepared_manifest);
             selected_prepared = Some(prepared);
         }
@@ -74,6 +78,13 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     manifest.variants = variants;
     fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
+    fs::write(
+        &prepared.rendered_config,
+        selected_rendered.with_context(|| {
+            format!("rendered config for variant '{selected_variant}' was not captured")
+        })?,
+    )
+    .with_context(|| format!("failed to write '{}'", prepared.rendered_config.display()))?;
 
     if args.render_only {
         println!("{}", prepared.rendered_config.display());
