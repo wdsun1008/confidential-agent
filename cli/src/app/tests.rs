@@ -1,8 +1,8 @@
 use super::commands::{
     cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries, collect_live_status,
     debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from, live_status_table_columns,
-    status_table_columns, status_views, validate_build_start, validate_deploy_start,
-    wait_for_daemon_status_from,
+    status_table_columns, status_views, validate_build_start, validate_deploy_build_matches_spec,
+    validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
 use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
@@ -97,6 +97,49 @@ fn deploy_start_only_accepts_built_or_deleted_current_builds() {
     validate_deploy_start(Some(&deleted)).unwrap();
     assert!(validate_deploy_start(Some(&active)).is_err());
     assert!(validate_deploy_start(None).is_err());
+}
+
+#[test]
+fn deploy_rejects_local_build_variant_that_differs_from_spec() {
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.variant = "release".to_string();
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+
+    let err = validate_deploy_build_matches_spec(&state, &spec).unwrap_err();
+    assert!(err.to_string().contains(
+        "current local build variant 'release' does not match deploy.image_variant 'debug'"
+    ));
 }
 
 #[test]
