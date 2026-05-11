@@ -103,6 +103,21 @@ pub(super) fn validate_deploy_start(existing: Option<&LocalServiceState>) -> Res
     }
 }
 
+pub(super) fn validate_deploy_build_matches_spec(
+    state: &LocalServiceState,
+    spec: &AgentSpec,
+) -> Result<()> {
+    let expected = spec.image_variant();
+    if state.build.variant != expected {
+        bail!(
+            "current local build variant '{}' does not match deploy.image_variant '{}'; run build again before deploying",
+            state.build.variant,
+            expected
+        );
+    }
+    Ok(())
+}
+
 fn ensure_current_build_present(state: &LocalServiceState, manifest: &BuildManifest) -> Result<()> {
     if manifest.shelter_build_id != state.build.build_id {
         bail!(
@@ -140,6 +155,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             spec.service.id
         )
     })?;
+    validate_deploy_build_matches_spec(&current_state, &spec)?;
     let current_manifest = read_build_manifest(&paths.manifest).with_context(|| {
         format!(
             "deploy requires a local build manifest for service '{}'; run build first",
