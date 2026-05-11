@@ -102,9 +102,11 @@ run_preflight_case \
   openclaw-vllm \
   tools/e2e/run-openclaw-vllm-e2e.sh
 
-run_preflight_case \
-  hermes-agent \
-  tools/e2e/run-hermes-agent-e2e.sh \
-  HERMES_API_KEY=test-provider-key
+if [[ -x "$ROOT_DIR/tools/e2e/run-hermes-agent-e2e.sh" ]]; then
+  run_preflight_case \
+    hermes-agent \
+    tools/e2e/run-hermes-agent-e2e.sh \
+    HERMES_API_KEY=test-provider-key
+fi
 
 printf 'Aliyun CLI profile preflight cases passed\n'

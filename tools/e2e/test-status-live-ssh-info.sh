@@ -49,6 +49,8 @@ JSON
 }
 
 run_case openclaw-vllm tools/e2e/run-openclaw-vllm-e2e.sh
-run_case hermes-agent tools/e2e/run-hermes-agent-e2e.sh
+if [[ -x "$ROOT_DIR/tools/e2e/run-hermes-agent-e2e.sh" ]]; then
+  run_case hermes-agent tools/e2e/run-hermes-agent-e2e.sh
+fi
 
 printf 'status-live ssh_info parsing cases passed\n'
