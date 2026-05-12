@@ -2389,6 +2389,22 @@ fn direct_challenge_envs_do_not_forward_proxies() {
 }
 
 #[test]
+fn allowed_cidr_check_rejects_direct_egress_mismatch() {
+    let err = ensure_allowed_cidr_contains_ip("34.84.30.0/24", "59.82.126.85".parse().unwrap())
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("direct public egress IP 59.82.126.85"));
+    assert!(msg.contains("34.84.30.0/24"));
+    assert!(msg.contains("59.82.126.0/24"));
+}
+
+#[test]
+fn allowed_cidr_check_accepts_direct_egress_match() {
+    ensure_allowed_cidr_contains_ip("59.82.126.0/24", "59.82.126.85".parse().unwrap()).unwrap();
+}
+
+#[test]
 fn proxied_challenge_envs_keep_guest_direct() {
     let envs = challenge_inject_envs(
         false,

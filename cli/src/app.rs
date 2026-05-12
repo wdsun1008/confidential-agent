@@ -10,7 +10,9 @@ use confidential_agent_core::schema::{
     MeshBundle, MeshService, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
     LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
 };
-use confidential_agent_core::spec::{AgentSpec, AttestationTee, ReferenceValueMode};
+use confidential_agent_core::spec::{
+    ipv4_cidr_contains, AgentSpec, AttestationTee, ReferenceValueMode,
+};
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use confidential_agent_shelter::{
     render_build_config, shelter_build_id, GuestAssets, GuestFileAsset, ShelterRenderOptions,
@@ -23,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::{
     fs::{chown, MetadataExt, PermissionsExt},
     io::AsRawFd,
@@ -509,6 +511,77 @@ fn warn_public_allowed_cidr(spec: &AgentSpec) {
             spec.service.id, spec.deploy.security.allowed_cidr
         );
     }
+}
+
+fn verify_allowed_cidr_for_direct_injection(spec: &AgentSpec) -> Result<()> {
+    if std::env::var_os("CA_SKIP_ALLOWED_CIDR_CHECK").is_some() {
+        eprintln!("[ca] warning: skipping deploy.security.allowed_cidr egress check");
+        return Ok(());
+    }
+
+    let Some(egress_ip) = resolve_direct_egress_ip()? else {
+        eprintln!(
+            "[ca] warning: could not determine direct public egress IP; deploy.security.allowed_cidr={} must include the host that will connect to guest :8006/:8088/connect ports",
+            spec.deploy.security.allowed_cidr
+        );
+        return Ok(());
+    };
+
+    ensure_allowed_cidr_contains_ip(&spec.deploy.security.allowed_cidr, egress_ip).with_context(
+        || {
+            format!(
+                "deploy.security.allowed_cidr must include this host's direct public egress IP {egress_ip}; this CIDR controls resource injection on :8006, daemon status on :8088, debug SSH, and connect ports"
+            )
+        },
+    )
+}
+
+fn resolve_direct_egress_ip() -> Result<Option<Ipv4Addr>> {
+    if let Some(value) = std::env::var_os("CA_OPERATOR_EGRESS_IP") {
+        let value = value.to_string_lossy();
+        return value.trim().parse::<Ipv4Addr>().map(Some).with_context(|| {
+            format!("CA_OPERATOR_EGRESS_IP is not a valid IPv4 address: {value}")
+        });
+    }
+
+    for endpoint in ["https://ipinfo.io/ip", "https://api.ipify.org"] {
+        if let Some(ip) = query_direct_egress_ip(endpoint)? {
+            return Ok(Some(ip));
+        }
+    }
+    Ok(None)
+}
+
+fn query_direct_egress_ip(endpoint: &str) -> Result<Option<Ipv4Addr>> {
+    let output = match Command::new("curl")
+        .args(["-fsSL", "--max-time", "5", "--noproxy", "*", endpoint])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| "failed to execute curl for egress check"),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    match body.trim().parse::<Ipv4Addr>() {
+        Ok(ip) => Ok(Some(ip)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn ensure_allowed_cidr_contains_ip(cidr: &str, ip: Ipv4Addr) -> Result<()> {
+    if !ipv4_cidr_contains(cidr, ip)? {
+        let octets = ip.octets();
+        bail!(
+            "direct public egress IP {ip} is not allowed by deploy.security.allowed_cidr={cidr}; use {}.{}.{}.0/24 or {ip}/32, or set CA_SKIP_ALLOWED_CIDR_CHECK=1 if another host will inject resources",
+            octets[0],
+            octets[1],
+            octets[2]
+        );
+    }
+    Ok(())
 }
 
 mod debug_ssh;
