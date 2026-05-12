@@ -908,6 +908,7 @@ fn start_service(service: &str) -> Result<()> {
     }
     let status = Command::new("systemctl")
         .arg("start")
+        .arg("--no-block")
         .arg(service)
         .status()
         .with_context(|| format!("failed to start service '{}'", service))?;

@@ -6,6 +6,7 @@ service:
     - 18789
   connect:
     - 18789
+  app_service: cai-openclaw-gateway.service
 
 build:
   image_name: openclaw-agent

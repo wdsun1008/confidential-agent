@@ -5,6 +5,7 @@ service:
   ports:
     - 3001
   connect: []
+  app_service: cai-mcp-server.service
 
 build:
   image_name: mcp-agent

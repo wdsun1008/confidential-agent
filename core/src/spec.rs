@@ -27,6 +27,8 @@ pub struct ServiceSpec {
     pub ports: Vec<u16>,
     #[serde(default)]
     pub connect: Vec<u16>,
+    #[serde(default)]
+    pub app_service: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -283,6 +285,14 @@ impl AgentSpec {
             bail!("attestation.mode=trustee is planned but not implemented");
         }
         validate_id("service.id", &self.service.id)?;
+        if self
+            .service
+            .app_service
+            .as_deref()
+            .is_some_and(|service| service.trim().is_empty())
+        {
+            bail!("service.app_service must not be empty when set");
+        }
         validate_id("build.image_name", &self.build.image_name)?;
         validate_ports("service.ports", &self.service.ports)?;
         validate_connect_ports(&self.service.ports, &self.service.connect)?;
@@ -505,6 +515,7 @@ service:
   id: openclaw
   ports: [18789, 18800]
   connect: [18789]
+  app_service: cai-openclaw-gateway.service
 build:
   base_image: ./base.qcow2
   image_name: openclaw-agent
@@ -552,6 +563,10 @@ resources:
         assert_eq!(spec.service.id, "openclaw");
         assert_eq!(spec.service.ports, vec![18789, 18800]);
         assert_eq!(spec.service.connect, vec![18789]);
+        assert_eq!(
+            spec.service.app_service.as_deref(),
+            Some("cai-openclaw-gateway.service")
+        );
         assert_eq!(spec.image_id(), "openclaw-agent");
         assert_eq!(spec.image_variant(), "release");
         assert_eq!(
@@ -599,6 +614,22 @@ resources:
 
         assert!(spec.build.base_image.is_none());
         assert_eq!(spec.image_id(), "openclaw-agent");
+    }
+
+    #[test]
+    fn rejects_empty_app_service() {
+        let err = AgentSpec::from_yaml(
+            &SPEC.replace(
+                "  app_service: cai-openclaw-gateway.service",
+                "  app_service: '   '",
+            ),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("service.app_service must not be empty"));
     }
 
     #[test]

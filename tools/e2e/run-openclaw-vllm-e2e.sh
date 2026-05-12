@@ -358,6 +358,7 @@ service:
   id: openclaw-vllm
   ports: [18789]
   connect: [18789]
+  app_service: cai-openclaw-gateway.service
 
 build:
 $base_image_yaml
