@@ -59,7 +59,7 @@ attestation:
   reference_values: rekor
   rekor:
     cosign_key: ./cosign.key
-    slsa_generator: /usr/local/libexec/shelter/slsa/slsa-generator
+    slsa_generator: /usr/libexec/shelter/slsa/slsa-generator
     required: true
 
 resources:

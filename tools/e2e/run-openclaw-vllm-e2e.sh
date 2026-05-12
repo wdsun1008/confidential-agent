@@ -14,7 +14,8 @@ ZONE_ID="${E2E_ZONE_ID:-cn-beijing-l}"
 INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.gn8v-tee.4xlarge}"
 DISK_GB="${E2E_DISK_GB:-512}"
 SHELTER_DIR="${E2E_SHELTER_DIR:-/root/shelter-rs}"
-SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/local/libexec/shelter/slsa/slsa-generator}"
+SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
+USE_SOURCE_SHELTER="${E2E_USE_SOURCE_SHELTER:-0}"
 BASE_IMAGE="${E2E_BASE_IMAGE:-/root/images/alinux3.qcow2}"
 CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-300000}"
 CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请用一句简短中文回复，说明 OpenClaw vLLM 服务可用。}"
@@ -606,11 +607,13 @@ main() {
   trap cleanup_on_int INT
   trap cleanup_on_term TERM
 
-  export CA_SHELTER_BIN="${CA_SHELTER_BIN:-shelter}"
-  if [[ -x "$SHELTER_DIR/target/release/shelter" ]]; then
-    export CA_SHELTER_BIN="$SHELTER_DIR/target/release/shelter"
-  elif [[ -x "$SHELTER_DIR/target/debug/shelter" ]]; then
-    export CA_SHELTER_BIN="$SHELTER_DIR/target/debug/shelter"
+  export CA_SHELTER_BIN="${CA_SHELTER_BIN:-/usr/bin/shelter}"
+  if [[ "$USE_SOURCE_SHELTER" == "1" ]]; then
+    if [[ -x "$SHELTER_DIR/target/release/shelter" ]]; then
+      export CA_SHELTER_BIN="$SHELTER_DIR/target/release/shelter"
+    elif [[ -x "$SHELTER_DIR/target/debug/shelter" ]]; then
+      export CA_SHELTER_BIN="$SHELTER_DIR/target/debug/shelter"
+    fi
   fi
   if [[ "${E2E_SKIP_CARGO_BUILD:-0}" != "1" ]]; then
     log "building current host CLI, guest daemon and PEP binary"
@@ -630,6 +633,14 @@ main() {
   record_cmd "$CA_SHELTER_BIN --version"
   "$CA_SHELTER_BIN" --version | tee "$WORK_DIR/shelter-version.txt"
   record_file_as_block "Shelter version:" "$WORK_DIR/shelter-version.txt" text
+  if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
+    if [[ ! -x "$SLSA_GENERATOR" ]]; then
+      echo "SLSA generator '$SLSA_GENERATOR' is not executable" >&2
+      exit 2
+    fi
+    record_cmd "$SLSA_GENERATOR --help"
+    "$SLSA_GENERATOR" --help >/dev/null
+  fi
   CA_ARGS=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$STATE_DIR")
 
   local allowed_cidr token cosign_key

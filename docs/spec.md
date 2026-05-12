@@ -178,7 +178,7 @@ attestation:
     artifact_version: "20260430"          # 可选
     rekor_url: https://rekor.sigstore.dev # 默认
     cosign_key: ./cosign.key              # required=true 时必填
-    slsa_generator: /usr/local/libexec/shelter/slsa/slsa-generator
+    slsa_generator: /usr/libexec/shelter/slsa/slsa-generator
     rv_name: openclaw-agent-rv            # 可选
     required: true                        # 默认 false；true 时验签失败即整个流程失败
 ```
@@ -292,7 +292,7 @@ attestation:
   reference_values: rekor
   rekor:
     cosign_key: ./cosign.key
-    slsa_generator: /usr/local/libexec/shelter/slsa/slsa-generator
+    slsa_generator: /usr/libexec/shelter/slsa/slsa-generator
     required: true
 
 resources:

@@ -15,7 +15,8 @@ ZONE_ID="${E2E_ZONE_ID:-cn-beijing-l}"
 INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.g8i.xlarge}"
 SHELTER_DIR="${E2E_SHELTER_DIR:-/root/shelter-rs}"
 SHELTER_OVMF="${E2E_SHELTER_OVMF:-/root/shelter-rs/OVMF.fd}"
-SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/local/libexec/shelter/slsa/slsa-generator}"
+SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
+USE_SOURCE_SHELTER="${E2E_USE_SOURCE_SHELTER:-0}"
 CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-180000}"
 CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请只回复 CA_E2E_OK，不要输出其他内容。}"
 CHAT_EXPECT="${E2E_CHAT_EXPECT:-CA_E2E_OK}"
@@ -272,6 +273,9 @@ ensure_shelter_installed() {
   if [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" == "1" ]]; then
     return
   fi
+  if [[ "$USE_SOURCE_SHELTER" != "1" ]]; then
+    return
+  fi
   require_cmd make
   if [[ ! -d "$SHELTER_DIR" ]]; then
     echo "missing Shelter source dir: $SHELTER_DIR" >&2
@@ -291,6 +295,18 @@ verify_shelter_command() {
   record_cmd "$CA_SHELTER_BIN --version"
   "$CA_SHELTER_BIN" --version | tee "$WORK_DIR/shelter-version.txt"
   record_file_as_block "Shelter version:" "$WORK_DIR/shelter-version.txt" text
+}
+
+verify_slsa_generator() {
+  if [[ "$REFERENCE_VALUES" != "rekor" ]]; then
+    return
+  fi
+  if [[ ! -x "$SLSA_GENERATOR" ]]; then
+    echo "SLSA generator '$SLSA_GENERATOR' is not executable" >&2
+    exit 2
+  fi
+  record_cmd "$SLSA_GENERATOR --help"
+  "$SLSA_GENERATOR" --help >/dev/null
 }
 
 ensure_mkosi_alinux_repo_hint() {
@@ -967,9 +983,10 @@ main() {
   trap cleanup_on_int INT
   trap cleanup_on_term TERM
 
-  export CA_SHELTER_BIN="${CA_SHELTER_BIN:-shelter}"
+  export CA_SHELTER_BIN="${CA_SHELTER_BIN:-/usr/bin/shelter}"
   ensure_shelter_installed
   verify_shelter_command
+  verify_slsa_generator
   ensure_mkosi_alinux_repo_hint
   record ""
   record "Using Shelter command from \`$CA_SHELTER_BIN\`."
