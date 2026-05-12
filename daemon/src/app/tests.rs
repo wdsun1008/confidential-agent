@@ -158,7 +158,7 @@ fn app_service_ready_requires_systemd_active_state() {
     assert!(!ready);
     let log = fs::read_to_string(log_path).unwrap();
     let commands: Vec<&str> = log.lines().collect();
-    assert_eq!(commands[0], "start cai-openclaw-gateway.service");
+    assert_eq!(commands[0], "start --no-block cai-openclaw-gateway.service");
     assert_eq!(
         commands[1],
         "is-active --quiet cai-openclaw-gateway.service"

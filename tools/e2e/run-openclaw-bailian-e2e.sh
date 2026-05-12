@@ -560,6 +560,7 @@ service:
   id: mcp
   ports: [3001]
   connect: []
+  app_service: cai-mcp-server.service
 
 build:
 $base_image_yaml
@@ -599,6 +600,7 @@ service:
   id: openclaw
   ports: [18789]
   connect: [18789]
+  app_service: cai-openclaw-gateway.service
 
 build:
 $base_image_yaml
@@ -1052,7 +1054,7 @@ main() {
   fi
 
   without_proxy "${ca[@]}" status --json >"$WORK_DIR/status-local.json" || finish_e2e "$?"
-  if ! wait_for_live_statuses "$WORK_DIR/status-local.json" 180; then
+  if ! wait_for_live_statuses "$WORK_DIR/status-local.json" 600; then
     record ""
     record "Live daemon status check failed after deploy."
     if [[ "$DEPLOY_ATTEMPTED" == "1" && "$DESTROY_ON_FAILURE" == "1" ]]; then

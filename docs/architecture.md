@@ -159,13 +159,13 @@ flowchart TB
     J --> K2["trustiflux-api-server<br/>:8006 inject API<br/>+ attestation-agent.sock"]
     J --> K3["trusted-network-gateway.service<br/>(等 attestation-agent.sock)"]
     K1 --> M["持续 apply bootstrap → 写 /etc/tng/config.json → restart TNG"]
-    K1 --> N["按需 enable cai-pep / 应用自定义 service"]
+    K1 --> N["按 spec.service.app_service<br/>启动并检查应用 service + ports"]
 ```
 
 关键 systemd unit 与依赖关系来自三处：
 - daemon 嵌入的 unit 文本：[`agentd_service_unit`](../cli/src/app.rs)、[`secret_fetch_service_unit`](../cli/src/app.rs)。
 - mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 装好 libtdx-verify、把 `tng-2.6.0` 软链到 `/usr/bin/tng`，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。
-- 每个示例自己的 `install-*.sh`，例如 [`examples/openclaw/install-openclaw.sh`](../examples/openclaw/install-openclaw.sh) 注册 `cai-openclaw-gateway.service`。
+- 每个示例自己的 `install-*.sh`，例如 [`examples/openclaw/install-openclaw.sh`](../examples/openclaw/install-openclaw.sh) 注册 `cai-openclaw-gateway.service`；spec 的 `service.app_service` 决定 daemon 是否把该 unit 纳入 `app_ready` 判定。
 
 ---
 

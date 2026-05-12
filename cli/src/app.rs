@@ -675,7 +675,7 @@ fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapC
         ports: spec.service.ports.clone(),
         connect: spec.service.connect.clone(),
         resources,
-        app_service: None,
+        app_service: spec.service.app_service.clone(),
     })
 }
 

@@ -67,11 +67,27 @@ npm cache clean --force || true
 EOF
 chmod 0755 /usr/local/bin/cai-openclaw-bootstrap
 
+cat >/usr/local/bin/cai-openclaw-wait-config <<'EOF'
+#!/bin/bash
+set -euo pipefail
+for _ in $(seq 1 180); do
+    if [[ -s /root/.openclaw/openclaw.json ]] &&
+       jq -e '.plugins.entries["cai-pep"].config.pepRequired == true and (.gateway.auth.token | type == "string" and length >= 32)' /root/.openclaw/openclaw.json >/dev/null 2>&1 &&
+       [[ -S /run/cai/pep.sock ]]; then
+        exit 0
+    fi
+    sleep 2
+done
+echo "OpenClaw config or PEP socket did not become ready" >&2
+exit 1
+EOF
+chmod 0755 /usr/local/bin/cai-openclaw-wait-config
+
 cat >/etc/systemd/system/cai-openclaw-gateway.service <<'EOF'
 [Unit]
 Description=Confidential Agent OpenClaw Gateway
-After=network-online.target confidential-agentd.service
-Wants=network-online.target confidential-agentd.service
+After=network-online.target confidential-agentd.service cai-pep.service
+Wants=network-online.target confidential-agentd.service cai-pep.service
 
 [Service]
 Type=simple
@@ -83,7 +99,8 @@ Environment=PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin
 Environment=OPENCLAW_NO_RESPAWN=1
 Environment=OPENCLAW_DISABLE_BONJOUR=1
 ExecStartPre=/usr/local/bin/cai-openclaw-bootstrap
-ExecStart=/usr/local/bin/openclaw gateway run --port 18789 --bind lan --allow-unconfigured
+ExecStartPre=/usr/local/bin/cai-openclaw-wait-config
+ExecStart=/usr/local/bin/openclaw gateway run --port 18789 --bind lan
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

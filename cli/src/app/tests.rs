@@ -1179,6 +1179,47 @@ resources: {}
 }
 
 #[test]
+fn render_bootstrap_carries_app_service_for_daemon_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+  app_service: cai-openclaw-gateway.service
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  security:
+    allowed_cidr: 203.0.113.0/24
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    let paths = context_paths(temp.path(), "openclaw");
+
+    let bootstrap = render_bootstrap(&paths, &spec).unwrap();
+
+    assert_eq!(
+        bootstrap.app_service.as_deref(),
+        Some("cai-openclaw-gateway.service")
+    );
+}
+
+#[test]
 fn latest_built_image_uses_current_state_build_id() {
     let temp = tempfile::tempdir().unwrap();
     let spec = AgentSpec::from_yaml(

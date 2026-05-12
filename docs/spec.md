@@ -33,6 +33,7 @@ service:
   id: openclaw                  # 服务唯一标识，作为 state-dir 子目录、安全组规则名前缀
   ports: [18789]                # 服务在 Guest 中实际监听的端口集合
   connect: [18789]              # 这些端口允许通过 host `connect` 子命令暴露到本地 / 暴露到 mesh
+  app_service: cai-openclaw-gateway.service  # 可选；daemon 用它判断应用 systemd unit + 端口是否 ready
 ```
 
 | 字段 | 类型 | 必填 | 校验 |
@@ -40,6 +41,9 @@ service:
 | `id` | string | ✅ | 仅允许 `[A-Za-z0-9_-]`；不能为空 |
 | `ports` | `[u16]` | ✅ | 不能为空、不能含 0、不能重复 |
 | `connect` | `[u16]` | ❌ | 默认 `[]`；每个端口必须出现在 `ports` 中；不能重复 |
+| `app_service` | string | ❌ | 可选；设置后不能为空；应为 guest 内的 systemd unit 名，例如 `cai-openclaw-gateway.service` |
+
+`app_service` 会写入 daemon bootstrap。若设置，`confidential-agentd` 会启动并检查该 systemd unit，同时确认 `service.ports` 都在 guest 本地可连接；`status --live` 中的 `app_ready` 才会变成 ready。若不设置，`app_ready` 只表示资源和 TNG 层就绪，不证明用户应用已经启动。
 
 **多服务约束**：跨服务的 `service.ports` 不允许冲突——`deploy/inject` 时 [`validate_mesh_port_conflicts`](../cli/src/app/workflows.rs) 会拒绝掉同 state-dir 下的端口重复。
 
@@ -261,6 +265,7 @@ service:
   id: openclaw
   ports: [18789]
   connect: [18789]
+  app_service: cai-openclaw-gateway.service
 
 build:
   image_name: openclaw-agent
