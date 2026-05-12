@@ -220,6 +220,9 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
     }
+    if !args.skip_inject {
+        verify_allowed_cidr_for_direct_injection(&spec)?;
+    }
 
     println!("[ca] deploying infrastructure with Shelter...");
     let mut shelter_args = deploy_shelter_args(&prepared);

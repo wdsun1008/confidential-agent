@@ -433,6 +433,28 @@ fn validate_ipv4_cidr(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn ipv4_cidr_contains(cidr: &str, ip: Ipv4Addr) -> Result<bool> {
+    let Some((addr, prefix)) = cidr.trim().split_once('/') else {
+        bail!("CIDR must be an IPv4 CIDR such as 203.0.113.0/24");
+    };
+    let network = addr
+        .parse::<Ipv4Addr>()
+        .context("CIDR must contain a valid IPv4 address")?;
+    let prefix = prefix
+        .parse::<u8>()
+        .context("CIDR must contain a numeric IPv4 prefix length")?;
+    if prefix > 32 {
+        bail!("CIDR IPv4 prefix length must be between 0 and 32");
+    }
+
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok((u32::from(network) & mask) == (u32::from(ip) & mask))
+}
+
 fn resolve_pathbuf(path: &mut PathBuf, base_dir: &Path) {
     if !path.is_absolute() {
         *path = base_dir.join(&*path);
@@ -795,6 +817,14 @@ delivery:
         .unwrap();
 
         assert!(spec.uses_public_allowed_cidr());
+    }
+
+    #[test]
+    fn ipv4_cidr_contains_matches_prefixes() {
+        assert!(ipv4_cidr_contains("59.82.126.0/24", "59.82.126.85".parse().unwrap()).unwrap());
+        assert!(ipv4_cidr_contains("59.82.126.85/32", "59.82.126.85".parse().unwrap()).unwrap());
+        assert!(ipv4_cidr_contains("0.0.0.0/0", "203.0.113.10".parse().unwrap()).unwrap());
+        assert!(!ipv4_cidr_contains("34.84.30.0/24", "59.82.126.85".parse().unwrap()).unwrap());
     }
 
     #[test]

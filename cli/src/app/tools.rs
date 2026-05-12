@@ -55,17 +55,42 @@ pub(super) fn run_tools_container(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
     } else {
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        command.stdin(Stdio::null());
     }
 
-    let status = command.status().context("failed to execute 'docker'")?;
-    if !status.success() {
-        bail!("tools container exited with status {status}");
+    if inherit_stdio {
+        let status = command.status().context("failed to execute 'docker'")?;
+        if !status.success() {
+            bail!("tools container exited with status {status}");
+        }
+    } else {
+        let output = command.output().context("failed to execute 'docker'")?;
+        if !output.status.success() {
+            bail!(
+                "tools container exited with status {}; stderr: {}; stdout: {}",
+                output.status,
+                summarize_command_bytes(&output.stderr),
+                summarize_command_bytes(&output.stdout)
+            );
+        }
     }
     Ok(())
+}
+
+fn summarize_command_bytes(bytes: &[u8]) -> String {
+    const MAX: usize = 4096;
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut chars = text.chars();
+    let summary = chars.by_ref().take(MAX).collect::<String>();
+    if chars.next().is_some() {
+        format!("{summary}...<truncated>")
+    } else {
+        summary
+    }
 }
 
 pub(super) fn run_attestation_client(
@@ -275,9 +300,8 @@ pub(super) fn challenge_inject(
             .and_then(|value| value.parse().ok())
             .unwrap_or(5),
     );
-
     loop {
-        if run_challenge_inject_once(
+        let direct_result = run_challenge_inject_once(
             cli,
             state_dir,
             &api_url,
@@ -286,28 +310,37 @@ pub(super) fn challenge_inject(
             resource_file,
             tee,
             true,
-        )
-        .is_ok()
-            || run_challenge_inject_once(
-                cli,
-                state_dir,
-                &api_url,
-                target_ip,
-                resource_path,
-                resource_file,
-                tee,
-                false,
-            )
-            .is_ok()
-        {
+        );
+        if direct_result.is_ok() {
             return Ok(());
         }
 
+        let proxied_result = run_challenge_inject_once(
+            cli,
+            state_dir,
+            &api_url,
+            target_ip,
+            resource_path,
+            resource_file,
+            tee,
+            false,
+        );
+        if proxied_result.is_ok() {
+            return Ok(());
+        }
+
+        let last_error = format!(
+            "direct attempt: {:#}; proxy-aware attempt: {:#}",
+            direct_result.unwrap_err(),
+            proxied_result.unwrap_err()
+        );
+
         if started.elapsed() >= timeout {
             bail!(
-                "failed to inject resource '{}' via {}",
+                "failed to inject resource '{}' via {}; last error: {}",
                 resource_path,
-                api_url
+                api_url,
+                last_error
             );
         }
         thread::sleep(interval);
