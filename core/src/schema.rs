@@ -9,6 +9,7 @@ pub const MESH_SCHEMA_VERSION: &str = "confidential-agent/mesh-bundle/v1";
 pub const SERVICE_DIRECTORY_SCHEMA_VERSION: &str = "confidential-agent/services/v1";
 pub const DAEMON_STATUS_SCHEMA_VERSION: &str = "confidential-agent/daemon-status/v1";
 pub const DAEMON_STATUS_PORT: u16 = 8088;
+pub const AGENT_CARD_PORT: u16 = 8089;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalServiceState {
@@ -131,6 +132,10 @@ pub struct BootstrapConfig {
     pub resources: Vec<GuestResource>,
     #[serde(default)]
     pub app_service: Option<String>,
+    #[serde(default)]
+    pub peers: Vec<BootstrapPeer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_card: Option<AgentCard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +153,34 @@ pub struct GuestResource {
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapPeer {
+    pub id: String,
+    pub url: String,
+    #[serde(default = "default_peer_policy_str")]
+    pub policy: String,
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval_sec: u64,
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub port_mappings: Vec<BootstrapPeerPortMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapPeerPortMapping {
+    pub remote: u16,
+    pub local: u16,
+}
+
+fn default_peer_policy_str() -> String {
+    "required".to_string()
+}
+
+fn default_refresh_interval() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -219,6 +252,102 @@ pub struct DaemonStatus {
     pub app_ready: bool,
     pub mesh_ready: bool,
     pub debug_ssh_ready: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub a2a_peers: BTreeMap<String, DaemonA2aPeerStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonA2aPeerStatus {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fetch_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCard {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<AgentCardSkill>,
+    #[serde(default, rename = "defaultInputModes")]
+    pub default_input_modes: Vec<String>,
+    #[serde(default, rename = "defaultOutputModes")]
+    pub default_output_modes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<serde_json::Value>,
+    #[serde(default)]
+    pub extensions: AgentCardExtensions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCardSkill {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCardExtensions {
+    #[serde(
+        rename = "x-confidential-agent/v1",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub confidential_agent: Option<AgentCardConfidential>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCardConfidential {
+    pub id: String,
+    #[serde(default = "default_agent_card_cache_ttl", rename = "cacheTtlSec")]
+    pub cache_ttl_sec: u64,
+    #[serde(rename = "publicIp")]
+    pub public_ip: String,
+    pub ports: Vec<AgentCardPort>,
+    pub rekor: AgentCardRekor,
+    pub tee: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCardPort {
+    pub name: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCardRekor {
+    #[serde(rename = "rekorUrl")]
+    pub rekor_url: String,
+    #[serde(rename = "artifactId")]
+    pub artifact_id: String,
+    #[serde(rename = "artifactType")]
+    pub artifact_type: String,
+    #[serde(rename = "artifactVersion")]
+    pub artifact_version: String,
+    #[serde(rename = "rvName")]
+    pub rv_name: String,
+}
+
+fn default_agent_card_cache_ttl() -> u64 {
+    300
 }
 
 pub fn default_bootstrap_mode() -> String {

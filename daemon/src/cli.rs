@@ -1,10 +1,11 @@
 use clap::{Args, Parser, Subcommand};
-use confidential_agent_core::schema::DAEMON_STATUS_PORT;
+use confidential_agent_core::schema::{AGENT_CARD_PORT, DAEMON_STATUS_PORT};
 use std::path::PathBuf;
 
 const DEFAULT_CDH_ROOT: &str = "/run/confidential-containers/cdh";
 const DEFAULT_BOOTSTRAP_RESOURCE: &str = "default/local-resources/cagent_bootstrap_config";
 const DEFAULT_MESH_RESOURCE: &str = "default/local-resources/cagent_mesh_bundle";
+const DEFAULT_A2A_BUNDLE_RESOURCE: &str = "default/local-resources/cagent_a2a_bundle";
 
 #[derive(Debug, Parser)]
 #[command(name = "confidential-agentd")]
@@ -36,6 +37,13 @@ pub(crate) struct RunArgs {
     #[arg(long, env = "CA_MESH_RESOURCE_PATH", default_value = DEFAULT_MESH_RESOURCE)]
     pub(crate) mesh_resource: String,
 
+    #[arg(
+        long,
+        env = "CA_A2A_BUNDLE_RESOURCE_PATH",
+        default_value = DEFAULT_A2A_BUNDLE_RESOURCE
+    )]
+    pub(crate) a2a_bundle_resource: String,
+
     #[arg(long, env = "CA_POLL_INTERVAL_SEC", default_value_t = 5)]
     pub(crate) poll_interval_sec: u64,
 
@@ -45,6 +53,13 @@ pub(crate) struct RunArgs {
         default_value_t = default_status_listen()
     )]
     pub(crate) status_listen: String,
+
+    #[arg(
+        long,
+        env = "CA_AGENT_CARD_LISTEN",
+        default_value_t = default_agent_card_listen()
+    )]
+    pub(crate) agent_card_listen: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -87,4 +102,8 @@ pub(crate) struct InitrdFetchArgs {
 
 fn default_status_listen() -> String {
     format!("0.0.0.0:{DAEMON_STATUS_PORT}")
+}
+
+fn default_agent_card_listen() -> String {
+    format!("0.0.0.0:{AGENT_CARD_PORT}")
 }

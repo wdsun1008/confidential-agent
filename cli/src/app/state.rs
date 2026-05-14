@@ -15,6 +15,7 @@ pub(super) fn context_paths(state_dir: &Path, service_id: &str) -> ContextPaths 
         manifest: service_dir.join("manifest.json"),
         bootstrap_file: service_dir.join("bootstrap.json"),
         service_state: service_dir.join("state.json"),
+        agent_card: service_dir.join("agent-card.json"),
         service_dir,
     }
 }

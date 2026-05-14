@@ -29,7 +29,24 @@ pub(super) fn inject_resources(
         reference_value_mode_name(spec.attestation.reference_values),
     )?;
 
-    let bootstrap = render_bootstrap(&paths, spec)?;
+    let mut bootstrap = render_bootstrap(&paths, spec)?;
+
+    if spec.a2a.as_ref().is_some_and(|a2a| a2a.enabled) {
+        let rekor_path = artifacts.rekor_meta.as_ref().with_context(|| {
+            format!(
+                "service '{}' enables a2a but has no Rekor metadata; set attestation.reference_values=rekor and configure attestation.rekor",
+                spec.service.id
+            )
+        })?;
+        let content = fs::read_to_string(rekor_path)
+            .with_context(|| format!("failed to read '{}'", rekor_path.display()))?;
+        let meta: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse '{}'", rekor_path.display()))?;
+        let card = render_agent_card(spec, target_ip, &meta)?;
+        write_json_atomic(&paths.agent_card, &card)?;
+        bootstrap.agent_card = Some(card);
+    }
+
     fs::write(
         &paths.bootstrap_file,
         serde_json::to_string_pretty(&bootstrap)?,
@@ -83,6 +100,65 @@ pub(super) fn inject_resources(
 
     println!("injected resources for service {}", spec.service.id);
     Ok(())
+}
+
+pub(super) fn render_agent_card(
+    spec: &AgentSpec,
+    target_ip: &str,
+    meta: &serde_json::Value,
+) -> Result<AgentCard> {
+    let a2a = spec
+        .a2a
+        .as_ref()
+        .context("a2a must be configured to render an AgentCard")?;
+    if !a2a.enabled {
+        bail!("a2a is disabled");
+    }
+    Ok(AgentCard {
+        name: a2a.name.clone(),
+        description: a2a.description.clone(),
+        version: a2a.version.clone(),
+        url: Some(format!(
+            "http://{target_ip}:{AGENT_CARD_PORT}/.well-known/agent-card.json"
+        )),
+        skills: a2a
+            .skills
+            .iter()
+            .map(|s| AgentCardSkill {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                description: s.description.clone(),
+            })
+            .collect(),
+        default_input_modes: vec!["text".to_string()],
+        default_output_modes: vec!["text".to_string()],
+        capabilities: None,
+        provider: None,
+        extensions: AgentCardExtensions {
+            confidential_agent: Some(AgentCardConfidential {
+                id: a2a.id.clone(),
+                cache_ttl_sec: a2a.cache_ttl_sec,
+                public_ip: target_ip.to_string(),
+                ports: spec
+                    .service
+                    .ports
+                    .iter()
+                    .map(|port| AgentCardPort {
+                        name: format!("port-{port}"),
+                        port: *port,
+                    })
+                    .collect(),
+                rekor: AgentCardRekor {
+                    rekor_url: required_json_string(meta, "rekor_url")?.to_string(),
+                    artifact_id: required_json_string(meta, "artifact_id")?.to_string(),
+                    artifact_type: required_json_string(meta, "artifact_type")?.to_string(),
+                    artifact_version: required_json_string(meta, "artifact_version")?.to_string(),
+                    rv_name: required_json_string(meta, "rv_name")?.to_string(),
+                },
+                tee: tee_name(spec.attestation.tee).to_string(),
+            }),
+        },
+    })
 }
 
 pub(super) fn write_service_state(
@@ -352,6 +428,7 @@ pub(super) fn render_service_config_from_state(
             deploy_resource_name: Some(state.deploy.resource_name.clone()),
             local_image_import_name: state.deploy.image_import_name.clone(),
             mesh_peer_cidrs,
+            peerings: read_peerings_or_empty(state_dir)?,
         },
     )?;
     fs::write(&paths.rendered_config, rendered)
@@ -521,6 +598,35 @@ pub(super) fn render_connect_config(state_dir: &Path) -> Result<serde_json::Valu
     }
 
     Ok(serde_json::json!({ "add_ingress": ingress }))
+}
+
+pub(super) fn render_agent_card_connect_config(card: &AgentCard) -> Result<serde_json::Value> {
+    render_agent_card_connect_config_with_port_checker(card, |port| !port_is_available(port))
+}
+
+pub(super) fn render_agent_card_connect_config_with_port_checker(
+    card: &AgentCard,
+    is_occupied: impl Fn(u16) -> bool,
+) -> Result<serde_json::Value> {
+    let ext = confidential_extension(card)?;
+    let mut used_local_ports = BTreeSet::new();
+    let control_port = allocate_local_port(50000, |port| is_occupied(port))?;
+    used_local_ports.insert(control_port);
+    derive_tng_client_config_with_local_ports(
+        card,
+        |remote_port| {
+            let local_port = allocate_local_port(remote_port, |port| {
+                used_local_ports.contains(&port) || is_occupied(port)
+            })?;
+            used_local_ports.insert(local_port);
+            eprintln!(
+                "connect 127.0.0.1:{} -> {}:{} ({})",
+                local_port, ext.public_ip, remote_port, ext.id
+            );
+            Ok(local_port)
+        },
+        control_port,
+    )
 }
 
 pub(super) fn connect_services(states: &[LocalServiceState]) -> Result<Vec<&LocalServiceState>> {

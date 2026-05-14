@@ -1,7 +1,9 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -150,6 +152,8 @@ fn app_service_ready_requires_systemd_active_state() {
         connect: Vec::new(),
         resources: Vec::new(),
         app_service: Some("cai-openclaw-gateway.service".to_string()),
+        peers: Vec::new(),
+        agent_card: None,
     };
 
     let ready = ensure_app_service_ready(&bootstrap);
@@ -197,6 +201,8 @@ fn app_service_ready_requires_service_port_to_accept_connections() {
         connect: Vec::new(),
         resources: Vec::new(),
         app_service: Some("cai-openclaw-gateway.service".to_string()),
+        peers: Vec::new(),
+        agent_card: None,
     };
 
     assert!(ensure_app_service_ready(&bootstrap));
@@ -463,13 +469,17 @@ fn bootstrap_reapplies_resource_when_target_content_drifted() {
             sha256: Some(digest.clone()),
         }],
         app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
     };
     let args = RunArgs {
         cdh_root,
         bootstrap_resource: "default/local-resources/cagent_bootstrap_config".to_string(),
         mesh_resource: "default/local-resources/cagent_mesh_bundle".to_string(),
+        a2a_bundle_resource: "default/local-resources/cagent_a2a_bundle".to_string(),
         poll_interval_sec: 5,
         status_listen: "127.0.0.1:0".to_string(),
+        agent_card_listen: "127.0.0.1:0".to_string(),
     };
     let mut state = DaemonState::default();
     state.applied_resources.insert(
@@ -516,13 +526,17 @@ fn bootstrap_rejects_oversized_resource() {
             sha256: None,
         }],
         app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
     };
     let args = RunArgs {
         cdh_root,
         bootstrap_resource: "default/local-resources/cagent_bootstrap_config".to_string(),
         mesh_resource: "default/local-resources/cagent_mesh_bundle".to_string(),
+        a2a_bundle_resource: "default/local-resources/cagent_a2a_bundle".to_string(),
         poll_interval_sec: 5,
         status_listen: "127.0.0.1:0".to_string(),
+        agent_card_listen: "127.0.0.1:0".to_string(),
     };
     let mut state = DaemonState::default();
 
@@ -557,13 +571,17 @@ fn bootstrap_rejects_non_regular_resource_even_when_empty() {
             sha256: None,
         }],
         app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
     };
     let args = RunArgs {
         cdh_root,
         bootstrap_resource: "default/local-resources/cagent_bootstrap_config".to_string(),
         mesh_resource: "default/local-resources/cagent_mesh_bundle".to_string(),
+        a2a_bundle_resource: "default/local-resources/cagent_a2a_bundle".to_string(),
         poll_interval_sec: 5,
         status_listen: "127.0.0.1:0".to_string(),
+        agent_card_listen: "127.0.0.1:0".to_string(),
     };
     let mut state = DaemonState::default();
 
@@ -617,11 +635,14 @@ fn bootstrap_ready_requires_matching_generation_and_resource_digests() {
             sha256: Some(digest.clone()),
         }],
         app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
     };
     let mut state = DaemonState {
         bootstrap_generation: 7,
         applied_resources: BTreeMap::new(),
         mesh_fingerprint: None,
+        ..DaemonState::default()
     };
     state.applied_resources.insert(
         "config".to_string(),
@@ -667,11 +688,14 @@ fn bootstrap_ready_accepts_present_digestless_resources() {
             sha256: None,
         }],
         app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
     };
     let mut state = DaemonState {
         bootstrap_generation: 7,
         applied_resources: BTreeMap::new(),
         mesh_fingerprint: None,
+        ..DaemonState::default()
     };
     state.applied_resources.insert(
         "config".to_string(),
@@ -687,4 +711,315 @@ fn bootstrap_ready_accepts_present_digestless_resources() {
     assert!(bootstrap_resources_ready(&bootstrap, &state).unwrap());
     state.applied_resources.clear();
     assert!(!bootstrap_resources_ready(&bootstrap, &state).unwrap());
+}
+
+#[test]
+fn a2a_tng_ingress_fetches_agent_card_and_generates_config() {
+    let card = test_agent_card("remote-agent", &[3001, 3002]);
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(None, &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 2);
+    assert_eq!(ingress[0]["mapping"]["out"]["host"], "127.0.0.1");
+    assert_eq!(ingress[0]["mapping"]["out"]["port"], 3001);
+    assert_eq!(ingress[0]["mapping"]["in"]["host"], "127.0.0.1");
+    assert_eq!(ingress[0]["mapping"]["in"]["port"], 3001);
+    assert_eq!(ingress[1]["mapping"]["out"]["port"], 3002);
+
+    let rv = &ingress[0]["verify"]["reference_values"][0];
+    assert_eq!(rv["type"], "slsa");
+    assert_eq!(
+        rv["payload"]["content"]["rv_list"][0]["id"],
+        "remote-agent-release"
+    );
+    assert_eq!(
+        rv["payload"]["content"]["rv_list"][0]["rv_name"],
+        "measurement.uki.SHA-384"
+    );
+
+    assert!(directory.contains_key("remote-agent"));
+    assert_eq!(directory["remote-agent"].ports.len(), 2);
+    assert_eq!(directory["remote-agent"].ports[0].port, 3001);
+    assert_eq!(state.a2a_status[&url].state, "ok");
+}
+
+#[test]
+fn a2a_tng_ingress_uses_alias_and_allocates_non_conflicting_local_port() {
+    let card = test_agent_card("remote-openclaw", &[18789]);
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(Some("beta"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[18789], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    assert_eq!(ingress[0]["mapping"]["out"]["port"], 18789);
+    assert_ne!(ingress[0]["mapping"]["in"]["port"], 18789);
+    assert_eq!(
+        directory["beta"].ports[0].port,
+        ingress[0]["mapping"]["in"]["port"]
+    );
+    assert_eq!(state.a2a_status["beta"].state, "ok");
+}
+
+#[test]
+fn a2a_tng_ingress_records_unreachable_peer_without_panicking() {
+    let bundle = test_a2a_bundle(
+        Some("unreachable"),
+        "http://127.0.0.1:1/.well-known/agent-card.json",
+        &[],
+    );
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(directory.is_empty());
+    assert_eq!(state.a2a_status["unreachable"].state, "error");
+    assert!(state.last_error.is_some());
+}
+
+#[test]
+fn a2a_tng_ingress_uses_negative_cache_after_initial_fetch_failure() {
+    let (url, hits) = serve_agent_card_error_counter();
+    let bundle = test_a2a_bundle(Some("unreachable"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let cached = state.a2a_cache.get("unreachable").unwrap();
+    assert!(cached.id.is_none());
+    assert_eq!(
+        cached.next_refresh_unix - cached.fetched_at_unix,
+        A2A_FETCH_FAILURE_BACKOFF_SEC
+    );
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.a2a_status["unreachable"].state, "error");
+}
+
+#[test]
+fn a2a_tng_ingress_rejects_agent_card_public_ip_mismatch() {
+    let mut card = test_agent_card("remote-agent", &[3001]);
+    card.extensions
+        .confidential_agent
+        .as_mut()
+        .unwrap()
+        .public_ip = "198.51.100.10".to_string();
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(directory.is_empty());
+    assert_eq!(state.a2a_status["remote"].state, "error");
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("publicIp"));
+}
+
+#[test]
+fn a2a_tng_ingress_rejects_untrusted_rekor_url() {
+    let mut card = test_agent_card("remote-agent", &[3001]);
+    card.extensions
+        .confidential_agent
+        .as_mut()
+        .unwrap()
+        .rekor
+        .rekor_url = "https://attacker.example/rekor".to_string();
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(directory.is_empty());
+    assert_eq!(state.a2a_status["remote"].state, "error");
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("rekorUrl"));
+}
+
+#[test]
+fn a2a_tng_ingress_rejects_peer_id_collision_with_service_directory() {
+    let card = test_agent_card("remote-agent", &[3001]);
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(None, &url, &[]);
+    let mut directory = empty_service_directory();
+    directory.services.insert(
+        "remote-agent".to_string(),
+        ServiceDirectoryService { ports: Vec::new() },
+    );
+    let mut state = DaemonState::default();
+
+    let (ingress, peer_directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(peer_directory.is_empty());
+    assert_eq!(state.a2a_status[&url].state, "error");
+    assert!(state.a2a_status[&url]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("conflicts with an existing service"));
+}
+
+#[test]
+fn a2a_tng_ingress_clamps_agent_card_cache_ttl() {
+    let mut card = test_agent_card("remote-agent", &[3001]);
+    card.extensions
+        .confidential_agent
+        .as_mut()
+        .unwrap()
+        .cache_ttl_sec = 1;
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(None, &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    let cached = state.a2a_cache.get(&url).unwrap();
+    assert_eq!(
+        cached.next_refresh_unix - cached.fetched_at_unix,
+        A2A_CACHE_TTL_MIN_SEC
+    );
+}
+
+fn test_agent_card(id: &str, ports: &[u16]) -> confidential_agent_core::schema::AgentCard {
+    use confidential_agent_core::schema::{
+        AgentCard, AgentCardConfidential, AgentCardExtensions, AgentCardPort, AgentCardRekor,
+    };
+
+    AgentCard {
+        name: id.to_string(),
+        description: None,
+        version: Some("1.0.0".to_string()),
+        url: None,
+        skills: Vec::new(),
+        default_input_modes: vec!["text".to_string()],
+        default_output_modes: vec!["text".to_string()],
+        capabilities: None,
+        provider: None,
+        extensions: AgentCardExtensions {
+            confidential_agent: Some(AgentCardConfidential {
+                id: id.to_string(),
+                cache_ttl_sec: 300,
+                public_ip: "127.0.0.1".to_string(),
+                ports: ports
+                    .iter()
+                    .map(|port| AgentCardPort {
+                        name: format!("port-{port}"),
+                        port: *port,
+                    })
+                    .collect(),
+                rekor: AgentCardRekor {
+                    rekor_url: "https://rekor.sigstore.dev".to_string(),
+                    artifact_id: format!("{id}-release"),
+                    artifact_type: "uki".to_string(),
+                    artifact_version: "20260512".to_string(),
+                    rv_name: "measurement.uki.SHA-384".to_string(),
+                },
+                tee: "tdx".to_string(),
+            }),
+        },
+    }
+}
+
+fn serve_agent_card_once(card: confidential_agent_core::schema::AgentCard) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let card_json = serde_json::to_string(&card).unwrap();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                card_json.len(),
+                card_json
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://127.0.0.1:{port}/.well-known/agent-card.json")
+}
+
+fn serve_agent_card_error_counter() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let thread_hits = hits.clone();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    thread_hits.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let body = "temporary failure";
+                    let response = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (
+        format!("http://127.0.0.1:{port}/.well-known/agent-card.json"),
+        hits,
+    )
+}
+
+fn test_a2a_bundle(alias: Option<&str>, url: &str, scoped_services: &[&str]) -> A2aBundle {
+    A2aBundle {
+        version: 1,
+        peers: vec![A2aBundlePeer {
+            alias: alias.map(str::to_string),
+            url: url.to_string(),
+            scoped_services: scoped_services
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            fingerprint: sha256_bytes(url.as_bytes()),
+        }],
+    }
+}
+
+fn empty_service_directory() -> ServiceDirectory {
+    ServiceDirectory {
+        schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
+        services: BTreeMap::new(),
+    }
 }

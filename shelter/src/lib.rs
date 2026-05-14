@@ -1,5 +1,6 @@
 use anyhow::Result;
-use confidential_agent_core::schema::DAEMON_STATUS_PORT;
+use confidential_agent_core::peerings::{PeeringScope, PeeringsFile};
+use confidential_agent_core::schema::{AGENT_CARD_PORT, DAEMON_STATUS_PORT};
 use confidential_agent_core::spec::{
     AgentSpec, AttestationMode, AttestationTee, ReferenceValueMode, RekorSpec,
 };
@@ -38,6 +39,7 @@ pub struct ShelterRenderOptions {
     pub deploy_resource_name: Option<String>,
     pub local_image_import_name: Option<String>,
     pub mesh_peer_cidrs: Vec<String>,
+    pub peerings: PeeringsFile,
 }
 
 pub fn render_build_config(
@@ -220,7 +222,14 @@ fn render_deploy_config(
         security_group: ShelterDeploySecurityGroup {
             rules: security_group_rules(spec, options),
         },
-        security_group_allowed_cidr: deploy.security.allowed_cidr.clone(),
+        // Shelter still requires this legacy scalar even when explicit
+        // security_group.rules carry the actual peerings-derived ingress set.
+        security_group_allowed_cidr: options
+            .peerings
+            .cidrs_for_scope(PeeringScope::Control)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "0.0.0.0/32".to_string()),
         image_id: None,
         image: Some(ShelterDeployImageConfig {
             source: options
@@ -270,33 +279,63 @@ fn security_group_rules(
     options: &ShelterRenderOptions,
 ) -> Vec<ShelterDeploySecurityGroupRule> {
     let mut rules = Vec::new();
-    rules.push(ShelterDeploySecurityGroupRule::ingress(
-        "control_8006",
-        "8006/8006",
-        "allowed",
-    ));
-    rules.push(ShelterDeploySecurityGroupRule::ingress(
-        format!("daemon_status_{DAEMON_STATUS_PORT}"),
-        format!("{0}/{0}", DAEMON_STATUS_PORT),
-        "allowed",
-    ));
-    if spec.deploys_debug_image() {
+    for cidr in options.peerings.cidrs_for_scope(PeeringScope::Control) {
         rules.push(ShelterDeploySecurityGroupRule::ingress(
-            "debug_ssh_22",
-            "22/22",
-            "allowed",
+            format!("control_8006_peer_{}", sanitize_rule_name_component(&cidr)),
+            "8006/8006",
+            cidr,
         ));
+    }
+    for cidr in options.peerings.cidrs_for_scope(PeeringScope::Status) {
+        rules.push(ShelterDeploySecurityGroupRule::ingress(
+            format!(
+                "status_{DAEMON_STATUS_PORT}_peer_{}",
+                sanitize_rule_name_component(&cidr)
+            ),
+            format!("{0}/{0}", DAEMON_STATUS_PORT),
+            cidr,
+        ));
+    }
+    for cidr in options.peerings.cidrs_for_scope(PeeringScope::AgentCard) {
+        rules.push(ShelterDeploySecurityGroupRule::ingress(
+            format!(
+                "agent_card_{AGENT_CARD_PORT}_peer_{}",
+                sanitize_rule_name_component(&cidr)
+            ),
+            format!("{0}/{0}", AGENT_CARD_PORT),
+            cidr,
+        ));
+    }
+    if spec.deploys_debug_image() {
+        for cidr in options.peerings.cidrs_for_scope(PeeringScope::Ssh) {
+            rules.push(ShelterDeploySecurityGroupRule::ingress(
+                format!("ssh_22_peer_{}", sanitize_rule_name_component(&cidr)),
+                "22/22",
+                cidr,
+            ));
+        }
     }
     for port in &spec.service.connect {
-        rules.push(ShelterDeploySecurityGroupRule::ingress(
-            format!("connect_{port}"),
-            format!("{0}/{0}", port),
-            "allowed",
-        ));
+        for cidr in options.peerings.cidrs_for_scope(PeeringScope::Connect) {
+            rules.push(ShelterDeploySecurityGroupRule::ingress(
+                format!(
+                    "connect_{port}_peer_{}",
+                    sanitize_rule_name_component(&cidr)
+                ),
+                format!("{0}/{0}", port),
+                cidr,
+            ));
+        }
     }
     let mesh_ports = spec.service.ports.iter().copied().collect::<BTreeSet<_>>();
+    let peer_mesh_cidrs = options
+        .mesh_peer_cidrs
+        .iter()
+        .cloned()
+        .chain(options.peerings.cidrs_for_scope(PeeringScope::Mesh))
+        .collect::<BTreeSet<_>>();
     for port in mesh_ports.iter() {
-        for cidr in &options.mesh_peer_cidrs {
+        for cidr in &peer_mesh_cidrs {
             rules.push(ShelterDeploySecurityGroupRule::ingress(
                 format!("mesh_{port}_peer_{}", sanitize_rule_name_component(cidr)),
                 format!("{0}/{0}", port),

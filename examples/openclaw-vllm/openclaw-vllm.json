@@ -31,7 +31,7 @@
   },
   "plugins": {
     "enabled": true,
-    "allow": ["cai-pep"],
+    "allow": ["cai-pep", "cai-a2a"],
     "entries": {
       "cai-pep": {
         "enabled": true,
@@ -39,6 +39,12 @@
           "socketPath": "/run/cai/pep.sock",
           "pepRequired": true,
           "defaultWorkdir": "/workspace"
+        }
+      },
+      "cai-a2a": {
+        "enabled": true,
+        "config": {
+          "peers": {}
         }
       }
     }
@@ -51,6 +57,13 @@
     "auth": {
       "mode": "token",
       "token": "<GATEWAY_TOKEN>"
+    },
+    "http": {
+      "endpoints": {
+        "responses": {
+          "enabled": true
+        }
+      }
     },
     "controlUi": {
       "enabled": true,

@@ -1,8 +1,8 @@
+pub use crate::peerings::{ipv4_cidr_contains, validate_ipv4_cidr};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: &str = "confidential-agent/v1";
@@ -18,6 +18,8 @@ pub struct AgentSpec {
     #[serde(default)]
     pub secrets: SecretsSpec,
     pub resources: BTreeMap<String, ResourceSpec>,
+    #[serde(default)]
+    pub a2a: Option<A2aSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -107,19 +109,12 @@ pub struct DeploySpec {
     pub vswitch_id: Option<String>,
     #[serde(default)]
     pub security_group_id: Option<String>,
-    pub security: DeploySecuritySpec,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeployProvider {
     Aliyun,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeploySecuritySpec {
-    pub allowed_cidr: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -202,6 +197,32 @@ pub struct ResourceSpec {
     pub required: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct A2aSpec {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default = "default_a2a_cache_ttl_sec", rename = "cacheTtlSec")]
+    pub cache_ttl_sec: u64,
+    #[serde(default)]
+    pub skills: Vec<A2aSkillSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct A2aSkillSpec {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 impl AgentSpec {
     pub fn from_path(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
@@ -234,10 +255,6 @@ impl AgentSpec {
             bail!("attestation.mode=trustee is planned but not implemented");
         }
         Ok(())
-    }
-
-    pub fn uses_public_allowed_cidr(&self) -> bool {
-        matches!(self.deploy.security.allowed_cidr.trim(), "0.0.0.0/0")
     }
 
     fn resolve_paths_against(&mut self, base_dir: &Path) {
@@ -313,13 +330,6 @@ impl AgentSpec {
         if self.deploy.zone_id.trim().is_empty() {
             bail!("deploy.zone_id must not be empty");
         }
-        if self.deploy.security.allowed_cidr.trim().is_empty() {
-            bail!("deploy.security.allowed_cidr must not be empty");
-        }
-        validate_ipv4_cidr(
-            "deploy.security.allowed_cidr",
-            &self.deploy.security.allowed_cidr,
-        )?;
         validate_variant("release", &self.build.variants.release)?;
         if let Some(debug) = &self.build.variants.debug {
             validate_variant("debug", debug)?;
@@ -374,6 +384,21 @@ impl AgentSpec {
         {
             bail!("attestation.rekor is required when attestation.reference_values=rekor");
         }
+        if let Some(a2a) = &self.a2a {
+            validate_id("a2a.id", &a2a.id)?;
+            if a2a.name.trim().is_empty() {
+                bail!("a2a.name must not be empty");
+            }
+            if a2a.cache_ttl_sec == 0 {
+                bail!("a2a.cacheTtlSec must be greater than 0");
+            }
+            for (idx, skill) in a2a.skills.iter().enumerate() {
+                validate_id(&format!("a2a.skills[{idx}].id"), &skill.id)?;
+                if skill.name.trim().is_empty() {
+                    bail!("a2a.skills[{idx}].name must not be empty");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -416,43 +441,6 @@ fn validate_variant(name: &str, variant: &BuildVariantSpec) -> Result<()> {
         bail!("build.variants.release.ssh_public_key is not allowed; release image must not enable SSH");
     }
     Ok(())
-}
-
-fn validate_ipv4_cidr(field: &str, value: &str) -> Result<()> {
-    let Some((addr, prefix)) = value.trim().split_once('/') else {
-        bail!("{field} must be an IPv4 CIDR such as 203.0.113.0/24");
-    };
-    addr.parse::<Ipv4Addr>()
-        .with_context(|| format!("{field} must contain a valid IPv4 address"))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .with_context(|| format!("{field} must contain a numeric IPv4 prefix length"))?;
-    if prefix > 32 {
-        bail!("{field} IPv4 prefix length must be between 0 and 32");
-    }
-    Ok(())
-}
-
-pub fn ipv4_cidr_contains(cidr: &str, ip: Ipv4Addr) -> Result<bool> {
-    let Some((addr, prefix)) = cidr.trim().split_once('/') else {
-        bail!("CIDR must be an IPv4 CIDR such as 203.0.113.0/24");
-    };
-    let network = addr
-        .parse::<Ipv4Addr>()
-        .context("CIDR must contain a valid IPv4 address")?;
-    let prefix = prefix
-        .parse::<u8>()
-        .context("CIDR must contain a numeric IPv4 prefix length")?;
-    if prefix > 32 {
-        bail!("CIDR IPv4 prefix length must be between 0 and 32");
-    }
-
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    Ok((u32::from(network) & mask) == (u32::from(ip) & mask))
 }
 
 fn resolve_pathbuf(path: &mut PathBuf, base_dir: &Path) {
@@ -512,6 +500,10 @@ fn default_rekor_url() -> String {
     "https://rekor.sigstore.dev".to_string()
 }
 
+fn default_a2a_cache_ttl_sec() -> u64 {
+    300
+}
+
 fn default_slsa_generator() -> PathBuf {
     PathBuf::from("tools/slsa/slsa-generator")
 }
@@ -563,8 +555,6 @@ deploy:
   zone_id: cn-beijing-l
   disk_gb: 200
   private_ip: 10.0.1.20
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -674,8 +664,6 @@ deploy:
   instance_type: ecs.gn8v-tee.4xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -725,8 +713,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 delivery:
   mode: challenge
 "#;
@@ -785,38 +771,17 @@ delivery:
     }
 
     #[test]
-    fn rejects_specs_without_explicit_allowed_cidr() {
+    fn rejects_legacy_deploy_security() {
         let err = AgentSpec::from_yaml(
-            &SPEC.replace("  security:\n    allowed_cidr: 203.0.113.0/24\n", ""),
+            &SPEC.replace(
+                "  private_ip: 10.0.1.20\n",
+                "  private_ip: 10.0.1.20\n  security:\n    allowed_cidr: 203.0.113.0/24\n",
+            ),
             Path::new("/project"),
         )
         .unwrap_err();
 
-        assert!(format!("{err:?}").contains("missing field `security`"));
-    }
-
-    #[test]
-    fn rejects_non_ipv4_allowed_cidr() {
-        let err = AgentSpec::from_yaml(
-            &SPEC.replace("allowed_cidr: 203.0.113.0/24", "allowed_cidr: ::/0"),
-            Path::new("/project"),
-        )
-        .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("deploy.security.allowed_cidr must contain a valid IPv4 address"));
-    }
-
-    #[test]
-    fn identifies_public_allowed_cidr_for_cli_warning() {
-        let spec = AgentSpec::from_yaml(
-            &SPEC.replace("allowed_cidr: 203.0.113.0/24", "allowed_cidr: 0.0.0.0/0"),
-            Path::new("/project"),
-        )
-        .unwrap();
-
-        assert!(spec.uses_public_allowed_cidr());
+        assert!(format!("{err:?}").contains("unknown field `security`"));
     }
 
     #[test]
@@ -833,5 +798,53 @@ delivery:
             .unwrap_err();
 
         assert!(format!("{err:?}").contains("missing field `tee`"));
+    }
+
+    #[test]
+    fn parses_spec_with_a2a() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  version: "1.0.0"
+  description: "OpenClaw confidential agent"
+  skills:
+    - id: chat
+      name: Chat
+      description: "General conversation"
+"#
+        );
+
+        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+
+        let a2a = spec.a2a.unwrap();
+        assert_eq!(a2a.name, "openclaw-agent");
+        assert_eq!(a2a.version.as_deref(), Some("1.0.0"));
+        assert_eq!(a2a.skills.len(), 1);
+        assert_eq!(a2a.skills[0].id, "chat");
+    }
+
+    #[test]
+    fn rejects_legacy_peers_field() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+peers:
+  - id: remote
+    url: http://1.2.3.4:8089/.well-known/agent-card.json
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+        assert!(format!("{err:?}").contains("unknown field `peers`"));
+    }
+
+    #[test]
+    fn spec_without_a2a_still_parses() {
+        let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+        assert!(spec.a2a.is_none());
     }
 }

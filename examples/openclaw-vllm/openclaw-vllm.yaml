@@ -57,6 +57,8 @@ build:
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
     - source: ../openclaw/files/cai-pep-plugin
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ../openclaw/files/cai-a2a-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin
     - source: ../openclaw/files/patch-openclaw-cai-pep.js
       target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
       executable: true
@@ -75,8 +77,6 @@ deploy:
   region: cn-beijing
   zone_id: cn-beijing-l
   disk_gb: 512
-  security:
-    allowed_cidr: 203.0.113.0/24
 
 attestation:
   tee: tdx
@@ -86,6 +86,16 @@ attestation:
     cosign_key: ./cosign.key
     slsa_generator: /usr/libexec/shelter/slsa/slsa-generator
     required: true
+
+a2a:
+  id: openclaw-vllm
+  name: openclaw-vllm
+  version: "1.0.0"
+  description: "OpenClaw vLLM confidential agent"
+  skills:
+    - id: chat
+      name: Chat
+      description: "OpenClaw gateway chat"
 
 resources:
   openclaw_config:

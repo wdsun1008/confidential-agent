@@ -10,6 +10,9 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Inject(args) => cmd_inject(cli, args),
         Commands::Mesh(args) => cmd_mesh(cli, args),
         Commands::Connect(args) => cmd_connect(cli, args),
+        Commands::Peering(args) => cmd_peering(cli, args),
+        Commands::A2a(args) => cmd_a2a(cli, args),
+        Commands::Migrate(args) => cmd_migrate(cli, args),
         Commands::Image(args) => cmd_image(cli, args),
         Commands::Status(args) => cmd_status(cli, args),
         Commands::Destroy(args) => cmd_destroy(cli, args),
@@ -23,6 +26,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     validate_build_start(existing_state.as_ref())?;
     let run_id = current_build_run_id();
     let selected_variant = spec.image_variant().to_string();
+    let peerings = read_peerings_or_empty(&cli.state_dir)?;
     let mut selected_prepared = None;
     let mut selected_manifest = None;
     let mut selected_rendered = None;
@@ -40,6 +44,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
                 build_id: Some(build_id),
                 image_variant: Some(variant.clone()),
                 deploy_names: Some(DeployNames::new(&variant_spec)),
+                peerings: peerings.clone(),
                 ..PrepareOptions::default()
             },
         )?;
@@ -195,8 +200,12 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         &spec.service.id,
         &spec.service.ports,
     )?;
+    if !args.render_only && !args.skip_inject {
+        verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
+    }
 
     let existing_services = read_service_states(&cli.state_dir)?;
+    let peerings = read_peerings_or_empty(&cli.state_dir)?;
     let deploy_names = DeployNames::new(&spec);
     let prepared = prepare(
         cli,
@@ -207,6 +216,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             image_variant: Some(deploy_variant.clone()),
             deploy_names: Some(deploy_names.clone()),
             mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
+            peerings,
         },
     )?;
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
@@ -220,10 +230,6 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
     }
-    if !args.skip_inject {
-        verify_allowed_cidr_for_direct_injection(&spec)?;
-    }
-
     println!("[ca] deploying infrastructure with Shelter...");
     let mut shelter_args = deploy_shelter_args(&prepared);
     run_shelter(cli, &mut shelter_args)?;
@@ -274,6 +280,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
         active_state.mesh_generation = mesh_generation;
         write_local_service_state(&cli.state_dir, &active_state)?;
+        sync_a2a_bundle(cli, &cli.state_dir)?;
         let active_services = read_service_states(&cli.state_dir)?;
         println!("[ca] refreshing active Shelter deploys for public mesh rules...");
         refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
@@ -292,6 +299,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
 
 pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     validate_mesh_port_conflicts(
         &read_service_states(&cli.state_dir)?,
         &spec.service.id,
@@ -333,6 +341,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
     active_state.mesh_generation = mesh_generation;
     write_local_service_state(&cli.state_dir, &active_state)?;
+    sync_a2a_bundle(cli, &cli.state_dir)?;
     let active_services = read_service_states(&cli.state_dir)?;
     refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
     Ok(())
@@ -344,8 +353,297 @@ pub(super) fn cmd_mesh(cli: &Cli, args: &MeshArgs) -> Result<()> {
     }
 }
 
+pub(super) fn cmd_peering(cli: &Cli, args: &PeeringArgs) -> Result<()> {
+    match &args.command {
+        PeeringCommands::Add {
+            role,
+            cidr,
+            label,
+            scope,
+            note,
+        } => {
+            let mut peerings = read_peerings_or_empty(&cli.state_dir)?;
+            if peerings.peerings.iter().any(|entry| entry.label == *label) {
+                bail!("peering label '{}' already exists", label);
+            }
+            let entry = PeeringEntry {
+                label: label.clone(),
+                role: parse_peering_role(role)?,
+                cidr: cidr.clone(),
+                scope: parse_peering_scopes(scope)?,
+                note: note.clone(),
+                added_at: Some(current_utc_timestamp()),
+                added_by: std::env::var("USER").ok(),
+            };
+            peerings.peerings.push(entry);
+            peerings.write_to_path(&peerings_path(&cli.state_dir))?;
+            println!(
+                "added peering '{}' ({}). Run `confidential-agent peering apply` to push SG changes.",
+                label, cidr
+            );
+            Ok(())
+        }
+        PeeringCommands::List => {
+            let peerings = read_peerings_or_empty(&cli.state_dir)?;
+            if peerings.peerings.is_empty() {
+                println!("no peerings");
+                return Ok(());
+            }
+            println!("{:<20} {:<9} {:<20} SCOPE", "LABEL", "ROLE", "CIDR");
+            for entry in &peerings.peerings {
+                let scopes = entry
+                    .effective_scope()
+                    .into_iter()
+                    .map(peering_scope_name)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{:<20} {:<9} {:<20} {}",
+                    entry.label,
+                    peering_role_name(entry.role),
+                    entry.cidr,
+                    scopes
+                );
+            }
+            Ok(())
+        }
+        PeeringCommands::Show { label } => {
+            let peerings = read_peerings_or_empty(&cli.state_dir)?;
+            let entry = peerings
+                .peerings
+                .iter()
+                .find(|entry| entry.label == *label)
+                .with_context(|| format!("peering '{}' does not exist", label))?;
+            println!("{}", serde_yaml::to_string(entry)?);
+            Ok(())
+        }
+        PeeringCommands::Remove { label } => {
+            let mut peerings = read_peerings_or_empty(&cli.state_dir)?;
+            let before = peerings.peerings.len();
+            peerings.peerings.retain(|entry| entry.label != *label);
+            if peerings.peerings.len() == before {
+                bail!("peering '{}' does not exist", label);
+            }
+            peerings.write_to_path(&peerings_path(&cli.state_dir))?;
+            println!(
+                "removed peering '{}'. Run `confidential-agent peering apply` to push SG changes.",
+                label
+            );
+            Ok(())
+        }
+        PeeringCommands::Apply { dry_run } => {
+            let peerings = read_peerings_or_empty(&cli.state_dir)?;
+            peerings.validate()?;
+            let services = read_service_states(&cli.state_dir)?;
+            let active = services
+                .iter()
+                .filter(|service| service.phase == "active")
+                .count();
+            if *dry_run {
+                println!("would refresh Shelter security groups for {active} active services");
+                return Ok(());
+            }
+            refresh_active_shelter_deploys(cli, &cli.state_dir, &services)?;
+            println!("applied peerings to {active} active services");
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
+    match &args.command {
+        A2aCommands::Add {
+            agent_card_url,
+            alias,
+            service,
+        } => {
+            parse_agent_card_url(agent_card_url).map_err(anyhow::Error::new)?;
+            let mut state = read_a2a_state_or_empty(&cli.state_dir)?;
+            if state.peers.iter().any(|peer| peer.url == *agent_card_url) {
+                bail!("a2a peer URL '{}' already exists", agent_card_url);
+            }
+            if let Some(alias) = alias.as_deref() {
+                confidential_agent_core::a2a::validate_id("a2a peer alias", alias)?;
+                ensure_a2a_alias_available(&cli.state_dir, alias, None)?;
+            }
+            validate_a2a_scoped_services(&cli.state_dir, service)?;
+            let preview = fetch_agent_card_preview(agent_card_url);
+            let (cli_preview, cli_preview_error) = match preview {
+                Ok(preview) => (Some(preview), None),
+                Err(err) => {
+                    let preview_error = a2a_cli_preview_error(&err);
+                    eprintln!(
+                        "[ca] warning: fetch from CLI failed (this is OK if peer only allows your service VM IPs); daemon will be authoritative: {err:#}"
+                    );
+                    (None, Some(preview_error))
+                }
+            };
+            if let (None, Some(preview)) = (alias, cli_preview.as_ref()) {
+                ensure_a2a_alias_available(&cli.state_dir, &preview.card_summary.id, None)?;
+            }
+            if let Some(err) = &cli_preview_error {
+                eprintln!("[ca] a2a preview status: {} ({})", err.kind, err.message);
+            }
+            let peer = A2aStatePeer {
+                alias: alias.clone(),
+                url: agent_card_url.clone(),
+                scoped_services: service.clone(),
+                added_at: current_utc_timestamp(),
+                cli_preview,
+                cli_preview_error,
+            };
+            state.peers.push(peer);
+            write_a2a_state(&cli.state_dir, &state)?;
+            sync_a2a_bundle(cli, &cli.state_dir)?;
+            print_a2a_network_hint(&cli.state_dir, service)?;
+            Ok(())
+        }
+        A2aCommands::Remove { alias_or_url } => {
+            let mut state = read_a2a_state_or_empty(&cli.state_dir)?;
+            let before = state.peers.len();
+            state.peers.retain(|peer| {
+                peer.url != *alias_or_url && peer.alias.as_deref() != Some(alias_or_url.as_str())
+            });
+            if state.peers.len() == before {
+                bail!("a2a peer '{}' does not exist", alias_or_url);
+            }
+            write_a2a_state(&cli.state_dir, &state)?;
+            sync_a2a_bundle(cli, &cli.state_dir)?;
+            println!("removed a2a peer '{}'", alias_or_url);
+            Ok(())
+        }
+        A2aCommands::List => {
+            let state = read_a2a_state_or_empty(&cli.state_dir)?;
+            if state.peers.is_empty() {
+                println!("no a2a peers");
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<48} {:<18} SERVICES",
+                "ALIAS", "URL", "CLI_PREVIEW"
+            );
+            for peer in &state.peers {
+                let services = if peer.scoped_services.is_empty() {
+                    "*".to_string()
+                } else {
+                    peer.scoped_services.join(",")
+                };
+                println!(
+                    "{:<20} {:<48} {:<18} {}",
+                    peer.alias.as_deref().unwrap_or("-"),
+                    truncate_for_table(&peer.url, 48),
+                    if let Some(error) = &peer.cli_preview_error {
+                        error.kind.as_str()
+                    } else if peer.cli_preview.is_some() {
+                        "verified"
+                    } else {
+                        "unverified"
+                    },
+                    services
+                );
+            }
+            Ok(())
+        }
+        A2aCommands::Show { alias_or_url } => {
+            let state = read_a2a_state_or_empty(&cli.state_dir)?;
+            let peer = find_a2a_peer(&state, alias_or_url)?;
+            println!("{}", serde_json::to_string_pretty(peer)?);
+            Ok(())
+        }
+        A2aCommands::Sync { alias, all } => {
+            if *all && alias.is_some() {
+                bail!("use either --all or --alias, not both");
+            }
+            let mut state = read_a2a_state_or_empty(&cli.state_dir)?;
+            for peer in &mut state.peers {
+                let selected = alias
+                    .as_deref()
+                    .map(|alias| peer.alias.as_deref() == Some(alias))
+                    .unwrap_or(true);
+                if !selected {
+                    continue;
+                }
+                match fetch_agent_card_preview(&peer.url) {
+                    Ok(preview) => {
+                        peer.cli_preview = Some(preview);
+                        peer.cli_preview_error = None;
+                    }
+                    Err(err) => {
+                        peer.cli_preview = None;
+                        peer.cli_preview_error = Some(a2a_cli_preview_error(&err));
+                        eprintln!(
+                            "[ca] warning: CLI fetch failed for '{}'; daemon remains authoritative: {err:#}",
+                            peer.alias.as_deref().unwrap_or(&peer.url)
+                        );
+                    }
+                }
+            }
+            if let Some(alias) = alias.as_deref() {
+                if !state
+                    .peers
+                    .iter()
+                    .any(|peer| peer.alias.as_deref() == Some(alias))
+                {
+                    bail!("a2a peer alias '{}' does not exist", alias);
+                }
+            }
+            write_a2a_state(&cli.state_dir, &state)?;
+            sync_a2a_bundle(cli, &cli.state_dir)?;
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn cmd_migrate(cli: &Cli, args: &MigrateArgs) -> Result<()> {
+    let content = fs::read_to_string(&args.spec)
+        .with_context(|| format!("failed to read '{}'", args.spec.display()))?;
+    let mut spec_yaml: serde_yaml::Value = serde_yaml::from_str(&content)
+        .with_context(|| format!("failed to parse '{}'", args.spec.display()))?;
+    let mut migrated_peerings = read_peerings_or_empty(&cli.state_dir)?;
+
+    if let Some(root) = spec_yaml.as_mapping_mut() {
+        root.remove(serde_yaml::Value::String("peers".to_string()));
+        if let Some(deploy) = root
+            .get_mut(serde_yaml::Value::String("deploy".to_string()))
+            .and_then(|value| value.as_mapping_mut())
+        {
+            if let Some(security) = deploy.remove(serde_yaml::Value::String("security".to_string()))
+            {
+                migrate_security_peerings(&security, &mut migrated_peerings)?;
+            }
+        }
+    }
+
+    let migrated_spec = serde_yaml::to_string(&spec_yaml)?;
+    if let Some(out) = args.out.as_ref() {
+        fs::write(out, migrated_spec)
+            .with_context(|| format!("failed to write '{}'", out.display()))?;
+        println!("wrote migrated spec to {}", out.display());
+    } else {
+        print!("{migrated_spec}");
+    }
+
+    let peerings_out = args
+        .peerings_out
+        .clone()
+        .unwrap_or_else(|| peerings_path(&cli.state_dir));
+    migrated_peerings.write_to_path(&peerings_out)?;
+    println!("wrote migrated peerings to {}", peerings_out.display());
+    Ok(())
+}
+
 pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
-    let config = render_connect_config(&cli.state_dir)?;
+    let config = if let Some(url) = args.from_card.as_deref() {
+        let card = fetch_agent_card(url)
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("failed to fetch AgentCard from '{url}'"))?;
+        render_agent_card_connect_config(&card)?
+    } else {
+        if args.service.is_some() {
+            bail!("--service is only supported with --from-card in this version");
+        }
+        render_connect_config(&cli.state_dir)?
+    };
     let config_content = serde_json::to_string(&config)?;
     if args.render_only {
         println!("{}", serde_json::to_string_pretty(&config)?);
@@ -366,9 +664,18 @@ pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
             mounts,
             envs: inherited_proxy_envs(None),
             workdir: Some(workdir),
+            container_name: Some(connect_container_name()),
         },
         true,
     )
+}
+
+fn connect_container_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("ca-connect-{}-{nanos}", std::process::id())
 }
 
 pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
@@ -804,6 +1111,45 @@ fn print_live_status_table(statuses: &[LiveStatusView]) {
             status.live_error.as_deref().unwrap_or("-"),
         );
     }
+
+    let has_a2a = statuses
+        .iter()
+        .filter_map(|status| status.daemon.as_ref())
+        .any(|daemon| !daemon.a2a_peers.is_empty());
+    if has_a2a {
+        println!();
+        println!("A2A Peers");
+        println!(
+            "{:<18} {:<20} {:<9} {:<12} {:<12} {:<12} ERROR",
+            "SERVICE", "PEER", "STATE", "FETCH", "SUCCESS", "PORTS"
+        );
+        for status in statuses {
+            let Some(daemon) = status.daemon.as_ref() else {
+                continue;
+            };
+            for (peer, peer_status) in &daemon.a2a_peers {
+                let ports = join_ports(&peer_status.ports);
+                println!(
+                    "{:<18} {:<20} {:<9} {:<12} {:<12} {:<12} {}",
+                    status.local.service_id,
+                    truncate_for_table(peer, 20),
+                    peer_status.state,
+                    format_unix_age(peer_status.last_fetch_unix),
+                    format_unix_age(peer_status.last_success_unix),
+                    if ports.is_empty() {
+                        "-".to_string()
+                    } else {
+                        ports
+                    },
+                    peer_status
+                        .error
+                        .as_deref()
+                        .map(|err| truncate_for_table(err, 80))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+        }
+    }
 }
 
 fn debug_ssh_hint_from_status(state: &StatusView) -> Option<String> {
@@ -833,6 +1179,20 @@ fn debug_ssh_hint_from_status(state: &StatusView) -> Option<String> {
             key.private_key.display()
         ),
     })
+}
+
+fn format_unix_age(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "-".to_string();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if timestamp > now {
+        return "now".to_string();
+    }
+    format!("{}s ago", now - timestamp)
 }
 
 fn print_debug_ssh_hint(state: &LocalServiceState) {
@@ -1075,4 +1435,292 @@ pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
     args.push(prepared.rendered_config.as_os_str().to_os_string());
     args.push(OsString::from("--auto-approve"));
     args
+}
+
+fn parse_peering_role(value: &str) -> Result<PeeringRole> {
+    match value {
+        "operator" => Ok(PeeringRole::Operator),
+        "peer" => Ok(PeeringRole::Peer),
+        other => bail!(
+            "unsupported peering role '{}'; expected operator or peer",
+            other
+        ),
+    }
+}
+
+fn peering_role_name(role: PeeringRole) -> &'static str {
+    match role {
+        PeeringRole::Operator => "operator",
+        PeeringRole::Peer => "peer",
+    }
+}
+
+fn parse_peering_scopes(values: &[String]) -> Result<Vec<PeeringScope>> {
+    values
+        .iter()
+        .map(|value| parse_peering_scope(value))
+        .collect()
+}
+
+fn parse_peering_scope(value: &str) -> Result<PeeringScope> {
+    match value {
+        "control" => Ok(PeeringScope::Control),
+        "status" => Ok(PeeringScope::Status),
+        "ssh" => Ok(PeeringScope::Ssh),
+        "agent_card" | "agent-card" => Ok(PeeringScope::AgentCard),
+        "connect" => Ok(PeeringScope::Connect),
+        "mesh" => Ok(PeeringScope::Mesh),
+        other => bail!(
+            "unsupported peering scope '{}'; expected control,status,ssh,agent_card,connect,mesh",
+            other
+        ),
+    }
+}
+
+fn peering_scope_name(scope: PeeringScope) -> &'static str {
+    match scope {
+        PeeringScope::Control => "control",
+        PeeringScope::Status => "status",
+        PeeringScope::Ssh => "ssh",
+        PeeringScope::AgentCard => "agent_card",
+        PeeringScope::Connect => "connect",
+        PeeringScope::Mesh => "mesh",
+    }
+}
+
+fn read_a2a_state_or_empty(state_dir: &Path) -> Result<A2aStateFile> {
+    A2aStateFile::from_path(&a2a_state_path(state_dir))
+}
+
+fn write_a2a_state(state_dir: &Path, state: &A2aStateFile) -> Result<()> {
+    state.validate()?;
+    write_json_atomic(&a2a_state_path(state_dir), state)
+}
+
+fn find_a2a_peer<'a>(state: &'a A2aStateFile, alias_or_url: &str) -> Result<&'a A2aStatePeer> {
+    state
+        .peers
+        .iter()
+        .find(|peer| peer.url == alias_or_url || peer.alias.as_deref() == Some(alias_or_url))
+        .with_context(|| format!("a2a peer '{}' does not exist", alias_or_url))
+}
+
+fn ensure_a2a_alias_available(
+    state_dir: &Path,
+    alias: &str,
+    existing_url: Option<&str>,
+) -> Result<()> {
+    if read_service_states(state_dir)?
+        .iter()
+        .any(|service| service.service_id == alias && service.phase != "deleted")
+    {
+        bail!("a2a alias '{}' conflicts with a local service id", alias);
+    }
+    let state = read_a2a_state_or_empty(state_dir)?;
+    if state.peers.iter().any(|peer| {
+        peer.alias.as_deref() == Some(alias)
+            && existing_url
+                .map(|url| peer.url.as_str() != url)
+                .unwrap_or(true)
+    }) {
+        bail!("a2a alias '{}' already exists", alias);
+    }
+    Ok(())
+}
+
+fn validate_a2a_scoped_services(state_dir: &Path, scoped_services: &[String]) -> Result<()> {
+    if scoped_services.is_empty() {
+        return Ok(());
+    }
+    let known = read_service_states(state_dir)?
+        .into_iter()
+        .filter(|service| service.phase != "deleted")
+        .map(|service| service.service_id)
+        .collect::<BTreeSet<_>>();
+    for service in scoped_services {
+        confidential_agent_core::a2a::validate_id("a2a scoped service", service)?;
+        if !known.contains(service) {
+            bail!("a2a scoped service '{}' does not exist locally", service);
+        }
+    }
+    Ok(())
+}
+
+fn fetch_agent_card_preview(url: &str) -> std::result::Result<A2aCliPreview, AgentCardFetchError> {
+    let card = fetch_agent_card(url)?;
+    let ext = confidential_extension(&card)
+        .map_err(|err| AgentCardFetchError::SchemaValidation(err.to_string()))?;
+    Ok(A2aCliPreview {
+        fetched_at: current_utc_timestamp(),
+        card_summary: A2aCardSummary {
+            id: ext.id.clone(),
+            public_ip: ext.public_ip.clone(),
+            ports: ext.ports.iter().map(|port| port.port).collect(),
+        },
+        verified: true,
+        lint: None,
+    })
+}
+
+fn a2a_cli_preview_error(err: &AgentCardFetchError) -> A2aCliPreviewError {
+    A2aCliPreviewError {
+        checked_at: current_utc_timestamp(),
+        kind: a2a_cli_preview_error_kind(err).to_string(),
+        message: err.to_string(),
+    }
+}
+
+fn a2a_cli_preview_error_kind(err: &AgentCardFetchError) -> &'static str {
+    match err {
+        AgentCardFetchError::Transport(_) | AgentCardFetchError::HttpStatus { .. } => "unreachable",
+        AgentCardFetchError::PublicIpHostMismatch { .. }
+        | AgentCardFetchError::RekorUrlNotTrusted { .. } => "untrusted",
+        AgentCardFetchError::InvalidUrl(_)
+        | AgentCardFetchError::BodyTooLarge
+        | AgentCardFetchError::InvalidContentType(_)
+        | AgentCardFetchError::InvalidJson(_)
+        | AgentCardFetchError::NotConfidentialAgent
+        | AgentCardFetchError::SchemaValidation(_) => "invalid",
+    }
+}
+
+fn sync_a2a_bundle(cli: &Cli, state_dir: &Path) -> Result<()> {
+    let state = read_a2a_state_or_empty(state_dir)?;
+    let bundle = render_a2a_bundle(&state)?;
+    let bundle_path = a2a_bundle_path(state_dir);
+    write_json_atomic(&bundle_path, &bundle)?;
+
+    let services = read_service_states(state_dir)?;
+    let mut delivered = Vec::new();
+    for service in services.iter().filter(|service| service.phase == "active") {
+        let Some(target_ip) = service.deploy.preferred_injection_ip() else {
+            bail!(
+                "service '{}' has no IP for a2a bundle injection",
+                service.service_id
+            );
+        };
+        challenge_inject(
+            cli,
+            state_dir,
+            target_ip,
+            A2A_BUNDLE_RESOURCE,
+            &bundle_path,
+            &service.deploy.tee,
+        )?;
+        delivered.push(service.service_id.clone());
+    }
+    if delivered.is_empty() {
+        println!("no active services; a2a bundle written locally");
+    } else {
+        println!(
+            "synced a2a bundle to active services: {}",
+            delivered.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn render_a2a_bundle(state: &A2aStateFile) -> Result<A2aBundle> {
+    state.validate()?;
+    let peers = state
+        .peers
+        .iter()
+        .map(|peer| {
+            let fingerprint_source = serde_json::json!({
+                "alias": peer.alias,
+                "url": peer.url,
+                "scoped_services": peer.scoped_services,
+            });
+            Ok(A2aBundlePeer {
+                alias: peer.alias.clone(),
+                url: peer.url.clone(),
+                scoped_services: peer.scoped_services.clone(),
+                fingerprint: sha256_bytes(&serde_json::to_vec(&fingerprint_source)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bundle = A2aBundle { version: 1, peers };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
+}
+
+fn print_a2a_network_hint(state_dir: &Path, scoped_services: &[String]) -> Result<()> {
+    let services = read_service_states(state_dir)?;
+    let ips = services
+        .iter()
+        .filter(|service| service.phase == "active")
+        .filter(|service| {
+            scoped_services.is_empty() || scoped_services.contains(&service.service_id)
+        })
+        .filter_map(|service| service.deploy.public_ip.as_deref())
+        .filter(|ip| !ip.trim().is_empty())
+        .map(|ip| format!("{ip}/32"))
+        .collect::<BTreeSet<_>>();
+    if !ips.is_empty() {
+        println!(
+            "remote side must allow these caller service public IPs to access :{} and mesh ports: {}",
+            AGENT_CARD_PORT,
+            ips.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn migrate_security_peerings(
+    security: &serde_yaml::Value,
+    peerings: &mut PeeringsFile,
+) -> Result<()> {
+    let Some(mapping) = security.as_mapping() else {
+        return Ok(());
+    };
+    if let Some(cidr) = mapping
+        .get(serde_yaml::Value::String("allowed_cidr".to_string()))
+        .and_then(|value| value.as_str())
+    {
+        if !peerings
+            .peerings
+            .iter()
+            .any(|entry| entry.label == "migrated-operator")
+        {
+            peerings.peerings.push(PeeringEntry {
+                label: "migrated-operator".to_string(),
+                role: PeeringRole::Operator,
+                cidr: cidr.to_string(),
+                scope: Vec::new(),
+                note: Some("migrated from deploy.security.allowed_cidr".to_string()),
+                added_at: Some(current_utc_timestamp()),
+                added_by: std::env::var("USER").ok(),
+            });
+        }
+    }
+    if let Some(values) = mapping
+        .get(serde_yaml::Value::String("a2a_peer_cidrs".to_string()))
+        .and_then(|value| value.as_sequence())
+    {
+        for (idx, value) in values.iter().enumerate() {
+            let Some(cidr) = value.as_str() else {
+                continue;
+            };
+            let label = format!("migrated-peer-{}", idx + 1);
+            if peerings.peerings.iter().any(|entry| entry.label == label) {
+                continue;
+            }
+            peerings.peerings.push(PeeringEntry {
+                label,
+                role: PeeringRole::Peer,
+                cidr: cidr.to_string(),
+                scope: Vec::new(),
+                note: Some("migrated from deploy.security.a2a_peer_cidrs".to_string()),
+                added_at: Some(current_utc_timestamp()),
+                added_by: std::env::var("USER").ok(),
+            });
+        }
+    }
+    peerings.validate()
 }

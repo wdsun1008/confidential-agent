@@ -10,6 +10,7 @@ deploy:         { ... }         # 必填
 attestation:    { ... }         # 必填
 secrets:        { ... }         # 可选，默认空
 resources:      { ... }         # 必填，可以为空对象 {}
+a2a:            { ... }         # 可选，跨组织 Agent 发现
 ```
 
 > **严格模式**：`#[serde(deny_unknown_fields)]`。出现任何未知字段都会让解析直接失败——这是为了避免拼写错误把安全相关字段静默忽略。
@@ -23,6 +24,7 @@ resources:      { ... }         # 必填，可以为空对象 {}
 | `attestation` | object | ✅ | 见 §5 |
 | `secrets` | object | ❌ | 默认 `{}`，见 §6 |
 | `resources` | map | ✅ | 必须显式声明（即便为空 `{}`），见 §7 |
+| `a2a` | object | ❌ | 可选，见 §8 |
 
 ---
 
@@ -126,8 +128,6 @@ deploy:
   vswitch_id: vsw-xxx          # 可选
   security_group_id: sg-xxx    # 可选
   private_ip: 10.0.1.20        # 可选，固定内网 IP
-  security:
-    allowed_cidr: 203.0.113.0/24   # 必填
 ```
 
 | 字段 | 类型 | 必填 | 校验 |
@@ -140,17 +140,19 @@ deploy:
 | `zone_id` | string | ✅ | 非空。可写成 `availability_zone` 别名 |
 | `vpc_id` / `vswitch_id` / `security_group_id` | string | ❌ | 留空时由 Shelter 自动创建 |
 | `private_ip` | string | ❌ | 期望分配的固定内网 IP |
-| `security.allowed_cidr` | string | ✅ | 必须是合法 IPv4 CIDR；为 `0.0.0.0/0` 时 CLI 会输出告警 |
+
+`deploy` 不再包含 `security.allowed_cidr` / `security.a2a_peer_cidrs`。所有入向安全组规则都从 `<state-dir>/peerings.yaml` 派生，由 `confidential-agent peering ...` 管理；旧字段会被严格模式拒绝，可用 `confidential-agent migrate <spec>` 迁移。
 
 **安全组规则的自动构造**（详见 [`shelter/src/lib.rs::security_group_rules`](../shelter/src/lib.rs)）：
 
 | 规则名 | 入向端口 | 来源 | 何时启用 |
 |---|---|---|---|
-| `control_8006` | 8006 | `allowed_cidr` | 总是。这是 host CLI 通过 `attestation-challenge-client inject-resource` 注入资源的端口 |
-| `daemon_status_8088` | 8088 | `allowed_cidr` | 总是。`confidential-agentd` 暴露的只读状态 HTTP（`DAEMON_STATUS_PORT`） |
-| `debug_ssh_22` | 22 | `allowed_cidr` | 仅当 `image_variant=debug` |
-| `connect_<port>` | `port`/`port` | `allowed_cidr` | 对每个 `service.connect` 端口，方便 host TNG 接入 |
-| `mesh_<port>_peer_<cidr>` | `port`/`port` | 其他 active 服务的公网 IP `/32` | 自动管理 mesh 对等放通 |
+| `control_8006_peer_<cidr>` | 8006 | `peerings` 中含 `control` scope 的 CIDR | host CLI 通过 `attestation-challenge-client inject-resource` 注入资源 |
+| `status_8088_peer_<cidr>` | 8088 | 含 `status` scope 的 CIDR | `confidential-agentd` 只读状态 HTTP |
+| `agent_card_8089_peer_<cidr>` | 8089 | 含 `agent_card` scope 的 CIDR | 外部 peer 拉取 `/.well-known/agent-card.json` |
+| `ssh_22_peer_<cidr>` | 22 | 含 `ssh` scope 的 CIDR | 仅当 `image_variant=debug` |
+| `connect_<port>_peer_<cidr>` | `service.connect[]` | 含 `connect` scope 的 CIDR | operator 通过 RATS-TLS 接入本服务 |
+| `mesh_<port>_peer_<cidr>` | `service.ports[]` | 同组织 active 服务公网 IP `/32` 或含 `mesh` scope 的 CIDR | 同组织 mesh 与跨组织 peer 数据面 |
 
 **Shelter 字段映射**（输出 YAML 由 [`render_deploy_config`](../shelter/src/lib.rs) 产生）：
 
@@ -243,7 +245,105 @@ resources:
 
 ---
 
-## 8. 路径解析规则
+## 8. `a2a` — 本机 AgentCard 发布
+
+```yaml
+a2a:
+  id: openclaw-agent              # 必填，写入 AgentCard extension，作为对端 service-directory key
+  name: openclaw-agent            # 必填，标准 A2A Agent 名称
+  version: "1.0.0"                # 可选
+  description: "OpenClaw AI Agent" # 可选
+  cacheTtlSec: 300                # 可选，默认 300
+  skills:
+    - id: chat
+      name: Chat
+      description: "General conversation"
+```
+
+| 字段 | 类型 | 必填 | 校验 |
+|---|---|:-:|---|
+| `enabled` | bool | ❌ | 默认 `true` |
+| `id` | string | ✅ | 仅允许 `[A-Za-z0-9_-]` |
+| `name` | string | ✅ | 非空 |
+| `version` | string | ❌ | — |
+| `description` | string | ❌ | — |
+| `cacheTtlSec` | u64 | ❌ | 默认 `300`，必须 > 0 |
+| `skills` | array | ❌ | 默认 `[]`；每项 `id` 必须合法、`name` 非空 |
+
+设置 `a2a` 后，CLI 在 `deploy` / `inject` 阶段生成 AgentCard 并注入 guest。daemon 在 `:8089/.well-known/agent-card.json` 发布 AgentCard；`:8088` 只用于 `/status` / `/health`，两者端口和安全组 scope 分离。
+
+AgentCard 的标准 A2A 字段保留在顶层，confidential-agent 扩展放在 `extensions["x-confidential-agent/v1"]`，包括本机 `publicIp`、`service.ports`、TEE 类型和 Rekor 指针。`a2a` 需要 `attestation.reference_values=rekor`，否则没有可公开审计的 reference value metadata，注入会失败。
+
+**不把 cosign 公钥放进 AgentCard**：v1 的信任根是本地 trusted Rekor allowlist 加 Rekor transparency log，AgentCard 只携带 `rekorUrl`、`artifactId`、`artifactType`、`artifactVersion`、`rvName` 这些指针。把公钥或签名放进可被中间人替换的 AgentCard 反而会让攻击者同时替换信任材料；特定组织身份 pinning 属于后续版本。
+
+## 9. 外部 Peering 与 A2A 连接
+
+跨组织接入不再写进 spec。网络入向授权由 `<state-dir>/peerings.yaml` 管理，协议层 desired state 由 `<state-dir>/a2a.json` 管理。
+
+### 9.1 `peering` — 入向网络授权
+
+```bash
+confidential-agent peering add --role operator --cidr <ops-cidr>/32 --label ops
+confidential-agent peering add --role peer --cidr <peer-vm-ip>/32 --label beta
+confidential-agent peering apply
+```
+
+`peerings.yaml` 示例：
+
+```yaml
+version: 1
+peerings:
+  - label: ops
+    role: operator
+    cidr: 203.0.113.10/32
+  - label: beta
+    role: peer
+    cidr: 198.51.100.20/32
+```
+
+默认 scope：
+
+| role | 默认 scope |
+|---|---|
+| `operator` | `control`, `status`, `ssh`, `agent_card`, `connect` |
+| `peer` | `agent_card`, `mesh` |
+
+可以用 `--scope control,status` 显式收窄。`peering add/remove` 只改本地 state，不自动改云上安全组；`peering apply` 对所有 active services 重新渲染并应用安全组。
+
+`deploy` / `inject` 会 fail-fast 检查是否存在包含 `control+status` 的 operator peering，并尽量确认当前机器出口 IP 被 `control` scope 覆盖。特殊网络下可用 `--skip-peering-check` 跳过。
+
+### 9.2 `a2a` — 外部 AgentCard desired state
+
+```bash
+confidential-agent a2a add --alias beta http://198.51.100.20:8089/.well-known/agent-card.json
+confidential-agent a2a list
+confidential-agent a2a sync --all
+confidential-agent a2a remove beta
+```
+
+`a2a add` 只需要一个 AgentCard URL。peer 的 public IP、业务端口、Rekor metadata 都由 daemon 从 AgentCard 获取；本地不再重复填写 peer 端口/CIDR/reference values。
+
+CLI 会 best-effort 拉取 AgentCard 做预览；失败不会阻塞，因为真实场景里对端可能只允许本服务 VM 访问 `:8089`，不允许 operator 笔记本访问。CLI 会把失败分类记录为 `unreachable` / `untrusted` / `invalid`，供 `a2a list` 和 `a2a show` 查看。daemon 侧拉取是权威结果，会按 AgentCard `cacheTtlSec` 刷新，并写入 `status --live` 的 `a2a_peers`。
+
+daemon 接收 `cagent_a2a_bundle` 后会：
+
+1. 拉取并校验 AgentCard：URL path 固定、content-type 为 JSON、body 有大小上限。
+2. 校验 `extensions["x-confidential-agent/v1"]` 存在，且 `publicIp` 与 URL host 的 IPv4 解析结果一致。
+3. 校验 `rekorUrl` 落在 trusted Rekor allowlist，默认只信任 `https://rekor.sigstore.dev`，可用 `CA_TRUSTED_REKOR_URLS` 扩展。
+4. 用 AgentCard 中的 Rekor metadata 生成 TNG reference values。
+5. 为 peer 的每个声明端口生成本地 TNG ingress，并写入 `/etc/cai/service-directory.json`。
+
+`status --live` 中 A2A peer 状态含义：
+
+| state | 含义 |
+|---|---|
+| `ok` | 最近一次 AgentCard 拉取和 TNG ingress 生成成功 |
+| `stale` | 当前拉取失败，但 daemon 仍有上一份成功 AgentCard cache，并继续使用旧 ingress |
+| `error` | 没有可用 AgentCard cache，或 peer id 与本地 service-directory 冲突 |
+
+OpenClaw A2A 插件不再从配置里读取对端 URL/端口，而是从 `/etc/cai/service-directory.json` 解析 peer alias/card id；配置里只需要保留 token 或 `defaultPeerToken`。
+
+## 10. 路径解析规则
 
 所有路径字段（`build.base_image`, `build.scripts[]`, `build.files[].source`, `build.variants.debug.ssh_public_key`, `secrets.disk_passphrase`, `resources.*.source`, `attestation.rekor.cosign_key`, `attestation.rekor.slsa_generator`）都遵循：
 
@@ -254,7 +354,7 @@ resources:
 
 ---
 
-## 9. 完整示例
+## 11. 完整示例
 
 最小可运行 spec（参见 [`examples/openclaw/openclaw.yaml`](../examples/openclaw/openclaw.yaml)）：
 
@@ -288,8 +388,6 @@ deploy:
   region: cn-beijing
   zone_id: cn-beijing-l
   disk_gb: 200
-  security:
-    allowed_cidr: 203.0.113.0/24
 
 attestation:
   tee: tdx
@@ -310,7 +408,7 @@ resources:
 
 ---
 
-## 10. 衍生 schema（只读）
+## 12. 衍生 schema（只读）
 
 下面这些 schema 由 CLI / daemon 生成，**不要手写**。它们是 spec → runtime 的中间产物。
 
@@ -322,5 +420,6 @@ resources:
 | `confidential-agent/mesh-bundle/v1` | MeshBundle | CLI（[`render_mesh_bundle`](../cli/src/app/workflows.rs)） | Guest daemon |
 | `confidential-agent/services/v1` | ServiceDirectory | Guest daemon | Guest TNG / 应用 |
 | `confidential-agent/daemon-status/v1` | DaemonStatus | Guest daemon `:8088` | CLI `status --live` |
+| `confidential-agent/agent-card/v1` | AgentCard | CLI → BootstrapConfig → Guest daemon `:8089` | 跨组织 peer agent |
 
 如果手动编辑了 state 文件，注意保持 schema 字符串完全匹配——CLI 会显式校验，不一致直接拒绝。

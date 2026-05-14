@@ -1,5 +1,5 @@
 use super::commands::{
-    cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries,
+    cmd_a2a, cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries,
     collect_live_status, debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from,
     live_status_table_columns, status_table_columns, status_views, validate_build_start,
     validate_deploy_start, wait_for_daemon_status_from,
@@ -53,8 +53,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -414,6 +412,8 @@ fn fetch_daemon_status_reads_readonly_status_endpoint() {
             app_ready: true,
             mesh_ready: true,
             debug_ssh_ready: true,
+            a2a_peers: BTreeMap::new(),
+            last_error: None,
         })
         .unwrap();
         write!(
@@ -471,6 +471,8 @@ fn wait_for_daemon_status_retries_until_status_is_ready() {
                     app_ready: false,
                     mesh_ready: false,
                     debug_ssh_ready: false,
+                    a2a_peers: BTreeMap::new(),
+                    last_error: None,
                 })
                 .unwrap();
                 write!(
@@ -660,6 +662,7 @@ fn tools_container_wraps_challenge_client() {
             mounts: vec![PathBuf::from("/tmp/resources")],
             envs: vec![("NO_PROXY".to_string(), "39.105.79.128".to_string())],
             workdir: Some(PathBuf::from("/work")),
+            container_name: None,
         },
     );
 
@@ -694,6 +697,7 @@ fn tools_container_wraps_tng_connect() {
             mounts: Vec::new(),
             envs: Vec::new(),
             workdir: None,
+            container_name: Some("ca-connect-test".to_string()),
         },
     );
 
@@ -706,6 +710,9 @@ fn tools_container_wraps_tng_connect() {
         .position(|arg| arg == "confidential-agent-tools:test")
         .unwrap();
 
+    assert!(args
+        .windows(2)
+        .any(|pair| pair == ["--name", "ca-connect-test"]));
     assert_eq!(
         &args[image_idx + 1..],
         ["tng", "launch", "--config-content={}"]
@@ -876,8 +883,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -951,8 +956,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -963,6 +966,20 @@ resources: {}
     .unwrap();
     let mut cli = test_cli();
     cli.state_dir = temp.path().join("state");
+    PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "203.0.113.10/32".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    }
+    .write_to_path(&cli.state_dir.join("peerings.yaml"))
+    .unwrap();
 
     cmd_build(
         &cli,
@@ -977,6 +994,7 @@ resources: {}
     let rendered =
         fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
     assert!(rendered.contains("name: openclaw-agent-release-"));
+    assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(!rendered.contains("name: openclaw-agent-debug-"));
 }
 
@@ -1012,8 +1030,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1106,6 +1122,7 @@ resources: {}
             spec,
             skip_inject: true,
             render_only: false,
+            skip_peering_check: true,
         },
     )
     .unwrap();
@@ -1141,8 +1158,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1198,8 +1213,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1217,6 +1230,71 @@ resources: {}
         bootstrap.app_service.as_deref(),
         Some("cai-openclaw-gateway.service")
     );
+}
+
+#[test]
+fn render_agent_card_uses_rekor_metadata_and_rejects_disabled_a2a() {
+    let yaml = r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789, 18800]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: rekor
+  rekor:
+    cosign_key: ./cosign.key
+resources: {}
+a2a:
+  id: openclaw-agent
+  name: OpenClaw
+  cacheTtlSec: 120
+  skills:
+    - id: chat
+      name: Chat
+"#;
+    let spec = AgentSpec::from_yaml(yaml, Path::new("/project")).unwrap();
+    let meta = serde_json::json!({
+        "rekor_url": "https://rekor.sigstore.dev",
+        "artifact_id": "openclaw-release",
+        "artifact_type": "uki",
+        "artifact_version": "20260514",
+        "rv_name": "measurement.uki.SHA-384"
+    });
+
+    let card = render_agent_card(&spec, "198.51.100.20", &meta).unwrap();
+
+    assert_eq!(card.name, "OpenClaw");
+    assert_eq!(
+        card.url.as_deref(),
+        Some("http://198.51.100.20:8089/.well-known/agent-card.json")
+    );
+    let ext = confidential_extension(&card).unwrap();
+    assert_eq!(ext.id, "openclaw-agent");
+    assert_eq!(ext.cache_ttl_sec, 120);
+    assert_eq!(
+        ext.ports.iter().map(|port| port.port).collect::<Vec<_>>(),
+        vec![18789, 18800]
+    );
+    assert_eq!(ext.rekor.artifact_id, "openclaw-release");
+
+    let disabled = AgentSpec::from_yaml(
+        &yaml.replace("a2a:\n", "a2a:\n  enabled: false\n"),
+        Path::new("/project"),
+    )
+    .unwrap();
+    let err = render_agent_card(&disabled, "198.51.100.20", &meta).unwrap_err();
+    assert!(err.to_string().contains("a2a is disabled"));
 }
 
 #[test]
@@ -1238,8 +1316,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1363,8 +1439,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1406,8 +1480,6 @@ deploy:
   instance_type: ecs.gn8v-tee.4xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1478,8 +1550,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1530,8 +1600,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1748,8 +1816,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -1997,8 +2063,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -2015,6 +2079,7 @@ resources: {}
         &InjectArgs {
             spec,
             target_ip: "127.0.0.1".to_string(),
+            skip_peering_check: true,
         },
     )
     .unwrap_err();
@@ -2043,8 +2108,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -2062,6 +2125,7 @@ resources: {}
             spec,
             skip_inject: false,
             render_only: false,
+            skip_peering_check: true,
         },
     )
     .unwrap_err();
@@ -2090,8 +2154,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -2130,6 +2192,7 @@ resources: {}
             spec,
             skip_inject: false,
             render_only: false,
+            skip_peering_check: true,
         },
     )
     .unwrap_err();
@@ -2159,8 +2222,6 @@ deploy:
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -2329,6 +2390,82 @@ fn connect_renders_all_connect_services() {
     assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 49152);
 }
 
+fn test_agent_card(ports: Vec<u16>) -> AgentCard {
+    AgentCard {
+        name: "peer-openclaw".to_string(),
+        description: None,
+        version: Some("1.0.0".to_string()),
+        url: Some("http://203.0.113.8:8089/.well-known/agent-card.json".to_string()),
+        skills: Vec::new(),
+        default_input_modes: vec!["text".to_string()],
+        default_output_modes: vec!["text".to_string()],
+        capabilities: None,
+        provider: None,
+        extensions: AgentCardExtensions {
+            confidential_agent: Some(AgentCardConfidential {
+                id: "peer".to_string(),
+                cache_ttl_sec: 300,
+                public_ip: "203.0.113.8".to_string(),
+                ports: ports
+                    .into_iter()
+                    .map(|port| AgentCardPort {
+                        name: format!("port-{port}"),
+                        port,
+                    })
+                    .collect(),
+                rekor: AgentCardRekor {
+                    rekor_url: "https://rekor.sigstore.dev".to_string(),
+                    artifact_id: "peer-disk".to_string(),
+                    artifact_type: "uki".to_string(),
+                    artifact_version: "20260514000000".to_string(),
+                    rv_name: "measurement.uki.SHA-384".to_string(),
+                },
+                tee: "tdx".to_string(),
+            }),
+        },
+    }
+}
+
+#[test]
+fn from_card_connect_allocates_available_local_ports() {
+    let card = test_agent_card(vec![18789, 18790]);
+
+    let config = render_agent_card_connect_config_with_port_checker(&card, |port| {
+        port == 18789 || port == 50000
+    })
+    .unwrap();
+
+    assert_eq!(config["control_interface"]["restful"]["port"], 50001);
+    assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
+    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 18790);
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 18789);
+    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 18791);
+    assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 18790);
+}
+
+#[test]
+fn a2a_add_rejects_unknown_scoped_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+
+    let err = cmd_a2a(
+        &cli,
+        &A2aArgs {
+            command: A2aCommands::Add {
+                agent_card_url: "http://127.0.0.1:8089/.well-known/agent-card.json".to_string(),
+                alias: Some("beta".to_string()),
+                service: vec!["missing".to_string()],
+            },
+        },
+    )
+    .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("a2a scoped service 'missing' does not exist locally"));
+}
+
 #[test]
 fn collect_sample_reference_values_uses_state_reference_value_path() {
     let temp = tempfile::tempdir().unwrap();
@@ -2389,19 +2526,43 @@ fn direct_challenge_envs_do_not_forward_proxies() {
 }
 
 #[test]
-fn allowed_cidr_check_rejects_direct_egress_mismatch() {
-    let err = ensure_allowed_cidr_contains_ip("34.84.30.0/24", "59.82.126.85".parse().unwrap())
-        .unwrap_err();
+fn operator_peering_control_scope_rejects_direct_egress_mismatch() {
+    let peerings = PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "34.84.30.0/24".to_string(),
+            scope: vec![PeeringScope::Control, PeeringScope::Status],
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    };
 
-    let msg = err.to_string();
-    assert!(msg.contains("direct public egress IP 59.82.126.85"));
-    assert!(msg.contains("34.84.30.0/24"));
-    assert!(msg.contains("59.82.126.0/24"));
+    assert!(!peerings
+        .control_cidrs_contain("59.82.126.85".parse().unwrap())
+        .unwrap());
 }
 
 #[test]
-fn allowed_cidr_check_accepts_direct_egress_match() {
-    ensure_allowed_cidr_contains_ip("59.82.126.0/24", "59.82.126.85".parse().unwrap()).unwrap();
+fn operator_peering_control_scope_accepts_direct_egress_match() {
+    let peerings = PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "59.82.126.0/24".to_string(),
+            scope: vec![PeeringScope::Control, PeeringScope::Status],
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    };
+
+    assert!(peerings
+        .control_cidrs_contain("59.82.126.85".parse().unwrap())
+        .unwrap());
 }
 
 #[test]

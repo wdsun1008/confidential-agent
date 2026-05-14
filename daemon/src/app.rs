@@ -1,37 +1,47 @@
 use anyhow::{bail, Context, Result};
+use confidential_agent_core::a2a::{A2aBundle, A2aBundlePeer};
+use confidential_agent_core::agent_card::{agent_card_reference_values, confidential_extension};
+use confidential_agent_core::agent_card_fetch::fetch_agent_card_result;
 use confidential_agent_core::schema::{
-    AppliedResourceState, BootstrapConfig, DaemonStatus, GuestResource, MeshBundle,
-    ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService, BOOTSTRAP_SCHEMA_VERSION,
-    DAEMON_STATUS_SCHEMA_VERSION, MESH_SCHEMA_VERSION, SERVICE_DIRECTORY_SCHEMA_VERSION,
+    AppliedResourceState, BootstrapConfig, DaemonA2aPeerStatus, DaemonStatus, GuestResource,
+    MeshBundle, ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService,
+    BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
+    SERVICE_DIRECTORY_SCHEMA_VERSION,
 };
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{Cli, Commands, InitrdFetchArgs, RunArgs};
 
 const DEFAULT_AA_SOCK: &str =
     "unix:///run/confidential-containers/attestation-agent/attestation-agent.sock";
-const TNG_CONFIG_PATH: &str = "/etc/tng/config.json";
+const DEFAULT_TNG_CONFIG_PATH: &str = "/etc/tng/config.json";
 const TNG_SERVICE: &str = "trusted-network-gateway.service";
 const TNG_CONTROL_PORT: u16 = 50000;
 const DEFAULT_POLICY_PATH: &str = "/opt/confidential-agent/policies/trustee-opa-default.rego";
-const DAEMON_STATE_PATH: &str = "/var/lib/confidential-agent/state.json";
-const DAEMON_STATUS_PATH: &str = "/run/confidential-agent/status.json";
+const DEFAULT_DAEMON_STATE_PATH: &str = "/var/lib/confidential-agent/state.json";
+const DEFAULT_DAEMON_STATUS_PATH: &str = "/run/confidential-agent/status.json";
+const DEFAULT_SERVICE_DIRECTORY_PATH: &str = "/etc/cai/service-directory.json";
+const DEFAULT_CACHE_DIR: &str = "/var/cache/confidential-agent";
 const DEBUG_SSH_MARKER_PATH: &str = "/etc/confidential-agent/debug-ssh-enabled";
 const DEBUG_AUTHORIZED_KEYS_PATH: &str = "/root/.ssh/authorized_keys";
 const DEBUG_SSHD_DROPIN_DIR: &str = "/etc/systemd/system/sshd.service.d";
 const DEBUG_SSHD_RUN_DIR: &str = "/run/sshd";
 const MAX_RESOURCE_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_AGENT_CARD_PATH: &str = "/opt/confidential-agent/agent-card.json";
+const A2A_CACHE_TTL_MIN_SEC: u64 = 60;
+const A2A_CACHE_TTL_MAX_SEC: u64 = 3600;
+const A2A_FETCH_FAILURE_BACKOFF_SEC: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
@@ -44,6 +54,37 @@ struct DaemonState {
     bootstrap_generation: u64,
     applied_resources: BTreeMap<String, AppliedResourceState>,
     mesh_fingerprint: Option<String>,
+    #[serde(default)]
+    a2a_cache: BTreeMap<String, A2aCachedPeer>,
+    #[serde(default)]
+    a2a_status: BTreeMap<String, DaemonA2aPeerStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct A2aCachedPeer {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default)]
+    ports: Vec<A2aCachedPort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_ip: Option<String>,
+    reference_values: Value,
+    fetched_at_unix: u64,
+    next_refresh_unix: u64,
+    fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct A2aCachedPort {
+    remote: u16,
+    local: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +92,36 @@ struct RuntimeReadiness {
     app_ready: bool,
     mesh_ready: bool,
     debug_ssh_ready: bool,
+}
+
+fn env_path(name: &str, default: &str) -> PathBuf {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default))
+}
+
+fn tng_config_path() -> PathBuf {
+    env_path("CA_TNG_CONFIG_PATH", DEFAULT_TNG_CONFIG_PATH)
+}
+
+fn service_directory_path() -> PathBuf {
+    env_path("CA_SERVICE_DIRECTORY_PATH", DEFAULT_SERVICE_DIRECTORY_PATH)
+}
+
+fn daemon_state_path() -> PathBuf {
+    env_path("CA_DAEMON_STATE_PATH", DEFAULT_DAEMON_STATE_PATH)
+}
+
+fn daemon_status_path() -> PathBuf {
+    env_path("CA_DAEMON_STATUS_PATH", DEFAULT_DAEMON_STATUS_PATH)
+}
+
+fn agent_card_path() -> PathBuf {
+    env_path("CA_AGENT_CARD_PATH", DEFAULT_AGENT_CARD_PATH)
+}
+
+fn daemon_cache_dir() -> PathBuf {
+    env_path("CA_DAEMON_CACHE_DIR", DEFAULT_CACHE_DIR)
 }
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
@@ -163,7 +234,8 @@ fn initrd_fail_closed(reason: String) -> Result<()> {
 
 fn run_daemon(args: RunArgs) -> Result<()> {
     println!("confidential-agentd starting");
-    start_status_server(&args.status_listen)?;
+    start_http_server(&args.status_listen, HttpServerKind::Status)?;
+    start_http_server(&args.agent_card_listen, HttpServerKind::AgentCard)?;
     let mut state = read_daemon_state().unwrap_or_default();
     let mut active_bootstrap: Option<BootstrapConfig> = None;
     loop {
@@ -222,50 +294,75 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     }
 }
 
-fn start_status_server(listen: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+enum HttpServerKind {
+    Status,
+    AgentCard,
+}
+
+fn start_http_server(listen: &str, kind: HttpServerKind) -> Result<()> {
     let listener = TcpListener::bind(listen)
-        .with_context(|| format!("failed to bind daemon status API on {listen}"))?;
-    println!("confidential-agentd status API listening on {listen}");
+        .with_context(|| format!("failed to bind daemon {:?} API on {listen}", kind))?;
+    println!("confidential-agentd {:?} API listening on {listen}", kind);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     thread::spawn(move || {
-                        if let Err(err) = handle_status_request(stream) {
-                            eprintln!("daemon status API request failed: {err:#}");
+                        if let Err(err) = handle_http_request(stream, kind) {
+                            eprintln!("daemon {:?} API request failed: {err:#}", kind);
                         }
                     });
                 }
-                Err(err) => eprintln!("daemon status API accept failed: {err}"),
+                Err(err) => eprintln!("daemon {:?} API accept failed: {err}", kind),
             }
         }
     });
     Ok(())
 }
 
-fn handle_status_request(mut stream: TcpStream) -> Result<()> {
+fn handle_http_request(mut stream: TcpStream, kind: HttpServerKind) -> Result<()> {
     let mut request = [0u8; 1024];
     let read = stream
         .read(&mut request)
-        .context("failed to read status API request")?;
+        .context("failed to read daemon API request")?;
     let request = std::str::from_utf8(&request[..read]).unwrap_or_default();
     let first_line = request.lines().next().unwrap_or_default();
-    match first_line.split_whitespace().collect::<Vec<_>>().as_slice() {
-        ["GET", "/status", _] => serve_status_file(stream),
-        ["GET", "/health", _] => {
-            write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
+    match kind {
+        HttpServerKind::Status => {
+            match first_line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["GET", "/status", _] => serve_status_file(stream),
+                ["GET", "/health", _] => {
+                    write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
+                }
+                _ => write_http_response(
+                    stream,
+                    "404 Not Found",
+                    "application/json",
+                    r#"{"error":"not found"}"#,
+                ),
+            }
         }
-        _ => write_http_response(
-            stream,
-            "404 Not Found",
-            "application/json",
-            r#"{"error":"not found"}"#,
-        ),
+        HttpServerKind::AgentCard => {
+            match first_line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["GET", "/.well-known/agent-card.json", _] => serve_agent_card(stream),
+                ["GET", "/health", _] => {
+                    write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
+                }
+                _ => write_http_response(
+                    stream,
+                    "404 Not Found",
+                    "application/json",
+                    r#"{"error":"not found"}"#,
+                ),
+            }
+        }
     }
 }
 
 fn serve_status_file(stream: TcpStream) -> Result<()> {
-    match fs::read_to_string(DAEMON_STATUS_PATH) {
+    let path = daemon_status_path();
+    match fs::read_to_string(&path) {
         Ok(body) => write_http_response(stream, "200 OK", "application/json", &body),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => write_http_response(
             stream,
@@ -273,7 +370,21 @@ fn serve_status_file(stream: TcpStream) -> Result<()> {
             "application/json",
             r#"{"error":"daemon status is not ready"}"#,
         ),
-        Err(err) => Err(err).with_context(|| format!("failed to read '{DAEMON_STATUS_PATH}'")),
+        Err(err) => Err(err).with_context(|| format!("failed to read '{}'", path.display())),
+    }
+}
+
+fn serve_agent_card(stream: TcpStream) -> Result<()> {
+    let path = agent_card_path();
+    match fs::read_to_string(&path) {
+        Ok(body) => write_http_response(stream, "200 OK", "application/json", &body),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => write_http_response(
+            stream,
+            "404 Not Found",
+            "application/json",
+            r#"{"error":"agent card not configured"}"#,
+        ),
+        Err(err) => Err(err).with_context(|| format!("failed to read '{}'", path.display())),
     }
 }
 
@@ -463,6 +574,19 @@ fn apply_bootstrap(
 
     let readiness = ensure_runtime_ready(bootstrap, false);
     write_status(status_for(bootstrap, state, "resources-applied", readiness))?;
+
+    // Write agent card file for the status server to serve
+    if let Some(card) = &bootstrap.agent_card {
+        let path = agent_card_path();
+        let card_dir = path.parent().context("agent card path has no parent")?;
+        fs::create_dir_all(card_dir)
+            .with_context(|| format!("failed to create '{}'", card_dir.display()))?;
+        let card_json = serde_json::to_string_pretty(card)?;
+        fs::write(&path, &card_json)
+            .with_context(|| format!("failed to write '{}'", path.display()))?;
+        println!("agent card written to {}", path.display());
+    }
+
     Ok(true)
 }
 
@@ -624,47 +748,118 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 
 fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonState) -> Result<()> {
     let bundle_path = args.cdh_root.join(&args.mesh_resource);
-    if !bundle_path.exists() || bundle_path.metadata()?.len() == 0 {
+    let has_bundle =
+        bundle_path.exists() && bundle_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let a2a_bundle = read_a2a_bundle(args)?;
+    let has_a2a_peers = a2a_bundle
+        .as_ref()
+        .map(|bundle| !bundle.peers.is_empty())
+        .unwrap_or(false);
+    if a2a_bundle.is_none() {
+        state.a2a_cache.clear();
+        state.a2a_status.clear();
+        state.last_error = None;
+    }
+
+    if !has_bundle && !has_a2a_peers {
         let readiness = ensure_runtime_ready(bootstrap, false);
         write_status(status_for(bootstrap, state, "waiting-mesh", readiness))?;
         return Ok(());
     }
 
-    let bundle_content = fs::read_to_string(&bundle_path)
-        .with_context(|| format!("failed to read mesh bundle '{}'", bundle_path.display()))?;
-    let bundle: MeshBundle =
-        serde_json::from_str(&bundle_content).context("invalid mesh bundle JSON")?;
-    if bundle.schema != MESH_SCHEMA_VERSION {
-        bail!(
-            "unsupported mesh bundle schema '{}'; expected '{}'",
-            bundle.schema,
-            MESH_SCHEMA_VERSION
+    let (mut config, mut directory) = if has_bundle {
+        let bundle_content = fs::read_to_string(&bundle_path)
+            .with_context(|| format!("failed to read mesh bundle '{}'", bundle_path.display()))?;
+        let bundle: MeshBundle =
+            serde_json::from_str(&bundle_content).context("invalid mesh bundle JSON")?;
+        if bundle.schema != MESH_SCHEMA_VERSION {
+            bail!(
+                "unsupported mesh bundle schema '{}'; expected '{}'",
+                bundle.schema,
+                MESH_SCHEMA_VERSION
+            );
+        }
+        let cache_dir = daemon_cache_dir();
+        fs::create_dir_all(&cache_dir)?;
+        fs::write(
+            cache_dir.join("mesh-bundle.json"),
+            serde_json::to_string_pretty(&bundle)?,
+        )?;
+        let dir = service_directory(&bundle, &bootstrap.service_id);
+        let cfg = tng_config(&bundle, &bootstrap.service_id)?;
+        (cfg, dir)
+    } else {
+        // No mesh bundle; start with empty config that has egress for self ports
+        let egress = bootstrap
+            .ports
+            .iter()
+            .enumerate()
+            .map(|(idx, port)| {
+                json!({
+                    "netfilter": {
+                        "capture_dst": { "port": port },
+                        "capture_local_traffic": false,
+                        "listen_port": 39000 + idx as u16,
+                    },
+                    "attest": {
+                        "model": "background_check",
+                        "aa_type": "uds",
+                        "aa_addr": DEFAULT_AA_SOCK,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let cfg = json!({
+            "control_interface": { "restful": { "host": "127.0.0.1", "port": 50000 } },
+            "add_egress": egress,
+            "add_ingress": [],
+        });
+        let dir = ServiceDirectory {
+            schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
+            services: BTreeMap::new(),
+        };
+        (cfg, dir)
+    };
+
+    if let Some(a2a_bundle) = a2a_bundle.as_ref() {
+        let (peer_ingress, peer_directory) = a2a_tng_ingress(
+            a2a_bundle,
+            &bootstrap.service_id,
+            &bootstrap.ports,
+            &directory,
+            state,
         );
+        if let Some(ingress_arr) = config.get_mut("add_ingress").and_then(|v| v.as_array_mut()) {
+            ingress_arr.extend(peer_ingress);
+        }
+        for (id, service) in peer_directory {
+            directory.services.insert(id, service);
+        }
     }
-    let directory = service_directory(&bundle, &bootstrap.service_id);
-    let config = tng_config(&bundle, &bootstrap.service_id)?;
+
     let fingerprint = sha256_bytes(serde_json::to_vec(&config)?.as_slice());
 
-    fs::create_dir_all("/var/cache/confidential-agent")?;
-    fs::write(
-        "/var/cache/confidential-agent/mesh-bundle.json",
-        serde_json::to_string_pretty(&bundle)?,
-    )?;
+    let directory_path = service_directory_path();
+    if let Some(parent) = directory_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&directory_path, serde_json::to_string_pretty(&directory)?)?;
 
-    fs::create_dir_all("/etc/cai")?;
-    fs::write(
-        "/etc/cai/service-directory.json",
-        serde_json::to_string_pretty(&directory)?,
-    )?;
-
-    fs::create_dir_all("/etc/tng")?;
-    let changed = write_json_if_changed(Path::new(TNG_CONFIG_PATH), &config)?;
+    let tng_path = tng_config_path();
+    let changed = write_json_if_changed(&tng_path, &config)?;
     if changed || state.mesh_fingerprint.as_deref() != Some(&fingerprint) {
         restart_service(TNG_SERVICE)?;
         state.mesh_fingerprint = Some(fingerprint);
     }
-    let readiness =
-        ensure_runtime_ready(bootstrap, ensure_tng_ready(&bundle, &bootstrap.service_id));
+
+    let mesh_ready = {
+        match service_is_active(TNG_SERVICE) {
+            Ok(true) => mesh_ports_ready(&service_directory_local_ports(&directory)),
+            _ => false,
+        }
+    };
+
+    let readiness = ensure_runtime_ready(bootstrap, mesh_ready);
     let phase = if !readiness.app_ready {
         "starting-app"
     } else if !readiness.mesh_ready {
@@ -698,6 +893,17 @@ fn service_directory(bundle: &MeshBundle, self_id: &str) -> ServiceDirectory {
         schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
         services,
     }
+}
+
+fn service_directory_local_ports(directory: &ServiceDirectory) -> Vec<u16> {
+    let mut ports = directory
+        .services
+        .values()
+        .flat_map(|service| service.ports.iter().map(|port| port.port))
+        .collect::<Vec<_>>();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
@@ -815,6 +1021,395 @@ fn tng_reference_values(bundle: &MeshBundle, service_id: &str) -> Result<Value> 
     bail!("missing reference values for active peer service '{service_id}'")
 }
 
+fn read_a2a_bundle(args: &RunArgs) -> Result<Option<A2aBundle>> {
+    let path = args.cdh_root.join(&args.a2a_bundle_resource);
+    if !path.exists() || path.metadata()?.len() == 0 {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read a2a bundle '{}'", path.display()))?;
+    let bundle: A2aBundle = serde_json::from_str(&content).context("invalid a2a bundle JSON")?;
+    bundle.validate()?;
+    let cache_dir = daemon_cache_dir();
+    fs::create_dir_all(&cache_dir)?;
+    fs::write(
+        cache_dir.join("a2a-bundle.json"),
+        serde_json::to_string_pretty(&bundle)?,
+    )?;
+    Ok(Some(bundle))
+}
+
+fn a2a_tng_ingress(
+    bundle: &A2aBundle,
+    self_id: &str,
+    reserved_local_ports: &[u16],
+    directory: &ServiceDirectory,
+    state: &mut DaemonState,
+) -> (Vec<Value>, BTreeMap<String, ServiceDirectoryService>) {
+    let mut ingress = Vec::new();
+    let mut peer_directory = BTreeMap::new();
+    let mut used_local_ports = reserved_local_ports
+        .iter()
+        .copied()
+        .chain(service_directory_local_ports(directory))
+        .collect::<BTreeSet<_>>();
+    let mut active_keys = BTreeSet::new();
+    state.a2a_status.clear();
+    state.last_error = None;
+
+    for peer in bundle
+        .peers
+        .iter()
+        .filter(|peer| a2a_peer_scoped_to_service(peer, self_id))
+    {
+        let key = a2a_peer_key(peer);
+        active_keys.insert(key.clone());
+        match resolve_a2a_peer(peer, &mut used_local_ports, state) {
+            Ok(resolved) => {
+                if directory.services.contains_key(&resolved.id)
+                    || peer_directory.contains_key(&resolved.id)
+                {
+                    let error = format!(
+                        "a2a peer '{}' directory id conflicts with an existing service",
+                        resolved.id
+                    );
+                    state.last_error = Some(error.clone());
+                    state.a2a_status.insert(
+                        key,
+                        DaemonA2aPeerStatus {
+                            url: peer.url.clone(),
+                            id: Some(resolved.id),
+                            state: "error".to_string(),
+                            last_fetch_unix: Some(now_unix()),
+                            last_success_unix: None,
+                            error: Some(error),
+                            ports: Vec::new(),
+                        },
+                    );
+                    continue;
+                }
+
+                let mut dir_ports = Vec::new();
+                for port in &resolved.ports {
+                    ingress.push(json!({
+                        "mapping": {
+                            "in": {
+                                "host": "127.0.0.1",
+                                "port": port.local,
+                            },
+                            "out": {
+                                "host": resolved.public_ip,
+                                "port": port.remote,
+                            },
+                        },
+                        "verify": {
+                            "as_type": "builtin",
+                            "policy": {
+                                "type": "path",
+                                "path": DEFAULT_POLICY_PATH,
+                            },
+                            "policy_ids": ["default"],
+                            "reference_values": resolved.reference_values,
+                        },
+                    }));
+                    dir_ports.push(ServiceDirectoryPort {
+                        address: "127.0.0.1".to_string(),
+                        port: port.local,
+                    });
+                }
+                peer_directory.insert(resolved.id, ServiceDirectoryService { ports: dir_ports });
+            }
+            Err(err) => {
+                let error = err.to_string();
+                state.last_error = Some(error.clone());
+                state
+                    .a2a_status
+                    .entry(key)
+                    .or_insert_with(|| DaemonA2aPeerStatus {
+                        url: peer.url.clone(),
+                        id: peer.alias.clone(),
+                        state: "error".to_string(),
+                        last_fetch_unix: Some(now_unix()),
+                        last_success_unix: None,
+                        error: Some(error),
+                        ports: Vec::new(),
+                    });
+            }
+        }
+    }
+    state.a2a_cache.retain(|key, _| active_keys.contains(key));
+    (ingress, peer_directory)
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedA2aPeer {
+    id: String,
+    public_ip: String,
+    ports: Vec<A2aCachedPort>,
+    reference_values: Value,
+}
+
+fn resolve_a2a_peer(
+    peer: &A2aBundlePeer,
+    used_local_ports: &mut BTreeSet<u16>,
+    state: &mut DaemonState,
+) -> Result<ResolvedA2aPeer> {
+    let key = a2a_peer_key(peer);
+    let now = now_unix();
+    let can_use_cache = state
+        .a2a_cache
+        .get(&key)
+        .map(|cached| cached.fingerprint == peer.fingerprint && now < cached.next_refresh_unix)
+        .unwrap_or(false);
+    if can_use_cache {
+        let cached = state
+            .a2a_cache
+            .get_mut(&key)
+            .expect("cache existence checked above");
+        if !cached_peer_is_resolvable(cached) {
+            let error = cached
+                .error
+                .clone()
+                .unwrap_or_else(|| "recent a2a peer fetch failed".to_string());
+            state.a2a_status.insert(
+                key.clone(),
+                DaemonA2aPeerStatus {
+                    url: peer.url.clone(),
+                    id: peer.alias.clone(),
+                    state: "error".to_string(),
+                    last_fetch_unix: Some(cached.fetched_at_unix),
+                    last_success_unix: None,
+                    error: Some(error.clone()),
+                    ports: Vec::new(),
+                },
+            );
+            bail!(
+                "a2a peer '{}' is in fetch backoff until {}: {}",
+                peer.alias.as_deref().unwrap_or(&peer.url),
+                cached.next_refresh_unix,
+                error
+            );
+        }
+        ensure_cached_ports_available(cached, used_local_ports)?;
+        let resolved = resolved_from_cache(cached)?;
+        state.a2a_status.insert(
+            key,
+            DaemonA2aPeerStatus {
+                url: peer.url.clone(),
+                id: Some(resolved.id.clone()),
+                state: "ok".to_string(),
+                last_fetch_unix: Some(cached.fetched_at_unix),
+                last_success_unix: Some(cached.fetched_at_unix),
+                error: None,
+                ports: resolved.ports.iter().map(|port| port.local).collect(),
+            },
+        );
+        return Ok(resolved);
+    }
+
+    match fetch_agent_card_result(&peer.url) {
+        Ok(card) => {
+            let ext = confidential_extension(&card)?;
+            let reference_values = agent_card_reference_values(&card)?;
+            let mut remote_ports = ext.ports.iter().map(|port| port.port).collect::<Vec<_>>();
+            remote_ports.sort_unstable();
+            remote_ports.dedup();
+            let mut ports = Vec::new();
+            for remote in remote_ports {
+                let local = allocate_a2a_local_port(remote, used_local_ports)?;
+                ports.push(A2aCachedPort { remote, local });
+            }
+            let id = peer.alias.clone().unwrap_or_else(|| ext.id.clone());
+            let cached = A2aCachedPeer {
+                url: peer.url.clone(),
+                alias: peer.alias.clone(),
+                id: Some(id.clone()),
+                ports: ports.clone(),
+                public_ip: Some(ext.public_ip.clone()),
+                reference_values: reference_values.clone(),
+                fetched_at_unix: now,
+                next_refresh_unix: now + a2a_cache_ttl_sec(ext.cache_ttl_sec),
+                fingerprint: peer.fingerprint.clone(),
+                error: None,
+            };
+            state.a2a_cache.insert(key.clone(), cached);
+            state.a2a_status.insert(
+                key,
+                DaemonA2aPeerStatus {
+                    url: peer.url.clone(),
+                    id: Some(id.clone()),
+                    state: "ok".to_string(),
+                    last_fetch_unix: Some(now),
+                    last_success_unix: Some(now),
+                    error: None,
+                    ports: ports.iter().map(|port| port.local).collect(),
+                },
+            );
+            Ok(ResolvedA2aPeer {
+                id,
+                public_ip: ext.public_ip.clone(),
+                ports,
+                reference_values,
+            })
+        }
+        Err(err) => {
+            let error = err.to_string();
+            if let Some(cached) = state.a2a_cache.get_mut(&key) {
+                cached.next_refresh_unix = now + A2A_FETCH_FAILURE_BACKOFF_SEC;
+                cached.error = Some(error.clone());
+                cached.url = peer.url.clone();
+                cached.alias = peer.alias.clone();
+                cached.fingerprint = peer.fingerprint.clone();
+
+                if cached_peer_is_resolvable(cached) {
+                    ensure_cached_ports_available(cached, used_local_ports)?;
+                    let resolved = resolved_from_cache(cached)?;
+                    state.a2a_status.insert(
+                        key,
+                        DaemonA2aPeerStatus {
+                            url: peer.url.clone(),
+                            id: Some(resolved.id.clone()),
+                            state: "stale".to_string(),
+                            last_fetch_unix: Some(now),
+                            last_success_unix: Some(cached.fetched_at_unix),
+                            error: Some(error),
+                            ports: resolved.ports.iter().map(|port| port.local).collect(),
+                        },
+                    );
+                    return Ok(resolved);
+                }
+
+                cached.fetched_at_unix = now;
+                state.a2a_status.insert(
+                    key.clone(),
+                    DaemonA2aPeerStatus {
+                        url: peer.url.clone(),
+                        id: peer.alias.clone(),
+                        state: "error".to_string(),
+                        last_fetch_unix: Some(now),
+                        last_success_unix: None,
+                        error: Some(error.clone()),
+                        ports: Vec::new(),
+                    },
+                );
+            } else {
+                state
+                    .a2a_cache
+                    .insert(key.clone(), negative_a2a_cache(peer, now, error.clone()));
+                state.a2a_status.insert(
+                    key.clone(),
+                    DaemonA2aPeerStatus {
+                        url: peer.url.clone(),
+                        id: peer.alias.clone(),
+                        state: "error".to_string(),
+                        last_fetch_unix: Some(now),
+                        last_success_unix: None,
+                        error: Some(error.clone()),
+                        ports: Vec::new(),
+                    },
+                );
+            }
+            bail!(
+                "failed to fetch a2a peer '{}' and no cached AgentCard is available: {}",
+                peer.alias.as_deref().unwrap_or(&peer.url),
+                error
+            )
+        }
+    }
+}
+
+fn resolved_from_cache(cached: &A2aCachedPeer) -> Result<ResolvedA2aPeer> {
+    Ok(ResolvedA2aPeer {
+        id: cached
+            .alias
+            .clone()
+            .or_else(|| cached.id.clone())
+            .context("cached a2a peer has no id")?,
+        public_ip: cached
+            .public_ip
+            .clone()
+            .context("cached a2a peer has no public_ip")?,
+        ports: cached.ports.clone(),
+        reference_values: cached.reference_values.clone(),
+    })
+}
+
+fn cached_peer_is_resolvable(cached: &A2aCachedPeer) -> bool {
+    cached.id.is_some()
+        && cached.public_ip.is_some()
+        && !cached.ports.is_empty()
+        && !cached.reference_values.is_null()
+}
+
+fn negative_a2a_cache(peer: &A2aBundlePeer, now: u64, error: String) -> A2aCachedPeer {
+    A2aCachedPeer {
+        url: peer.url.clone(),
+        alias: peer.alias.clone(),
+        id: None,
+        ports: Vec::new(),
+        public_ip: None,
+        reference_values: Value::Null,
+        fetched_at_unix: now,
+        next_refresh_unix: now + A2A_FETCH_FAILURE_BACKOFF_SEC,
+        fingerprint: peer.fingerprint.clone(),
+        error: Some(error),
+    }
+}
+
+fn a2a_cache_ttl_sec(declared: u64) -> u64 {
+    declared.clamp(A2A_CACHE_TTL_MIN_SEC, A2A_CACHE_TTL_MAX_SEC)
+}
+
+fn ensure_cached_ports_available(
+    cached: &mut A2aCachedPeer,
+    used_local_ports: &mut BTreeSet<u16>,
+) -> Result<()> {
+    if cached
+        .ports
+        .iter()
+        .all(|port| !used_local_ports.contains(&port.local))
+    {
+        for port in &cached.ports {
+            used_local_ports.insert(port.local);
+        }
+        return Ok(());
+    }
+
+    for port in &mut cached.ports {
+        port.local = allocate_a2a_local_port(port.remote, used_local_ports)?;
+    }
+    Ok(())
+}
+
+fn allocate_a2a_local_port(preferred: u16, used: &mut BTreeSet<u16>) -> Result<u16> {
+    if preferred != 0 && !used.contains(&preferred) {
+        used.insert(preferred);
+        return Ok(preferred);
+    }
+    for port in 18000..=60999 {
+        if !used.contains(&port) {
+            used.insert(port);
+            return Ok(port);
+        }
+    }
+    bail!("no available local port for a2a peer")
+}
+
+fn a2a_peer_scoped_to_service(peer: &A2aBundlePeer, service_id: &str) -> bool {
+    peer.scoped_services.is_empty() || peer.scoped_services.iter().any(|id| id == service_id)
+}
+
+fn a2a_peer_key(peer: &A2aBundlePeer) -> String {
+    peer.alias.clone().unwrap_or_else(|| peer.url.clone())
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
     let new_content = serde_json::to_string_pretty(value)?;
     if let Ok(old_content) = fs::read_to_string(path) {
@@ -829,23 +1424,23 @@ fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
 }
 
 fn read_daemon_state() -> Result<DaemonState> {
-    let path = Path::new(DAEMON_STATE_PATH);
+    let path = daemon_state_path();
     if !path.exists() {
         return Ok(DaemonState::default());
     }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read '{}'", path.display()))?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
     serde_json::from_str(&content).context("failed to parse daemon state")
 }
 
 fn write_daemon_state(state: &DaemonState) -> Result<()> {
-    let path = Path::new(DAEMON_STATE_PATH);
-    write_json_atomic(path, state)
+    let path = daemon_state_path();
+    write_json_atomic(&path, state)
 }
 
 fn write_status(status: DaemonStatus) -> Result<()> {
-    let path = Path::new(DAEMON_STATUS_PATH);
-    write_json_atomic(path, &status)
+    let path = daemon_status_path();
+    write_json_atomic(&path, &status)
 }
 
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -891,6 +1486,8 @@ fn status_for(
         app_ready: readiness.app_ready,
         mesh_ready: readiness.mesh_ready,
         debug_ssh_ready: readiness.debug_ssh_ready,
+        a2a_peers: state.a2a_status.clone(),
+        last_error: state.last_error.clone(),
     }
 }
 
@@ -940,35 +1537,9 @@ fn app_ports_ready(ports: &[u16]) -> bool {
     ports.iter().all(|port| local_tcp_port_ready(*port))
 }
 
-fn ensure_tng_ready(bundle: &MeshBundle, self_id: &str) -> bool {
-    match service_is_active(TNG_SERVICE) {
-        Ok(true) => {}
-        Ok(false) => return false,
-        Err(err) => {
-            eprintln!("TNG service status check failed: {err:#}");
-            return false;
-        }
-    }
-
-    let ingress_ports = tng_local_ingress_ports(bundle, self_id);
-    mesh_ports_ready(&ingress_ports)
-}
-
 fn mesh_ports_ready(peer_ports: &[u16]) -> bool {
     local_tcp_port_ready(TNG_CONTROL_PORT)
         && peer_ports.iter().all(|port| local_tcp_port_ready(*port))
-}
-
-fn tng_local_ingress_ports(bundle: &MeshBundle, self_id: &str) -> Vec<u16> {
-    let mut ports = bundle
-        .services
-        .iter()
-        .filter(|(id, service)| id.as_str() != self_id && service.phase == "active")
-        .flat_map(|(_, service)| service.ports.iter().copied())
-        .collect::<Vec<_>>();
-    ports.sort_unstable();
-    ports.dedup();
-    ports
 }
 
 fn local_tcp_port_ready(port: u16) -> bool {

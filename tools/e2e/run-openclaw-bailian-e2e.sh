@@ -506,7 +506,7 @@ config = {
     "agents": {"defaults": {"model": {"primary": "bailian/qwen3-max-2026-01-23"}}},
     "plugins": {
         "enabled": True,
-        "allow": ["cai-pep"],
+        "allow": ["cai-pep", "cai-a2a"],
         "entries": {
             "cai-pep": {
                 "enabled": True,
@@ -514,6 +514,12 @@ config = {
                     "socketPath": "/run/cai/pep.sock",
                     "pepRequired": True,
                     "defaultWorkdir": "/workspace",
+                }
+            },
+            "cai-a2a": {
+                "enabled": True,
+                "config": {
+                    "peers": {},
                 }
             }
         },
@@ -524,6 +530,7 @@ config = {
         "bind": "lan",
         "port": 18789,
         "auth": {"mode": "token", "token": token},
+        "http": {"endpoints": {"responses": {"enabled": True}}},
         "controlUi": {
             "enabled": True,
             "basePath": "/openclaw",
@@ -542,8 +549,6 @@ PY
   base_image_yaml="$(build_base_image_yaml)"
   local rekor_yaml
   rekor_yaml="$(attestation_rekor_yaml "$cosign_key")"
-  local allowed_cidr_yaml
-  allowed_cidr_yaml="$(yaml_quote "$allowed_cidr")"
   local instance_type_yaml
   instance_type_yaml="$(yaml_quote "$INSTANCE_TYPE")"
   local region_yaml
@@ -581,8 +586,6 @@ deploy:
   region: $region_yaml
   zone_id: $zone_id_yaml
   disk_gb: 200
-  security:
-    allowed_cidr: $allowed_cidr_yaml
 
 attestation:
   tee: tdx
@@ -620,6 +623,8 @@ $base_image_yaml
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
     - source: ./files/cai-pep-plugin
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/cai-a2a-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin
     - source: ./files/patch-openclaw-cai-pep.js
       target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
       executable: true
@@ -637,8 +642,6 @@ deploy:
   region: $region_yaml
   zone_id: $zone_id_yaml
   disk_gb: 200
-  security:
-    allowed_cidr: $allowed_cidr_yaml
 
 attestation:
   tee: tdx
@@ -1030,6 +1033,8 @@ main() {
 
   local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$STATE_DIR")
   CA_ARGS=("${ca[@]}")
+  record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
+  "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     record ""
     record "Build commands run with proxy environment cleared so mkosi/DNF can use the selected internal repo directly."

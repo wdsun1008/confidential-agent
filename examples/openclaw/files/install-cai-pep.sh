@@ -61,10 +61,17 @@ EOF
 install_openclaw_plugin() {
     local extensions_dir="$OPENCLAW_HOME/extensions"
     install -d -m 0755 "$extensions_dir"
+    install -d -m 0755 "$OPENCLAW_HOME/skills"
     rm -rf "$extensions_dir/cai-pep"
     cp -a "$CAI_SHARE_DIR/cai-pep-plugin" "$extensions_dir/cai-pep"
+    local chown_paths=("$extensions_dir/cai-pep" "$OPENCLAW_HOME/skills")
+    if [[ -d "$CAI_SHARE_DIR/cai-a2a-plugin" ]]; then
+        rm -rf "$extensions_dir/cai-a2a"
+        cp -a "$CAI_SHARE_DIR/cai-a2a-plugin" "$extensions_dir/cai-a2a"
+        chown_paths+=("$extensions_dir/cai-a2a")
+    fi
     node "$CAI_SHARE_DIR/patch-openclaw-cai-pep.js"
-    chown -R "$OPENCLAW_USER:openclaw" "$extensions_dir/cai-pep" "$OPENCLAW_HOME/skills" 2>/dev/null || true
+    chown -R "$OPENCLAW_USER:openclaw" "${chown_paths[@]}"
 }
 
 case "$COMMAND" in
