@@ -1,26 +1,37 @@
 use crate::cli::{
-    BuildArgs, Cli, Commands, ConnectArgs, DeployArgs, DestroyArgs, ImageArgs, ImageCommands,
-    InjectArgs, MeshArgs, MeshCommands, StatusArgs,
+    A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, DeployArgs, DestroyArgs,
+    ImageArgs, ImageCommands, InjectArgs, MeshArgs, MeshCommands, MigrateArgs, PeeringArgs,
+    PeeringCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use confidential_agent_core::a2a::{
+    A2aBundle, A2aBundlePeer, A2aCardSummary, A2aCliPreview, A2aCliPreviewError, A2aStateFile,
+    A2aStatePeer,
+};
+use confidential_agent_core::agent_card::{
+    confidential_extension, derive_tng_client_config_with_local_ports,
+};
+use confidential_agent_core::agent_card_fetch::{
+    fetch_agent_card, parse_agent_card_url, AgentCardFetchError,
+};
+use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{
-    BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState, LocalDebugSshKey,
-    LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState, LocalSpecState,
-    MeshBundle, MeshService, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
-    LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
+    AgentCard, AgentCardConfidential, AgentCardExtensions, AgentCardPort, AgentCardRekor,
+    AgentCardSkill, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState,
+    LocalDebugSshKey, LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState,
+    LocalSpecState, MeshBundle, MeshService, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION,
+    DAEMON_STATUS_PORT, LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
 };
-use confidential_agent_core::spec::{
-    ipv4_cidr_contains, AgentSpec, AttestationTee, ReferenceValueMode,
-};
-use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
+use confidential_agent_core::spec::{AgentSpec, AttestationTee, ReferenceValueMode};
+use confidential_agent_core::util::{hex_encode, rekor_payload, required_json_string, sha256_file};
 use confidential_agent_shelter::{
     render_build_config, shelter_build_id, GuestAssets, GuestFileAsset, ShelterRenderOptions,
 };
 use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, scalar::Scalar};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -32,6 +43,10 @@ use std::os::unix::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +62,7 @@ struct ContextPaths {
     manifest: PathBuf,
     bootstrap_file: PathBuf,
     service_state: PathBuf,
+    agent_card: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +122,7 @@ struct PrepareOptions {
     image_variant: Option<String>,
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
+    peerings: PeeringsFile,
 }
 
 impl BuildManifest {
@@ -236,6 +253,7 @@ struct ToolContainerSpec {
     mounts: Vec<PathBuf>,
     envs: Vec<(String, String)>,
     workdir: Option<PathBuf>,
+    container_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -366,6 +384,7 @@ struct ImageListEntry {
 
 const MAX_SHELTER_IMAGE_BUCKET_LEN: usize = 63;
 const SHELTER_IMAGE_BUCKET_SUFFIX: &str = "-images";
+const A2A_BUNDLE_RESOURCE: &str = "default/local-resources/cagent_a2a_bundle";
 
 impl DeployObservation {
     fn preferred_injection_ip(&self) -> Option<String> {
@@ -401,7 +420,6 @@ fn prepare(
         spec.deploy.image_variant = Some(variant.clone());
     }
     spec.ensure_mvp_supported()?;
-    warn_public_allowed_cidr(&spec);
 
     let paths = context_paths(state_dir, &spec.service.id);
     fs::create_dir_all(&paths.guest_staging_dir)
@@ -453,6 +471,7 @@ fn prepare(
                 .as_ref()
                 .map(|names| names.image_import_name.clone()),
             mesh_peer_cidrs: options.mesh_peer_cidrs.clone(),
+            peerings: options.peerings.clone(),
         },
     )?;
 
@@ -504,36 +523,39 @@ fn prepare(
     })
 }
 
-fn warn_public_allowed_cidr(spec: &AgentSpec) {
-    if spec.uses_public_allowed_cidr() {
-        eprintln!(
-            "[ca] warning: service '{}' uses deploy.security.allowed_cidr={}; restrict it to your operator CIDR for non-test deployments",
-            spec.service.id, spec.deploy.security.allowed_cidr
+fn verify_operator_peering_for_direct_injection(state_dir: &Path, skip: bool) -> Result<()> {
+    if skip {
+        eprintln!("[ca] warning: skipping peerings.yaml operator egress check");
+        return Ok(());
+    }
+    let path = peerings_path(state_dir);
+    if !path.exists() {
+        bail!(
+            "no operator peering with control+status scope in {}. Add one before deploy, e.g.:\n  confidential-agent peering add --role operator --cidr <your-jumphost-cidr>/32 --label <name>",
+            path.display()
         );
     }
-}
-
-fn verify_allowed_cidr_for_direct_injection(spec: &AgentSpec) -> Result<()> {
-    if std::env::var_os("CA_SKIP_ALLOWED_CIDR_CHECK").is_some() {
-        eprintln!("[ca] warning: skipping deploy.security.allowed_cidr egress check");
-        return Ok(());
+    let peerings = PeeringsFile::from_path(&path)?;
+    if !peerings.has_operator_control_status() {
+        bail!(
+            "no operator peering with control+status scope in {}. Add one before deploy, e.g.:\n  confidential-agent peering add --role operator --cidr <your-jumphost-cidr>/32 --label <name>",
+            path.display()
+        );
     }
 
     let Some(egress_ip) = resolve_direct_egress_ip()? else {
         eprintln!(
-            "[ca] warning: could not determine direct public egress IP; deploy.security.allowed_cidr={} must include the host that will connect to guest :8006/:8088/connect ports",
-            spec.deploy.security.allowed_cidr
+            "[ca] warning: could not determine direct public egress IP; peerings.yaml must include the host that will connect to guest :8006/:8088"
         );
         return Ok(());
     };
 
-    ensure_allowed_cidr_contains_ip(&spec.deploy.security.allowed_cidr, egress_ip).with_context(
-        || {
-            format!(
-                "deploy.security.allowed_cidr must include this host's direct public egress IP {egress_ip}; this CIDR controls resource injection on :8006, daemon status on :8088, debug SSH, and connect ports"
-            )
-        },
-    )
+    if !peerings.control_cidrs_contain(egress_ip)? {
+        bail!(
+            "this host's outbound IP {egress_ip} is not covered by any operator peering with control scope. Add it first, or rerun with --skip-peering-check."
+        );
+    }
+    Ok(())
 }
 
 fn resolve_direct_egress_ip() -> Result<Option<Ipv4Addr>> {
@@ -553,35 +575,55 @@ fn resolve_direct_egress_ip() -> Result<Option<Ipv4Addr>> {
 }
 
 fn query_direct_egress_ip(endpoint: &str) -> Result<Option<Ipv4Addr>> {
-    let output = match Command::new("curl")
-        .args(["-fsSL", "--max-time", "5", "--noproxy", "*", endpoint])
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| "failed to execute curl for egress check"),
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(5))
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build();
+    let response = match agent.get(endpoint).call() {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
     };
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let body = String::from_utf8_lossy(&output.stdout);
+    let body = response
+        .into_string()
+        .with_context(|| format!("failed to read egress IP response from {endpoint}"))?;
     match body.trim().parse::<Ipv4Addr>() {
         Ok(ip) => Ok(Some(ip)),
         Err(_) => Ok(None),
     }
 }
 
-fn ensure_allowed_cidr_contains_ip(cidr: &str, ip: Ipv4Addr) -> Result<()> {
-    if !ipv4_cidr_contains(cidr, ip)? {
-        let octets = ip.octets();
-        bail!(
-            "direct public egress IP {ip} is not allowed by deploy.security.allowed_cidr={cidr}; use {}.{}.{}.0/24 or {ip}/32, or set CA_SKIP_ALLOWED_CIDR_CHECK=1 if another host will inject resources",
-            octets[0],
-            octets[1],
-            octets[2]
-        );
+fn peerings_path(state_dir: &Path) -> PathBuf {
+    absolute_path_for_state(state_dir).join("peerings.yaml")
+}
+
+fn a2a_state_path(state_dir: &Path) -> PathBuf {
+    absolute_path_for_state(state_dir).join("a2a.json")
+}
+
+fn a2a_bundle_path(state_dir: &Path) -> PathBuf {
+    absolute_path_for_state(state_dir).join("a2a-bundle.json")
+}
+
+fn read_peerings_or_empty(state_dir: &Path) -> Result<PeeringsFile> {
+    let path = peerings_path(state_dir);
+    if path.exists() {
+        PeeringsFile::from_path(&path)
+    } else {
+        Ok(PeeringsFile::empty())
     }
-    Ok(())
+}
+
+fn current_utc_timestamp() -> String {
+    Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| unix_timestamp().to_string())
 }
 
 mod debug_ssh;
@@ -749,6 +791,8 @@ fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapC
         connect: spec.service.connect.clone(),
         resources,
         app_service: spec.service.app_service.clone(),
+        peers: Vec::new(),
+        agent_card: None,
     })
 }
 

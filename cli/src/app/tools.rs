@@ -1,12 +1,14 @@
 use super::*;
 
 pub(super) fn tools_container_args(cli: &Cli, spec: ToolContainerSpec) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("run"),
-        OsString::from("--rm"),
-        OsString::from("--network"),
-        OsString::from("host"),
-    ];
+    let mut args = vec![OsString::from("run"), OsString::from("--rm")];
+
+    if let Some(name) = spec.container_name {
+        args.push(OsString::from("--name"));
+        args.push(OsString::from(name));
+    }
+
+    args.extend([OsString::from("--network"), OsString::from("host")]);
 
     let mut seen_mounts = BTreeSet::new();
     for mount in spec.mounts {
@@ -42,6 +44,7 @@ pub(super) fn run_tools_container(
     inherit_stdio: bool,
 ) -> Result<()> {
     ensure_docker_available()?;
+    let container_name = spec.container_name.clone();
     let envs = spec.envs.clone();
     let args = tools_container_args(cli, spec);
     let mut command = Command::new("docker");
@@ -58,23 +61,126 @@ pub(super) fn run_tools_container(
         command.stdin(Stdio::null());
     }
 
-    if inherit_stdio {
+    let cleanup_state = if let Some(name) = container_name.as_deref() {
+        let state = install_tools_container_cleanup_handler()?;
+        {
+            let mut guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("tools container cleanup lock is poisoned"))?;
+            *guard = Some(name.to_string());
+        }
+        Some(state)
+    } else {
+        None
+    };
+    let mut cleanup_watcher = if let Some(name) = container_name.as_deref() {
+        Some(spawn_tools_container_cleanup_watcher(name)?)
+    } else {
+        None
+    };
+
+    let result = if inherit_stdio {
         let status = command.status().context("failed to execute 'docker'")?;
         if !status.success() {
-            bail!("tools container exited with status {status}");
+            Err(anyhow::anyhow!(
+                "tools container exited with status {status}"
+            ))
+        } else {
+            Ok(())
         }
     } else {
         let output = command.output().context("failed to execute 'docker'")?;
         if !output.status.success() {
-            bail!(
+            Err(anyhow::anyhow!(
                 "tools container exited with status {}; stderr: {}; stdout: {}",
                 output.status,
                 summarize_command_bytes(&output.stderr),
                 summarize_command_bytes(&output.stdout)
-            );
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    if let Some(name) = container_name.as_deref() {
+        cleanup_tools_container(name);
+    }
+    if let Some(state) = cleanup_state {
+        if let Ok(mut guard) = state.lock() {
+            *guard = None;
         }
     }
-    Ok(())
+    if let Some(mut watcher) = cleanup_watcher.take() {
+        let _ = watcher.kill();
+        let _ = watcher.wait();
+    }
+
+    result
+}
+
+static TOOL_CONTAINER_CLEANUP_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+static TOOL_CONTAINER_TO_CLEANUP: OnceLock<Arc<Mutex<Option<String>>>> = OnceLock::new();
+
+fn install_tools_container_cleanup_handler() -> Result<Arc<Mutex<Option<String>>>> {
+    let state = TOOL_CONTAINER_TO_CLEANUP
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone();
+    if !TOOL_CONTAINER_CLEANUP_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        let handler_state = state.clone();
+        ctrlc::set_handler(move || {
+            if let Some(name) = handler_state.lock().ok().and_then(|guard| guard.clone()) {
+                cleanup_tools_container(&name);
+            }
+            std::process::exit(130);
+        })
+        .context("failed to install tools container cleanup signal handler")?;
+    }
+    Ok(state)
+}
+
+fn cleanup_tools_container(name: &str) {
+    let _ = Command::new("docker")
+        .args(["rm", "-f", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn spawn_tools_container_cleanup_watcher(name: &str) -> Result<std::process::Child> {
+    let parent_pid = std::process::id().to_string();
+    Command::new("sh")
+        .arg("-c")
+        .arg(
+            r#"parent_pid=$1
+container_name=$2
+while kill -0 "$parent_pid" 2>/dev/null; do
+  if [ -r "/proc/$parent_pid/stat" ]; then
+    state=$(awk '{print $3}' "/proc/$parent_pid/stat" 2>/dev/null || true)
+    if [ "$state" = Z ]; then
+      break
+    fi
+  fi
+  sleep 1
+done
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  if docker rm -f "$container_name" >/dev/null 2>&1; then
+    exit 0
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
+"#,
+        )
+        .arg("ca-connect-cleanup")
+        .arg(parent_pid)
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn tools container cleanup watcher")
 }
 
 fn summarize_command_bytes(bytes: &[u8]) -> String {
@@ -140,6 +246,7 @@ pub(super) fn run_attestation_tool(
             mounts,
             envs,
             workdir: Some(workdir),
+            container_name: None,
         },
         inherit_stdio,
     )

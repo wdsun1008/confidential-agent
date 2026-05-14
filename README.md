@@ -242,3 +242,4 @@ confidential-agent/
 
 - [docs/architecture.md](docs/architecture.md) — 控制流与数据流详解（含序列图）
 - [docs/spec.md](docs/spec.md) — `confidential-agent/v1` AppSpec 完整字段参考
+- [docs/a2a.md](docs/a2a.md) — 跨组织/跨用户 A2A：背景、架构、信任模型、step-by-step 上手与排错

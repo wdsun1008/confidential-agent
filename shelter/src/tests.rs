@@ -1,4 +1,5 @@
 use super::*;
+use confidential_agent_core::peerings::{PeeringEntry, PeeringRole};
 use confidential_agent_core::spec::AgentSpec;
 use std::path::Path;
 
@@ -29,8 +30,6 @@ deploy:
   region: cn-beijing
   zone_id: cn-beijing-l
   disk_gb: 200
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge
@@ -57,10 +56,33 @@ fn assets() -> GuestAssets {
     }
 }
 
+fn operator_peerings() -> PeeringsFile {
+    PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "203.0.113.0/24".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    }
+}
+
 #[test]
 fn renders_release_shelter_build_without_ssh_key_name() {
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
-    let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            peerings: operator_peerings(),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
 
     assert!(rendered.contains("from: /images/base.qcow2"));
     assert!(rendered.contains("variants:"));
@@ -85,11 +107,11 @@ fn renders_release_shelter_build_without_ssh_key_name() {
     assert!(rendered.contains("zone_id: cn-beijing-l"));
     assert!(rendered.contains("cc: tdx"));
     assert!(rendered.contains("tdx: true"));
-    assert!(rendered.contains("name: control_8006"));
+    assert!(rendered.contains("name: control_8006_peer_203_0_113_0_24"));
     assert!(rendered.contains("port_range: 8006/8006"));
-    assert!(rendered.contains("name: daemon_status_8088"));
+    assert!(rendered.contains("name: status_8088_peer_203_0_113_0_24"));
     assert!(rendered.contains("port_range: 8088/8088"));
-    assert!(rendered.contains("name: connect_18789"));
+    assert!(rendered.contains("name: connect_18789_peer_203_0_113_0_24"));
     assert!(!rendered.contains("name: mesh_18789"));
     assert!(!rendered.contains("cidr: vpc"));
     assert!(!rendered.contains("openssh-server"));
@@ -107,7 +129,15 @@ fn renders_mkosi_build_without_from_or_legacy_variants() {
         Path::new("/project"),
     )
     .unwrap();
-    let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            peerings: operator_peerings(),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
 
     assert!(!rendered.contains("from:"));
     assert!(!rendered.contains("variants:"));
@@ -124,7 +154,15 @@ fn renders_debug_deploy_with_ssh_security_group() {
         Path::new("/project"),
     )
     .unwrap();
-    let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            peerings: operator_peerings(),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
 
     assert!(rendered.contains("name: debug"));
     assert!(!rendered.contains("name: release"));
@@ -162,6 +200,36 @@ fn renders_mesh_only_ports_in_shelter_security_group() {
     assert!(rendered.contains("cidr: 39.105.93.168/32"));
     assert!(!rendered.contains("cidr: vpc"));
     assert!(!rendered.contains("name: connect_3001"));
+}
+
+#[test]
+fn renders_peerings_for_agent_card_and_mesh_ports() {
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let mut peerings = operator_peerings();
+    peerings.peerings.push(PeeringEntry {
+        label: "beta".to_string(),
+        role: PeeringRole::Peer,
+        cidr: "198.51.100.10/32".to_string(),
+        scope: Vec::new(),
+        note: None,
+        added_at: None,
+        added_by: None,
+    });
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            peerings,
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(rendered.contains("name: agent_card_8089_peer_198_51_100_10_32"));
+    assert!(rendered.contains("port_range: 8089/8089"));
+    assert!(rendered.contains("name: mesh_18789_peer_198_51_100_10_32"));
+    assert!(rendered.contains("port_range: 18789/18789"));
+    assert!(rendered.contains("cidr: 198.51.100.10/32"));
 }
 
 #[test]
@@ -270,8 +338,6 @@ deploy:
   instance_type: ecs.gn8v-tee.4xlarge
   region: cn-beijing
   zone_id: cn-beijing-l
-  security:
-    allowed_cidr: 203.0.113.0/24
 attestation:
   tee: tdx
   mode: challenge

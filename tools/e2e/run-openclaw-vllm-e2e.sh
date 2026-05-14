@@ -328,7 +328,7 @@ if os.environ.get("OPENCLAW_ENABLE_DINGTALK") == "1":
         raise SystemExit("DingTalk requested but DINGTALK_BOT_CLIENT_ID/SECRET is missing")
     plugins = config.setdefault("plugins", {})
     plugins["enabled"] = True
-    allow = list(dict.fromkeys([*(plugins.get("allow") or []), "cai-pep", "dingtalk"]))
+    allow = list(dict.fromkeys([*(plugins.get("allow") or []), "cai-pep", "cai-a2a", "dingtalk"]))
     plugins["allow"] = allow
     config["channels"] = {
         "dingtalk": {
@@ -384,6 +384,8 @@ $base_image_yaml
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
     - source: ./files/cai-pep-plugin
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/cai-a2a-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin
     - source: ./files/patch-openclaw-cai-pep.js
       target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
       executable: true
@@ -401,8 +403,6 @@ deploy:
   region: $(yaml_quote "$REGION")
   zone_id: $(yaml_quote "$ZONE_ID")
   disk_gb: $DISK_GB
-  security:
-    allowed_cidr: $(yaml_quote "$allowed_cidr")
 
 attestation:
   tee: tdx
@@ -651,6 +651,9 @@ main() {
   write_spec_and_config "$allowed_cidr" "$token" "$cosign_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- OpenClaw gateway token generated but not printed."
+
+  record_cmd "${CA_ARGS[*]} peering add --role operator --cidr $allowed_cidr --label ops"
+  "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
 
   record_cmd "${CA_ARGS[*]} build --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
   without_proxy "${CA_ARGS[@]}" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"

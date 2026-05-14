@@ -1,0 +1,11 @@
+{
+  "id": "cai-a2a",
+  "contracts": {
+    "tools": ["a2a_chat"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}

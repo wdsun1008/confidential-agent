@@ -275,13 +275,14 @@ sequenceDiagram
 
 | 端口 | 监听者 | 用途 | 安全组规则名 |
 |---|---|---|---|
-| 22  | sshd（仅 debug） | Debug SSH | `debug_ssh_22` |
-| 8006 | trustiflux-api-server | 远程证明 + 资源注入 API | `control_8006` |
-| 8088 | confidential-agentd | 只读 daemon status HTTP | `daemon_status_8088` |
+| 22  | sshd（仅 debug） | Debug SSH | `ssh_22_peer_<cidr>` |
+| 8006 | trustiflux-api-server | 远程证明 + 资源注入 API | `control_8006_peer_<cidr>` |
+| 8088 | confidential-agentd | 只读 daemon status HTTP | `status_8088_peer_<cidr>` |
+| 8089 | confidential-agentd | A2A AgentCard discovery HTTP | `agent_card_8089_peer_<cidr>` |
 | 50000 | TNG control | 本地控制面 | (loopback only) |
 | 39000+i | TNG egress | 应用本地 capture/listen | (loopback only) |
-| `service.ports[]` | 用户应用 | 业务端口；通过 mesh 接收对端访问 | `mesh_<port>_peer_<peer_cidr>` |
-| `service.connect[]` | 用户应用 | 同上，且允许 host CLI 经 RATS-TLS 接入 | `connect_<port>` |
+| `service.ports[]` | 用户应用 | 业务端口；通过 mesh 接收对端访问 | `mesh_<port>_peer_<cidr>` |
+| `service.connect[]` | 用户应用 | 同上，且允许 host CLI 经 RATS-TLS 接入 | `connect_<port>_peer_<cidr>` |
 
 ---
 
@@ -290,7 +291,7 @@ sequenceDiagram
 | 现象 | 多半的原因 | 建议做法 |
 |---|---|---|
 | `confidential-agent build` 卡在 `tng --version` | tools 镜像里的 TNG 不是 2.6.0 | 用 `tools/Dockerfile` 重新构建工具镜像 |
-| Shelter deploy 完了，但 `inject-resource` 一直 timeout | 安全组 8006 没放通；或 `allowed_cidr` 不包含 host | 检查 `deploy.security.allowed_cidr` |
+| Shelter deploy 完了，但 `inject-resource` 一直 timeout | 安全组 8006 没放通；或 `peerings.yaml` 的 `control` scope 不包含 host | 检查 `confidential-agent peering list` 并运行 `peering apply` |
 | daemon phase 长期停在 `waiting-resources` | 某个 `required=true` 资源缺失或 sha256 不对 | `confidential-agent status --live --json` 看 `applied_resources` |
 | daemon phase 停在 `starting-mesh` | TNG 未启动；通常因为 attestation-agent.sock 还没 ready | `journalctl -u trusted-network-gateway` |
 | `connect` 报 `mesh bundle has no reference values` | 还没 deploy 过 / sample_rv 文件被手删 | 重新 `deploy` 或 `mesh sync` |

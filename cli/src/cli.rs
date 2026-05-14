@@ -38,6 +38,9 @@ pub(crate) enum Commands {
     #[command(hide = true)]
     Mesh(MeshArgs),
     Connect(ConnectArgs),
+    Peering(PeeringArgs),
+    A2a(A2aArgs),
+    Migrate(MigrateArgs),
     Image(ImageArgs),
     Status(StatusArgs),
     Destroy(DestroyArgs),
@@ -59,6 +62,8 @@ pub(crate) struct DeployArgs {
     pub(crate) skip_inject: bool,
     #[arg(long, hide = true)]
     pub(crate) render_only: bool,
+    #[arg(long, env = "CA_SKIP_PEERING_CHECK")]
+    pub(crate) skip_peering_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -67,6 +72,8 @@ pub(crate) struct InjectArgs {
     pub(crate) spec: PathBuf,
     #[arg(long)]
     pub(crate) target_ip: String,
+    #[arg(long, env = "CA_SKIP_PEERING_CHECK")]
+    pub(crate) skip_peering_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -87,6 +94,82 @@ pub(crate) enum MeshCommands {
 pub(crate) struct ConnectArgs {
     #[arg(long, hide = true)]
     pub(crate) render_only: bool,
+    #[arg(long)]
+    pub(crate) from_card: Option<String>,
+    #[arg(long)]
+    pub(crate) service: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PeeringArgs {
+    #[command(subcommand)]
+    pub(crate) command: PeeringCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PeeringCommands {
+    Add {
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        cidr: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    List,
+    Show {
+        label: String,
+    },
+    Remove {
+        label: String,
+    },
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct A2aArgs {
+    #[command(subcommand)]
+    pub(crate) command: A2aCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum A2aCommands {
+    Add {
+        agent_card_url: String,
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        service: Vec<String>,
+    },
+    Remove {
+        alias_or_url: String,
+    },
+    List,
+    Show {
+        alias_or_url: String,
+    },
+    Sync {
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MigrateArgs {
+    pub(crate) spec: PathBuf,
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) peerings_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

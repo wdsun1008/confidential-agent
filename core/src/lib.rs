@@ -1,3 +1,7 @@
+pub mod a2a;
+pub mod agent_card;
+pub mod agent_card_fetch;
+pub mod peerings;
 pub mod schema;
 pub mod spec;
 pub mod util;
@@ -138,6 +142,8 @@ mod schema_tests {
                 sha256: Some("abc".to_string()),
             }],
             app_service: Some("app.service".to_string()),
+            peers: Vec::new(),
+            agent_card: None,
         };
 
         let encoded = serde_json::to_string(&bootstrap).unwrap();
@@ -150,6 +156,90 @@ mod schema_tests {
         );
         assert!(decoded.resources[0].required);
         assert_eq!(decoded.app_service.as_deref(), Some("app.service"));
+    }
+
+    #[test]
+    fn bootstrap_config_round_trips_peers_and_agent_card() {
+        use crate::schema::{
+            AgentCard, AgentCardConfidential, AgentCardExtensions, AgentCardPort, AgentCardRekor,
+            AgentCardSkill, BootstrapPeer, BootstrapPeerPortMapping,
+        };
+
+        let bootstrap = BootstrapConfig {
+            schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
+            generation: 5,
+            service_id: "svc-a".to_string(),
+            mode: "challenge".to_string(),
+            ports: vec![18789],
+            connect: vec![18789],
+            resources: Vec::new(),
+            app_service: None,
+            peers: vec![BootstrapPeer {
+                id: "remote-agent".to_string(),
+                url: "http://1.2.3.4:8089/.well-known/agent-card.json".to_string(),
+                policy: "required".to_string(),
+                refresh_interval_sec: 60,
+                ports: vec![3001],
+                port_mappings: vec![BootstrapPeerPortMapping {
+                    remote: 18789,
+                    local: 18790,
+                }],
+            }],
+            agent_card: Some(AgentCard {
+                name: "test-agent".to_string(),
+                description: Some("A test agent".to_string()),
+                version: Some("1.0.0".to_string()),
+                url: Some("http://1.2.3.4:8089/.well-known/agent-card.json".to_string()),
+                skills: vec![AgentCardSkill {
+                    id: "chat".to_string(),
+                    name: "Chat".to_string(),
+                    description: None,
+                }],
+                default_input_modes: vec!["text".to_string()],
+                default_output_modes: vec!["text".to_string()],
+                capabilities: None,
+                provider: None,
+                extensions: AgentCardExtensions {
+                    confidential_agent: Some(AgentCardConfidential {
+                        id: "test-agent".to_string(),
+                        cache_ttl_sec: 300,
+                        public_ip: "1.2.3.4".to_string(),
+                        ports: vec![AgentCardPort {
+                            name: "chat".to_string(),
+                            port: 18789,
+                        }],
+                        rekor: AgentCardRekor {
+                            rekor_url: "https://rekor.sigstore.dev".to_string(),
+                            artifact_id: "test-agent-release".to_string(),
+                            artifact_type: "uki".to_string(),
+                            artifact_version: "20260512".to_string(),
+                            rv_name: "measurement.uki.SHA-384".to_string(),
+                        },
+                        tee: "tdx".to_string(),
+                    }),
+                },
+            }),
+        };
+
+        let encoded = serde_json::to_string(&bootstrap).unwrap();
+        let decoded: BootstrapConfig = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.peers.len(), 1);
+        assert_eq!(decoded.peers[0].id, "remote-agent");
+        assert_eq!(decoded.peers[0].policy, "required");
+        assert_eq!(decoded.peers[0].ports, vec![3001]);
+        assert_eq!(decoded.peers[0].port_mappings[0].remote, 18789);
+        assert_eq!(decoded.peers[0].port_mappings[0].local, 18790);
+
+        let card = decoded.agent_card.unwrap();
+        assert_eq!(card.name, "test-agent");
+        let confidential = card.extensions.confidential_agent.unwrap();
+        assert_eq!(confidential.tee, "tdx");
+        assert_eq!(confidential.id, "test-agent");
+        assert_eq!(confidential.public_ip, "1.2.3.4");
+        assert_eq!(confidential.ports[0].port, 18789);
+        let rekor = confidential.rekor;
+        assert_eq!(rekor.artifact_id, "test-agent-release");
     }
 }
 
