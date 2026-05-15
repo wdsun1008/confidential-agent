@@ -783,13 +783,14 @@ fn cryptpilot_fde_config_matches_current_schema() {
     let config = cryptpilot_fde_config();
 
     assert!(config.contains("[rootfs]"));
-    assert!(config.contains("rw_overlay = \"disk-persist\""));
-    assert!(config.contains("[data]"));
+    assert!(config.contains("delta_location = \"disk\""));
+    assert!(config.contains("delta_backend = \"dm-snapshot\""));
+    assert!(config.contains("[delta]"));
     assert!(config.contains("integrity = false"));
-    assert!(config.contains("[data.encrypt.exec]"));
+    assert!(config.contains("[delta.encrypt.exec]"));
     assert!(config.contains("args = [\"/run/cai/secrets/disk_key\"]"));
-    assert!(!config.contains("delta_location"));
-    assert!(!config.contains("[delta]"));
+    assert!(!config.contains("rw_overlay"));
+    assert!(!config.contains("[data]"));
 }
 
 #[test]

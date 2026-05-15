@@ -902,12 +902,13 @@ systemctl reset-failed trusted-network-gateway.service || true
 
 fn cryptpilot_fde_config() -> &'static str {
     r#"[rootfs]
-rw_overlay = "disk-persist"
+delta_location = "disk"
+delta_backend = "dm-snapshot"
 
-[data]
+[delta]
 integrity = false
 
-[data.encrypt.exec]
+[delta.encrypt.exec]
 command = "cat"
 args = ["/run/cai/secrets/disk_key"]
 "#

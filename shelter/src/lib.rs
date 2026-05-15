@@ -6,7 +6,7 @@ use confidential_agent_core::spec::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct GuestAssets {
@@ -457,9 +457,33 @@ impl ShelterTools {
         Self {
             cryptpilot_enhance: "cryptpilot-enhance".to_string(),
             cryptpilot_convert: "cryptpilot-convert".to_string(),
-            cryptpilot_fde: "cryptpilot-fde".to_string(),
+            cryptpilot_fde: preferred_cryptpilot_fde_tool(),
         }
     }
+}
+
+fn preferred_cryptpilot_fde_tool() -> String {
+    preferred_existing_tool_path(
+        [
+            "/usr/libexec/shelter/cryptpilot-fde",
+            "/usr/local/libexec/shelter/cryptpilot-fde",
+            "/root/shelter-rs/deps/libexec/redhat/cryptpilot-fde",
+        ],
+        "cryptpilot-fde",
+    )
+}
+
+fn preferred_existing_tool_path<I, P>(candidates: I, fallback: &str) -> String
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    candidates
+        .into_iter()
+        .map(|candidate| candidate.as_ref().to_path_buf())
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 #[derive(Debug, Serialize)]
