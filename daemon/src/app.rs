@@ -3,8 +3,8 @@ use confidential_agent_core::a2a::{A2aBundle, A2aBundlePeer};
 use confidential_agent_core::agent_card::{agent_card_reference_values, confidential_extension};
 use confidential_agent_core::agent_card_fetch::fetch_agent_card_result;
 use confidential_agent_core::schema::{
-    AppliedResourceState, BootstrapConfig, DaemonA2aPeerStatus, DaemonStatus, GuestResource,
-    MeshBundle, ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService,
+    confidential_ports, AppliedResourceState, BootstrapConfig, DaemonA2aPeerStatus, DaemonStatus,
+    GuestResource, MeshBundle, ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService,
     BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
     SERVICE_DIRECTORY_SCHEMA_VERSION,
 };
@@ -52,6 +52,8 @@ enum ApplyOutcome {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct DaemonState {
     bootstrap_generation: u64,
+    #[serde(default)]
+    mesh_generation: u64,
     applied_resources: BTreeMap<String, AppliedResourceState>,
     mesh_fingerprint: Option<String>,
     #[serde(default)]
@@ -762,6 +764,7 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
     }
 
     if !has_bundle && !has_a2a_peers {
+        state.mesh_generation = 0;
         let readiness = ensure_runtime_ready(bootstrap, false);
         write_status(status_for(bootstrap, state, "waiting-mesh", readiness))?;
         return Ok(());
@@ -787,26 +790,31 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
         )?;
         let dir = service_directory(&bundle, &bootstrap.service_id);
         let cfg = tng_config(&bundle, &bootstrap.service_id)?;
+        state.mesh_generation = bundle.generation;
         (cfg, dir)
     } else {
         // No mesh bundle; start with empty config that has egress for self ports
+        state.mesh_generation = 0;
+        let confidential_port_set = confidential_ports(&bootstrap.ports, &bootstrap.connect)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let egress = bootstrap
             .ports
             .iter()
             .enumerate()
             .map(|(idx, port)| {
-                json!({
+                let mut route = json!({
                     "netfilter": {
                         "capture_dst": { "port": port },
                         "capture_local_traffic": false,
                         "listen_port": 39000 + idx as u16,
                     },
-                    "attest": {
-                        "model": "background_check",
-                        "aa_type": "uds",
-                        "aa_addr": DEFAULT_AA_SOCK,
-                    },
-                })
+                    "attest": tng_attest_config(),
+                });
+                if confidential_port_set.contains(port) {
+                    route["verify"] = tng_verify_config(Value::Array(Vec::new()));
+                }
+                route
             })
             .collect::<Vec<_>>();
         let cfg = json!({
@@ -878,14 +886,25 @@ fn service_directory(bundle: &MeshBundle, self_id: &str) -> ServiceDirectory {
         if id == self_id || service.phase != "active" {
             continue;
         }
-        let ports = service
-            .ports
+        let connect_ports = service.connect.iter().copied().collect::<BTreeSet<_>>();
+        let mut service_ports = service.ports.clone();
+        service_ports.sort_unstable();
+        service_ports.dedup();
+        let ports = service_ports
             .iter()
             .map(|port| ServiceDirectoryPort {
                 address: "127.0.0.1".to_string(),
                 port: *port,
+                mode: Some(if connect_ports.contains(port) {
+                    "connect".to_string()
+                } else {
+                    "mesh".to_string()
+                }),
             })
             .collect::<Vec<_>>();
+        if ports.is_empty() {
+            continue;
+        }
         services.insert(id.clone(), ServiceDirectoryService { ports });
     }
 
@@ -906,6 +925,45 @@ fn service_directory_local_ports(directory: &ServiceDirectory) -> Vec<u16> {
     ports
 }
 
+fn tng_attest_config() -> Value {
+    json!({
+        "model": "background_check",
+        "aa_type": "uds",
+        "aa_addr": DEFAULT_AA_SOCK,
+    })
+}
+
+fn tng_verify_config(reference_values: Value) -> Value {
+    json!({
+        "as_type": "builtin",
+        "policy": {
+            "type": "path",
+            "path": DEFAULT_POLICY_PATH,
+        },
+        "policy_ids": ["default"],
+        "reference_values": reference_values,
+    })
+}
+
+fn mesh_peer_reference_values(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
+    let mut values = Vec::new();
+    let mut peers = bundle
+        .services
+        .iter()
+        .filter(|(id, service)| id.as_str() != self_id && service.phase == "active")
+        .collect::<Vec<_>>();
+    peers.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (service_id, _) in peers {
+        let peer_values = tng_reference_values(bundle, service_id)?;
+        if let Value::Array(peer_values) = peer_values {
+            values.extend(peer_values);
+        } else {
+            values.push(peer_values);
+        }
+    }
+    Ok(Value::Array(values))
+}
+
 fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
     let mut egress = Vec::new();
     let service = bundle
@@ -915,10 +973,19 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
     if service.phase != "active" {
         bail!("service '{self_id}' is not active in mesh bundle");
     }
+    let confidential_port_set = confidential_ports(&service.ports, &service.connect)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let peer_reference_values = if confidential_port_set.is_empty() {
+        None
+    } else {
+        Some(mesh_peer_reference_values(bundle, self_id)?)
+    };
     let mut ports = service.ports.clone();
     ports.sort_unstable();
+    ports.dedup();
     for (idx, port) in ports.iter().enumerate() {
-        egress.push(json!({
+        let mut route = json!({
             "netfilter": {
                 "capture_dst": {
                     "port": port,
@@ -926,12 +993,17 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
                 "capture_local_traffic": false,
                 "listen_port": 39000 + idx as u16,
             },
-            "attest": {
-                "model": "background_check",
-                "aa_type": "uds",
-                "aa_addr": DEFAULT_AA_SOCK,
-            },
-        }));
+            "attest": tng_attest_config(),
+        });
+        if confidential_port_set.contains(port) {
+            route["verify"] = tng_verify_config(
+                peer_reference_values
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new())),
+            );
+        }
+        egress.push(route);
     }
 
     let mut ingress = Vec::new();
@@ -942,6 +1014,13 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
         .collect::<Vec<_>>();
     peers.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (service_id, service) in peers {
+        let connect_ports = service.connect.iter().copied().collect::<BTreeSet<_>>();
+        let mut ports = service.ports.clone();
+        ports.sort_unstable();
+        ports.dedup();
+        if ports.is_empty() {
+            continue;
+        }
         let host = service
             .public_ip
             .as_deref()
@@ -954,10 +1033,8 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
             })
             .with_context(|| format!("active peer service '{service_id}' has no reachable IP"))?;
         let reference_values = tng_reference_values(bundle, service_id)?;
-        let mut ports = service.ports.clone();
-        ports.sort_unstable();
         for port in ports {
-            ingress.push(json!({
+            let mut entry = json!({
                 "mapping": {
                     "in": {
                         "host": "127.0.0.1",
@@ -968,16 +1045,12 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
                         "port": port,
                     },
                 },
-                "verify": {
-                    "as_type": "builtin",
-                    "policy": {
-                        "type": "path",
-                        "path": DEFAULT_POLICY_PATH,
-                    },
-                    "policy_ids": ["default"],
-                    "reference_values": reference_values,
-                },
-            }));
+                "verify": tng_verify_config(reference_values.clone()),
+            });
+            if !connect_ports.contains(&port) {
+                entry["attest"] = tng_attest_config();
+            }
+            ingress.push(entry);
         }
     }
 
@@ -1115,6 +1188,7 @@ fn a2a_tng_ingress(
                     dir_ports.push(ServiceDirectoryPort {
                         address: "127.0.0.1".to_string(),
                         port: port.local,
+                        mode: Some("connect".to_string()),
                     });
                 }
                 peer_directory.insert(resolved.id, ServiceDirectoryService { ports: dir_ports });
@@ -1481,6 +1555,7 @@ fn status_for(
         service_id: bootstrap.service_id.clone(),
         phase: phase.to_string(),
         bootstrap_generation: state.bootstrap_generation,
+        mesh_generation: state.mesh_generation,
         applied_resources: state.applied_resources.clone(),
         mesh_fingerprint: state.mesh_fingerprint.clone(),
         app_ready: readiness.app_ready,

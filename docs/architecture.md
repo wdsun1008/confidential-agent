@@ -181,8 +181,8 @@ flowchart TB
   "generation": 7,
   "updated_at": 1714000000,
   "services": {
-    "openclaw":      { "phase": "active", "public_ip": "1.2.3.4",  "private_ip": "10.0.0.8", "ports": [18789], "connect": [18789] },
-    "openclaw-vllm": { "phase": "active", "public_ip": "5.6.7.8",  "private_ip": "10.0.0.9", "ports": [18789], "connect": [18789] }
+    "openclaw":      { "phase": "active", "public_ip": "1.2.3.4",  "private_ip": "10.0.0.8", "ports": [18789, 18800], "connect": [18789] },
+    "openclaw-vllm": { "phase": "active", "public_ip": "5.6.7.8",  "private_ip": "10.0.0.9", "ports": [3001], "connect": [] }
   },
   "reference_values":      { "openclaw": ..., "openclaw-vllm": ... },   // sample 模式
   "rekor_reference_values":{ "openclaw": ..., "openclaw-vllm": ... }    // rekor 模式
@@ -194,11 +194,13 @@ flowchart TB
 2. 通过 `attestation-challenge-client inject-resource default/local-resources/cagent_mesh_bundle` 推到每台 Guest。
 3. Guest daemon [`sync_mesh`](../daemon/src/app.rs) 读到后：
    - 写 `/var/cache/confidential-agent/mesh-bundle.json`（持久化）；
-   - 写 `/etc/cai/service-directory.json`（应用读这个文件做服务发现，把同 mesh 服务当作 `127.0.0.1:<port>` 调）；
-   - 渲染并写 `/etc/tng/config.json`，让 TNG 在 39000+i 监听 + 把对端服务从公/私 IP RATS-TLS 连过去；
+   - 写 `/etc/cai/service-directory.json`（包含对端所有 `service.ports`，每个端口标记 `mode=connect|mesh`，应用读这个文件做服务发现）；
+   - 渲染并写 `/etc/tng/config.json`，让本地 TNG 对本服务的 `connect` 端口只做服务端 attestation，对本服务的 `ports - connect` 端口同时验证调用方 attestation；访问对端 `connect` 端口时只验证对端服务端 attestation，访问对端 `ports - connect` 端口时同时携带本服务 attestation；
    - 如果配置 hash 变了，`systemctl restart trusted-network-gateway.service`。
 
-> 重点：mesh-bundle 中的 reference value 既出现在 host CLI 的 `connect` 配置（host → guest），也下发给 guest TNG（guest → guest），保证两个方向都用同样的 RV 做 RATS-TLS 验签。
+mesh-bundle 是按 active service 集合滚动生成的。新 service deploy 时 generation 会推进，已有 service 可能先收到包含新 RV 的 bundle，再等新 service 自身 ingress 完成重启；e2e 成功路径应等待 daemon `:8088/status` 的 `mesh_generation` 更新且 `mesh_ready=true` 后再断言双向 RA 生效。
+
+> 重点：`connect` 和 A2A 是单向 RA；同 state-dir confidential mesh 端口是双向 RA。应用需要通过端口拆分公开接入面和 confidential-only 能力。
 
 ---
 
@@ -281,8 +283,8 @@ sequenceDiagram
 | 8089 | confidential-agentd | A2A AgentCard discovery HTTP | `agent_card_8089_peer_<cidr>` |
 | 50000 | TNG control | 本地控制面 | (loopback only) |
 | 39000+i | TNG egress | 应用本地 capture/listen | (loopback only) |
-| `service.ports[]` | 用户应用 | 业务端口；通过 mesh 接收对端访问 | `mesh_<port>_peer_<cidr>` |
-| `service.connect[]` | 用户应用 | 同上，且允许 host CLI 经 RATS-TLS 接入 | `connect_<port>_peer_<cidr>` |
+| `service.connect[]` | 用户应用 | host CLI / A2A / mesh service 经 RATS-TLS 接入，单向 RA | `connect_<port>_peer_<cidr>` + `mesh_<port>_peer_<cidr>` |
+| `service.ports[] - service.connect[]` | 用户应用 | confidential mesh 数据面，双向 RA | `mesh_<port>_peer_<cidr>` |
 
 ---
 

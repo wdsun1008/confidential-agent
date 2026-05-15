@@ -432,7 +432,14 @@ if not data:
     raise SystemExit(1)
 item = data[0]
 daemon = item.get("daemon") or {}
-if daemon.get("app_ready") and daemon.get("mesh_ready") and daemon.get("debug_ssh_ready"):
+expected_generation = ((item.get("local") or {}).get("mesh_generation") or 0)
+daemon_generation = daemon.get("mesh_generation") or 0
+if (
+    daemon.get("app_ready")
+    and daemon.get("mesh_ready")
+    and daemon.get("debug_ssh_ready")
+    and int(daemon_generation) >= int(expected_generation)
+):
     raise SystemExit(0)
 raise SystemExit(1)
 PY

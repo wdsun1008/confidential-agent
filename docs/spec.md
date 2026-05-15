@@ -34,7 +34,7 @@ a2a:            { ... }         # 可选，跨组织 Agent 发现
 service:
   id: openclaw                  # 服务唯一标识，作为 state-dir 子目录、安全组规则名前缀
   ports: [18789]                # 服务在 Guest 中实际监听的端口集合
-  connect: [18789]              # 这些端口允许通过 host `connect` 子命令暴露到本地 / 暴露到 mesh
+  connect: [18789]              # ports 子集；允许 host connect / A2A / mesh service 单向 RA 接入
   app_service: cai-openclaw-gateway.service  # 可选；daemon 用它判断应用 systemd unit + 端口是否 ready
 ```
 
@@ -46,6 +46,8 @@ service:
 | `app_service` | string | ❌ | 可选；设置后不能为空；应为 guest 内的 systemd unit 名，例如 `cai-openclaw-gateway.service` |
 
 `app_service` 会写入 daemon bootstrap。若设置，`confidential-agentd` 会启动并检查该 systemd unit，同时确认 `service.ports` 都在 guest 本地可连接；`status --live` 中的 `app_ready` 才会变成 ready。若不设置，`app_ready` 只表示资源和 TNG 层就绪，不证明用户应用已经启动。
+
+端口语义固定为：`service.ports` 是所有 TNG 保护的业务端口；`service.connect` 是其中允许 host CLI、非 TEE client、跨组织 A2A、同 state-dir mesh service 以单向 RA 访问的子集，调用方只验证服务端 TEE；`service.ports - service.connect` 是 confidential-only mesh 端口，调用双方都会做 RA。敏感的 confidential-only API 不应暴露在 `connect` 端口上。
 
 **多服务约束**：跨服务的 `service.ports` 不允许冲突——`deploy/inject` 时 [`validate_mesh_port_conflicts`](../cli/src/app/workflows.rs) 会拒绝掉同 state-dir 下的端口重复。
 
@@ -151,8 +153,8 @@ deploy:
 | `status_8088_peer_<cidr>` | 8088 | 含 `status` scope 的 CIDR | `confidential-agentd` 只读状态 HTTP |
 | `agent_card_8089_peer_<cidr>` | 8089 | 含 `agent_card` scope 的 CIDR | 外部 peer 拉取 `/.well-known/agent-card.json` |
 | `ssh_22_peer_<cidr>` | 22 | 含 `ssh` scope 的 CIDR | 仅当 `image_variant=debug` |
-| `connect_<port>_peer_<cidr>` | `service.connect[]` | 含 `connect` scope 的 CIDR | operator 通过 RATS-TLS 接入本服务 |
-| `mesh_<port>_peer_<cidr>` | `service.ports[]` | 同组织 active 服务公网 IP `/32` 或含 `mesh` scope 的 CIDR | 同组织 mesh 与跨组织 peer 数据面 |
+| `connect_<port>_peer_<cidr>` | `service.connect[]` | 含 `connect` scope 的 CIDR | host CLI / A2A client 通过 RATS-TLS 接入本服务，单向 RA |
+| `mesh_<port>_peer_<cidr>` | `service.ports[]` | 同组织 active 服务公网 IP `/32` 或含 `mesh` scope 的 CIDR | 同组织 mesh service 数据面；`connect` 端口单向 RA，`ports - connect` 端口双向 RA |
 
 **Shelter 字段映射**（输出 YAML 由 [`render_deploy_config`](../shelter/src/lib.rs) 产生）：
 
@@ -272,7 +274,7 @@ a2a:
 
 设置 `a2a` 后，CLI 在 `deploy` / `inject` 阶段生成 AgentCard 并注入 guest。daemon 在 `:8089/.well-known/agent-card.json` 发布 AgentCard；`:8088` 只用于 `/status` / `/health`，两者端口和安全组 scope 分离。
 
-AgentCard 的标准 A2A 字段保留在顶层，confidential-agent 扩展放在 `extensions["x-confidential-agent/v1"]`，包括本机 `publicIp`、`service.ports`、TEE 类型和 Rekor 指针。`a2a` 需要 `attestation.reference_values=rekor`，否则没有可公开审计的 reference value metadata，注入会失败。
+AgentCard 的标准 A2A 字段保留在顶层，confidential-agent 扩展放在 `extensions["x-confidential-agent/v1"]`，包括本机 `publicIp`、`service.connect` 端口、TEE 类型和 Rekor 指针。`a2a` 需要 `attestation.reference_values=rekor` 且 `service.connect` 非空，否则没有可公开审计的 reference value metadata 或可公开接入端口，注入会失败。
 
 **不把 cosign 公钥放进 AgentCard**：v1 的信任根是本地 trusted Rekor allowlist 加 Rekor transparency log，AgentCard 只携带 `rekorUrl`、`artifactId`、`artifactType`、`artifactVersion`、`rvName` 这些指针。把公钥或签名放进可被中间人替换的 AgentCard 反而会让攻击者同时替换信任材料；特定组织身份 pinning 属于后续版本。
 
@@ -306,9 +308,9 @@ peerings:
 | role | 默认 scope |
 |---|---|
 | `operator` | `control`, `status`, `ssh`, `agent_card`, `connect` |
-| `peer` | `agent_card`, `mesh` |
+| `peer` | `agent_card`, `connect` |
 
-可以用 `--scope control,status` 显式收窄。`peering add/remove` 只改本地 state，不自动改云上安全组；`peering apply` 对所有 active services 重新渲染并应用安全组。
+可以用 `--scope control,status` 显式收窄，也可以显式加入 `mesh` 来开放 confidential mesh 端口。`peering add/remove` 只改本地 state，不自动改云上安全组；`peering apply` 对所有 active services 重新渲染并应用安全组。
 
 `deploy` / `inject` 会 fail-fast 检查是否存在包含 `control+status` 的 operator peering，并尽量确认当前机器出口 IP 被 `control` scope 覆盖。特殊网络下可用 `--skip-peering-check` 跳过。
 
@@ -331,7 +333,9 @@ daemon 接收 `cagent_a2a_bundle` 后会：
 2. 校验 `extensions["x-confidential-agent/v1"]` 存在，且 `publicIp` 与 URL host 的 IPv4 解析结果一致。
 3. 校验 `rekorUrl` 落在 trusted Rekor allowlist，默认只信任 `https://rekor.sigstore.dev`，可用 `CA_TRUSTED_REKOR_URLS` 扩展。
 4. 用 AgentCard 中的 Rekor metadata 生成 TNG reference values。
-5. 为 peer 的每个声明端口生成本地 TNG ingress，并写入 `/etc/cai/service-directory.json`。
+5. 为 AgentCard 声明的 connect 端口生成本地 TNG ingress，并写入 `/etc/cai/service-directory.json`。
+
+A2A 按 `connect` 模型处理：本地调用方验证对端服务端 TEE，不要求对端显式 `a2a add` 本服务；如果业务需要双向应用调用，双方各自添加一条出向 A2A desired state。
 
 `status --live` 中 A2A peer 状态含义：
 

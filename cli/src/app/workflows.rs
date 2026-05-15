@@ -114,6 +114,9 @@ pub(super) fn render_agent_card(
     if !a2a.enabled {
         bail!("a2a is disabled");
     }
+    if spec.service.connect.is_empty() {
+        bail!("a2a requires service.connect to expose at least one connect port");
+    }
     Ok(AgentCard {
         name: a2a.name.clone(),
         description: a2a.description.clone(),
@@ -141,7 +144,7 @@ pub(super) fn render_agent_card(
                 public_ip: target_ip.to_string(),
                 ports: spec
                     .service
-                    .ports
+                    .connect
                     .iter()
                     .map(|port| AgentCardPort {
                         name: format!("port-{port}"),

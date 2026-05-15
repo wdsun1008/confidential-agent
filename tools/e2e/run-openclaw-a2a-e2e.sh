@@ -366,7 +366,7 @@ $base_image_yaml
   scripts: [./install-openclaw.sh]
   variants:
     release:
-      enabled: false
+      enabled: true
     debug:
       enabled: true
 
@@ -604,6 +604,58 @@ PY
   cleanup_connect || true
 }
 
+run_from_card_probe() {
+  local label="$1"
+  local card_url="$2"
+  local token="$3"
+  local marker="$4"
+  local state_dir="$WORK_DIR/connect-card-$label-state"
+  local log_path="$WORK_DIR/connect-card-$label.log"
+  local config_path="$WORK_DIR/connect-card-$label-config.json"
+  local config_stderr="$WORK_DIR/connect-card-$label-config.stderr"
+  local chat_file="$WORK_DIR/chat-connect-card-$label.json"
+  local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir")
+
+  mkdir -p "$state_dir"
+  cleanup_connect || true
+
+  record_cmd "${ca[*]} connect --from-card $card_url --render-only"
+  without_proxy "${ca[@]}" connect --from-card "$card_url" --render-only \
+    >"$config_path" 2>"$config_stderr"
+  record_file_as_block "$label connect --from-card rendered TNG config:" "$config_path" json
+  if [[ -s "$config_stderr" ]]; then
+    record_file_as_block "$label connect --from-card render stderr:" "$config_stderr" text
+  fi
+
+  record_cmd "${ca[*]} connect --from-card $card_url"
+  setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+    "${ca[@]}" connect --from-card "$card_url" >"$log_path" 2>&1 &
+  CONNECT_PID=$!
+
+  local connect_port
+  connect_port="$(wait_for_connect_port "$log_path" 90)"
+  wait_for_local_port "$connect_port" 120
+
+  record_cmd "node tools/e2e/openclaw-chat-probe.mjs --url http://127.0.0.1:$connect_port --token '<redacted>' --message '<redacted>' --expect $marker"
+  if ! node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
+    --url "http://127.0.0.1:$connect_port" \
+    --token "$token" \
+    --message "请只回复 ${marker}，不要输出其他内容。" \
+    --expect "$marker" \
+    --session "confidential-agent-a2a-card-$label-$E2E_RUN_ID" \
+    --timeout-ms "$CHAT_TIMEOUT_MS" \
+    >"$chat_file" 2>&1; then
+    record_file_as_block "$label connect --from-card chat failure:" "$chat_file" text
+    record_file_as_block "$label connect --from-card diagnostic log:" "$log_path" text
+    cleanup_connect || true
+    return 1
+  fi
+
+  cat "$chat_file"
+  record_file_as_block "$label connect --from-card chat result:" "$chat_file" json
+  cleanup_connect || true
+}
+
 fetch_guest_a2a_diagnostics() {
   local label="$1"
   local guest_host="$2"
@@ -764,6 +816,11 @@ main() {
   curl --noproxy '*' -fsS "http://$beta_ip:8089/.well-known/agent-card.json" -o "$WORK_DIR/beta-agent-card.json"
   record_file_as_block "Alpha AgentCard:" "$WORK_DIR/alpha-agent-card.json" json
   record_file_as_block "Beta AgentCard:" "$WORK_DIR/beta-agent-card.json" json
+
+  log "probing host connect --from-card to Alpha"
+  run_from_card_probe alpha "http://$alpha_ip:8089/.well-known/agent-card.json" "$alpha_token" CA_A2A_ALPHA_CARD_OK
+  log "probing host connect --from-card to Beta"
+  run_from_card_probe beta "http://$beta_ip:8089/.well-known/agent-card.json" "$beta_token" CA_A2A_BETA_CARD_OK
 
   record "- alpha local peer port for beta: \`$(peer_local_port "$alpha_ip" "$alpha_key" beta)\`"
   record "- beta local peer port for alpha: \`$(peer_local_port "$beta_ip" "$beta_key" alpha)\`"

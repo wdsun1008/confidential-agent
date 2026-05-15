@@ -62,7 +62,7 @@ impl PeeringEntry {
             ]
             .into_iter()
             .collect(),
-            PeeringRole::Peer => [PeeringScope::AgentCard, PeeringScope::Mesh]
+            PeeringRole::Peer => [PeeringScope::AgentCard, PeeringScope::Connect]
                 .into_iter()
                 .collect(),
         }
@@ -213,4 +213,28 @@ fn validate_label(field: &str, value: &str) -> Result<()> {
         bail!("{field} may only contain letters, numbers, underscores, and hyphens");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_role_defaults_to_agent_card_and_connect() {
+        let entry = PeeringEntry {
+            label: "beta".to_string(),
+            role: PeeringRole::Peer,
+            cidr: "198.51.100.10/32".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        };
+
+        let scope = entry.effective_scope();
+
+        assert!(scope.contains(&PeeringScope::AgentCard));
+        assert!(scope.contains(&PeeringScope::Connect));
+        assert!(!scope.contains(&PeeringScope::Mesh));
+    }
 }

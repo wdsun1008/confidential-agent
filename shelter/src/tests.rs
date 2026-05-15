@@ -176,7 +176,7 @@ fn renders_debug_deploy_with_ssh_security_group() {
 }
 
 #[test]
-fn renders_mesh_only_ports_in_shelter_security_group() {
+fn renders_mesh_peer_rules_for_all_service_ports() {
     let spec = AgentSpec::from_yaml(
         &SPEC.replace(
             "ports: [18789]\n  connect: [18789]",
@@ -203,7 +203,7 @@ fn renders_mesh_only_ports_in_shelter_security_group() {
 }
 
 #[test]
-fn renders_peerings_for_agent_card_and_mesh_ports() {
+fn renders_peerings_for_agent_card_and_connect_ports() {
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let mut peerings = operator_peerings();
     peerings.peerings.push(PeeringEntry {
@@ -227,14 +227,22 @@ fn renders_peerings_for_agent_card_and_mesh_ports() {
 
     assert!(rendered.contains("name: agent_card_8089_peer_198_51_100_10_32"));
     assert!(rendered.contains("port_range: 8089/8089"));
-    assert!(rendered.contains("name: mesh_18789_peer_198_51_100_10_32"));
+    assert!(rendered.contains("name: connect_18789_peer_198_51_100_10_32"));
     assert!(rendered.contains("port_range: 18789/18789"));
+    assert!(!rendered.contains("name: mesh_18789_peer_198_51_100_10_32"));
     assert!(rendered.contains("cidr: 198.51.100.10/32"));
 }
 
 #[test]
 fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
-    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let spec = AgentSpec::from_yaml(
+        &SPEC.replace(
+            "ports: [18789]\n  connect: [18789]",
+            "ports: [18789, 18800]\n  connect: [18789]",
+        ),
+        Path::new("/project"),
+    )
+    .unwrap();
     let rendered = render_build_config(
         &spec,
         &assets(),
@@ -257,6 +265,7 @@ fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
     assert!(rendered.contains("cache_dir: /state/services/openclaw/cache"));
     assert!(rendered.contains("name: openclaw-agent-debug-20260429201011"));
     assert!(!rendered.contains("bucket:"));
+    assert!(rendered.contains("name: mesh_18800_peer_39_105_93_168_32"));
     assert!(rendered.contains("name: mesh_18789_peer_39_105_93_168_32"));
     assert!(rendered.contains("cidr: 39.105.93.168/32"));
     assert!(!rendered.contains("cidr: vpc"));

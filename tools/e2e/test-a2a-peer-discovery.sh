@@ -189,6 +189,14 @@ else
   exit 1
 fi
 
+if jq -e '.add_ingress[] | select(.mapping.out.port == 3001 and has("attest"))' "$TNG_CONFIG" >/dev/null 2>&1; then
+  log "FAIL: A2A ingress unexpectedly includes caller attestation"
+  jq . "$TNG_CONFIG"
+  exit 1
+else
+  log "PASS: A2A ingress uses connect-mode single-direction RA"
+fi
+
 # --- Verify service directory ---
 log "verifying service directory..."
 SERVICE_DIR="$CA_SERVICE_DIRECTORY_PATH"

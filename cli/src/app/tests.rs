@@ -407,6 +407,7 @@ fn fetch_daemon_status_reads_readonly_status_endpoint() {
             service_id: "openclaw".to_string(),
             phase: "running".to_string(),
             bootstrap_generation: 3,
+            mesh_generation: 2,
             applied_resources: BTreeMap::new(),
             mesh_fingerprint: Some("abc123".to_string()),
             app_ready: true,
@@ -466,6 +467,7 @@ fn wait_for_daemon_status_retries_until_status_is_ready() {
                     service_id: "openclaw".to_string(),
                     phase: "resources-applied".to_string(),
                     bootstrap_generation: 1,
+                    mesh_generation: 0,
                     applied_resources: BTreeMap::new(),
                     mesh_fingerprint: None,
                     app_ready: false,
@@ -1284,7 +1286,7 @@ a2a:
     assert_eq!(ext.cache_ttl_sec, 120);
     assert_eq!(
         ext.ports.iter().map(|port| port.port).collect::<Vec<_>>(),
-        vec![18789, 18800]
+        vec![18789]
     );
     assert_eq!(ext.rekor.artifact_id, "openclaw-release");
 
@@ -1295,6 +1297,14 @@ a2a:
     .unwrap();
     let err = render_agent_card(&disabled, "198.51.100.20", &meta).unwrap_err();
     assert!(err.to_string().contains("a2a is disabled"));
+
+    let no_connect = AgentSpec::from_yaml(
+        &yaml.replace("  connect: [18789]\n", "  connect: []\n"),
+        Path::new("/project"),
+    )
+    .unwrap();
+    let err = render_agent_card(&no_connect, "198.51.100.20", &meta).unwrap_err();
+    assert!(err.to_string().contains("a2a requires service.connect"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 pub const LOCAL_SERVICE_STATE_SCHEMA_VERSION: &str = "confidential-agent/service-state/v1";
@@ -209,6 +209,18 @@ pub struct MeshService {
     pub connect: Vec<u16>,
 }
 
+pub fn confidential_ports(ports: &[u16], connect: &[u16]) -> Vec<u16> {
+    let connect = connect.iter().copied().collect::<BTreeSet<_>>();
+    let mut ports = ports
+        .iter()
+        .copied()
+        .filter(|port| !connect.contains(port))
+        .collect::<Vec<_>>();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceDirectory {
     pub schema: String,
@@ -226,6 +238,8 @@ pub struct ServiceDirectoryService {
 pub struct ServiceDirectoryPort {
     pub address: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,6 +259,8 @@ pub struct DaemonStatus {
     pub service_id: String,
     pub phase: String,
     pub bootstrap_generation: u64,
+    #[serde(default)]
+    pub mesh_generation: u64,
     #[serde(default)]
     pub applied_resources: BTreeMap<String, AppliedResourceState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
