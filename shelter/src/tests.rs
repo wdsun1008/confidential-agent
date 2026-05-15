@@ -1,7 +1,9 @@
 use super::*;
 use confidential_agent_core::peerings::{PeeringEntry, PeeringRole};
 use confidential_agent_core::spec::AgentSpec;
+use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SPEC: &str = r#"
 schema: confidential-agent/v1
@@ -93,7 +95,7 @@ fn renders_release_shelter_build_without_ssh_key_name() {
     assert!(!rendered.contains("/project/secrets/debug_ssh.pub"));
     assert!(rendered.contains("trustiflux:"));
     assert!(rendered.contains("tng: true"));
-    assert!(rendered.contains("cryptpilot-fde: cryptpilot-fde"));
+    assert!(rendered.contains("cryptpilot-fde:"));
     assert!(rendered.contains("disk-crypt:"));
     assert!(rendered.contains("fde_config_file: /build/fde.toml"));
     assert!(rendered.contains("99confidential-agent-secret-fetch"));
@@ -378,4 +380,33 @@ fn local_image_import_name_defaults_to_build_id() {
 
     assert!(rendered.contains("name: openclaw-agent-release"));
     assert!(!rendered.contains("bucket:"));
+}
+
+#[test]
+fn preferred_tool_path_uses_first_existing_candidate() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "confidential-agent-shelter-tool-test-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("missing-tool");
+    let candidate = dir.join("cryptpilot-fde");
+    fs::write(&candidate, b"test").unwrap();
+
+    let selected =
+        preferred_existing_tool_path([missing.as_path(), candidate.as_path()], "fallback");
+
+    assert_eq!(selected, candidate.to_string_lossy());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn preferred_tool_path_falls_back_when_no_candidate_exists() {
+    let selected = preferred_existing_tool_path(["/definitely/missing/cryptpilot-fde"], "fallback");
+
+    assert_eq!(selected, "fallback");
 }
