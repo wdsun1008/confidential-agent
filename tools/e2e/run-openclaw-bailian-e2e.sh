@@ -66,7 +66,7 @@ record_connect_diagnostics() {
   local log_path="$WORK_DIR/connect.log"
   [[ -s "$log_path" ]] || return 0
   local summary="$WORK_DIR/connect-summary.log"
-  grep -E '^(connect )|ERROR|WARN|All of the|Failed during|Verification completed|Quote DCAP check|access_log=' "$log_path" \
+  grep -E '^(connect )|ERROR|WARN|Caused by:|Failed during|Failed to send|client error|Failed to establish|No attestation|Token verification|InvalidSignature|All of the|Verification completed|Quote DCAP check|MRCONFIGID|EventLog|Tdx Verifier|access_log=' "$log_path" \
     | sed -E 's/token: "[^"]+"/token: "<redacted>"/g' \
     | tail -n 120 >"$summary" || true
   if [[ -s "$summary" ]]; then
@@ -758,7 +758,7 @@ probe_mcp_from_openclaw_guest() {
   fi
 }
 
-probe_openclaw_from_mcp_guest() {
+probe_openclaw_connect_from_mcp_guest() {
   local state_json="$1"
   local info="$WORK_DIR/mcp-ssh.env"
   extract_service_ssh_info "$state_json" mcp "$info"
@@ -766,23 +766,46 @@ probe_openclaw_from_mcp_guest() {
   source "$info"
   chmod 0600 "$MCP_SSH_KEY"
 
-  log "probing OpenClaw from MCP guest through TNG mesh"
+  log "probing OpenClaw connect port from MCP guest through mesh single-direction RA"
   wait_for_ssh "$MCP_IP" "$MCP_SSH_KEY" 180
-  wait_for_guest_tcp_port "$MCP_IP" "$MCP_SSH_KEY" 18789 240 "MCP guest TNG ingress for OpenClaw"
-  record_cmd "ssh -i <debug_ssh> root@$MCP_IP 'curl http://127.0.0.1:18789/openclaw through TNG mesh'"
+  record_cmd "ssh -i <debug_ssh> root@$MCP_IP 'verify OpenClaw connect service-directory entry and curl http://127.0.0.1:18789/openclaw'"
   if ! ssh -i "$MCP_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=10 root@"$MCP_IP" \
-    "timeout 180s bash -lc 'for i in \$(seq 1 60); do if curl --noproxy \"*\" -fsS --max-time 3 -o /tmp/openclaw-peer.html http://127.0.0.1:18789/openclaw; then wc -c /tmp/openclaw-peer.html; exit 0; fi; sleep 3; done; echo \"=== trusted-network-gateway ===\"; systemctl status trusted-network-gateway.service --no-pager -l || true; echo \"=== tng journal ===\"; journalctl -u trusted-network-gateway.service -n 120 --no-pager || true; echo \"=== listening sockets ===\"; ss -ltnp || true; exit 1'" \
+    "timeout 420s bash -lc 'node <<\"NODE\"
+const fs = require(\"fs\");
+const directory = JSON.parse(fs.readFileSync(\"/etc/cai/service-directory.json\", \"utf8\"));
+const entry = (directory.services?.openclaw?.ports || []).find((port) => Number(port.port) === 18789);
+if (!entry) throw new Error(\"service-directory is missing openclaw connect port 18789\");
+if (entry.mode !== \"connect\") throw new Error(\"expected openclaw port 18789 mode=connect, got \" + entry.mode);
+const config = JSON.parse(fs.readFileSync(\"/etc/tng/config.json\", \"utf8\"));
+const ingress = (config.add_ingress || []).find((item) => Number(item.mapping?.out?.port) === 18789);
+if (!ingress) throw new Error(\"TNG config is missing ingress to openclaw port 18789\");
+if (!ingress.verify) throw new Error(\"connect ingress must verify peer service attestation\");
+if (ingress.attest) throw new Error(\"connect ingress must not require caller attestation\");
+console.log(JSON.stringify({service: \"openclaw\", port: entry.port, mode: entry.mode, local: ingress.mapping.in}, null, 2));
+NODE
+for i in \$(seq 1 60); do
+  if curl --noproxy \"*\" -fsS --max-time 2 -o /tmp/openclaw-from-mcp.html http://127.0.0.1:18789/openclaw; then
+    wc -c /tmp/openclaw-from-mcp.html
+    exit 0
+  fi
+  sleep 3
+done
+echo \"=== trusted-network-gateway ===\"
+systemctl status trusted-network-gateway.service --no-pager -l || true
+echo \"=== tng journal ===\"
+journalctl -u trusted-network-gateway.service -n 160 --no-pager || true
+exit 1'" \
     >"$WORK_DIR/openclaw-from-mcp.stdout" 2>"$WORK_DIR/openclaw-from-mcp.stderr"; then
-    record_file_as_block "OpenClaw probe from MCP guest stdout:" "$WORK_DIR/openclaw-from-mcp.stdout" text
+    record_file_as_block "OpenClaw connect probe from MCP stdout:" "$WORK_DIR/openclaw-from-mcp.stdout" text
     if [[ -s "$WORK_DIR/openclaw-from-mcp.stderr" ]]; then
-      record_file_as_block "OpenClaw probe from MCP guest stderr:" "$WORK_DIR/openclaw-from-mcp.stderr" text
+      record_file_as_block "OpenClaw connect probe from MCP stderr:" "$WORK_DIR/openclaw-from-mcp.stderr" text
     fi
     return 1
   fi
-  record_file_as_block "OpenClaw probe from MCP guest stdout:" "$WORK_DIR/openclaw-from-mcp.stdout" text
+  record_file_as_block "OpenClaw connect probe from MCP stdout:" "$WORK_DIR/openclaw-from-mcp.stdout" text
   if [[ -s "$WORK_DIR/openclaw-from-mcp.stderr" ]]; then
-    record_file_as_block "OpenClaw probe from MCP guest stderr:" "$WORK_DIR/openclaw-from-mcp.stderr" text
+    record_file_as_block "OpenClaw connect probe from MCP stderr:" "$WORK_DIR/openclaw-from-mcp.stderr" text
   fi
 }
 
@@ -857,7 +880,7 @@ wait_for_http() {
   local url="$1"
   local deadline=$((SECONDS + ${2:-180}))
   while (( SECONDS < deadline )); do
-    if curl -fsS -o /dev/null "$url"; then
+    if curl --noproxy '*' -fsS -o /dev/null "$url"; then
       return 0
     fi
     sleep 3
@@ -881,8 +904,9 @@ with open(sys.argv[2], "w", encoding="utf-8") as f:
         ip = (state.get("cloud") or {}).get("public_ip")
         service_id = state.get("service_id")
         debug_ssh = 1 if ((state.get("build") or {}).get("debug_ssh") or {}).get("private_key") else 0
+        mesh_generation = state.get("mesh_generation") or 0
         if ip and service_id:
-            f.write(f"{service_id} {ip} {debug_ssh}\n")
+            f.write(f"{service_id} {ip} {debug_ssh} {mesh_generation}\n")
 PY
   if [[ ! -s "$endpoints" ]]; then
     echo "no live daemon status endpoints found in $state_json" >&2
@@ -890,18 +914,18 @@ PY
   fi
   while (( SECONDS < deadline )); do
     local ok=1
-    while read -r service_id ip debug_ssh; do
+    while read -r service_id ip debug_ssh mesh_generation; do
       [[ -n "$service_id" && -n "$ip" ]] || continue
       local status_path="$WORK_DIR/live-status-$service_id.json"
       if ! curl --noproxy '*' -fsS --max-time 5 "http://$ip:8088/status" -o "$status_path"; then
         ok=0
         break
       fi
-      if ! python3 - "$service_id" "$status_path" "$debug_ssh" <<'PY'
+      if ! python3 - "$service_id" "$status_path" "$debug_ssh" "$mesh_generation" <<'PY'
 import json
 import sys
 
-service_id, path, debug_ssh = sys.argv[1:4]
+service_id, path, debug_ssh, mesh_generation = sys.argv[1:5]
 with open(path, encoding="utf-8") as f:
     status = json.load(f)
 if status.get("service_id") != service_id:
@@ -911,6 +935,8 @@ if status.get("phase") != "running":
 if status.get("app_ready") is not True:
     raise SystemExit(1)
 if status.get("mesh_ready") is not True:
+    raise SystemExit(1)
+if int(status.get("mesh_generation") or 0) < int(mesh_generation or 0):
     raise SystemExit(1)
 if debug_ssh == "1" and status.get("debug_ssh_ready") is not True:
     raise SystemExit(1)
@@ -1079,9 +1105,18 @@ main() {
   collect_guest_tng_config "$WORK_DIR/status-local.json" mcp
   probe_openclaw_gateway_from_guest "$WORK_DIR/status-local.json"
   probe_mcp_from_openclaw_guest "$WORK_DIR/status-local.json"
-  probe_openclaw_from_mcp_guest "$WORK_DIR/status-local.json"
+  probe_openclaw_connect_from_mcp_guest "$WORK_DIR/status-local.json"
 
   log "starting connect"
+  record_cmd "${ca[*]} connect --render-only"
+  "${ca[@]}" connect --render-only \
+    >"$WORK_DIR/connect-rendered-config.json" \
+    2>"$WORK_DIR/connect-rendered-config.stderr"
+  record_file_as_block "Rendered connect TNG config:" "$WORK_DIR/connect-rendered-config.json" json
+  if [[ -s "$WORK_DIR/connect-rendered-config.stderr" ]]; then
+    record_file_as_block "Rendered connect TNG config stderr:" "$WORK_DIR/connect-rendered-config.stderr" text
+  fi
+
   record_cmd "${ca[*]} connect"
   setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
     "${ca[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
@@ -1094,8 +1129,9 @@ main() {
 
   if ! wait_for_http "http://127.0.0.1:$connect_port/openclaw" 180; then
     record ""
-    record "Connect HTTP preflight did not return a complete response; continuing to the WebSocket chat probe."
+    record "Connect HTTP preflight did not return a complete response; failing before the WebSocket chat probe."
     record_connect_diagnostics
+    return 1
   fi
   if (( OPENCLAW_STABILIZE_SEC > 0 )); then
     log "waiting ${OPENCLAW_STABILIZE_SEC}s for OpenClaw gateway stabilization"

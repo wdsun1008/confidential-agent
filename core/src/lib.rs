@@ -9,10 +9,10 @@ pub mod util;
 #[cfg(test)]
 mod schema_tests {
     use crate::schema::{
-        BootstrapConfig, GuestResource, LocalBuildState, LocalDebugSshKey, LocalDeployState,
-        LocalServiceNetwork, LocalServiceState, LocalSpecState, MeshBundle, MeshService,
-        BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION, LOCAL_SERVICE_STATE_SCHEMA_VERSION,
-        MESH_SCHEMA_VERSION, SERVICE_DIRECTORY_SCHEMA_VERSION,
+        confidential_ports, BootstrapConfig, GuestResource, LocalBuildState, LocalDebugSshKey,
+        LocalDeployState, LocalServiceNetwork, LocalServiceState, LocalSpecState, MeshBundle,
+        MeshService, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION,
+        LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION, SERVICE_DIRECTORY_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -120,6 +120,15 @@ mod schema_tests {
 
         assert_eq!(decoded.services["svc-a"].ports, vec![18789]);
         assert_eq!(decoded.services["svc-a"].connect, vec![18789]);
+    }
+
+    #[test]
+    fn confidential_ports_are_ports_minus_connect() {
+        assert_eq!(
+            confidential_ports(&[18789, 3001, 3001, 18800], &[18789]),
+            vec![3001, 18800]
+        );
+        assert!(confidential_ports(&[18789], &[18789]).is_empty());
     }
 
     #[test]

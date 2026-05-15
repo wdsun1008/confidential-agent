@@ -85,12 +85,12 @@ AppSpec 不再包含 `allowed_cidr` 与 `peers[]` 字段。所有 SG ingress 规
 │  :8006 inject control                   — control     scope                │
 │  :22   debug ssh (debug image only)     — ssh         scope                │
 │                                                                            │
-│  service.connect 端口 (RATS-TLS server) — connect     scope                │
-│  service.ports 全集 (RATS-TLS server)   — mesh        scope                │
+│  service.connect 端口 (RATS-TLS server)           — connect + mesh scope   │
+│  service.ports - service.connect (confidential)   — mesh scope            │
 │                                                                            │
 │  TNG ingress (RATS-TLS client) → 127.0.0.1:<auto-alias> → peer:<port>      │
 │  /etc/cai/service-directory.json:                                          │
-│     services["beta"] = { ports: [{address: "127.0.0.1", port: 18000}] }    │
+│     services["beta"] = { ports: [{address: "127.0.0.1", port: 18000, mode:"connect"}] } │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -148,8 +148,8 @@ a2a-bundle 仅携带 `url + alias + scoped_services + fingerprint`，不携带 c
 | `status` | `:8088` | operator |
 | `ssh` | `:22`（仅 debug 镜像） | operator |
 | `agent_card` | `:8089` | operator + peer |
-| `connect` | `service.connect` 端口 | operator |
-| `mesh` | `service.ports` 全集 | peer |
+| `connect` | `service.connect` 端口 | operator + peer |
+| `mesh` | `service.ports - service.connect` | 显式 scope / 同 state-dir mesh |
 
 `role=operator` 默认不包含 `mesh`：运维通过 `connect` 端口走 RATS-TLS 接入，不直接打开 mesh 全端口。
 
@@ -295,7 +295,7 @@ BETA_IP=$(jq  -r '.deploy.public_ip' ./beta-state/services/openclaw/state.json)
 
 ### 5.6 Step 4：配置 peer peering
 
-`peering` 表示入向授权。alpha 将 `BETA_IP` 加入自身 peerings，意味着允许 beta 入向访问 alpha 的 `:8089` 与 `service.ports`。
+`peering` 表示入向授权。alpha 将 `BETA_IP` 加入自身 peerings，意味着允许 beta 入向访问 alpha 的 `:8089` 与 `service.connect` 端口。A2A 是 connect 模型，不默认开放 confidential mesh 端口。
 
 ```bash
 # alpha-mgmt
@@ -311,7 +311,7 @@ confidential-agent --state-dir ./alpha-state peering apply
 confidential-agent --state-dir ./beta-state  peering apply
 ```
 
-`role=peer` 默认 scope 为 `[agent_card, mesh]`。
+`role=peer` 默认 scope 为 `[agent_card, connect]`。如果确实要开放 confidential mesh 端口，需要显式设置 `scope: [agent_card, mesh]` 或额外声明 mesh scope。
 
 ### 5.7 Step 5：声明 a2a peer
 
@@ -322,7 +322,7 @@ confidential-agent --state-dir ./beta-state  peering apply
 confidential-agent --state-dir ./alpha-state \
   a2a add --alias beta http://${BETA_IP}:8089/.well-known/agent-card.json
 
-# beta 调 alpha
+# beta 调 alpha；只有需要反向应用调用时才需要
 confidential-agent --state-dir ./beta-state \
   a2a add --alias alpha http://${ALPHA_IP}:8089/.well-known/agent-card.json
 ```
@@ -331,7 +331,7 @@ confidential-agent --state-dir ./beta-state \
 
 - `<state-dir>/a2a.json` 写入 desired peer 记录
 - `<state-dir>/a2a-bundle.json` 重新渲染并 inject 至所有 active service 的 daemon
-- daemon 在 guest 内 fetch 对端 AgentCard，校验 `publicIp` 与 `rekorUrl`，按 AgentCard 中的 `ports` 配置 TNG ingress，写入 `/etc/cai/service-directory.json`
+- daemon 在 guest 内 fetch 对端 AgentCard，校验 `publicIp` 与 `rekorUrl`，按 AgentCard 中的 connect `ports` 配置 TNG ingress，写入 `/etc/cai/service-directory.json`
 
 CLI fetch 失败不阻塞写入；daemon 端 fetch 是权威结果。
 
@@ -525,7 +525,7 @@ openclaw  charlie unreachable -   -         -       transport error: ...
 
 ### 8.6 监控集成
 
-`status --live --json` 输出 JSON 结构供监控脚本消费。建议对 `a2a_peers[*].state` 持续处于 `error` 或 `stale` 的情况配置告警。
+`status --live --json` 输出 JSON 结构供监控脚本消费。建议对 `a2a_peers[*].state` 持续处于 `error` 或 `stale` 的情况配置告警；双向 RA mesh 的 e2e 断言应等待 `mesh_generation` 达到期望值且 `mesh_ready=true`。
 
 ---
 
@@ -622,11 +622,11 @@ confidential-agent peering apply --dry-run
 **Q2：一台管理机能管理多个组织或环境吗？**
 能。每个组织或环境使用独立的 `--state-dir`，`peerings.yaml` 与 `a2a.json` 在 state-dir 范围内隔离。
 
-**Q3：peer 的 `service.ports` 修改后如何同步？**
+**Q3：peer 的 `service.connect` 修改后如何同步？**
 对端重新 deploy 后会发布新的 AgentCard。本地执行 `a2a sync --alias <name>` 可重新注入当前 desired state；如果本地 URL / alias / service scope 没变，daemon 仍会遵守现有 cache TTL。需要立即绕过成功缓存时，变更 desired state（例如 remove 后重新 add）或等待 `cacheTtlSec` 到期。
 
 **Q4：未持有部署方 state-dir 时如何接入？**
-使用 `connect --from-card`，前提是接入方 IP 已被部署方加入 peerings（`scope=agent_card,mesh`）。详见 §6.2。
+使用 `connect --from-card`，前提是接入方 IP 已被部署方加入 peerings（`scope=agent_card,connect`）。详见 §6.2。
 
 **Q5：AgentCard 中可见的字段有哪些？**
 公开字段：`name`、`version`、`skills`、`url`、`cacheTtlSec`、`publicIp`、`ports`、`rekor.{rekorUrl,artifactId,artifactType,artifactVersion,rvName}`、`tee`。不包含 secret、镜像哈希、cosign 公钥。

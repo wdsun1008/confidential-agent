@@ -21,7 +21,7 @@ fn rejects_excessive_octal_modes() {
 }
 
 #[test]
-fn service_directory_omits_self_and_inactive_services() {
+fn service_directory_includes_peer_connect_and_mesh_ports() {
     let bundle: MeshBundle = serde_json::from_value(json!({
         "schema": "confidential-agent/mesh-bundle/v1",
         "generation": 1,
@@ -34,8 +34,13 @@ fn service_directory_omits_self_and_inactive_services() {
             },
             "peer": {
                 "phase": "active",
-                "ports": [3001],
-                "connect": []
+                "ports": [3001, 3002],
+                "connect": [3002]
+            },
+            "connect-only": {
+                "phase": "active",
+                "ports": [4001],
+                "connect": [4001]
             },
             "old": {
                 "phase": "deleted",
@@ -52,7 +57,25 @@ fn service_directory_omits_self_and_inactive_services() {
 
     assert!(directory["services"].get("self").is_none());
     assert!(directory["services"].get("old").is_none());
+    assert_eq!(
+        directory["services"]["connect-only"]["ports"][0]["port"],
+        4001
+    );
+    assert_eq!(
+        directory["services"]["connect-only"]["ports"][0]["mode"],
+        "connect"
+    );
+    assert_eq!(
+        directory["services"]["peer"]["ports"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(directory["services"]["peer"]["ports"][0]["port"], 3001);
+    assert_eq!(directory["services"]["peer"]["ports"][0]["mode"], "mesh");
+    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 3002);
+    assert_eq!(directory["services"]["peer"]["ports"][1]["mode"], "connect");
 }
 
 #[test]
@@ -301,11 +324,70 @@ fn tng_config_adds_egress_for_self_ports() {
     );
     assert_eq!(config["add_egress"][0]["netfilter"]["listen_port"], 39000);
     assert_eq!(config["add_egress"][0]["attest"]["aa_type"], "uds");
+    assert!(config["add_egress"][0].get("verify").is_none());
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 0);
 }
 
 #[test]
-fn tng_config_adds_builtin_as_ingress_for_peer_services() {
+fn tng_config_adds_verify_for_confidential_self_ports() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": "confidential-agent/mesh-bundle/v1",
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "self": {
+                "phase": "active",
+                "private_ip": "10.0.1.10",
+                "public_ip": "47.95.242.63",
+                "ports": [18789, 18800],
+                "connect": [18789]
+            },
+            "peer": {
+                "phase": "active",
+                "private_ip": "10.0.1.11",
+                "public_ip": "39.105.93.168",
+                "ports": [3001],
+                "connect": []
+            },
+            "connect-only-peer": {
+                "phase": "active",
+                "private_ip": "10.0.1.12",
+                "public_ip": "39.105.93.169",
+                "ports": [4001],
+                "connect": [4001]
+            }
+        },
+        "reference_values": {
+            "peer": {"measurement.uki.SHA-384": ["abc123"]},
+            "connect-only-peer": {"measurement.uki.SHA-384": ["def456"]}
+        },
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+
+    let config = tng_config(&bundle, "self").unwrap();
+
+    assert!(config["add_egress"][0].get("verify").is_none());
+    assert_eq!(
+        config["add_egress"][1]["netfilter"]["capture_dst"]["port"],
+        18800
+    );
+    assert_eq!(config["add_egress"][1]["verify"]["as_type"], "builtin");
+    assert_eq!(
+        config["add_egress"][1]["verify"]["reference_values"][0]["type"],
+        "sample"
+    );
+    assert_eq!(
+        config["add_egress"][1]["verify"]["reference_values"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
     let bundle: MeshBundle = serde_json::from_value(json!({
         "schema": "confidential-agent/mesh-bundle/v1",
         "generation": 1,
@@ -322,12 +404,20 @@ fn tng_config_adds_builtin_as_ingress_for_peer_services() {
                 "phase": "active",
                 "private_ip": "10.0.1.11",
                 "public_ip": "39.105.93.168",
-                "ports": [3001],
-                "connect": []
+                "ports": [3001, 3002],
+                "connect": [3002]
+            },
+            "remote-connect": {
+                "phase": "active",
+                "private_ip": "10.0.1.12",
+                "public_ip": "39.105.93.169",
+                "ports": [4001],
+                "connect": [4001]
             }
         },
         "reference_values": {
-            "mcp": {"measurement.uki.SHA-384": ["abc123"]}
+            "mcp": {"measurement.uki.SHA-384": ["abc123"]},
+            "remote-connect": {"measurement.uki.SHA-384": ["def456"]}
         },
         "rekor_reference_values": {}
     }))
@@ -350,6 +440,16 @@ fn tng_config_adds_builtin_as_ingress_for_peer_services() {
         config["add_ingress"][0]["verify"]["reference_values"][0]["type"],
         "sample"
     );
+    assert_eq!(config["add_ingress"][0]["attest"]["aa_type"], "uds");
+    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 3002);
+    assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 3002);
+    assert_eq!(config["add_ingress"][1]["verify"]["as_type"], "builtin");
+    assert!(config["add_ingress"][1].get("attest").is_none());
+    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 4001);
+    assert_eq!(config["add_ingress"][2]["mapping"]["out"]["port"], 4001);
+    assert_eq!(config["add_ingress"][2]["verify"]["as_type"], "builtin");
+    assert!(config["add_ingress"][2].get("attest").is_none());
+    assert_eq!(config["add_ingress"].as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -732,6 +832,7 @@ fn a2a_tng_ingress_fetches_agent_card_and_generates_config() {
 
     let rv = &ingress[0]["verify"]["reference_values"][0];
     assert_eq!(rv["type"], "slsa");
+    assert!(ingress[0].get("attest").is_none());
     assert_eq!(
         rv["payload"]["content"]["rv_list"][0]["id"],
         "remote-agent-release"
