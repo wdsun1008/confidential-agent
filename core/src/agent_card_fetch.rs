@@ -10,6 +10,8 @@ const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 const MAX_AGENT_CARD_BODY_BYTES: u64 = 64 * 1024;
 const BODY_PREVIEW_BYTES: usize = 256;
 const DEFAULT_TRUSTED_REKOR_URL: &str = "https://rekor.sigstore.dev";
+const AGENT_CARD_FETCH_ATTEMPTS: usize = 3;
+const AGENT_CARD_FETCH_RETRY_DELAY_MS: u64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAgentCardUrl {
@@ -156,6 +158,24 @@ pub fn parse_agent_card_url(
 
 pub fn fetch_agent_card(url: &str) -> std::result::Result<AgentCard, AgentCardFetchError> {
     let parsed = parse_agent_card_url(url)?;
+    let mut attempt = 1;
+    loop {
+        match fetch_agent_card_once(url, &parsed) {
+            Ok(card) => return Ok(card),
+            Err(AgentCardFetchError::Transport(_)) if attempt < AGENT_CARD_FETCH_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(AGENT_CARD_FETCH_RETRY_DELAY_MS));
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn fetch_agent_card_once(
+    url: &str,
+    parsed: &ParsedAgentCardUrl,
+) -> std::result::Result<AgentCard, AgentCardFetchError> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(10))
@@ -193,7 +213,7 @@ pub fn fetch_agent_card(url: &str) -> std::result::Result<AgentCard, AgentCardFe
             AgentCardFetchError::SchemaValidation(err.to_string())
         }
     })?;
-    verify_agent_card_trust(&card, &parsed)?;
+    verify_agent_card_trust(&card, parsed)?;
     Ok(card)
 }
 
@@ -228,8 +248,13 @@ pub fn verify_agent_card_trust(
 }
 
 pub fn trusted_rekor_urls() -> Vec<String> {
-    let raw = std::env::var("CA_TRUSTED_REKOR_URLS")
-        .unwrap_or_else(|_| DEFAULT_TRUSTED_REKOR_URL.to_string());
+    parse_trusted_rekor_urls(std::env::var("CA_TRUSTED_REKOR_URLS").ok().as_deref())
+}
+
+fn parse_trusted_rekor_urls(env_value: Option<&str>) -> Vec<String> {
+    let Some(raw) = env_value else {
+        return vec![DEFAULT_TRUSTED_REKOR_URL.to_string()];
+    };
     let values = raw
         .split(',')
         .map(str::trim)
@@ -295,4 +320,158 @@ fn normalize_url(url: &str) -> String {
 
 pub fn fetch_agent_card_result(url: &str) -> Result<AgentCard> {
     fetch_agent_card(url).map_err(anyhow::Error::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(url: &str) -> std::result::Result<ParsedAgentCardUrl, AgentCardFetchError> {
+        parse_agent_card_url(url)
+    }
+
+    fn invalid_msg(err: AgentCardFetchError) -> String {
+        match err {
+            AgentCardFetchError::InvalidUrl(msg) => msg,
+            other => panic!("expected InvalidUrl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_canonical_http_with_explicit_port() {
+        let parsed = parse("http://1.2.3.4:8089/.well-known/agent-card.json").unwrap();
+        assert_eq!(parsed.scheme, "http");
+        assert_eq!(parsed.host, "1.2.3.4");
+        assert_eq!(parsed.port, 8089);
+    }
+
+    #[test]
+    fn parse_uses_default_port_for_https() {
+        let parsed = parse("https://agent.example/.well-known/agent-card.json").unwrap();
+        assert_eq!(parsed.scheme, "https");
+        assert_eq!(parsed.port, 443);
+    }
+
+    #[test]
+    fn parse_uses_default_port_for_http() {
+        let parsed = parse("http://agent.example/.well-known/agent-card.json").unwrap();
+        assert_eq!(parsed.port, 80);
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_scheme() {
+        let err = parse("ftp://1.2.3.4/.well-known/agent-card.json").unwrap_err();
+        assert!(invalid_msg(err).contains("scheme must be http"));
+    }
+
+    #[test]
+    fn parse_rejects_whitespace_or_control_characters() {
+        for value in [
+            "http://1.2.3.4/.well-known/ag ent-card.json",
+            "http://1.2.3.4\t/.well-known/agent-card.json",
+            "http://1.2.3.4\n/.well-known/agent-card.json",
+        ] {
+            let err = parse(value).unwrap_err();
+            assert!(
+                invalid_msg(err).contains("whitespace or control characters"),
+                "value {value:?} did not produce expected error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_userinfo_query_and_fragment() {
+        let cases = [
+            (
+                "http://user:pw@1.2.3.4/.well-known/agent-card.json",
+                "userinfo",
+            ),
+            ("http://1.2.3.4/.well-known/agent-card.json?x=1", "query"),
+            ("http://1.2.3.4/.well-known/agent-card.json#frag", "query"),
+        ];
+        for (url, fragment) in cases {
+            let err = parse(url).unwrap_err();
+            let msg = invalid_msg(err);
+            assert!(
+                msg.contains(fragment),
+                "url {url:?} produced unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_ipv6_host_syntax() {
+        let err = parse("http://[::1]:8089/.well-known/agent-card.json").unwrap_err();
+        assert!(invalid_msg(err).contains("IPv6"));
+    }
+
+    #[test]
+    fn parse_rejects_path_other_than_well_known() {
+        let err = parse("http://1.2.3.4/other.json").unwrap_err();
+        assert!(invalid_msg(err).contains(AGENT_CARD_PATH));
+    }
+
+    #[test]
+    fn parse_rejects_zero_or_oversize_port() {
+        let zero = parse("http://1.2.3.4:0/.well-known/agent-card.json").unwrap_err();
+        assert!(invalid_msg(zero).contains("port must be 1..65535"));
+        let huge = parse("http://1.2.3.4:99999/.well-known/agent-card.json").unwrap_err();
+        assert!(invalid_msg(huge).contains("port must be 1..65535"));
+    }
+
+    #[test]
+    fn parse_rejects_empty_host() {
+        // Authority is empty before the path => fail.
+        let err = parse("http:///.well-known/agent-card.json").unwrap_err();
+        assert!(invalid_msg(err).contains("host"));
+    }
+
+    #[test]
+    fn parse_rejects_url_without_path() {
+        let err = parse("http://1.2.3.4").unwrap_err();
+        assert!(invalid_msg(err).contains(AGENT_CARD_PATH));
+    }
+
+    #[test]
+    fn is_json_content_type_recognises_canonical_and_extended_types() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("Application/JSON"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(is_json_content_type("application/vnd.example+json"));
+        assert!(!is_json_content_type("text/json"));
+        assert!(!is_json_content_type("text/plain"));
+        assert!(!is_json_content_type(""));
+    }
+
+    #[test]
+    fn normalize_url_strips_trailing_slashes_and_whitespace() {
+        assert_eq!(normalize_url("https://example/"), "https://example");
+        assert_eq!(normalize_url("  https://example  "), "https://example");
+        assert_eq!(normalize_url("https://example///"), "https://example");
+    }
+
+    #[test]
+    fn trusted_rekor_urls_uses_default_when_env_unset() {
+        let urls = parse_trusted_rekor_urls(None);
+        assert_eq!(urls, vec![DEFAULT_TRUSTED_REKOR_URL.to_string()]);
+    }
+
+    #[test]
+    fn trusted_rekor_urls_parses_env_with_commas_and_whitespace() {
+        let urls =
+            parse_trusted_rekor_urls(Some("https://rekor.example  ,  https://other.example,  ,"));
+        assert_eq!(
+            urls,
+            vec![
+                "https://rekor.example".to_string(),
+                "https://other.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_rekor_urls_falls_back_to_default_when_env_value_is_only_separators() {
+        let urls = parse_trusted_rekor_urls(Some(", , ,"));
+        assert_eq!(urls, vec![DEFAULT_TRUSTED_REKOR_URL.to_string()]);
+    }
 }
