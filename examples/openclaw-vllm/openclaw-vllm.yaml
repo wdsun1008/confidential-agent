@@ -21,7 +21,13 @@ build:
     - gcc
     - glibc-devel
     - jq
-    - kernel-devel-5.10.134-19.1.al8
+    # Match whatever kernel-core/kernel-modules shelter >= 2026-05-14
+    # (commit be1e7aa "Install build kernel from image packages by
+    # default") installs from image packages. Pinning a specific patch
+    # level here previously caused an ABI mismatch with the newer
+    # kernel-modules dnf picked, breaking the NVIDIA driver compile at
+    # insmod time ("disagrees about version of symbol fd_install").
+    - kernel-devel
     - kernel-headers
     - kmod
     - make

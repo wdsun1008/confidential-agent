@@ -365,7 +365,7 @@ $base_image_yaml
   image_name: openclaw-vllm-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
-  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, glibc-devel, jq, kernel-devel-5.10.134-19.1.al8, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
     - source: ./nvidia-persistenced.service
       target: /usr/local/share/cai/nvidia-persistenced.service
