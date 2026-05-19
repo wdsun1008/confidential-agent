@@ -410,3 +410,22 @@ fn preferred_tool_path_falls_back_when_no_candidate_exists() {
 
     assert_eq!(selected, "fallback");
 }
+
+#[test]
+fn renders_explicit_rootfs_integrity_for_modern_shelter() {
+    // Shelter >= 2026-05-14 (commit 09ae0f1 "Default builds to rootfs
+    // integrity") infers reference-value extraction from
+    // `disk-crypt.rootfs.integrity` and removed the dedicated
+    // `security.extract_reference_values` field. Render must therefore
+    // (a) include `rootfs: integrity: true` inside `disk-crypt:` so the
+    // intent survives any future default flip, and (b) NOT emit the
+    // legacy `extract_reference_values` field that newer SecurityConfig
+    // structs no longer document.
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
+
+    assert!(rendered.contains("disk-crypt:"));
+    assert!(rendered.contains("rootfs:"));
+    assert!(rendered.contains("integrity: true"));
+    assert!(!rendered.contains("extract_reference_values"));
+}

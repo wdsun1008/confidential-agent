@@ -493,7 +493,6 @@ struct ShelterSecurity {
     tng: bool,
     #[serde(rename = "disk-crypt")]
     disk_crypt: ShelterDiskCrypt,
-    extract_reference_values: bool,
 }
 
 impl ShelterSecurity {
@@ -507,7 +506,6 @@ impl ShelterSecurity {
             trustiflux: ShelterTrustiflux::challenge_defaults(),
             tng: true,
             disk_crypt: ShelterDiskCrypt::writable_layer_defaults(assets, spec),
-            extract_reference_values: true,
         }
     }
 }
@@ -523,6 +521,7 @@ struct ShelterHarden {
 #[derive(Debug, Serialize)]
 struct ShelterDiskCrypt {
     fde_config_file: PathBuf,
+    rootfs: ShelterDiskCryptRootfs,
     uki: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     uki_append_cmdline: Option<String>,
@@ -532,10 +531,21 @@ impl ShelterDiskCrypt {
     fn writable_layer_defaults(assets: &GuestAssets, spec: &AgentSpec) -> Self {
         Self {
             fde_config_file: assets.fde_config_file.clone(),
+            // Shelter >= 2026-05-14 (commit 09ae0f1) drives reference-value
+            // extraction off `disk-crypt.rootfs.integrity` and dropped the
+            // `security.extract_reference_values` field. We always want
+            // dm-verity reference values for the rootfs UKI build, so set
+            // it explicitly rather than relying on shelter's default.
+            rootfs: ShelterDiskCryptRootfs { integrity: true },
             uki: true,
             uki_append_cmdline: spec.build.kernel_cmdline_append.clone(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterDiskCryptRootfs {
+    integrity: bool,
 }
 
 #[derive(Debug, Serialize)]

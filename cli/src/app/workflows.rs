@@ -79,6 +79,14 @@ pub(super) fn inject_resources(
         &disk_passphrase,
         tee,
     )?;
+    challenge_inject(
+        cli,
+        state_dir,
+        target_ip,
+        "default/local-resources/data_passphrase",
+        &disk_passphrase,
+        tee,
+    )?;
 
     for (id, resource) in &spec.resources {
         if !resource.source.exists() {
@@ -613,7 +621,7 @@ pub(super) fn render_agent_card_connect_config_with_port_checker(
 ) -> Result<serde_json::Value> {
     let ext = confidential_extension(card)?;
     let mut used_local_ports = BTreeSet::new();
-    let control_port = allocate_local_port(50000, |port| is_occupied(port))?;
+    let control_port = allocate_local_port(50000, &is_occupied)?;
     used_local_ports.insert(control_port);
     derive_tng_client_config_with_local_ports(
         card,

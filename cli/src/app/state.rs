@@ -104,12 +104,13 @@ pub(super) fn absolute_path_for_state(path: &Path) -> PathBuf {
 }
 
 pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
-    let status = shelter_command(cli, args)
+    let shelter_bin = effective_shelter_bin(cli);
+    let status = shelter_command_with_bin(&shelter_bin, args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .with_context(|| format!("failed to execute '{}'", cli.shelter_bin.display()))?;
+        .with_context(|| format!("failed to execute '{}'", shelter_bin.display()))?;
 
     if !status.success() {
         bail!(
@@ -121,10 +122,32 @@ pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn shelter_command(cli: &Cli, args: &mut [OsString]) -> Command {
-    let mut command = Command::new(&cli.shelter_bin);
+fn shelter_command_with_bin(bin: &Path, args: &mut [OsString]) -> Command {
+    let mut command = Command::new(bin);
     command.args(args);
     command
+}
+
+fn effective_shelter_bin(cli: &Cli) -> PathBuf {
+    effective_shelter_bin_from_candidates(
+        cli,
+        &[
+            PathBuf::from("/usr/bin/shelter"),
+            PathBuf::from("/usr/local/bin/shelter"),
+        ],
+    )
+}
+
+pub(super) fn effective_shelter_bin_from_candidates(cli: &Cli, candidates: &[PathBuf]) -> PathBuf {
+    if cli.shelter_bin != PathBuf::from("shelter") || std::env::var_os("CA_SHELTER_BIN").is_some() {
+        return cli.shelter_bin.clone();
+    }
+
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+        .unwrap_or_else(|| cli.shelter_bin.clone())
 }
 
 pub(super) fn resolve_deploy_observation(
