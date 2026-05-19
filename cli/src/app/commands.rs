@@ -1238,10 +1238,19 @@ fn fetch_daemon_status(host: &str) -> Result<DaemonStatus> {
 }
 
 fn wait_for_daemon_status(host: &str) -> Result<DaemonStatus> {
+    // Override via `CA_DAEMON_STATUS_WAIT_SEC=N` when the guest is known to
+    // take longer to converge (e.g. cross-org A2A pairs whose mesh peer
+    // can race the first /status probe). Falls back to the conservative
+    // 180s default used by single-instance deploys.
+    let timeout = std::env::var("CA_DAEMON_STATUS_WAIT_SEC")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DAEMON_STATUS_WAIT_TIMEOUT);
     wait_for_daemon_status_from(
         host,
         DAEMON_STATUS_PORT,
-        DAEMON_STATUS_WAIT_TIMEOUT,
+        timeout,
         DAEMON_STATUS_WAIT_INTERVAL,
     )
 }
