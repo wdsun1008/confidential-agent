@@ -1078,3 +1078,250 @@ fn default_pids_limit() -> u64 {
 fn default_docker_network_mode() -> String {
     "none".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_allowed(prefixes: Vec<String>) -> PepConfig {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.allowed_workspace_prefixes = prefixes;
+        config
+    }
+
+    fn deny_rule(err: PepError) -> String {
+        match err {
+            PepError::PolicyDeny { rule_id, .. } => rule_id,
+            other => panic!("expected PolicyDeny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_attestation_args_uses_documented_defaults() {
+        let req = parse_attestation_args(&["collect-and-verify".to_string()]).unwrap();
+
+        assert_eq!(req.aa_url, "http://localhost:8006");
+        assert_eq!(req.tee, "tdx");
+        assert_eq!(req.policy, "default");
+        assert!(!req.claims);
+    }
+
+    #[test]
+    fn parse_attestation_args_consumes_each_flag() {
+        let req = parse_attestation_args(&[
+            "collect-and-verify".to_string(),
+            "--aa-url".to_string(),
+            "http://10.0.0.1:8006".to_string(),
+            "--tee".to_string(),
+            "sgx".to_string(),
+            "--policy".to_string(),
+            "strict".to_string(),
+            "--claims".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(req.aa_url, "http://10.0.0.1:8006");
+        assert_eq!(req.tee, "sgx");
+        assert_eq!(req.policy, "strict");
+        assert!(req.claims);
+    }
+
+    #[test]
+    fn parse_attestation_args_rejects_unsupported_subcommand() {
+        let err = parse_attestation_args(&["status".to_string()]).unwrap_err();
+        assert!(err.contains("unsupported attest subcommand: status"));
+    }
+
+    #[test]
+    fn parse_attestation_args_requires_a_subcommand() {
+        let err = parse_attestation_args(&[]).unwrap_err();
+        assert!(err.contains("attest requires a subcommand"));
+    }
+
+    #[test]
+    fn parse_attestation_args_rejects_missing_value() {
+        let err =
+            parse_attestation_args(&["collect-and-verify".to_string(), "--aa-url".to_string()])
+                .unwrap_err();
+        assert!(err.contains("--aa-url requires a value"));
+    }
+
+    #[test]
+    fn parse_attestation_args_rejects_unknown_flag() {
+        let err =
+            parse_attestation_args(&["collect-and-verify".to_string(), "--bogus".to_string()])
+                .unwrap_err();
+        assert!(err.contains("unknown attest argument: --bogus"));
+    }
+
+    #[test]
+    fn try_parse_attestation_shell_command_matches_canonical_invocation() {
+        let req = try_parse_attestation_shell_command(
+            "/usr/local/bin/cai-pep attest collect-and-verify --tee tdx",
+            "audit-1",
+        )
+        .unwrap()
+        .expect("expected an attestation request to be parsed");
+
+        assert_eq!(req.tee, "tdx");
+        assert_eq!(req.aa_url, "http://localhost:8006");
+    }
+
+    #[test]
+    fn try_parse_attestation_shell_command_returns_none_for_other_binary() {
+        // The fast-path filter requires the literal substring; anything not
+        // matching it must short-circuit to None without parsing.
+        let result = try_parse_attestation_shell_command("/usr/bin/echo hello", "audit-1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_parse_attestation_shell_command_returns_none_when_subcommand_is_not_attest() {
+        // The substring filter accepts "cai-pep attest" but we must still
+        // reject when the parsed argv shape is not `cai-pep attest …`.
+        let result =
+            try_parse_attestation_shell_command("/bin/cai-pep attestation foo", "audit-1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_parse_attestation_shell_command_rejects_unbalanced_quotes() {
+        let err = try_parse_attestation_shell_command(
+            "/bin/cai-pep attest collect-and-verify --tee \"tdx",
+            "audit-1",
+        )
+        .unwrap_err();
+        assert_eq!(deny_rule(err), "command.attest_parse");
+    }
+
+    #[test]
+    fn try_parse_attestation_shell_command_surfaces_attest_arg_errors() {
+        let err = try_parse_attestation_shell_command(
+            "/bin/cai-pep attest collect-and-verify --bogus",
+            "audit-1",
+        )
+        .unwrap_err();
+        assert_eq!(deny_rule(err), "command.attest_invalid");
+    }
+
+    #[test]
+    fn ensure_allowed_workdir_accepts_canonical_prefix_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let nested = workspace.join("project/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let config = config_with_allowed(vec![workspace.to_string_lossy().to_string()]);
+
+        ensure_allowed_workdir(&nested, &config, "audit-1").unwrap();
+    }
+
+    #[test]
+    fn ensure_allowed_workdir_rejects_outside_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let outside = std::env::temp_dir().canonicalize().unwrap();
+        let config = config_with_allowed(vec![workspace.to_string_lossy().to_string()]);
+
+        let err = ensure_allowed_workdir(&outside, &config, "audit-1").unwrap_err();
+        assert_eq!(deny_rule(err), "fs.workdir_prefix");
+    }
+
+    #[test]
+    fn ensure_allowed_workdir_skips_missing_prefix_silently() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        // The only allowed prefix on disk does match — but we add a
+        // non-existent prefix first to confirm `canonicalize_existing_dir`
+        // failure does not abort the search.
+        let config = config_with_allowed(vec![
+            "/this/path/does/not/exist".to_string(),
+            workspace.to_string_lossy().to_string(),
+        ]);
+
+        ensure_allowed_workdir(&workspace, &config, "audit-1").unwrap();
+    }
+
+    #[test]
+    fn ensure_command_policy_matches_denied_pattern_case_insensitively() {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.denied_command_patterns = vec!["RM -RF".to_string()];
+
+        let err = ensure_command_policy("rm -rf /workspace/foo", &config, "audit-1").unwrap_err();
+        assert_eq!(deny_rule(err), "command.deny_pattern");
+    }
+
+    #[test]
+    fn ensure_command_policy_matches_denied_path_prefix() {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.denied_command_patterns = Vec::new();
+        config.denied_path_prefixes = vec!["/etc".to_string()];
+
+        let err = ensure_command_policy("cat /etc/passwd", &config, "audit-1").unwrap_err();
+        assert_eq!(deny_rule(err), "fs.deny_prefix");
+    }
+
+    #[test]
+    fn ensure_command_policy_allows_safe_command() {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.denied_command_patterns = vec!["rm -rf".to_string()];
+        config.denied_path_prefixes = vec!["/etc".to_string()];
+
+        ensure_command_policy("ls /workspace", &config, "audit-1").unwrap();
+    }
+
+    #[test]
+    fn host_to_container_path_maps_workspace_root_to_mount_target() {
+        let config: PepConfig = serde_json::from_str("{}").unwrap();
+        let root = Path::new("/workspace");
+
+        let mapped = host_to_container_path(root, root, &config).unwrap();
+        assert_eq!(mapped, "/workspace");
+    }
+
+    #[test]
+    fn host_to_container_path_keeps_relative_tail() {
+        let config: PepConfig = serde_json::from_str("{}").unwrap();
+        let root = Path::new("/workspace");
+        let nested = Path::new("/workspace/proj/sub");
+
+        let mapped = host_to_container_path(nested, root, &config).unwrap();
+        assert_eq!(mapped, "/workspace/proj/sub");
+    }
+
+    #[test]
+    fn host_to_container_path_strips_trailing_slash_on_mount_target() {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.workspace_mount_target = "/sandbox/".to_string();
+        let root = Path::new("/workspace");
+        let nested = Path::new("/workspace/proj");
+
+        let mapped = host_to_container_path(nested, root, &config).unwrap();
+        assert_eq!(mapped, "/sandbox/proj");
+    }
+
+    #[test]
+    fn host_to_container_path_rejects_workdir_outside_root() {
+        let config: PepConfig = serde_json::from_str("{}").unwrap();
+        let err = host_to_container_path(
+            Path::new("/elsewhere/proj"),
+            Path::new("/workspace"),
+            &config,
+        )
+        .unwrap_err();
+        assert!(err.contains("outside workspace root"));
+    }
+
+    #[test]
+    fn summarize_command_passes_short_strings_through() {
+        let short = "echo hi";
+        assert_eq!(summarize_command(short), short);
+    }
+
+    #[test]
+    fn summarize_command_truncates_oversize_with_ellipsis() {
+        let long = "x".repeat(200);
+        let summary = summarize_command(&long);
+        assert!(summary.ends_with("..."));
+        assert_eq!(summary.len(), 123); // 120 chars + "..."
+    }
+}

@@ -580,6 +580,39 @@ sys.exit(0)
     );
 }
 
+#[test]
+fn effective_shelter_bin_prefers_packaged_binary_when_default_is_used() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("CA_SHELTER_BIN");
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("usr-bin-shelter");
+    let second = temp.path().join("usr-local-bin-shelter");
+    write_script(&first, "#!/bin/sh\nexit 0\n");
+    write_script(&second, "#!/bin/sh\nexit 0\n");
+
+    let cli = test_cli();
+    assert_eq!(
+        effective_shelter_bin_from_candidates(&cli, &[first.clone(), second]),
+        first
+    );
+}
+
+#[test]
+fn effective_shelter_bin_respects_explicit_env_override() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CA_SHELTER_BIN", "shelter");
+    let temp = tempfile::tempdir().unwrap();
+    let preferred = temp.path().join("preferred-shelter");
+    write_script(&preferred, "#!/bin/sh\nexit 0\n");
+
+    let cli = test_cli();
+    assert_eq!(
+        effective_shelter_bin_from_candidates(&cli, &[preferred]),
+        PathBuf::from("shelter")
+    );
+    std::env::remove_var("CA_SHELTER_BIN");
+}
+
 fn write_fake_prepare_tools(temp: &Path) -> PathBuf {
     let current = std::env::current_exe().unwrap();
     let agentd = current.parent().unwrap().join("confidential-agentd");
@@ -2622,18 +2655,116 @@ fn challenge_inject_args_are_wrapped_with_timeout() {
 }
 
 #[test]
-fn connect_policy_defaults_to_tools_image_policy() {
-    let policy = connect_policy_config();
-
-    assert_eq!(policy["type"], "path");
-    assert_eq!(policy["path"], TOOLS_DEFAULT_POLICY_PATH);
-}
-
-#[test]
 fn local_port_allocator_skips_occupied_ports() {
     assert_eq!(allocate_local_port(18789, |_| false).unwrap(), 18789);
     assert_eq!(
         allocate_local_port(18789, |port| port == 18789).unwrap(),
         18790
     );
+}
+
+#[test]
+fn local_port_allocator_bails_when_no_port_above_preferred_is_free() {
+    let err = allocate_local_port(u16::MAX, |_| true).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("no available local port at or above 65535"));
+}
+
+#[test]
+fn local_port_allocator_skips_to_first_free_port_above_preferred() {
+    // Block a contiguous range [18789, 18793] and confirm the allocator
+    // walks forward to the next free slot rather than returning early.
+    let occupied = [18789, 18790, 18791, 18792, 18793];
+    let port = allocate_local_port(18789, |port| occupied.contains(&port)).unwrap();
+    assert_eq!(port, 18794);
+}
+
+#[test]
+fn mounts_for_file_returns_absolute_parent_verbatim() {
+    let mounts = mounts_for_file(Path::new("/tmp/resource"), Path::new("/work"));
+    assert_eq!(mounts, vec![PathBuf::from("/tmp")]);
+}
+
+#[test]
+fn mounts_for_file_joins_relative_parent_with_workdir() {
+    let mounts = mounts_for_file(Path::new("project/file"), Path::new("/state"));
+    assert_eq!(mounts, vec![PathBuf::from("/state/project")]);
+}
+
+#[test]
+fn mounts_for_file_returns_empty_when_path_has_no_parent() {
+    // Bare filename has parent ""; no host mount should be requested.
+    let mounts = mounts_for_file(Path::new("file"), Path::new("/state"));
+    assert!(mounts.is_empty());
+}
+
+#[test]
+fn inherited_proxy_envs_only_pulls_recognised_proxy_keys() {
+    let envs = inherited_proxy_envs_from(
+        [
+            ("HTTP_PROXY", "http://proxy.example:8080"),
+            ("https_proxy", "http://lower.example:8080"),
+            ("UNRELATED", "ignored"),
+            ("NO_PROXY", "localhost"),
+        ],
+        None,
+    );
+
+    let keys: Vec<&str> = envs.iter().map(|(key, _)| key.as_str()).collect();
+    assert!(keys.contains(&"HTTP_PROXY"));
+    assert!(keys.contains(&"https_proxy"));
+    assert!(keys.contains(&"no_proxy"));
+    assert!(keys.contains(&"NO_PROXY"));
+    assert!(!keys.contains(&"UNRELATED"));
+}
+
+#[test]
+fn inherited_proxy_envs_appends_target_to_no_proxy_when_supplied() {
+    let envs =
+        inherited_proxy_envs_from([("NO_PROXY", "localhost,127.0.0.1")], Some("203.0.113.10"));
+
+    let no_proxy = envs
+        .iter()
+        .find(|(key, _)| key == "NO_PROXY")
+        .map(|(_, value)| value.as_str())
+        .unwrap();
+    assert_eq!(no_proxy, "localhost,127.0.0.1,203.0.113.10");
+}
+
+#[test]
+fn inherited_proxy_envs_first_no_proxy_wins_when_both_cases_set() {
+    // Both `no_proxy` and `NO_PROXY` exist; the first one observed wins,
+    // mirroring how docker / process environments propagate the first
+    // occurrence of a duplicated env var.
+    let envs = inherited_proxy_envs_from(
+        [("no_proxy", "first.win"), ("NO_PROXY", "second.lose")],
+        None,
+    );
+    let no_proxy = envs
+        .iter()
+        .find(|(key, _)| key == "no_proxy")
+        .map(|(_, value)| value.as_str())
+        .unwrap();
+    assert_eq!(no_proxy, "first.win");
+}
+
+#[test]
+fn inherited_proxy_envs_returns_empty_when_no_proxy_state_exists() {
+    // No proxy keys, no NO_PROXY, and no target host -> empty vec, so we
+    // do not pollute the docker environment with unrelated knobs.
+    let envs: Vec<(String, String)> = inherited_proxy_envs_from([("UNRELATED", "ignored")], None);
+    assert!(envs.is_empty());
+}
+
+#[test]
+fn no_proxy_with_target_dedupes_existing_target_entry() {
+    let value = no_proxy_with_target("localhost,203.0.113.10,127.0.0.1", "203.0.113.10");
+    assert_eq!(value, "localhost,203.0.113.10,127.0.0.1");
+}
+
+#[test]
+fn no_proxy_with_target_trims_whitespace_in_existing_entries() {
+    let value = no_proxy_with_target("  localhost ,  127.0.0.1 ", "203.0.113.10");
+    assert_eq!(value, "localhost,127.0.0.1,203.0.113.10");
 }
