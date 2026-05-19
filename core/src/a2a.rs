@@ -149,15 +149,34 @@ impl A2aBundle {
         if self.version != 1 {
             bail!("a2a bundle version must be 1");
         }
+        let mut aliases = BTreeSet::new();
+        let mut urls = BTreeSet::new();
         for peer in &self.peers {
             if let Some(alias) = peer.alias.as_deref() {
                 validate_id("a2a bundle peer alias", alias)?;
+                if !aliases.insert(alias) {
+                    bail!("a2a bundle contains duplicate alias '{alias}'");
+                }
             }
             if peer.url.trim().is_empty() {
                 bail!("a2a bundle peer url must not be empty");
             }
+            if !urls.insert(peer.url.as_str()) {
+                bail!("a2a bundle contains duplicate url '{}'", peer.url);
+            }
             if peer.fingerprint.trim().is_empty() {
                 bail!("a2a bundle peer fingerprint must not be empty");
+            }
+            let mut scoped = BTreeSet::new();
+            for service in &peer.scoped_services {
+                validate_id("a2a bundle peer scoped service", service)?;
+                if !scoped.insert(service.as_str()) {
+                    bail!(
+                        "a2a bundle peer '{}' contains duplicate scoped service '{}'",
+                        peer.alias.as_deref().unwrap_or(&peer.url),
+                        service
+                    );
+                }
             }
         }
         Ok(())
@@ -186,11 +205,43 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
 
+    fn peer(alias: Option<&str>, url: &str) -> A2aStatePeer {
+        A2aStatePeer {
+            alias: alias.map(str::to_string),
+            url: url.to_string(),
+            scoped_services: Vec::new(),
+            added_at: "2026-05-14T00:00:00Z".to_string(),
+            cli_preview: None,
+            cli_preview_error: None,
+        }
+    }
+
+    fn bundle_peer(alias: Option<&str>, url: &str) -> A2aBundlePeer {
+        A2aBundlePeer {
+            alias: alias.map(str::to_string),
+            url: url.to_string(),
+            scoped_services: Vec::new(),
+            fingerprint: "fp".to_string(),
+        }
+    }
+
     #[test]
     fn empty_a2a_state_file_is_empty_state() {
         let temp = tempfile::NamedTempFile::new().unwrap();
 
         let state = A2aStateFile::from_path(temp.path()).unwrap();
+
+        assert_eq!(state, A2aStateFile::empty());
+    }
+
+    #[test]
+    fn missing_a2a_state_file_is_empty_state() {
+        // `from_path` should not error on a fresh state directory where the
+        // file has not been created yet; we use that path on first run.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a2a.json");
+
+        let state = A2aStateFile::from_path(&path).unwrap();
 
         assert_eq!(state, A2aStateFile::empty());
     }
@@ -225,5 +276,227 @@ mod tests {
 
         assert!(state.peers[0].cli_preview.as_ref().unwrap().verified);
         assert!(state.peers[0].cli_preview.as_ref().unwrap().lint.is_some());
+    }
+
+    #[test]
+    fn state_validate_rejects_unknown_version() {
+        let state = A2aStateFile {
+            version: 2,
+            peers: Vec::new(),
+        };
+
+        let err = state.validate().unwrap_err();
+        assert!(err.to_string().contains("a2a.json version must be 1"));
+    }
+
+    #[test]
+    fn state_validate_rejects_duplicate_alias() {
+        let state = A2aStateFile {
+            version: 1,
+            peers: vec![
+                peer(Some("beta"), "http://1.example/.well-known/agent-card.json"),
+                peer(Some("beta"), "http://2.example/.well-known/agent-card.json"),
+            ],
+        };
+
+        let err = state.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate alias 'beta'"));
+    }
+
+    #[test]
+    fn state_validate_rejects_duplicate_url() {
+        let state = A2aStateFile {
+            version: 1,
+            peers: vec![
+                peer(
+                    Some("alpha"),
+                    "http://1.example/.well-known/agent-card.json",
+                ),
+                peer(Some("beta"), "http://1.example/.well-known/agent-card.json"),
+            ],
+        };
+
+        let err = state.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate url"));
+    }
+
+    #[test]
+    fn state_validate_rejects_alias_with_disallowed_characters() {
+        let state = A2aStateFile {
+            version: 1,
+            peers: vec![peer(Some("bad alias"), "http://1.example/")],
+        };
+
+        let err = state.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("may only contain letters, numbers"));
+    }
+
+    #[test]
+    fn state_validate_rejects_duplicate_scoped_service_inside_one_peer() {
+        let mut state = A2aStateFile {
+            version: 1,
+            peers: vec![peer(Some("beta"), "http://1.example/")],
+        };
+        state.peers[0].scoped_services = vec!["openclaw".to_string(), "openclaw".to_string()];
+
+        let err = state.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("duplicate scoped service 'openclaw'"));
+    }
+
+    #[test]
+    fn state_validate_allows_distinct_aliases_and_urls() {
+        let state = A2aStateFile {
+            version: 1,
+            peers: vec![
+                peer(Some("alpha"), "http://1.example/"),
+                peer(Some("beta"), "http://2.example/"),
+            ],
+        };
+
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn bundle_validate_rejects_unknown_version() {
+        let bundle = A2aBundle {
+            version: 9,
+            peers: Vec::new(),
+        };
+        assert!(bundle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("a2a bundle version must be 1"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_empty_url() {
+        let mut bundle = A2aBundle {
+            version: 1,
+            peers: vec![bundle_peer(None, "   ")],
+        };
+        // Make sure the blank fingerprint doesn't accidentally hide the
+        // url assertion we are exercising here.
+        bundle.peers[0].fingerprint = "fp".to_string();
+        let err = bundle.validate().unwrap_err();
+        assert!(err.to_string().contains("peer url must not be empty"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_empty_fingerprint() {
+        let bundle = A2aBundle {
+            version: 1,
+            peers: vec![A2aBundlePeer {
+                alias: None,
+                url: "http://1.example/".to_string(),
+                scoped_services: Vec::new(),
+                fingerprint: "".to_string(),
+            }],
+        };
+        let err = bundle.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("peer fingerprint must not be empty"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_alias_with_disallowed_characters() {
+        let bundle = A2aBundle {
+            version: 1,
+            peers: vec![bundle_peer(Some("a/b"), "http://1.example/")],
+        };
+        let err = bundle.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("may only contain letters, numbers"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_duplicate_alias() {
+        let bundle = A2aBundle {
+            version: 1,
+            peers: vec![
+                bundle_peer(Some("beta"), "http://1.example/"),
+                bundle_peer(Some("beta"), "http://2.example/"),
+            ],
+        };
+
+        let err = bundle.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate alias 'beta'"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_duplicate_url() {
+        let bundle = A2aBundle {
+            version: 1,
+            peers: vec![
+                bundle_peer(Some("alpha"), "http://1.example/"),
+                bundle_peer(Some("beta"), "http://1.example/"),
+            ],
+        };
+
+        let err = bundle.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate url"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_duplicate_scoped_service_inside_one_peer() {
+        let mut bundle = A2aBundle {
+            version: 1,
+            peers: vec![bundle_peer(Some("beta"), "http://1.example/")],
+        };
+        bundle.peers[0].scoped_services = vec!["openclaw".to_string(), "openclaw".to_string()];
+
+        let err = bundle.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("duplicate scoped service 'openclaw'"));
+    }
+
+    #[test]
+    fn validate_id_accepts_canonical_charset() {
+        validate_id("test", "abc-DEF_123").unwrap();
+        validate_id("test", "x").unwrap();
+    }
+
+    #[test]
+    fn validate_id_rejects_empty_or_whitespace() {
+        assert!(validate_id("test", "").is_err());
+        assert!(validate_id("test", "   ").is_err());
+    }
+
+    #[test]
+    fn validate_id_rejects_special_characters() {
+        for value in ["a.b", "a/b", "a*b", "a@b", "a b"] {
+            let err = validate_id("test", value).unwrap_err();
+            assert!(
+                err.to_string().contains("may only contain"),
+                "value {value:?} did not produce expected error"
+            );
+        }
+    }
+
+    #[test]
+    fn from_path_propagates_validation_errors_for_duplicate_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a2a.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "peers": [
+                {"alias": "beta", "url": "http://1.example/", "added_at": "2026-05-14T00:00:00Z"},
+                {"alias": "beta", "url": "http://2.example/", "added_at": "2026-05-14T00:00:00Z"}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = A2aStateFile::from_path(&path).unwrap_err();
+        assert!(err.to_string().contains("duplicate alias 'beta'"));
     }
 }
