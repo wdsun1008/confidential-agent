@@ -72,7 +72,7 @@ pub fn agent_card_reference_values(card: &AgentCard) -> Result<Value> {
 }
 
 pub fn derive_tng_client_config(card: &AgentCard) -> Result<Value> {
-    derive_tng_client_config_with_local_ports(card, |port| Ok(port), 50000)
+    derive_tng_client_config_with_local_ports(card, Ok, 50000)
 }
 
 pub fn derive_tng_client_config_with_local_ports(

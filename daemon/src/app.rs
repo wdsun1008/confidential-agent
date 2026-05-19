@@ -584,7 +584,7 @@ fn apply_bootstrap(
         fs::create_dir_all(card_dir)
             .with_context(|| format!("failed to create '{}'", card_dir.display()))?;
         let card_json = serde_json::to_string_pretty(card)?;
-        fs::write(&path, &card_json)
+        fs::write(&path, card_json)
             .with_context(|| format!("failed to write '{}'", path.display()))?;
         println!("agent card written to {}", path.display());
     }
