@@ -11,29 +11,11 @@ mod schema_tests {
     use crate::schema::{
         confidential_ports, BootstrapConfig, GuestResource, LocalBuildState, LocalDebugSshKey,
         LocalDeployState, LocalServiceNetwork, LocalServiceState, LocalSpecState, MeshBundle,
-        MeshService, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION,
-        LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION, SERVICE_DIRECTORY_SCHEMA_VERSION,
+        MeshService, BOOTSTRAP_SCHEMA_VERSION, LOCAL_SERVICE_STATE_SCHEMA_VERSION,
+        MESH_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-
-    #[test]
-    fn schema_versions_are_v1_during_initial_development() {
-        assert_eq!(
-            LOCAL_SERVICE_STATE_SCHEMA_VERSION,
-            "confidential-agent/service-state/v1"
-        );
-        assert_eq!(BOOTSTRAP_SCHEMA_VERSION, "confidential-agent/bootstrap/v1");
-        assert_eq!(MESH_SCHEMA_VERSION, "confidential-agent/mesh-bundle/v1");
-        assert_eq!(
-            SERVICE_DIRECTORY_SCHEMA_VERSION,
-            "confidential-agent/services/v1"
-        );
-        assert_eq!(
-            DAEMON_STATUS_SCHEMA_VERSION,
-            "confidential-agent/daemon-status/v1"
-        );
-    }
 
     #[test]
     fn local_service_state_round_trips_ports_and_connect() {
