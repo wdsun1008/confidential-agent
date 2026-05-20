@@ -242,4 +242,6 @@ confidential-agent/
 
 - [docs/architecture.md](docs/architecture.md) — 控制流与数据流详解（含序列图）
 - [docs/spec.md](docs/spec.md) — `confidential-agent/v1` AppSpec 完整字段参考
+- [docs/confidential-agent-architecture/](docs/confidential-agent-architecture/) — Confidential Agent 技术白皮书：Agentic AI 的机密计算安全底座
+- [docs/security-coverage.md](docs/security-coverage.md) — 按 agentic AI 威胁模型梳理当前基础设施层安全覆盖与边界
 - [docs/a2a.md](docs/a2a.md) — 跨组织/跨用户 A2A：背景、架构、信任模型、step-by-step 上手与排错
