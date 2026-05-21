@@ -28,9 +28,6 @@ INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.g8i.xlarge}"
 BASELINE_INSTANCE_TYPE="${E2E_BASELINE_INSTANCE_TYPE:-$INSTANCE_TYPE}"
 DISK_GB="${E2E_CMAAS_DISK_GB:-40}"
 SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
-MCP_PROXY_VERSION="${E2E_MCP_PROXY_VERSION:-6.5.0}"
-MCP_MEMORY_VERSION="${E2E_MCP_MEMORY_VERSION:-2026.1.26}"
-NPM_REGISTRY="${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}"
 DESTROY_ON_SUCCESS="${E2E_DESTROY_ON_SUCCESS:-1}"
 DESTROY_ON_FAILURE="${E2E_DESTROY_ON_FAILURE:-1}"
 STEP_LOG="$WORK_DIR/e2e-steps.md"
@@ -238,18 +235,6 @@ prepare_examples() {
   cp "$ROOT_DIR/examples/cmaas/install-agent.sh" "$AGENT_DIR/install-agent.sh"
   cp -a "$ROOT_DIR/examples/cmaas/files" "$CMAAS_DIR/files"
   cp -a "$ROOT_DIR/examples/cmaas/files" "$AGENT_DIR/files"
-  rm -rf "$CMAAS_DIR/files/cmaas-node" "$AGENT_DIR/files/cmaas-node"
-  mkdir -p "$CMAAS_DIR/files/cmaas-node"
-  record_cmd "npm install --prefix $CMAAS_DIR/files/cmaas-node --omit=dev --no-audit --no-fund --registry=$NPM_REGISTRY mcp-proxy@$MCP_PROXY_VERSION @modelcontextprotocol/server-memory@$MCP_MEMORY_VERSION"
-  npm install \
-    --prefix "$CMAAS_DIR/files/cmaas-node" \
-    --omit=dev \
-    --no-audit \
-    --no-fund \
-    --registry="$NPM_REGISTRY" \
-    "mcp-proxy@$MCP_PROXY_VERSION" \
-    "@modelcontextprotocol/server-memory@$MCP_MEMORY_VERSION"
-  node -e 'const fs=require("fs"); for (const p of ["node_modules/mcp-proxy/dist/bin/mcp-proxy.mjs", "node_modules/@modelcontextprotocol/server-memory/dist/index.js"]) { if (!fs.existsSync(process.argv[1]+"/"+p)) process.exit(1); }' "$CMAAS_DIR/files/cmaas-node"
 }
 
 write_specs() {
@@ -280,17 +265,16 @@ build:
 $base_image_yaml
   image_name: cmaas-memory
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
   files:
-    - source: ./files/cmaas-node
-      target: /opt/confidential-agent/cmaas-node
     - source: ./files/cmaas-access-proxy.mjs
       target: /usr/local/share/confidential-agent/cmaas/cmaas-access-proxy.mjs
       executable: true
   scripts: [./install-cmaas.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
@@ -324,6 +308,7 @@ build:
 $base_image_yaml
   image_name: cmaas-agent
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
   files:
     - source: ./files/agent-client.mjs
@@ -332,7 +317,7 @@ $base_image_yaml
   scripts: [./install-agent.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
@@ -683,6 +668,7 @@ assert_snapshot_lacks_marker() {
   disk_id="$(system_disk_id "$cmaas_instance_id")"
   snapshot_out="$WORK_DIR/create-snapshot.json"
   aliyun_json "$snapshot_out" ecs CreateSnapshot \
+    --RegionId "$REGION" \
     --DiskId "$disk_id" \
     --SnapshotName "cmaas-$E2E_RUN_ID" \
     --RetentionDays 1
@@ -707,6 +693,7 @@ assert_snapshot_lacks_marker() {
   }
   wait_disk_status "$SNAPSHOT_DISK_ID" Available 600
   aliyun_json "$WORK_DIR/attach-snapshot-disk.json" ecs AttachDisk \
+    --RegionId "$REGION" \
     --InstanceId "$BASELINE_ID" \
     --DiskId "$SNAPSHOT_DISK_ID" \
     --DeleteWithInstance false
@@ -743,18 +730,18 @@ cleanup_cloud() {
   fi
   if [[ "$should_destroy" == "1" ]]; then
     if [[ "$SNAPSHOT_DISK_ATTACHED" == "1" && -n "$SNAPSHOT_DISK_ID" && -n "$BASELINE_ID" ]]; then
-      aliyun ecs DetachDisk --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
+      aliyun ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
       wait_disk_status "$SNAPSHOT_DISK_ID" Available 300 || true
       SNAPSHOT_DISK_ATTACHED=0
     fi
     if [[ -n "$SNAPSHOT_DISK_ID" ]]; then
-      aliyun ecs DeleteDisk --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
+      aliyun ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
     fi
     if [[ -n "$SNAPSHOT_ID" ]]; then
-      aliyun ecs DeleteSnapshot --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || true
+      aliyun ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || true
     fi
     if [[ -n "$BASELINE_ID" ]]; then
-      aliyun ecs DeleteInstance --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || true
+      aliyun ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || true
     fi
     if [[ -n "$BASELINE_KEY_NAME" ]]; then
       aliyun ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || true
@@ -779,8 +766,6 @@ main() {
   require_cmd curl
   require_cmd docker
   require_cmd python3
-  require_cmd node
-  require_cmd npm
   require_cmd openssl
   require_cmd ssh
   require_cmd ssh-keygen
@@ -870,7 +855,18 @@ main() {
   observation="penicillin_${marker}"
   log "Act 1: attested mesh agent writes and reads memory marker"
   record_cmd "ssh agent 'cmaas-agent-client --marker $marker --observation $observation'"
-  ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --marker '$marker' --observation '$observation'" >"$WORK_DIR/agent-client-output.json"
+  for attempt in 1 2 3 4 5 6; do
+    if ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --marker '$marker' --observation '$observation'" >"$WORK_DIR/agent-client-output.json" 2>"$WORK_DIR/agent-client-output.err"; then
+      break
+    fi
+    if [[ "$attempt" == "6" ]]; then
+      record_file_as_block "Agent MCP roundtrip stderr:" "$WORK_DIR/agent-client-output.err" text
+      cat "$WORK_DIR/agent-client-output.err" >&2
+      exit 1
+    fi
+    log "agent MCP roundtrip not ready yet; retrying ($attempt/6)"
+    sleep 10
+  done
   record_file_as_block "Agent MCP roundtrip output:" "$WORK_DIR/agent-client-output.json" json
   ssh_guest "$cmaas_key" "$cmaas_ip" "sync; grep -F '$marker' /var/lib/mcp-memory/memory.jsonl >/tmp/cmaas-marker.txt"
   record "- marker is present inside the running CMaaS guest memory file."

@@ -10,6 +10,7 @@ service:
 build:
   image_name: mcp-agent
   resize: 30G
+  with_network: true
   packages:
     - ca-certificates
     - nodejs
@@ -24,7 +25,7 @@ build:
 
 deploy:
   provider: aliyun
-  image_variant: release
+  image_variant: debug
   instance_type: ecs.g8i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-l

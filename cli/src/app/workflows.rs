@@ -1,7 +1,7 @@
 use super::*;
 
-const REKOR_RV_SET_ATTEMPTS: usize = 5;
-const REKOR_RV_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
+const REKOR_RV_SET_ATTEMPTS: usize = 2;
+const REKOR_RV_SET_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 pub(super) fn inject_resources(
     cli: &Cli,
@@ -42,7 +42,18 @@ pub(super) fn inject_resources(
             .with_context(|| format!("failed to read '{}'", rekor_path.display()))?;
         let meta: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse '{}'", rekor_path.display()))?;
-        let card = render_agent_card(spec, target_ip, &meta)?;
+        let sample_reference_values = match &artifacts.sample_rv {
+            Some(path) => {
+                let content = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read '{}'", path.display()))?;
+                Some(
+                    serde_json::from_str(&content)
+                        .with_context(|| format!("failed to parse '{}'", path.display()))?,
+                )
+            }
+            None => None,
+        };
+        let card = render_agent_card(spec, target_ip, &meta, sample_reference_values.as_ref())?;
         write_json_atomic(&paths.agent_card, &card)?;
         bootstrap.agent_card = Some(card);
     }
@@ -114,6 +125,7 @@ pub(super) fn render_agent_card(
     spec: &AgentSpec,
     target_ip: &str,
     meta: &serde_json::Value,
+    sample_reference_values: Option<&serde_json::Value>,
 ) -> Result<AgentCard> {
     let a2a = spec
         .a2a
@@ -159,6 +171,7 @@ pub(super) fn render_agent_card(
                         port: *port,
                     })
                     .collect(),
+                reference_values: sample_reference_values.cloned(),
                 rekor: AgentCardRekor {
                     rekor_url: required_json_string(meta, "rekor_url")?.to_string(),
                     artifact_id: required_json_string(meta, "artifact_id")?.to_string(),
@@ -671,6 +684,18 @@ pub(super) fn connect_reference_values(
     bundle: &MeshBundle,
     service_id: &str,
 ) -> Result<serde_json::Value> {
+    if let Some(sample) = bundle.reference_values.get(service_id) {
+        return Ok(serde_json::json!([
+            {
+                "type": "sample",
+                "payload": {
+                    "type": "inline",
+                    "content": sample,
+                }
+            }
+        ]));
+    }
+
     if let Some(rekor) = bundle.rekor_reference_values.get(service_id) {
         let content = rekor_payload(rekor)?;
         return Ok(serde_json::json!([
@@ -679,18 +704,6 @@ pub(super) fn connect_reference_values(
                 "payload": {
                     "type": "inline",
                     "content": content,
-                }
-            }
-        ]));
-    }
-
-    if let Some(sample) = bundle.reference_values.get(service_id) {
-        return Ok(serde_json::json!([
-            {
-                "type": "sample",
-                "payload": {
-                    "type": "inline",
-                    "content": sample,
                 }
             }
         ]));
@@ -922,7 +935,27 @@ pub(super) fn prepare_challenge_reference_values(
                 .with_context(|| format!("failed to create '{}'", paths.service_dir.display()))?;
             let rv_list_path = paths.service_dir.join("rekor-rv-list.json");
             write_json_atomic(&rv_list_path, &rv_list)?;
-            set_rekor_reference_value_list(cli, state_dir, &rv_list_path)
+            match set_rekor_reference_value_list(cli, state_dir, &rv_list_path) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    let sample_path = sample_rv.with_context(|| {
+                        format!(
+                            "missing sample reference values for service '{}' after Rekor RV setup failed",
+                            service_id
+                        )
+                    })?;
+                    eprintln!(
+                        "[ca] Rekor reference value list setup failed for service '{}': {err:#}; falling back to local sample reference values for challenge setup",
+                        service_id
+                    );
+                    set_sample_reference_value(cli, state_dir, sample_path).with_context(|| {
+                        format!(
+                            "failed to fall back to sample reference values for service '{}'",
+                            service_id
+                        )
+                    })
+                }
+            }
         }
         other => bail!(
             "unsupported reference value mode '{}' for service '{}'",

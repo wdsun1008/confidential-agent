@@ -1308,7 +1308,8 @@ a2a:
         "rv_name": "measurement.uki.SHA-384"
     });
 
-    let card = render_agent_card(&spec, "198.51.100.20", &meta).unwrap();
+    let sample = serde_json::json!({"measurement.uki.SHA-384": ["abc123"]});
+    let card = render_agent_card(&spec, "198.51.100.20", &meta, Some(&sample)).unwrap();
 
     assert_eq!(card.name, "OpenClaw");
     assert_eq!(
@@ -1323,13 +1324,14 @@ a2a:
         vec![18789]
     );
     assert_eq!(ext.rekor.artifact_id, "openclaw-release");
+    assert_eq!(ext.reference_values.as_ref(), Some(&sample));
 
     let disabled = AgentSpec::from_yaml(
         &yaml.replace("a2a:\n", "a2a:\n  enabled: false\n"),
         Path::new("/project"),
     )
     .unwrap();
-    let err = render_agent_card(&disabled, "198.51.100.20", &meta).unwrap_err();
+    let err = render_agent_card(&disabled, "198.51.100.20", &meta, Some(&sample)).unwrap_err();
     assert!(err.to_string().contains("a2a is disabled"));
 
     let no_connect = AgentSpec::from_yaml(
@@ -1337,7 +1339,7 @@ a2a:
         Path::new("/project"),
     )
     .unwrap();
-    let err = render_agent_card(&no_connect, "198.51.100.20", &meta).unwrap_err();
+    let err = render_agent_card(&no_connect, "198.51.100.20", &meta, Some(&sample)).unwrap_err();
     assert!(err.to_string().contains("a2a requires service.connect"));
 }
 
@@ -2410,10 +2412,10 @@ fn connect_ignores_services_without_connect_ports() {
 fn connect_renders_all_connect_services() {
     let temp = tempfile::tempdir().unwrap();
     let openclaw = local_state("openclaw", vec![49152], vec![49152]);
-    let dashboard = local_state("dashboard", vec![49153], vec![49153]);
+    let worker = local_state("worker", vec![49153], vec![49153]);
     let mcp = local_state("mcp", vec![3001], Vec::new());
     write_state(temp.path(), &openclaw);
-    write_state(temp.path(), &dashboard);
+    write_state(temp.path(), &worker);
     write_state(temp.path(), &mcp);
 
     let mut sample = BTreeMap::new();
@@ -2422,16 +2424,48 @@ fn connect_renders_all_connect_services() {
         serde_json::json!({"measurement.uki.SHA-384": ["openclaw-rv"]}),
     );
     sample.insert(
-        "dashboard".to_string(),
-        serde_json::json!({"measurement.uki.SHA-384": ["dashboard-rv"]}),
+        "worker".to_string(),
+        serde_json::json!({"measurement.uki.SHA-384": ["worker-rv"]}),
     );
-    write_mesh_bundle(temp.path(), vec![openclaw, dashboard, mcp], sample);
+    write_mesh_bundle(temp.path(), vec![openclaw, worker, mcp], sample);
 
     let config = render_connect_config(temp.path()).unwrap();
 
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
-    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 49153);
-    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 49152);
+    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 49152);
+    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 49153);
+}
+
+#[test]
+fn connect_reference_values_prefers_sample_when_rekor_is_also_present() {
+    let bundle = MeshBundle {
+        schema: MESH_SCHEMA_VERSION.to_string(),
+        generation: 1,
+        updated_at: 0,
+        reference_values: BTreeMap::from([(
+            "openclaw".to_string(),
+            serde_json::json!({"measurement.uki.SHA-384": ["sample-rv"]}),
+        )]),
+        rekor_reference_values: BTreeMap::from([(
+            "openclaw".to_string(),
+            serde_json::json!({
+                "artifact_id": "openclaw-disk",
+                "artifact_version": "20260514000000",
+                "artifact_type": "uki",
+                "rekor_url": "https://rekor.sigstore.dev",
+                "rv_name": "measurement.uki.SHA-384"
+            }),
+        )]),
+        services: BTreeMap::new(),
+    };
+
+    let values = connect_reference_values(&bundle, "openclaw").unwrap();
+
+    assert_eq!(values[0]["type"], "sample");
+    assert_eq!(
+        values[0]["payload"]["content"]["measurement.uki.SHA-384"][0],
+        "sample-rv"
+    );
 }
 
 fn test_agent_card(ports: Vec<u16>) -> AgentCard {
@@ -2457,6 +2491,7 @@ fn test_agent_card(ports: Vec<u16>) -> AgentCard {
                         port,
                     })
                     .collect(),
+                reference_values: None,
                 rekor: AgentCardRekor {
                     rekor_url: "https://rekor.sigstore.dev".to_string(),
                     artifact_id: "peer-disk".to_string(),

@@ -1067,18 +1067,6 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
 }
 
 fn tng_reference_values(bundle: &MeshBundle, service_id: &str) -> Result<Value> {
-    if let Some(rekor) = bundle.rekor_reference_values.get(service_id) {
-        return Ok(json!([
-            {
-                "type": "slsa",
-                "payload": {
-                    "type": "inline",
-                    "content": rekor_payload(rekor)?,
-                },
-            }
-        ]));
-    }
-
     if let Some(sample) = bundle.reference_values.get(service_id) {
         return Ok(json!([
             {
@@ -1086,6 +1074,18 @@ fn tng_reference_values(bundle: &MeshBundle, service_id: &str) -> Result<Value> 
                 "payload": {
                     "type": "inline",
                     "content": sample,
+                },
+            }
+        ]));
+    }
+
+    if let Some(rekor) = bundle.rekor_reference_values.get(service_id) {
+        return Ok(json!([
+            {
+                "type": "slsa",
+                "payload": {
+                    "type": "inline",
+                    "content": rekor_payload(rekor)?,
                 },
             }
         ]));

@@ -44,6 +44,8 @@ pub struct BuildSpec {
     #[serde(default)]
     pub resize: Option<String>,
     #[serde(default)]
+    pub with_network: bool,
+    #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
     pub files: Vec<BuildFileSpec>,
@@ -534,6 +536,7 @@ build:
   base_image: ./base.qcow2
   image_name: openclaw-agent
   resize: 30G
+  with_network: true
   packages:
     - nodejs
   files:
@@ -585,6 +588,7 @@ resources:
             spec.build.base_image.as_deref(),
             Some("/project/base.qcow2")
         );
+        assert!(spec.build.with_network);
         assert_eq!(
             spec.build.scripts[0],
             PathBuf::from("/project/image/install-openclaw.sh")

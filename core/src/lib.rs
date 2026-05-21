@@ -199,6 +199,7 @@ mod schema_tests {
                             name: "chat".to_string(),
                             port: 18789,
                         }],
+                        reference_values: None,
                         rekor: AgentCardRekor {
                             rekor_url: "https://rekor.sigstore.dev".to_string(),
                             artifact_id: "test-agent-release".to_string(),

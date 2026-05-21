@@ -54,6 +54,7 @@ pub fn render_build_config(
         cache_dir: options.cache_dir.clone(),
         images_dir: options.images_dir.clone(),
         resize: spec.build.resize.clone(),
+        with_network: spec.build.with_network,
         packages: shelter_packages(spec, assets),
         variants: if spec.build.base_image.is_some() {
             shelter_variants(spec)
@@ -364,6 +365,8 @@ struct ShelterBuildConfig {
     images_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resize: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    with_network: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     packages: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

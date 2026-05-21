@@ -9,10 +9,9 @@ service:
 build:
   image_name: cmaas-memory
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
   files:
-    - source: ./files/cmaas-node
-      target: /opt/confidential-agent/cmaas-node
     - source: ./files/cmaas-access-proxy.mjs
       target: /usr/local/share/confidential-agent/cmaas/cmaas-access-proxy.mjs
       executable: true

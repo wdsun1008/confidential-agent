@@ -24,6 +24,9 @@ pub fn validate_confidential_agent_card(card: &AgentCard) -> Result<()> {
     if ext.ports.is_empty() {
         bail!("agent card confidential ports must not be empty");
     }
+    if ext.reference_values.as_ref().is_some_and(Value::is_null) {
+        bail!("agent card referenceValues must not be null");
+    }
     for port in &ext.ports {
         if port.name.trim().is_empty() {
             bail!("agent card confidential port name must not be empty");
@@ -53,6 +56,16 @@ pub fn validate_confidential_agent_card(card: &AgentCard) -> Result<()> {
 
 pub fn agent_card_reference_values(card: &AgentCard) -> Result<Value> {
     let ext = confidential_extension(card)?;
+    if let Some(sample) = &ext.reference_values {
+        return Ok(json!([{
+            "type": "sample",
+            "payload": {
+                "type": "inline",
+                "content": sample,
+            },
+        }]));
+    }
+
     let rekor = &ext.rekor;
     let metadata = json!({
         "artifact_id": rekor.artifact_id,

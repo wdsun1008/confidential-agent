@@ -3,23 +3,26 @@ set -euo pipefail
 
 echo "installing MCP service"
 
+MCP_SERVER_EVERYTHING_VERSION="${MCP_SERVER_EVERYTHING_VERSION:-latest}"
+
 mkdir -p /opt/mcp-server
+cd /opt/mcp-server
+
+npm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
+if [ ! -f package.json ]; then
+    npm init -y
+fi
+if [ ! -x node_modules/.bin/mcp-server-everything ]; then
+    npm install --omit=dev --no-audit --no-fund "@modelcontextprotocol/server-everything@${MCP_SERVER_EVERYTHING_VERSION}"
+fi
+test -x /opt/mcp-server/node_modules/.bin/mcp-server-everything
+npm cache clean --force || true
 
 cat >/usr/local/bin/cai-mcp-bootstrap <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
-npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com}"
-
-mkdir -p /opt/mcp-server
-cd /opt/mcp-server
-if [ ! -f package.json ]; then
-    npm init -y
-fi
-if [ ! -x node_modules/.bin/mcp-server-everything ]; then
-    npm install --omit=dev --no-audit --no-fund @modelcontextprotocol/server-everything
-fi
-npm cache clean --force || true
+test -x /opt/mcp-server/node_modules/.bin/mcp-server-everything
 EOF
 chmod 0755 /usr/local/bin/cai-mcp-bootstrap
 

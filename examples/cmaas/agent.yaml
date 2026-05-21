@@ -9,6 +9,7 @@ service:
 build:
   image_name: cmaas-agent
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
   files:
     - source: ./files/agent-client.mjs
