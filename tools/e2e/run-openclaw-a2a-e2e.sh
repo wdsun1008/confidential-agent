@@ -344,6 +344,7 @@ build:
 $base_image_yaml
   image_name: ${service_name}-agent
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, podman, tar, xz]
   files:
     - source: $(yaml_quote "$ROOT_DIR/target/debug/cai-pep")
@@ -366,7 +367,7 @@ $base_image_yaml
   scripts: [./install-openclaw.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
@@ -507,6 +508,13 @@ wait_for_connect_port() {
   return 1
 }
 
+parse_connect_port() {
+  local log_path="$1"
+  if [[ -s "$log_path" ]]; then
+    awk '/^connect 127\.0\.0\.1:/ { split($2, a, ":"); print a[2]; exit }' "$log_path"
+  fi
+}
+
 wait_for_local_port() {
   local port="$1"
   local deadline=$((SECONDS + ${2:-90}))
@@ -527,6 +535,59 @@ PY
   return 1
 }
 
+start_connect_until_local_port_ready() {
+  local label="$1"
+  local log_path="$2"
+  local port_out="$3"
+  shift 3
+
+  local attempts="${E2E_CONNECT_ATTEMPTS:-4}"
+  local wait_seconds="${E2E_CONNECT_WAIT_SECONDS:-180}"
+  local attempt
+
+  for attempt in $(seq 1 "$attempts"); do
+    local connect_port=""
+    local deadline=$((SECONDS + wait_seconds))
+    local archived_log="${log_path%.log}-attempt-$attempt.log"
+
+    cleanup_connect || true
+    rm -f "$log_path"
+    record "- $label connect attempt: $attempt/$attempts."
+    setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+      "$@" >"$log_path" 2>&1 &
+    CONNECT_PID=$!
+
+    while (( SECONDS < deadline )); do
+      connect_port="$(parse_connect_port "$log_path" || true)"
+      if [[ -n "$connect_port" ]] && python3 - "$connect_port" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1):
+    pass
+PY
+      then
+        record_file_as_block "$label connect log:" "$log_path" text
+        printf '%s\n' "$connect_port" >"$port_out"
+        return 0
+      fi
+      if ! kill -0 "$CONNECT_PID" >/dev/null 2>&1; then
+        record "- $label connect attempt $attempt exited before the local port became ready."
+        break
+      fi
+      sleep 2
+    done
+
+    cp "$log_path" "$archived_log" 2>/dev/null || true
+    record_file_as_block "$label connect attempt $attempt log:" "$archived_log" text
+    cleanup_connect || true
+    sleep 15
+  done
+
+  echo "$label connect did not become local-port-ready after $attempts attempts" >&2
+  return 1
+}
+
 run_chat_probe() {
   local label="$1"
   local state_dir="$2"
@@ -537,14 +598,11 @@ run_chat_probe() {
   local guest_key="$7"
   local log_path="$WORK_DIR/connect-$label.log"
   local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir")
-  cleanup_connect || true
   record_cmd "${ca[*]} connect"
-  setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-    "${ca[@]}" connect >"$log_path" 2>&1 &
-  CONNECT_PID=$!
   local connect_port
-  connect_port="$(wait_for_connect_port "$log_path" 90)"
-  wait_for_local_port "$connect_port" 90
+  local connect_port_file="$WORK_DIR/connect-$label.port"
+  start_connect_until_local_port_ready "$label" "$log_path" "$connect_port_file" "${ca[@]}" connect
+  connect_port="$(<"$connect_port_file")"
   local peer_message
   peer_message="请只回复 ${peer_marker}，不要输出其他内容。"
   record_cmd "node tools/e2e/openclaw-a2a-responses-probe.mjs --url http://127.0.0.1:$connect_port --token '<redacted>' --peer $peer_id --message '<redacted>' --expect $peer_marker"
@@ -628,13 +686,10 @@ run_from_card_probe() {
   fi
 
   record_cmd "${ca[*]} connect --from-card $card_url"
-  setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-    "${ca[@]}" connect --from-card "$card_url" >"$log_path" 2>&1 &
-  CONNECT_PID=$!
-
   local connect_port
-  connect_port="$(wait_for_connect_port "$log_path" 90)"
-  wait_for_local_port "$connect_port" 120
+  local connect_port_file="$WORK_DIR/connect-card-$label.port"
+  start_connect_until_local_port_ready "$label connect --from-card" "$log_path" "$connect_port_file" "${ca[@]}" connect --from-card "$card_url"
+  connect_port="$(<"$connect_port_file")"
 
   record_cmd "node tools/e2e/openclaw-chat-probe.mjs --url http://127.0.0.1:$connect_port --token '<redacted>' --message '<redacted>' --expect $marker"
   if ! node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \

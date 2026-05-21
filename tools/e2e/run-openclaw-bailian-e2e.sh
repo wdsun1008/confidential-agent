@@ -213,8 +213,21 @@ destroy_managed_resources() {
     return 0
   fi
   for service in openclaw mcp; do
+    local state_json="$STATE_DIR/services/$service/state.json"
     if [[ ! -f "$STATE_DIR/services/$service/manifest.json" ]]; then
       record "- destroy $service: skipped; no local manifest in this state dir."
+      continue
+    fi
+    if [[ -f "$state_json" ]] &&
+      python3 - "$state_json" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    raise SystemExit(0 if (json.load(f).get("phase") == "deleted") else 1)
+PY
+    then
+      record "- destroy $service: skipped; state is already deleted."
       continue
     fi
     if [[ ! -d "$STATE_DIR/services/$service/terraform" ]]; then
@@ -223,10 +236,28 @@ destroy_managed_resources() {
     fi
     log "destroying $service ($reason)"
     record_cmd "${CA_ARGS[*]} destroy $service"
-    if without_proxy "${CA_ARGS[@]}" destroy "$service"; then
-      record "- destroy $service: ok."
-    else
-      record "- destroy $service: failed."
+    local attempt destroy_log destroyed=0
+    for attempt in 1 2 3; do
+      destroy_log="$WORK_DIR/destroy-$service-attempt-$attempt.log"
+      if without_proxy "${CA_ARGS[@]}" destroy "$service" >"$destroy_log" 2>&1; then
+        cat "$destroy_log"
+        record "- destroy $service: ok."
+        destroyed=1
+        break
+      fi
+      cat "$destroy_log" >&2
+      if grep -qi "already deleted" "$destroy_log"; then
+        record "- destroy $service: already deleted."
+        destroyed=1
+        break
+      fi
+      record "- destroy $service: attempt $attempt failed."
+      if (( attempt < 3 )); then
+        sleep $((attempt * 20))
+      fi
+    done
+    if [[ "$destroyed" != "1" ]]; then
+      record "- destroy $service: failed after retries."
       rc=1
     fi
   done
@@ -571,11 +602,12 @@ build:
 $base_image_yaml
   image_name: mcp-agent
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, nodejs, npm]
   scripts: [./install-mcp.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
@@ -609,6 +641,7 @@ build:
 $base_image_yaml
   image_name: openclaw-agent
   resize: 30G
+  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, podman, tar, xz]
   files:
     - source: $(yaml_quote "$ROOT_DIR/target/debug/cai-pep")
@@ -631,7 +664,7 @@ $base_image_yaml
   scripts: [./install-openclaw.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
@@ -741,20 +774,79 @@ probe_mcp_from_openclaw_guest() {
   log "probing MCP from OpenClaw guest through TNG mesh"
   wait_for_ssh "$OPENCLAW_IP" "$OPENCLAW_SSH_KEY" 180
   wait_for_guest_tcp_port "$OPENCLAW_IP" "$OPENCLAW_SSH_KEY" 3001 240 "OpenClaw guest TNG ingress for MCP"
-  record_cmd "ssh -i <debug_ssh> root@$OPENCLAW_IP 'timeout 180s npx -y mcporter@0.10.1 list --http-url http://127.0.0.1:3001/mcp --allow-http --json --schema'"
+  cat >"$WORK_DIR/mcp-streamable-probe.mjs" <<'NODE'
+const endpoint = "http://127.0.0.1:3001/mcp";
+const session = { value: "" };
+let nextId = 1;
+
+function parseMcpBody(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("{")) return JSON.parse(trimmed);
+  const events = trimmed.split(/\n\n+/);
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const data = events[i]
+      .split(/\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (data) return JSON.parse(data);
+  }
+  throw new Error(`cannot parse MCP response: ${trimmed.slice(0, 200)}`);
+}
+
+async function rpc(method, params = {}) {
+  const notification = method.startsWith("notifications/");
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+  };
+  if (session.value) headers["mcp-session-id"] = session.value;
+  const payload = notification
+    ? { jsonrpc: "2.0", method, params }
+    : { jsonrpc: "2.0", id: nextId++, method, params };
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+  const responseSession = response.headers.get("mcp-session-id");
+  if (responseSession) session.value = responseSession;
+  const text = await response.text();
+  if (!response.ok && response.status !== 202) {
+    throw new Error(`MCP ${method} failed: HTTP ${response.status}: ${text.slice(0, 500)}`);
+  }
+  const body = parseMcpBody(text);
+  if (body?.error) throw new Error(`MCP ${method} error: ${JSON.stringify(body.error)}`);
+  return body?.result ?? null;
+}
+
+await rpc("initialize", {
+  protocolVersion: "2025-06-18",
+  capabilities: {},
+  clientInfo: { name: "confidential-agent-e2e", version: "1" },
+});
+await rpc("notifications/initialized", {});
+const result = await rpc("tools/list", {});
+const tools = Array.isArray(result?.tools) ? result.tools : [];
+if (tools.length === 0) throw new Error("MCP tools/list returned no tools");
+console.log(JSON.stringify({ endpoint, toolCount: tools.length, tools: tools.map((tool) => tool.name) }, null, 2));
+NODE
+  record_cmd "ssh -i <debug_ssh> root@$OPENCLAW_IP 'timeout 180s node < mcp-streamable-probe.mjs'"
   if ! ssh -i "$OPENCLAW_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=10 root@"$OPENCLAW_IP" \
-    "timeout 180s npx -y mcporter@0.10.1 list --http-url http://127.0.0.1:3001/mcp --allow-http --json --schema" \
-    > >(tee "$WORK_DIR/mcporter-mcp.json") \
-    2> >(tee "$WORK_DIR/mcporter-mcp.stderr" >&2); then
-    if [[ -s "$WORK_DIR/mcporter-mcp.stderr" ]]; then
-      record_file_as_block "MCP probe stderr:" "$WORK_DIR/mcporter-mcp.stderr" text
+    "timeout 180s node" \
+    <"$WORK_DIR/mcp-streamable-probe.mjs" \
+    > >(tee "$WORK_DIR/mcp-probe.json") \
+    2> >(tee "$WORK_DIR/mcp-probe.stderr" >&2); then
+    if [[ -s "$WORK_DIR/mcp-probe.stderr" ]]; then
+      record_file_as_block "MCP probe stderr:" "$WORK_DIR/mcp-probe.stderr" text
     fi
     return 1
   fi
-  record_file_as_block "MCP probe from OpenClaw guest:" "$WORK_DIR/mcporter-mcp.json" json
-  if [[ -s "$WORK_DIR/mcporter-mcp.stderr" ]]; then
-    record_file_as_block "MCP probe stderr:" "$WORK_DIR/mcporter-mcp.stderr" text
+  record_file_as_block "MCP probe from OpenClaw guest:" "$WORK_DIR/mcp-probe.json" json
+  if [[ -s "$WORK_DIR/mcp-probe.stderr" ]]; then
+    record_file_as_block "MCP probe stderr:" "$WORK_DIR/mcp-probe.stderr" text
   fi
 }
 
@@ -973,6 +1065,58 @@ wait_for_connect_port() {
   return 1
 }
 
+parse_connect_port() {
+  local log_path="$1"
+  if [[ -s "$log_path" ]]; then
+    awk '/^connect 127\.0\.0\.1:/ { split($2, a, ":"); print a[2]; exit }' "$log_path"
+  fi
+}
+
+start_connect_until_http_ready() {
+  local port_out="$1"
+  local attempts="${2:-4}"
+  local wait_seconds="${3:-180}"
+  local attempt
+
+  record_cmd "${CA_ARGS[*]} connect"
+  for attempt in $(seq 1 "$attempts"); do
+    local log_path="$WORK_DIR/connect.log"
+    local archived_log="$WORK_DIR/connect-attempt-$attempt.log"
+    local connect_port=""
+    local deadline=$((SECONDS + wait_seconds))
+
+    record "- connect attempt: $attempt/$attempts."
+    rm -f "$log_path"
+    setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+      "${CA_ARGS[@]}" connect >"$log_path" 2>&1 &
+    E2E_CONNECT_PID=$!
+
+    while (( SECONDS < deadline )); do
+      connect_port="$(parse_connect_port "$log_path" || true)"
+      if [[ -n "$connect_port" ]] &&
+         curl --noproxy '*' -fsS --max-time 5 "http://127.0.0.1:$connect_port/openclaw" >/dev/null 2>&1; then
+        record_file_as_block "Connect log:" "$log_path" text
+        printf '%s\n' "$connect_port" >"$port_out"
+        return 0
+      fi
+      if ! kill -0 "$E2E_CONNECT_PID" >/dev/null 2>&1; then
+        record "- connect attempt $attempt exited before HTTP became ready."
+        break
+      fi
+      sleep 2
+    done
+
+    cp "$log_path" "$archived_log" 2>/dev/null || true
+    record_file_as_block "Connect attempt $attempt log:" "$archived_log" text
+    cleanup_connect "$E2E_CONNECT_PID"
+    E2E_CONNECT_PID=""
+    sleep 15
+  done
+
+  echo "connect did not become HTTP-ready after $attempts attempts" >&2
+  return 1
+}
+
 main() {
   validate_e2e_modes
   require_cmd docker
@@ -1059,8 +1203,20 @@ main() {
 
   local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$STATE_DIR")
   CA_ARGS=("${ca[@]}")
-  record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-  "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+  local ops_peering="$WORK_DIR/peering-ops.txt"
+  if "${ca[@]}" peering show ops >"$ops_peering" 2>/dev/null; then
+    if grep -Fxq "cidr: $allowed_cidr" "$ops_peering"; then
+      record "- peering ops: already present for \`$allowed_cidr\`."
+    else
+      record_cmd "${ca[*]} peering remove ops"
+      "${ca[@]}" peering remove ops
+      record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
+      "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+    fi
+  else
+    record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
+    "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+  fi
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     record ""
     record "Build commands run with proxy environment cleared so mkosi/DNF can use the selected internal repo directly."
@@ -1117,22 +1273,12 @@ main() {
     record_file_as_block "Rendered connect TNG config stderr:" "$WORK_DIR/connect-rendered-config.stderr" text
   fi
 
-  record_cmd "${ca[*]} connect"
-  setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-    "${ca[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
-  local connect_pid=$!
-  E2E_CONNECT_PID="$connect_pid"
   local connect_port
-  connect_port="$(wait_for_connect_port "$WORK_DIR/connect.log" 60)"
+  local connect_port_file="$WORK_DIR/connect-port.txt"
+  start_connect_until_http_ready "$connect_port_file" 4 180
+  connect_port="$(<"$connect_port_file")"
   record ""
   record "Connect mapped OpenClaw to \`127.0.0.1:$connect_port\`."
-
-  if ! wait_for_http "http://127.0.0.1:$connect_port/openclaw" 180; then
-    record ""
-    record "Connect HTTP preflight did not return a complete response; failing before the WebSocket chat probe."
-    record_connect_diagnostics
-    return 1
-  fi
   if (( OPENCLAW_STABILIZE_SEC > 0 )); then
     log "waiting ${OPENCLAW_STABILIZE_SEC}s for OpenClaw gateway stabilization"
     record ""

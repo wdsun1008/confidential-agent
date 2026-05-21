@@ -19,15 +19,10 @@ Run the automated demo:
 tools/e2e/run-cmaas-e2e.sh
 ```
 
-The e2e script vendors `mcp-proxy` and `@modelcontextprotocol/server-memory` into
-`files/cmaas-node` before building, because Shelter image post-install runs without
-network access. For a manual build of `examples/cmaas/cmaas.yaml`, prepare the same
-offline prefix first:
-
-```bash
-npm install --prefix examples/cmaas/files/cmaas-node --omit=dev --no-audit --no-fund \
-  mcp-proxy@6.5.0 @modelcontextprotocol/server-memory@2026.1.26
-```
+`install-cmaas.sh` installs `mcp-proxy` and `@modelcontextprotocol/server-memory`
+into `/opt/confidential-agent/cmaas-node` during image build. Override
+`MCP_PROXY_VERSION`, `MCP_MEMORY_VERSION`, or `NPM_REGISTRY` if you need a pinned
+internal mirror.
 
 The script performs three checks:
 

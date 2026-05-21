@@ -387,6 +387,45 @@ fn tng_config_adds_verify_for_confidential_self_ports() {
 }
 
 #[test]
+fn tng_reference_values_prefers_sample_when_rekor_is_also_present() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": "confidential-agent/mesh-bundle/v1",
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "peer": {
+                "phase": "active",
+                "private_ip": "10.0.1.11",
+                "public_ip": "39.105.93.168",
+                "ports": [3001],
+                "connect": [3001]
+            }
+        },
+        "reference_values": {
+            "peer": {"measurement.uki.SHA-384": ["sample-rv"]}
+        },
+        "rekor_reference_values": {
+            "peer": {
+                "artifact_id": "peer-disk",
+                "artifact_version": "20260514000000",
+                "artifact_type": "uki",
+                "rekor_url": "https://rekor.sigstore.dev",
+                "rv_name": "measurement.uki.SHA-384"
+            }
+        }
+    }))
+    .unwrap();
+
+    let values = tng_reference_values(&bundle, "peer").unwrap();
+
+    assert_eq!(values[0]["type"], "sample");
+    assert_eq!(
+        values[0]["payload"]["content"]["measurement.uki.SHA-384"][0],
+        "sample-rv"
+    );
+}
+
+#[test]
 fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
     let bundle: MeshBundle = serde_json::from_value(json!({
         "schema": "confidential-agent/mesh-bundle/v1",
@@ -849,6 +888,29 @@ fn a2a_tng_ingress_fetches_agent_card_and_generates_config() {
 }
 
 #[test]
+fn a2a_tng_ingress_prefers_agent_card_sample_reference_values() {
+    let mut card = test_agent_card("remote-agent", &[3001]);
+    card.extensions
+        .confidential_agent
+        .as_mut()
+        .unwrap()
+        .reference_values = Some(json!({"measurement.uki.SHA-384": ["sample-rv"]}));
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(None, &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    let rv = &ingress[0]["verify"]["reference_values"][0];
+    assert_eq!(rv["type"], "sample");
+    assert_eq!(
+        rv["payload"]["content"]["measurement.uki.SHA-384"][0],
+        "sample-rv"
+    );
+}
+
+#[test]
 fn a2a_tng_ingress_uses_alias_and_allocates_non_conflicting_local_port() {
     let card = test_agent_card("remote-openclaw", &[18789]);
     let url = serve_agent_card_once(card);
@@ -1036,6 +1098,7 @@ fn test_agent_card(id: &str, ports: &[u16]) -> confidential_agent_core::schema::
                         port: *port,
                     })
                     .collect(),
+                reference_values: None,
                 rekor: AgentCardRekor {
                     rekor_url: "https://rekor.sigstore.dev".to_string(),
                     artifact_id: format!("{id}-release"),

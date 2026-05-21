@@ -13,10 +13,33 @@ NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-550.144.03}"
 NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://cn.download.nvidia.cn/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run}"
 NVIDIA_DRIVER_REFERER="${NVIDIA_DRIVER_REFERER:-https://www.nvidia.cn/}"
 NVIDIA_DRIVER_SHA256="${NVIDIA_DRIVER_SHA256:-}"
+CUDA_TOOLKIT_VERSION="${OPENCLAW_VLLM_CUDA_TOOLKIT_VERSION:-12.4.1}"
+CUDA_BUNDLED_DRIVER_VERSION="${OPENCLAW_VLLM_CUDA_BUNDLED_DRIVER_VERSION:-550.54.15}"
+CUDA_TOOLKIT_URL="${OPENCLAW_VLLM_CUDA_TOOLKIT_URL:-https://developer.download.nvidia.com/compute/cuda/${CUDA_TOOLKIT_VERSION}/local_installers/cuda_${CUDA_TOOLKIT_VERSION}_${CUDA_BUNDLED_DRIVER_VERSION}_linux.run}"
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+BUILD_POSTINSTALL_MARKER=/var/lib/cai/openclaw-vllm/build-postinstall.done
+
+ensure_openclaw_runtime_ownership() {
+  if ! id -u openclaw >/dev/null 2>&1; then
+    return 0
+  fi
+  install -d -m 0750 -o openclaw -g openclaw /home/openclaw /home/openclaw/.openclaw
+  install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.openclaw/skills
+  install -d -m 0775 -o openclaw -g openclaw /workspace
+  chown -R openclaw:openclaw /home/openclaw /workspace
+  chmod 0750 /home/openclaw/.openclaw
+  chmod 0775 /workspace
+}
+
+if [[ -f "$BUILD_POSTINSTALL_MARKER" ]]; then
+  ensure_openclaw_runtime_ownership
+  echo "OpenClaw vLLM build postinstall already completed; fixed runtime ownership and skipped repeated mkosi postinstall pass"
+  exit 0
+fi
 
 ensure_build_dependencies() {
   local missing=()
-  for cmd in curl gcc jq make npm python3.11 rpm wget; do
+  for cmd in curl gcc jq make npm python3.11 rpm sha256sum wget; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   command -v depmod >/dev/null 2>&1 || missing+=("kmod")
@@ -31,6 +54,107 @@ ensure_build_dependencies() {
     printf 'add the corresponding packages to build.packages in the Confidential Agent spec\n' >&2
     exit 1
   fi
+}
+
+target_kernel_version() {
+  find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n 1
+}
+
+verify_nvidia_driver_checksum() {
+  local runfile="$1"
+  if [[ -z "$NVIDIA_DRIVER_SHA256" ]]; then
+    return 0
+  fi
+  local actual
+  actual="$(sha256sum "$runfile" | awk '{print $1}')"
+  if [[ "$actual" != "$NVIDIA_DRIVER_SHA256" ]]; then
+    echo "NVIDIA driver checksum mismatch: expected $NVIDIA_DRIVER_SHA256 got $actual" >&2
+    return 1
+  fi
+}
+
+download_nvidia_driver() {
+  local state_dir runfile
+  state_dir=/var/lib/cai/nvidia-cc
+  runfile="$state_dir/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run"
+  mkdir -p "$state_dir"
+  if [[ -s "$runfile" ]]; then
+    verify_nvidia_driver_checksum "$runfile"
+    chmod 0755 "$runfile"
+    printf '%s\n' "$runfile"
+    return
+  fi
+  echo "downloading NVIDIA driver $NVIDIA_DRIVER_VERSION" >&2
+  if ! wget --referer="$NVIDIA_DRIVER_REFERER" -O "$runfile.tmp" "$NVIDIA_DRIVER_URL"; then
+    rm -f "$runfile.tmp"
+    return 1
+  fi
+  mv "$runfile.tmp" "$runfile"
+  verify_nvidia_driver_checksum "$runfile" || { rm -f "$runfile"; return 1; }
+  chmod 0755 "$runfile"
+  printf '%s\n' "$runfile"
+}
+
+preinstall_nvidia_driver() {
+  local kernel runfile state_dir
+  state_dir=/var/lib/cai/nvidia-cc
+  kernel="$(target_kernel_version)"
+  if [[ -z "$kernel" ]]; then
+    echo "unable to determine target kernel from /lib/modules" >&2
+    return 1
+  fi
+  echo "pre-installing NVIDIA driver $NVIDIA_DRIVER_VERSION for target kernel $kernel"
+  if find "/lib/modules/$kernel" -name 'nvidia*.ko*' -print -quit 2>/dev/null | grep -q . &&
+     command -v nvidia-smi >/dev/null 2>&1 &&
+     command -v nvidia-persistenced >/dev/null 2>&1; then
+    touch "$state_dir/build-preinstalled.done"
+    return 0
+  fi
+  if [[ ! -e "/lib/modules/$kernel/build" && -d "/usr/src/kernels/$kernel" ]]; then
+    ln -sfn "/usr/src/kernels/$kernel" "/lib/modules/$kernel/build"
+  fi
+  if [[ ! -e "/lib/modules/$kernel/build" ]]; then
+    echo "missing kernel build tree for target kernel $kernel" >&2
+    return 1
+  fi
+  runfile="$(download_nvidia_driver)"
+  bash "$runfile" \
+    --ui=none \
+    --no-questions \
+    --accept-license \
+    --disable-nouveau \
+    --no-cc-version-check \
+    --install-libglvnd \
+    --kernel-module-build-directory=kernel-open \
+    --kernel-name="$kernel" || true
+  depmod -a "$kernel" 2>/dev/null || true
+  if ! find "/lib/modules/$kernel" -name 'nvidia*.ko*' -print -quit 2>/dev/null | grep -q .; then
+    echo "NVIDIA kernel modules were not installed for target kernel $kernel" >&2
+    return 1
+  fi
+  touch "$state_dir/build-preinstalled.done"
+  rm -f "$runfile"
+}
+
+preinstall_cuda_toolkit() {
+  local state_dir runfile
+  if [[ -x /usr/local/cuda/bin/nvcc || -d /usr/local/cuda/targets/x86_64-linux/lib ]]; then
+    return 0
+  fi
+  state_dir=/var/lib/cai/nvidia-cc
+  runfile="$state_dir/cuda_${CUDA_TOOLKIT_VERSION}_${CUDA_BUNDLED_DRIVER_VERSION}_linux.run"
+  mkdir -p "$state_dir"
+  if [[ ! -s "$runfile" ]]; then
+    echo "downloading CUDA toolkit $CUDA_TOOLKIT_VERSION"
+    if ! wget -O "$runfile.tmp" "$CUDA_TOOLKIT_URL"; then
+      rm -f "$runfile.tmp"
+      return 1
+    fi
+    mv "$runfile.tmp" "$runfile"
+    chmod 0755 "$runfile"
+  fi
+  bash "$runfile" --silent --toolkit
+  rm -f "$runfile"
 }
 
 groupadd -r openclaw 2>/dev/null || true
@@ -48,9 +172,10 @@ blacklist nouveau
 options nouveau modeset=0
 EOF
 
-preserve_driver_build_inputs() {
+preserve_runtime_build_inputs() {
   local kernel build_root kernel_src
-  kernel="$(uname -r)"
+  kernel="$(target_kernel_version)"
+  [[ -n "$kernel" ]] || return 0
   build_root=/opt/confidential-agent/openclaw-vllm
   kernel_src="/usr/src/kernels/$kernel"
   if [[ ! -d "$kernel_src" ]]; then
@@ -68,7 +193,21 @@ preserve_driver_build_inputs() {
   fi
 }
 
-preserve_driver_build_inputs
+preserve_runtime_build_inputs
+if ! preinstall_nvidia_driver; then
+  if [[ "${CAI_NVIDIA_DRIVER_PREINSTALL_REQUIRED:-1}" == "1" ]]; then
+    echo "failed to pre-install NVIDIA driver during image build" >&2
+    exit 1
+  fi
+  echo "warning: failed to pre-install NVIDIA driver; guest bootstrap will only try loading existing modules" >&2
+fi
+if [[ "${OPENCLAW_VLLM_PREINSTALL_CUDA_TOOLKIT:-0}" == "1" ]] && ! preinstall_cuda_toolkit; then
+  if [[ "${CAI_CUDA_TOOLKIT_PREINSTALL_REQUIRED:-1}" == "1" ]]; then
+    echo "failed to pre-install CUDA toolkit during image build" >&2
+    exit 1
+  fi
+  echo "warning: failed to pre-install CUDA toolkit; relying on Python wheel runtime libraries" >&2
+fi
 
 install -D -m 0644 /usr/local/share/cai/nvidia-persistenced.service /usr/lib/systemd/system/nvidia-persistenced.service
 chmod 0755 /usr/local/sbin/cai-nvidia-cc-stack-install.sh
@@ -91,13 +230,50 @@ ExecStart=/usr/local/sbin/cai-nvidia-cc-stack-install.sh
 WantedBy=multi-user.target
 EOF
 
-cat >/usr/local/bin/cai-vllm-setup.sh <<'EOF'
+cat >/usr/local/bin/cai-vllm-install-deps.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 PYPI_INDEX_URL="${OPENCLAW_VLLM_PYPI_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.19.1}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/cai-pip-cache}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/cai-uv-cache}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/cai-cache}"
+cleanup_package_caches() {
+  rm -rf "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" /root/.cache/pip /root/.cache/uv
+}
+trap cleanup_package_caches EXIT
+restore_vllm_build_headers() {
+  local src=/opt/confidential-agent/openclaw-vllm/usr-include
+  if [[ -f /usr/include/python3.11/Python.h && -f /usr/include/stdio.h ]]; then
+    return 0
+  fi
+  if [[ ! -d "$src" ]]; then
+    echo "missing preserved build headers at $src" >&2
+    return 1
+  fi
+  mkdir -p /usr/include
+  cp -a "$src"/. /usr/include/
+}
+vllm_deps_ready() {
+  [[ -x /root/.venv/bin/python && -x /root/.venv/bin/vllm ]] || return 1
+  VLLM_VERSION="$VLLM_VERSION" /root/.venv/bin/python - <<'PY' || return 1
+import importlib.metadata
+import os
+raise SystemExit(0 if importlib.metadata.version("vllm") == os.environ["VLLM_VERSION"] else 1)
+PY
+  python3.11 - <<'PY' || return 1
+import importlib
+importlib.import_module("modelscope")
+PY
+}
+restore_vllm_build_headers
+if vllm_deps_ready; then
+  cleanup_package_caches
+  exit 0
+fi
 python3.11 -m pip --version >/dev/null
-python3.11 -m pip install -i "$PYPI_INDEX_URL" uv
+python3.11 -m pip install -i "$PYPI_INDEX_URL" uv 'modelscope>=1.15.0' importlib-metadata
 mkdir -p /etc/uv
 cat >/etc/uv/uv.toml <<UV
 [[index]]
@@ -109,6 +285,56 @@ if [[ ! -d .venv ]]; then
   uv venv --python 3.11
 fi
 uv pip install -i "$PYPI_INDEX_URL" --only-binary=:all: "vllm==$VLLM_VERSION"
+cleanup_package_caches
+EOF
+chmod 0755 /usr/local/bin/cai-vllm-install-deps.sh
+if [[ "${OPENCLAW_VLLM_PREINSTALL_VLLM:-1}" == "1" ]]; then
+  /usr/local/bin/cai-vllm-install-deps.sh
+else
+  PIP_CACHE_DIR=/tmp/cai-pip-cache python3.11 -m pip install -i "$PYPI_INDEX_URL" uv 'modelscope>=1.15.0' importlib-metadata
+  rm -rf /tmp/cai-pip-cache /root/.cache/pip
+fi
+
+cat >/usr/local/bin/cai-vllm-setup.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.19.1}"
+restore_vllm_build_headers() {
+  local src=/opt/confidential-agent/openclaw-vllm/usr-include
+  if [[ -f /usr/include/python3.11/Python.h && -f /usr/include/stdio.h ]]; then
+    return 0
+  fi
+  if [[ ! -d "$src" ]]; then
+    echo "missing preserved build headers at $src" >&2
+    return 1
+  fi
+  mkdir -p /usr/include
+  cp -a "$src"/. /usr/include/
+}
+restore_vllm_build_headers
+cd /root
+command -v uv >/dev/null 2>&1 || { echo "uv is missing; image build must preinstall vLLM dependencies" >&2; exit 1; }
+[[ -x /root/.venv/bin/python && -x /root/.venv/bin/vllm ]] || { echo "vLLM virtualenv is missing; image build must preinstall vLLM dependencies" >&2; exit 1; }
+if ! VLLM_VERSION="$VLLM_VERSION" /root/.venv/bin/python - <<'PY'
+import importlib.metadata
+import os
+raise SystemExit(0 if importlib.metadata.version("vllm") == os.environ["VLLM_VERSION"] else 1)
+PY
+then
+  echo "vLLM version mismatch; image build must preinstall the requested version" >&2
+  exit 1
+fi
+if ! python3.11 - <<'PY'
+import importlib
+importlib.import_module("modelscope")
+PY
+then
+  echo "modelscope is missing; image build must preinstall model fetch dependencies" >&2
+  exit 1
+fi
+test -x /root/.venv/bin/python
+test -x /root/.venv/bin/vllm
 EOF
 chmod 0755 /usr/local/bin/cai-vllm-setup.sh
 
@@ -121,7 +347,14 @@ PYPI_INDEX_URL="$PYPI_INDEX_URL"
 if [[ -f "\$MODEL_DIR/config.json" ]] || [[ -f "\$MODEL_DIR/configuration.json" ]]; then
   exit 0
 fi
-python3.11 -m pip install -i "\$PYPI_INDEX_URL" 'modelscope>=1.15.0' importlib-metadata
+if ! /usr/bin/python3.11 - <<'PY_CHECK'
+import importlib
+importlib.import_module("modelscope")
+PY_CHECK
+then
+  echo "modelscope is missing; image build must preinstall model fetch dependencies" >&2
+  exit 1
+fi
 mkdir -p "\$MODEL_DIR"
 export MODELSCOPE_CACHE="\${MODELSCOPE_CACHE:-/opt/modelscope-cache}"
 mkdir -p "\$MODELSCOPE_CACHE"
@@ -139,6 +372,9 @@ done
 exit 1
 EOF
 chmod 0755 /usr/local/bin/cai-modelscope-fetch.sh
+if [[ "${OPENCLAW_VLLM_PRELOAD_MODEL:-0}" == "1" ]]; then
+  /usr/local/bin/cai-modelscope-fetch.sh
+fi
 
 cat >/usr/local/bin/cai-vllm-wait-deps.sh <<EOF
 #!/bin/bash
@@ -169,8 +405,12 @@ chmod 0755 /usr/local/bin/cai-vllm-wait-deps.sh
 cat >/usr/local/bin/cai-vllm-run.sh <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ ! -f /usr/include/python3.11/Python.h && -d /opt/confidential-agent/openclaw-vllm/usr-include ]]; then
+  mkdir -p /usr/include
+  cp -a /opt/confidential-agent/openclaw-vllm/usr-include/. /usr/include/
+fi
 cd /root
-uv run vllm serve "$MODEL_DIR/" \\
+/root/.venv/bin/vllm serve "$MODEL_DIR/" \\
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \\
   --port "$VLLM_PORT" --host 127.0.0.1 --served-model-name "$SERVED_MODEL_NAME" \\
   --gdn-prefill-backend triton
@@ -182,20 +422,90 @@ cat >/usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh <<EOF
 set -euo pipefail
 NODE_VERSION="\${OPENCLAW_NODE_VERSION:-$NODE_VERSION}"
 OPENCLAW_VERSION="\${OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
-npm config set registry "\${NPM_REGISTRY:-https://registry.npmmirror.com}"
+npm config set registry "\${NPM_REGISTRY:-https://registry.npmjs.org/}"
+
+resolve_n_bin() {
+  local candidate npm_prefix npm_root
+  candidate="\$(command -v n 2>/dev/null || true)"
+  if [[ -n "\$candidate" ]]; then
+    printf '%s\n' "\$candidate"
+    return 0
+  fi
+  npm_prefix="\$(npm prefix -g 2>/dev/null || true)"
+  npm_root="\$(npm root -g 2>/dev/null || true)"
+  for candidate in \\
+    "\$npm_prefix/bin/n" \\
+    "\$npm_root/n/bin/n" \\
+    /usr/local/bin/n \\
+    /usr/bin/n; do
+    if [[ -f "\$candidate" ]]; then
+      chmod 0755 "\$candidate" || true
+      printf '%s\n' "\$candidate"
+      return 0
+    fi
+  done
+  candidate="\$(find /usr/local /usr -path '*/node_modules/n/bin/n' -type f -print -quit 2>/dev/null || true)"
+  if [[ -n "\$candidate" ]]; then
+    chmod 0755 "\$candidate" || true
+    printf '%s\n' "\$candidate"
+    return 0
+  fi
+  return 1
+}
+
+install_node_with_retry() {
+  local node_version="\$1"
+  local attempt delay mirror mirrors timeout_sec
+  timeout_sec="\${NODE_INSTALL_TIMEOUT_SEC:-300}"
+  if [[ -n "\${N_NODE_MIRROR:-}" ]]; then
+    mirrors=("\$N_NODE_MIRROR")
+  else
+    mirrors=("https://npmmirror.com/mirrors/node" "https://nodejs.org/dist")
+  fi
+  for mirror in "\${mirrors[@]}"; do
+    export N_NODE_MIRROR="\$mirror"
+    for attempt in 1 2 3; do
+      rm -rf "/usr/local/n/versions/node/\$node_version"
+      if command -v timeout >/dev/null 2>&1; then
+        timeout "\$timeout_sec" n "\$node_version" && return 0
+      else
+        n "\$node_version" && return 0
+      fi
+      delay=\$((attempt * 15))
+      echo "Node.js \$node_version install attempt \$attempt from \$mirror failed; retrying in \${delay}s" >&2
+      sleep "\$delay"
+    done
+  done
+  echo "failed to install Node.js \$node_version after trying configured mirrors" >&2
+  return 1
+}
 
 ensure_node22() {
+  local n_bin
   if command -v node >/dev/null 2>&1 && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' >/dev/null 2>&1; then
     return
   fi
   command -v tar >/dev/null 2>&1 || { echo "tar is required to install Node.js \$NODE_VERSION" >&2; exit 1; }
   command -v xz >/dev/null 2>&1 || { echo "xz is required to install Node.js \$NODE_VERSION" >&2; exit 1; }
-  if ! command -v n >/dev/null 2>&1; then
+  if ! n_bin="\$(resolve_n_bin)"; then
     npm install -g n --no-audit --no-fund
+    hash -r
+    n_bin="\$(resolve_n_bin || true)"
   fi
-  export N_NODE_MIRROR="\${N_NODE_MIRROR:-https://npmmirror.com/mirrors/node}"
-  n "\$NODE_VERSION"
+  if [[ -z "\$n_bin" ]]; then
+    echo "n was installed but its executable could not be found; npm prefix=\$(npm prefix -g 2>/dev/null || true), npm root=\$(npm root -g 2>/dev/null || true)" >&2
+    exit 1
+  fi
+  if [[ "\$n_bin" != "/usr/local/bin/n" ]]; then
+    install -d -m 0755 /usr/local/bin
+    ln -sf "\$n_bin" /usr/local/bin/n
+    hash -r
+    n_bin="\$(command -v n 2>/dev/null || printf '%s' "\$n_bin")"
+  fi
+  install_node_with_retry "\$NODE_VERSION"
+  export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
   hash -r
 }
 
@@ -210,6 +520,9 @@ preinstall_openclaw_bundled_runtime_deps() {
     jq -e '(.dependencies // {}) | length > 0' "\$package_json" >/dev/null || continue
     (
       cd "\$plugin_dir"
+      if [[ -d node_modules ]]; then
+        exit 0
+      fi
       if jq -e '(.devDependencies // {}) | to_entries | any(.value | type == "string" and startswith("workspace:"))' package.json >/dev/null; then
         tmp_package="\$(mktemp)"
         jq 'del(.devDependencies)' package.json >"\$tmp_package"
@@ -222,6 +535,8 @@ preinstall_openclaw_bundled_runtime_deps() {
 }
 
 ensure_node22
+node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'
+command -v npm >/dev/null
 if ! command -v openclaw >/dev/null 2>&1; then
   npm install -g "openclaw@\$OPENCLAW_VERSION" --no-audit --no-fund
 fi
@@ -241,18 +556,32 @@ preinstall_openclaw_bundled_runtime_deps
 npm cache clean --force || true
 EOF
 chmod 0755 /usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh
+/usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh
+
+cat >/usr/local/bin/cai-openclaw-vllm-runtime-check.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+command -v node >/dev/null
+node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'
+command -v openclaw >/dev/null
+test -d "$(npm root -g)/openclaw/dist"
+test -d /home/openclaw/.openclaw/extensions/cai-pep
+test -d /home/openclaw/.openclaw/extensions/cai-a2a
+EOF
+chmod 0755 /usr/local/bin/cai-openclaw-vllm-runtime-check.sh
 
 cat >/etc/systemd/system/cai-openclaw-vllm-runtime-bootstrap.service <<'EOF'
 [Unit]
-Description=CAI install OpenClaw runtime dependencies
+Description=CAI verify OpenClaw runtime dependencies
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=1800
-ExecStart=/usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh
+TimeoutStartSec=120
+ExecStart=/usr/local/bin/cai-openclaw-vllm-runtime-check.sh
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
@@ -288,6 +617,7 @@ cat >/etc/systemd/system/cai-vllm.service <<'EOF'
 Description=CAI vLLM OpenAI server
 After=network-online.target cai-nvidia-cc-bootstrap.service cai-modelscope-fetch.service nvidia-persistenced.service
 Wants=network-online.target cai-nvidia-cc-bootstrap.service cai-modelscope-fetch.service nvidia-persistenced.service
+ConditionPathExists=/dev/nvidia0
 StartLimitIntervalSec=0
 
 [Service]
@@ -378,3 +708,7 @@ systemctl enable cai-openclaw-vllm-runtime-bootstrap.service
 systemctl enable cai-modelscope-fetch.service
 systemctl enable cai-vllm.service
 systemctl enable cai-openclaw-gateway.service
+
+install -d -m 0755 "$(dirname "$BUILD_POSTINSTALL_MARKER")"
+touch "$BUILD_POSTINSTALL_MARKER"
+ensure_openclaw_runtime_ownership

@@ -6,7 +6,7 @@ After=nvidia-fabricmanager.service
 
 [Service]
 Type=forking
-ExecStart=/usr/bin/nvidia-persistenced --user root
+ExecStart=/usr/bin/nvidia-persistenced --user root --uvm-persistence-mode --verbose
 ExecStartPost=-/usr/bin/nvidia-smi conf-compute -srs 1
 ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
 TimeoutStartSec=900

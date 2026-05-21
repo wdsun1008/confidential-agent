@@ -264,6 +264,10 @@ resolve_cosign_key() {
   require_cmd cosign
   mkdir -p "$WORK_DIR/secrets"
   local prefix="$WORK_DIR/secrets/cosign"
+  if [[ -f "$prefix.key" ]]; then
+    printf '%s' "$prefix.key"
+    return
+  fi
   record_cmd "COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix $prefix"
   if ! COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null; then
     return 1
@@ -365,6 +369,7 @@ $base_image_yaml
   image_name: openclaw-vllm-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
+  with_network: true
   packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
     - source: ./nvidia-persistenced.service
@@ -392,7 +397,7 @@ $base_image_yaml
   scripts: [./install-openclaw-vllm.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
@@ -451,6 +456,44 @@ PY
   done
   record_file_as_block "Last live status:" "$WORK_DIR/status-live.json" json
   record_file_as_block "Last live status stderr:" "$WORK_DIR/status-live.err" text
+  return 1
+}
+
+wait_status_debug_ready() {
+  local deadline=$((SECONDS + 1800))
+  while (( SECONDS < deadline )); do
+    if without_proxy "${CA_ARGS[@]}" status --live --json >"$WORK_DIR/status-live.json" 2>"$WORK_DIR/status-live.err"; then
+      if [[ -s "$WORK_DIR/status-live.json" ]] && python3 - "$WORK_DIR/status-live.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if not data:
+    raise SystemExit(1)
+item = data[0]
+local = item.get("local") or {}
+cloud = local.get("cloud") or local.get("deploy") or {}
+daemon = item.get("daemon") or {}
+build = local.get("build") or {}
+debug_ssh = build.get("debug_ssh") or {}
+expected_generation = local.get("mesh_generation") or 0
+daemon_generation = daemon.get("mesh_generation") or 0
+if (
+    cloud.get("public_ip")
+    and debug_ssh.get("private_key")
+    and daemon.get("mesh_ready")
+    and daemon.get("debug_ssh_ready")
+    and int(daemon_generation) >= int(expected_generation)
+):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+      then
+        return 0
+      fi
+    fi
+    sleep 10
+  done
+  record_file_as_block "Last live status before debug SSH:" "$WORK_DIR/status-live.json" json
+  record_file_as_block "Last live status stderr before debug SSH:" "$WORK_DIR/status-live.err" text
   return 1
 }
 
@@ -514,6 +557,7 @@ guest_wait() {
 }
 
 start_connect() {
+  local port_out="$1"
   record_cmd "${CA_ARGS[*]} connect"
   local attempt
   for attempt in $(seq 1 8); do
@@ -526,7 +570,7 @@ start_connect() {
       connect_port="$(parse_connect_port "$WORK_DIR/connect.log" || true)"
       if [[ -n "$connect_port" ]] && curl -fsS "http://127.0.0.1:$connect_port/openclaw/" >/dev/null 2>&1; then
         record_file_as_block "Connect log:" "$WORK_DIR/connect.log" text
-        printf '%s' "$connect_port"
+        printf '%s\n' "$connect_port" >"$port_out"
         return 0
       fi
       if ! kill -0 "$CONNECT_PID" >/dev/null 2>&1; then
@@ -659,19 +703,60 @@ main() {
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- OpenClaw gateway token generated but not printed."
 
-  record_cmd "${CA_ARGS[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-  "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+  local ops_peering="$WORK_DIR/peering-ops.txt"
+  if "${CA_ARGS[@]}" peering show ops >"$ops_peering" 2>/dev/null; then
+    if grep -Fxq "cidr: $allowed_cidr" "$ops_peering"; then
+      record "- peering ops: already present for \`$allowed_cidr\`."
+    else
+      record_cmd "${CA_ARGS[*]} peering remove ops"
+      "${CA_ARGS[@]}" peering remove ops
+      record_cmd "${CA_ARGS[*]} peering add --role operator --cidr $allowed_cidr --label ops"
+      "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+    fi
+  else
+    record_cmd "${CA_ARGS[*]} peering add --role operator --cidr $allowed_cidr --label ops"
+    "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+  fi
 
-  record_cmd "${CA_ARGS[*]} build --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
-  without_proxy "${CA_ARGS[@]}" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+  if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
+    record_cmd "${CA_ARGS[*]} build --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+    without_proxy "${CA_ARGS[@]}" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+  else
+    local manifest="$STATE_DIR/services/openclaw-vllm/manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+      echo "E2E_SKIP_BUILD=1 requires an existing OpenClaw vLLM build manifest at '$manifest'" >&2
+      exit 2
+    fi
+    local image_path
+    image_path="$(python3 - "$manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+
+variant = ((manifest.get("variants") or {}).get("debug") or {})
+result_path = variant.get("build_result") or manifest.get("build_result")
+if not result_path:
+    raise SystemExit(1)
+with open(result_path, encoding="utf-8") as f:
+    result = json.load(f)
+print(result["image_path"])
+PY
+)"
+    if [[ ! -f "$image_path" ]]; then
+      echo "E2E_SKIP_BUILD=1 requires the existing OpenClaw vLLM image at '$image_path'" >&2
+      exit 2
+    fi
+    record "- build openclaw-vllm: skipped; reusing \`$image_path\`."
+  fi
   record_manifest_variants openclaw-vllm
   DEPLOY_ATTEMPTED=1
   record_cmd "${CA_ARGS[*]} deploy --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
   without_proxy "${CA_ARGS[@]}" deploy --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
 
-  wait_status_ready
-  record_file_as_block "Live status:" "$WORK_DIR/status-live.json" json
-
+  wait_status_debug_ready
+  record_file_as_block "Live status after debug SSH readiness:" "$WORK_DIR/status-live.json" json
   mapfile -t ssh_lines < <(ssh_info)
   local host="${ssh_lines[0]}"
   local key="${ssh_lines[1]}"
@@ -681,9 +766,13 @@ main() {
   guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 7200
   guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:$VLLM_PORT/v1/models" 7200
   guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 7200
+  wait_status_ready
+  record_file_as_block "Live status:" "$WORK_DIR/status-live.json" json
 
   local connect_port
-  connect_port="$(start_connect)"
+  local connect_port_file="$WORK_DIR/connect-port.txt"
+  start_connect "$connect_port_file"
+  connect_port="$(<"$connect_port_file")"
   record "Connect mapped OpenClaw vLLM to \`127.0.0.1:$connect_port\`."
   run_chat_probe "$connect_port"
 }

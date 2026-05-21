@@ -11,6 +11,7 @@ service:
 build:
   image_name: openclaw-agent
   resize: 30G
+  with_network: true
   packages:
     - ca-certificates
     - curl
@@ -48,10 +49,10 @@ build:
 
 deploy:
   provider: aliyun
-  image_variant: release
-  instance_type: ecs.g8i.xlarge
+  image_variant: debug
+  instance_type: ecs.g9i.xlarge
   region: cn-beijing
-  zone_id: cn-beijing-l
+  zone_id: cn-beijing-i
   disk_gb: 200
 
 attestation:

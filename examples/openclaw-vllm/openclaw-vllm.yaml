@@ -12,6 +12,7 @@ build:
   image_name: openclaw-vllm-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
+  with_network: true
   packages:
     - binutils
     - ca-certificates

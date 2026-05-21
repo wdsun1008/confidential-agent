@@ -60,6 +60,7 @@ build:
   base_image: ./base.qcow2                    # 可选，存在则走 "convert/enhance" 模式；不写则走 mkosi 模式
   image_name: openclaw-agent                  # 必填，构建产物名 + cloud 镜像名 prefix
   resize: 30G                                 # 可选，扩盘到的目标大小
+  with_network: true                          # 可选，允许构建阶段访问网络
   kernel_cmdline_append: "swiotlb=4194304,any" # 可选，UKI cmdline 追加项
   packages: [nodejs, npm, jq, ...]            # 可选，注入到镜像里的 RPM/DEB 包列表
   files:
@@ -82,6 +83,7 @@ build:
 | `base_image` | string (path 或 URL) | ❌ | `None` | 设了则不能为空；存在 `://` 视为 URL，否则按相对路径解析。**不写时**，Shelter 走 mkosi 流程 |
 | `image_name` | string | ✅ | — | 仅 `[A-Za-z0-9_-]` |
 | `resize` | string | ❌ | `None` | 例如 `30G`，原样透传给 Shelter |
+| `with_network` | bool | ❌ | `false` | 透传给 Shelter/mkosi 的 with-network；需要在 build/post-install/finalize 阶段执行 npm/pip/model 下载等网络安装时设为 `true` |
 | `kernel_cmdline_append` | string | ❌ | `None` | 当 `disk-crypt.uki=true` 时透传到 UKI cmdline |
 | `packages` | `[string]` | ❌ | `[]` | 透传给 Shelter `packages` |
 | `files` | `[BuildFileSpec]` | ❌ | `[]` | 见下表 |

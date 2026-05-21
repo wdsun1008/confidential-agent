@@ -338,6 +338,12 @@ pub struct AgentCardConfidential {
     #[serde(rename = "publicIp")]
     pub public_ip: String,
     pub ports: Vec<AgentCardPort>,
+    #[serde(
+        default,
+        rename = "referenceValues",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reference_values: Option<Value>,
     pub rekor: AgentCardRekor,
     pub tee: String,
 }

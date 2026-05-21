@@ -21,6 +21,15 @@ ensure_container_runtime() {
     exit 1
 }
 
+prepull_pep_image() {
+    ensure_container_runtime
+    if docker image inspect "$PEP_IMAGE" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "pre-pulling CAI PEP sandbox image: $PEP_IMAGE"
+    docker pull "$PEP_IMAGE"
+}
+
 setup_runtime() {
     ensure_container_runtime
     getent group openclaw >/dev/null 2>&1 || groupadd -r openclaw
@@ -42,7 +51,7 @@ Group=openclaw
 WorkingDirectory=/var/lib/cai/pep
 RuntimeDirectory=cai
 RuntimeDirectoryMode=0770
-ExecStartPre=/bin/bash -lc 'command -v docker >/dev/null && (docker image inspect ${PEP_IMAGE} >/dev/null 2>&1 || docker pull ${PEP_IMAGE})'
+ExecStartPre=/bin/bash -lc 'command -v docker >/dev/null && docker image inspect ${PEP_IMAGE} >/dev/null'
 ExecStart=/usr/local/bin/cai-pep serve --config /etc/cai/pep/policy.json --socket /run/cai/pep.sock
 Restart=on-failure
 RestartSec=5
@@ -56,6 +65,13 @@ EOF
 
     systemctl daemon-reload || true
     systemctl enable cai-pep.service
+    if ! prepull_pep_image; then
+        if [[ "${CAI_PEP_PREPULL_REQUIRED:-1}" == "1" ]]; then
+            echo "failed to pre-pull CAI PEP sandbox image during image build" >&2
+            exit 1
+        fi
+        echo "warning: failed to pre-pull CAI PEP sandbox image; service startup will retry" >&2
+    fi
 }
 
 install_openclaw_plugin() {
@@ -76,6 +92,7 @@ install_openclaw_plugin() {
 
 case "$COMMAND" in
     setup-runtime) setup_runtime ;;
+    prepull-pep-image) prepull_pep_image ;;
     install-openclaw-plugin) install_openclaw_plugin ;;
     *) echo "unknown cai-pep install command: $COMMAND" >&2; exit 1 ;;
 esac
