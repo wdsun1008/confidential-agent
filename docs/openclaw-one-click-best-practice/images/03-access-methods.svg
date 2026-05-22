@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="620" viewBox="0 0 1180 620" role="img" aria-labelledby="title desc">
+  <title id="title">OpenClaw 访问方式</title>
+  <desc id="desc">展示钉钉、Web、桌面客户端和 TUI 通过 OpenClaw Gateway 或 TNG connect 访问 TDX 实例。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .center { fill: #edf8f1; stroke: #4f9b69; stroke-width: 2.5; rx: 14; }
+      .client { fill: #ffffff; stroke: #d7dde8; stroke-width: 2; rx: 12; }
+      .tunnel { fill: #eef4ff; stroke: #5f7fd1; stroke-width: 2; rx: 12; }
+      .text { font-family: Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #1f2937; }
+      .title { font-size: 30px; font-weight: 700; }
+      .h { font-size: 19px; font-weight: 700; }
+      .body { font-size: 15px; fill: #4b5563; }
+      .small { font-size: 13px; fill: #667085; }
+      .arrow { stroke: #667085; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1180" height="620"/>
+  <text class="text title" x="52" y="58">OpenClaw 访问方式</text>
+  <text class="text body" x="52" y="88">所有本地客户端流量经 TNG RATS-TLS 通道进入 TDX 实例</text>
+
+  <rect class="center" x="430" y="220" width="320" height="170"/>
+  <text class="text h" x="488" y="258">TDX ECS 内的 OpenClaw</text>
+  <text class="text body" x="472" y="294">OpenClaw Gateway :18789</text>
+  <text class="text body" x="472" y="322">cai-pep 策略沙箱</text>
+  <text class="text body" x="472" y="350">机密配置与服务凭证</text>
+
+  <rect class="tunnel" x="430" y="450" width="320" height="82"/>
+  <text class="text h" x="514" y="484">部署机 TNG Client</text>
+  <text class="text body" x="482" y="510">本地绑定 127.0.0.1:18789</text>
+
+  <rect class="client" x="70" y="145" width="250" height="104"/>
+  <text class="text h" x="112" y="182">钉钉机器人</text>
+  <text class="text body" x="104" y="213">企业内部应用凭据</text>
+  <text class="text small" x="104" y="236">间接聊天入口</text>
+
+  <rect class="client" x="70" y="345" width="250" height="104"/>
+  <text class="text h" x="120" y="382">Web 浏览器</text>
+  <text class="text body" x="104" y="413">http://127.0.0.1:18789/openclaw</text>
+  <text class="text small" x="104" y="436">输入 Gateway Token</text>
+
+  <rect class="client" x="860" y="145" width="250" height="104"/>
+  <text class="text h" x="906" y="182">桌面客户端</text>
+  <text class="text body" x="894" y="213">ws://127.0.0.1:18789</text>
+  <text class="text small" x="894" y="236">Remote 模式</text>
+
+  <rect class="client" x="860" y="345" width="250" height="104"/>
+  <text class="text h" x="930" y="382">TUI</text>
+  <text class="text body" x="894" y="413">openclaw tui --url ...</text>
+  <text class="text small" x="894" y="436">首次连接需授权设备</text>
+
+  <path class="arrow" d="M320 197 C380 197 380 250 430 270"/>
+  <path class="arrow" d="M320 397 C382 397 388 492 430 492"/>
+  <path class="arrow" d="M860 397 C798 397 792 492 750 492"/>
+  <path class="arrow" d="M860 197 C800 197 800 250 750 270"/>
+  <path class="arrow" d="M590 450 L590 390"/>
+  <text class="text small" x="424" y="580">个人电脑访问 Web、桌面客户端或 TUI 时，可先执行 SSH -L 将本地端口转发到部署机。</text>
+</svg>

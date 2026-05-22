@@ -1,6 +1,13 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+fn default_state_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"))
+        .join(".confidential-agent")
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "confidential-agent")]
 #[command(about = "Confidential Agent host CLI")]
@@ -17,7 +24,7 @@ pub(crate) struct Cli {
     )]
     pub(crate) shelter_bin: PathBuf,
 
-    #[arg(long, default_value = ".confidential-agent", global = true)]
+    #[arg(long, default_value_os_t = default_state_dir(), global = true)]
     pub(crate) state_dir: PathBuf,
 
     #[arg(

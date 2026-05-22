@@ -18,7 +18,7 @@ CA_BIN="${CA_BIN:-$ROOT_DIR/target/debug/confidential-agent}"
 TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
 SHELTER_DIR="${E2E_SHELTER_DIR:-/root/shelter-rs}"
 SHELTER_OVMF="${E2E_SHELTER_OVMF:-/root/shelter-rs/OVMF.fd}"
-USE_SOURCE_SHELTER="${E2E_USE_SOURCE_SHELTER:-1}"
+USE_SOURCE_SHELTER="${E2E_USE_SOURCE_SHELTER:-0}"
 BASE_IMAGE="${E2E_BASE_IMAGE:-/root/images/alinux3.qcow2}"
 BUILD_BACKEND="${E2E_BUILD_BACKEND:-mkosi}"
 REFERENCE_VALUES="${E2E_REFERENCE_VALUES:-rekor}"
@@ -81,8 +81,10 @@ require_cmd() {
   }
 }
 
-without_proxy() {
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy "$@"
+CA_CONTROL_NO_PROXY=(-u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy)
+
+ca_control_without_proxy() {
+  env "${CA_CONTROL_NO_PROXY[@]}" "$@"
 }
 
 use_aliyun_cli_profile() {
@@ -350,14 +352,55 @@ ensure_source_shelter() {
     (cd "$SHELTER_DIR" && make RELEASE=0 install OVMF_SRC="$SHELTER_OVMF")
     record_cmd "cd $SHELTER_DIR && make verify-system-dependencies"
     (cd "$SHELTER_DIR" && make verify-system-dependencies)
+  elif [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" ]] && ! command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
+    install_bundled_shelter_rpm
   fi
   record_cmd "$CA_SHELTER_BIN --version"
   "$CA_SHELTER_BIN" --version | tee "$WORK_DIR/shelter-version.txt"
-  if [[ -d "$SHELTER_DIR/.git" ]]; then
+  if [[ "$USE_SOURCE_SHELTER" == "1" && -d "$SHELTER_DIR/.git" ]]; then
     git -C "$SHELTER_DIR" log -1 --oneline | tee "$WORK_DIR/shelter-source.txt"
   fi
   record_file_as_block "Shelter version:" "$WORK_DIR/shelter-version.txt" text
   record_file_as_block "Shelter source:" "$WORK_DIR/shelter-source.txt" text
+}
+
+resolve_shelter_rpm() {
+  if [[ -n "${E2E_SHELTER_RPM:-}" ]]; then
+    [[ -f "$E2E_SHELTER_RPM" ]] || {
+      echo "Shelter RPM does not exist: $E2E_SHELTER_RPM" >&2
+      exit 2
+    }
+    printf '%s\n' "$E2E_SHELTER_RPM"
+    return
+  fi
+
+  local rpm
+  for rpm in "$ROOT_DIR"/hack/shelter-*.rpm; do
+    [[ -f "$rpm" ]] || continue
+    printf '%s\n' "$rpm"
+    return
+  done
+  echo "Shelter command '$CA_SHELTER_BIN' is unavailable and no bundled Shelter RPM was found under $ROOT_DIR/hack" >&2
+  exit 2
+}
+
+install_bundled_shelter_rpm() {
+  local rpm pm
+  rpm="$(resolve_shelter_rpm)"
+  if [[ "$(id -u)" != "0" ]]; then
+    echo "Shelter is missing and installing $rpm requires root" >&2
+    exit 2
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    pm=dnf
+  elif command -v yum >/dev/null 2>&1; then
+    pm=yum
+  else
+    echo "yum or dnf is required to install $rpm" >&2
+    exit 2
+  fi
+  record_cmd "$pm install -y $rpm"
+  "$pm" install -y "$rpm"
 }
 
 wait_for_live_status() {
@@ -748,8 +791,8 @@ cleanup_cloud() {
     fi
     if [[ "$DEPLOY_ATTEMPTED" == "1" ]]; then
       local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$STATE_DIR")
-      without_proxy "${ca[@]}" destroy cmaas-agent >/dev/null 2>&1 || true
-      without_proxy "${ca[@]}" destroy cmaas >/dev/null 2>&1 || true
+      ca_control_without_proxy "${ca[@]}" destroy cmaas-agent >/dev/null 2>&1 || true
+      ca_control_without_proxy "${ca[@]}" destroy cmaas >/dev/null 2>&1 || true
     fi
   else
     record "- cleanup skipped; resources preserved for debugging."
@@ -806,30 +849,30 @@ main() {
     (cd "$ROOT_DIR" && cargo build -p confidential-agent-cli -p confidential-agentd)
   fi
 
-  if "${ca[@]}" peering show ops >/dev/null 2>&1; then
+  if ca_control_without_proxy "${ca[@]}" peering show ops >/dev/null 2>&1; then
     record_cmd "${ca[*]} peering remove ops"
-    "${ca[@]}" peering remove ops
+    ca_control_without_proxy "${ca[@]}" peering remove ops
   fi
   record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-  "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+  ca_control_without_proxy "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     log "building CMaaS memory image variants"
     record_cmd "${ca[*]} build --spec $CMAAS_DIR/cmaas.yaml"
-    without_proxy "${ca[@]}" build --spec "$CMAAS_DIR/cmaas.yaml"
+    "${ca[@]}" build --spec "$CMAAS_DIR/cmaas.yaml"
     log "building CMaaS agent image variants"
     record_cmd "${ca[*]} build --spec $AGENT_DIR/agent.yaml"
-    without_proxy "${ca[@]}" build --spec "$AGENT_DIR/agent.yaml"
+    "${ca[@]}" build --spec "$AGENT_DIR/agent.yaml"
   fi
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     DEPLOY_ATTEMPTED=1
     log "deploying CMaaS memory service"
     record_cmd "${ca[*]} deploy --spec $CMAAS_DIR/cmaas.yaml"
-    without_proxy "${ca[@]}" deploy --spec "$CMAAS_DIR/cmaas.yaml"
+    ca_control_without_proxy "${ca[@]}" deploy --spec "$CMAAS_DIR/cmaas.yaml"
     log "deploying CMaaS agent service"
     record_cmd "${ca[*]} deploy --spec $AGENT_DIR/agent.yaml"
-    without_proxy "${ca[@]}" deploy --spec "$AGENT_DIR/agent.yaml"
+    ca_control_without_proxy "${ca[@]}" deploy --spec "$AGENT_DIR/agent.yaml"
   fi
 
   local cmaas_ip agent_ip cmaas_key agent_key cmaas_generation agent_generation cmaas_instance_id
@@ -873,14 +916,14 @@ main() {
 
   log "provisioning non-TEE baseline ECS"
   provision_baseline "$cmaas_instance_id"
-  if "${ca[@]}" peering show baseline >/dev/null 2>&1; then
+  if ca_control_without_proxy "${ca[@]}" peering show baseline >/dev/null 2>&1; then
     record_cmd "${ca[*]} peering remove baseline"
-    "${ca[@]}" peering remove baseline
+    ca_control_without_proxy "${ca[@]}" peering remove baseline
   fi
   record_cmd "${ca[*]} peering add --role peer --cidr $BASELINE_IP/32 --label baseline --scope mesh"
-  "${ca[@]}" peering add --role peer --cidr "$BASELINE_IP/32" --label baseline --scope mesh
+  ca_control_without_proxy "${ca[@]}" peering add --role peer --cidr "$BASELINE_IP/32" --label baseline --scope mesh
   record_cmd "${ca[*]} peering apply"
-  without_proxy "${ca[@]}" peering apply
+  ca_control_without_proxy "${ca[@]}" peering apply
   sleep 10
 
   log "Act 2: non-attested baseline is rejected before application"
