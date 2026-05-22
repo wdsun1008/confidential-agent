@@ -76,131 +76,61 @@ flowchart TB
 
 ## 快速开始 (Quick Start)
 
-下面这条路径覆盖最常见的用法：**OpenClaw + Challenge 注入 + Rekor reference value**。完成后你会得到一台跑在阿里云 TDX ECS 上、可远程证明、可通过 TNG RATS-TLS 访问的 OpenClaw Agent。
+最短路径是 one-click installer。它会在本机安装依赖、在缺少 Shelter 时安装仓库内置的 Shelter RPM、构建当前源码、生成 OpenClaw 配置、交互式选择 operator CIDR，然后通过 Shelter 在阿里云上创建一台 TDX ECS。
 
-### 0. 环境与依赖
+```bash
+curl -fsSL https://raw.githubusercontent.com/wdsun1008/confidential-agent/one-click/one-click/install.sh | sh
+```
 
-| 要求 | 说明 |
+在 Alibaba Cloud Linux 3 上，脚本会优先通过系统源安装 `cargo`/`rust`，并为 Cargo 写入 Aliyun crates mirror。默认不会走 rustup；只有显式传入 `--allow-rustup` 时，系统源工具链不可用才会 fallback 到 rustup。
+
+默认值面向 Alibaba Cloud Linux 3 测试环境；OpenClaw full deploy 当前建议从 alinux3 部署机执行。
+
+| 参数 | 默认值 |
 |---|---|
-| 操作系统 | Linux x86_64（推荐 Alibaba Cloud Linux 3） |
-| Rust | 1.75+ |
-| Docker | 必需，CLI 通过 docker 运行 `confidential-agent-tools` 镜像调用 `tng` 与 `attestation-challenge-client` |
-| Shelter | 外部二进制 [shelter](https://github.com/inclavare-containers/shelter)，需在 `$PATH` 或通过 `--shelter-bin` 指定 |
-| 阿里云权限 | 需要 ECS / VPC / OSS / 安全组创建权限（用于 Terraform） |
-| Cosign Key | rekor 模式必需。可用 `cosign generate-key-pair` 生成 |
+| Region | `cn-beijing` |
+| Zone | `cn-beijing-i` |
+| Instance Type | `ecs.g9i.xlarge` |
+| Disk | `200G` |
+| Attestation | `rekor` |
+| State Dir | `$HOME/.confidential-agent` |
 
-### 1. 编译
-
-```bash
-git clone https://github.com/inclavare-containers/confidential-agent.git
-cd confidential-agent
-
-# 构建 workspace（产出 confidential-agent / confidential-agentd / cai-pep / shelter lib）
-cargo build --release
-
-# 构建工具镜像（包含 tng 2.6.0 + attestation-challenge-client）
-docker build -t confidential-agent-tools:latest -f tools/Dockerfile .
-```
-
-> 后续会发布预编译 release 包；当前阶段请先从源码构建。
-
-### 2. 准备 Aliyun 凭据
-
-CLI 会通过 Shelter / Terraform 调阿里云 API。最简方式：
-```bash
-export ALIBABA_CLOUD_ACCESS_KEY_ID=<your-ak>
-export ALIBABA_CLOUD_ACCESS_KEY_SECRET=<your-sk>
-```
-
-Shelter 实际使用的凭据规则以其文档为准；这里只列最常用的环境变量。
-
-### 3. 准备 cosign 公私钥（仅 rekor 模式）
+脚本会交互式询问缺失的阿里云凭证、百炼 API Key、是否启用钉钉，以及 operator access CIDR。启用钉钉时，镜像会安装并构建 `soimy/openclaw-channel-dingtalk`，再写入 `dingtalk` channel 配置。脚本也会在部署机安装同版本 Node.js/OpenClaw CLI，并把 `confidential-agent` 安装到 PATH。CIDR 默认使用当前部署机公网 IP `/32`，仅支持 IPv4；也可以选择 `0.0.0.0/0`，脚本会先提示这会把控制面、状态、debug SSH 和 connect 入口暴露给所有 IPv4 来源，且默认 OpenClaw 配置禁用 device auth、仅靠 gateway token 鉴权，0.0.0.0/0 模式下务必妥善保管 token。非交互传入的 `--allowed-cidr` 可用于你的浏览器或运维出口，脚本仍会额外探测部署机出口 IP 并加入 `deployer` peering，避免资源注入和 connect 被安全组挡住。非交互部署示例：
 
 ```bash
-cd examples/openclaw
-cosign generate-key-pair                  # 生成 cosign.key / cosign.pub
+export ALICLOUD_ACCESS_KEY=<your-ak>
+export ALICLOUD_SECRET_KEY=<your-sk>
+export DASHSCOPE_API_KEY=<your-bailian-key>
+
+curl -fsSL https://raw.githubusercontent.com/wdsun1008/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
+  --non-interactive \
+  --region cn-beijing \
+  --zone-id cn-beijing-i \
+  --instance-type ecs.g9i.xlarge
 ```
 
-### 4. 准备 OpenClaw / 钉钉等敏感配置
-
-打开 `examples/openclaw/openclaw.json`，按注释替换以下字段（这些都是会被远程证明注入到 Guest `/root/.openclaw/openclaw.json` 的密文资源）：
-
-```jsonc
-{
-  "models": { "providers": { "bailian": {
-    "apiKey": "替换为你的百炼 API Key"
-  } } },
-  "channels": { "dingtalk": {
-    "clientId": "替换为钉钉机器人 clientId",
-    "clientSecret": "替换为钉钉机器人 clientSecret"
-  } },
-  "gateway": { "auth": {
-    "token": "替换为一个强随机字符串，host 通过 connect 时的鉴权 token"
-  } }
-}
-```
-
-如果你不需要钉钉/百炼，直接删掉对应小节即可。
-
-### 5. 修改 AppSpec 中需要因人而异的部分
-
-编辑 `examples/openclaw/openclaw.yaml`，**重点修改**：
-
-| 字段 | 必改 | 说明 |
-|---|---|---|
-| `deploy.region` | ✅ | 阿里云 region，例如 `cn-beijing`，需与 zone 匹配。 |
-| `deploy.zone_id` | ✅ | TDX 可用区，例如 `cn-beijing-l`。 |
-| `deploy.instance_type` | ✅ | TDX ECS 规格，例如 `ecs.g8i.xlarge`。 |
-| `deploy.security.allowed_cidr` | ✅✅ | **务必改成你自己的运维 CIDR**（默认 `203.0.113.0/24` 是 TEST-NET 占位符）。 |
-| `attestation.rekor.cosign_key` | ✅ | 指向你刚生成的 cosign 密钥路径。 |
-
-### 6. 一条龙：build + deploy + inject + mesh
+如果只想安装 host 侧组件，不创建云资源：
 
 ```bash
-# 让 CLI 找到 confidential-agentd（必须和 confidential-agent 同目录）
-export PATH="$PWD/target/release:$PATH"
-
-# 1) 构建机密镜像（会构建所有 enabled variants；产出 .qcow2 + reference value + Rekor metadata）
-confidential-agent build --spec examples/openclaw/openclaw.yaml
-
-# 2) 上云 + 注入资源 + 同步 mesh bundle；实际部署 deploy.image_variant 指定的 variant
-confidential-agent deploy --spec examples/openclaw/openclaw.yaml
+curl -fsSL https://raw.githubusercontent.com/wdsun1008/confidential-agent/one-click/one-click/install.sh | sh -s -- install-only
 ```
 
-成功后你会看到类似输出：
-```
-[ca] deploy completed: service=openclaw public_ip=1.2.3.4 private_ip=10.0.0.8 mesh_generation=1
+部署完成后，脚本会输出本地 connect 地址：
+
+```text
+web:    http://127.0.0.1:<port>/openclaw
+ws/api: ws://127.0.0.1:<port>
+token:  <generated-or-provided-token>
 ```
 
-### 7. 可信地访问 Agent（host → guest）
+生成的 gateway token 会保存在 `$HOME/.confidential-agent/one-click/secrets/gateway.token`，后续重跑会复用同一个 token。部署完成后可以直接运行 `confidential-agent status --live`、`confidential-agent connect` 和 `openclaw tui --url ws://127.0.0.1:<port> --token <token>`。
+
+清理云资源：
 
 ```bash
-# 启动一条本地 TNG 隧道，把 127.0.0.1:18789 RATS-TLS 转发到 Guest 的 18789
-confidential-agent connect
-
-# 现在可以直接访问 OpenClaw 控制台
-curl -H "Authorization: Bearer <你前面填的 GATEWAY_TOKEN>" http://127.0.0.1:18789/openclaw/health
+curl -fsSL https://raw.githubusercontent.com/wdsun1008/confidential-agent/one-click/one-click/install.sh | sh -s -- cleanup \
+  --state-dir "$HOME/.confidential-agent"
 ```
-
-> 注意：`connect` 内部跑的是带远程证明的 TLS 握手，握手失败（reference value 不匹配、证明过期等）会直接拒绝连接。
-
-### 8. 查看状态
-
-```bash
-# 本地视角
-confidential-agent status
-
-# 包含 Guest 实时上报（HTTP GET :8088/status）
-confidential-agent status --live --json
-```
-
-### 9. 销毁
-
-```bash
-confidential-agent destroy openclaw
-```
-
-> `destroy` 会回收 Terraform 创建的全部资源（ECS、自定义镜像、安全组等），并把 mesh-bundle 里这台实例的 entry 摘除。
 
 ---
 
@@ -211,7 +141,7 @@ confidential-agent destroy openclaw
 | **GPU TEE（vLLM + H20）** | `examples/openclaw-vllm/` ，用 `ecs.gn8v-tee.4xlarge`，spec 里追加 NVIDIA CC 驱动安装脚本。 |
 | **最小 MCP Server** | `examples/mcp/mcp-demo.yaml`，最薄的一个 spec，可作为模板。 |
 | **多实例 Mesh** | 在不同的 spec 文件里使用相同的 `connect` 端口集合分别 `deploy`，CLI 会自动维护 `mesh-bundle.json` 并把对端公网 CIDR 注入安全组。 |
-| **Debug SSH** | spec 里把 `deploy.image_variant: debug` + `build.variants.debug.enabled: true`，CLI 会自动生成 ed25519 密钥对并放通 22 端口（仍受 `allowed_cidr` 约束）。 |
+| **Debug SSH** | spec 里把 `deploy.image_variant: debug` + `build.variants.debug.enabled: true`，CLI 会自动生成 ed25519 密钥对；入向访问由 `peering add --role operator --cidr ...` 控制。 |
 
 ---
 
@@ -226,10 +156,10 @@ confidential-agent/
 ├── daemon/                # confidential-agentd (guest 控制面 + initrd-fetch)
 ├── cai-pep/               # Policy Enforcement Point，运行时 sandbox + attest helper
 ├── tools/
-│   ├── Dockerfile         # confidential-agent-tools 镜像（tng 2.6.0 + attestation-challenge-client）
+│   ├── Dockerfile         # confidential-agent-tools 镜像（hack/tng-2.6.0 + attestation-challenge-client）
 │   ├── policies/          # Trustee/OPA rego（生产 + dev）
 │   └── e2e/               # 端到端测试脚本
-├── hack/                  # 严格 pin 的 TNG 二进制 + libtdx-verify rpm
+├── hack/                  # 严格 pin 的 TNG 二进制、Shelter RPM、libtdx-verify RPM
 └── examples/
     ├── openclaw/          # OpenClaw + cai-pep（推荐起步）
     ├── openclaw-vllm/     # OpenClaw + vLLM + NVIDIA TEE

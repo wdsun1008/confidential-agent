@@ -51,6 +51,13 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         "libtdx-verify.rpm",
         0o644,
     )?);
+    let staged_attestation_client = stage_tools_image_asset(
+        cli,
+        guest_staging_dir,
+        "/usr/bin/attestation-challenge-client",
+        "attestation-challenge-client",
+        0o755,
+    )?;
     let guest_setup_script = Some(stage_guest_setup_script(guest_staging_dir)?);
 
     Ok(GuestAssets {
@@ -63,7 +70,11 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         guest_tng_bin: staged_guest_tng_bin,
         libtdx_verify_rpm,
         guest_setup_script,
-        extra_files: Vec::new(),
+        extra_files: vec![GuestFileAsset {
+            source: staged_attestation_client,
+            destination: "/opt/confidential-agent/hack/attestation-challenge-client".to_string(),
+            executable: true,
+        }],
     })
 }
 

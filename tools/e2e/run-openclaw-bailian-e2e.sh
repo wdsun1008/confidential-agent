@@ -143,8 +143,10 @@ require_bailian_credentials() {
   exit 2
 }
 
-without_proxy() {
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy "$@"
+CA_CONTROL_NO_PROXY=(-u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy)
+
+ca_control_without_proxy() {
+  env "${CA_CONTROL_NO_PROXY[@]}" "$@"
 }
 
 cleanup_connect() {
@@ -239,7 +241,7 @@ PY
     local attempt destroy_log destroyed=0
     for attempt in 1 2 3; do
       destroy_log="$WORK_DIR/destroy-$service-attempt-$attempt.log"
-      if without_proxy "${CA_ARGS[@]}" destroy "$service" >"$destroy_log" 2>&1; then
+      if ca_control_without_proxy "${CA_ARGS[@]}" destroy "$service" >"$destroy_log" 2>&1; then
         cat "$destroy_log"
         record "- destroy $service: ok."
         destroyed=1
@@ -305,6 +307,10 @@ ensure_shelter_installed() {
     return
   fi
   if [[ "$USE_SOURCE_SHELTER" != "1" ]]; then
+    if command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
+      return
+    fi
+    install_bundled_shelter_rpm
     return
   fi
   require_cmd make
@@ -316,6 +322,45 @@ ensure_shelter_installed() {
   (cd "$SHELTER_DIR" && make RELEASE=0 install OVMF_SRC="$SHELTER_OVMF")
   record_cmd "cd $SHELTER_DIR && make verify-system-dependencies"
   (cd "$SHELTER_DIR" && make verify-system-dependencies)
+}
+
+resolve_shelter_rpm() {
+  if [[ -n "${E2E_SHELTER_RPM:-}" ]]; then
+    [[ -f "$E2E_SHELTER_RPM" ]] || {
+      echo "Shelter RPM does not exist: $E2E_SHELTER_RPM" >&2
+      exit 2
+    }
+    printf '%s\n' "$E2E_SHELTER_RPM"
+    return
+  fi
+
+  local rpm
+  for rpm in "$ROOT_DIR"/hack/shelter-*.rpm; do
+    [[ -f "$rpm" ]] || continue
+    printf '%s\n' "$rpm"
+    return
+  done
+  echo "Shelter command '$CA_SHELTER_BIN' is unavailable and no bundled Shelter RPM was found under $ROOT_DIR/hack" >&2
+  exit 2
+}
+
+install_bundled_shelter_rpm() {
+  local rpm pm
+  rpm="$(resolve_shelter_rpm)"
+  if [[ "$(id -u)" != "0" ]]; then
+    echo "Shelter is missing and installing $rpm requires root" >&2
+    exit 2
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    pm=dnf
+  elif command -v yum >/dev/null 2>&1; then
+    pm=yum
+  else
+    echo "yum or dnf is required to install $rpm" >&2
+    exit 2
+  fi
+  record_cmd "$pm install -y $rpm"
+  "$pm" install -y "$rpm"
 }
 
 verify_shelter_command() {
@@ -342,6 +387,9 @@ verify_slsa_generator() {
 
 ensure_mkosi_alinux_repo_hint() {
   if [[ "$BUILD_BACKEND" != "mkosi" ]]; then
+    return
+  fi
+  if [[ "${E2E_ENABLE_MKOSI_ALINUX_REPO_HINT:-0}" != "1" ]]; then
     return
   fi
   local hint="/etc/yum.repos.d/AlinuxApsara.repo"
@@ -523,8 +571,8 @@ config = {
                 "api": "openai-completions",
                 "models": [
                     {
-                        "id": "qwen3-max-2026-01-23",
-                        "name": "qwen3-max-2026-01-23",
+                        "id": "qwen3.7-max",
+                        "name": "qwen3.7-max",
                         "reasoning": False,
                         "input": ["text"],
                         "contextWindow": 262144,
@@ -534,7 +582,7 @@ config = {
             }
         },
     },
-    "agents": {"defaults": {"model": {"primary": "bailian/qwen3-max-2026-01-23"}}},
+    "agents": {"defaults": {"model": {"primary": "bailian/qwen3.7-max"}}},
     "plugins": {
         "enabled": True,
         "allow": ["cai-pep", "cai-a2a"],
@@ -642,7 +690,7 @@ $base_image_yaml
   image_name: openclaw-agent
   resize: 30G
   with_network: true
-  packages: [ca-certificates, curl, jq, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
   files:
     - source: $(yaml_quote "$ROOT_DIR/target/debug/cai-pep")
       target: /usr/local/bin/cai-pep
@@ -651,6 +699,9 @@ $base_image_yaml
       target: /root/.openclaw/skills/tdx-remote-attestation/SKILL.md
     - source: ./files/install-cai-pep.sh
       target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/install-openclaw-runtime.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh
       executable: true
     - source: ./files/cai-pep-default-policy.json
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
@@ -1087,8 +1138,7 @@ start_connect_until_http_ready() {
 
     record "- connect attempt: $attempt/$attempts."
     rm -f "$log_path"
-    setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-      "${CA_ARGS[@]}" connect >"$log_path" 2>&1 &
+    setsid env "${CA_CONTROL_NO_PROXY[@]}" "${CA_ARGS[@]}" connect >"$log_path" 2>&1 &
     E2E_CONNECT_PID=$!
 
     while (( SECONDS < deadline )); do
@@ -1204,29 +1254,27 @@ main() {
   local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$STATE_DIR")
   CA_ARGS=("${ca[@]}")
   local ops_peering="$WORK_DIR/peering-ops.txt"
-  if "${ca[@]}" peering show ops >"$ops_peering" 2>/dev/null; then
+  if ca_control_without_proxy "${ca[@]}" peering show ops >"$ops_peering" 2>/dev/null; then
     if grep -Fxq "cidr: $allowed_cidr" "$ops_peering"; then
       record "- peering ops: already present for \`$allowed_cidr\`."
     else
       record_cmd "${ca[*]} peering remove ops"
-      "${ca[@]}" peering remove ops
+      ca_control_without_proxy "${ca[@]}" peering remove ops
       record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-      "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+      ca_control_without_proxy "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
     fi
   else
     record_cmd "${ca[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-    "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+    ca_control_without_proxy "${ca[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
   fi
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
-    record ""
-    record "Build commands run with proxy environment cleared so mkosi/DNF can use the selected internal repo directly."
     log "building MCP enabled image variants (deploy target: debug)"
     record_cmd "${ca[*]} build --spec $WORK_DIR/mcp/mcp-demo.yaml"
-    without_proxy "${ca[@]}" build --spec "$WORK_DIR/mcp/mcp-demo.yaml"
+    "${ca[@]}" build --spec "$WORK_DIR/mcp/mcp-demo.yaml"
     record_manifest_variants mcp
     log "building OpenClaw enabled image variants (deploy target: debug)"
     record_cmd "${ca[*]} build --spec $WORK_DIR/openclaw/openclaw.yaml"
-    without_proxy "${ca[@]}" build --spec "$WORK_DIR/openclaw/openclaw.yaml"
+    "${ca[@]}" build --spec "$WORK_DIR/openclaw/openclaw.yaml"
     record_manifest_variants openclaw
   fi
 
@@ -1234,13 +1282,13 @@ main() {
     DEPLOY_ATTEMPTED=1
     log "deploying MCP"
     record_cmd "${ca[*]} deploy --spec $WORK_DIR/mcp/mcp-demo.yaml"
-    without_proxy "${ca[@]}" deploy --spec "$WORK_DIR/mcp/mcp-demo.yaml"
+    ca_control_without_proxy "${ca[@]}" deploy --spec "$WORK_DIR/mcp/mcp-demo.yaml"
     log "deploying OpenClaw"
     record_cmd "${ca[*]} deploy --spec $WORK_DIR/openclaw/openclaw.yaml"
-    without_proxy "${ca[@]}" deploy --spec "$WORK_DIR/openclaw/openclaw.yaml"
+    ca_control_without_proxy "${ca[@]}" deploy --spec "$WORK_DIR/openclaw/openclaw.yaml"
   fi
 
-  without_proxy "${ca[@]}" status --json >"$WORK_DIR/status-local.json" || finish_e2e "$?"
+  ca_control_without_proxy "${ca[@]}" status --json >"$WORK_DIR/status-local.json" || finish_e2e "$?"
   if ! wait_for_live_statuses "$WORK_DIR/status-local.json" 600; then
     record ""
     record "Live daemon status check failed after deploy."
@@ -1254,7 +1302,7 @@ main() {
 
   log "checking local and live status"
   record_cmd "${ca[*]} status --live"
-  without_proxy "${ca[@]}" status --live | tee "$WORK_DIR/status-live.txt"
+  ca_control_without_proxy "${ca[@]}" status --live | tee "$WORK_DIR/status-live.txt"
   record_file_as_block "Live status output:" "$WORK_DIR/status-live.txt" text
 
   collect_guest_tng_config "$WORK_DIR/status-local.json" openclaw
@@ -1265,7 +1313,7 @@ main() {
 
   log "starting connect"
   record_cmd "${ca[*]} connect --render-only"
-  "${ca[@]}" connect --render-only \
+  ca_control_without_proxy "${ca[@]}" connect --render-only \
     >"$WORK_DIR/connect-rendered-config.json" \
     2>"$WORK_DIR/connect-rendered-config.stderr"
   record_file_as_block "Rendered connect TNG config:" "$WORK_DIR/connect-rendered-config.json" json

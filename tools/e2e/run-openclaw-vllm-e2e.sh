@@ -124,8 +124,10 @@ require_aliyun_credentials() {
   exit 2
 }
 
-without_proxy() {
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy "$@"
+CA_CONTROL_NO_PROXY=(-u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy)
+
+ca_control_without_proxy() {
+  env "${CA_CONTROL_NO_PROXY[@]}" "$@"
 }
 
 cleanup_connect() {
@@ -182,7 +184,7 @@ destroy_managed_resources() {
   fi
   log "destroying openclaw-vllm ($reason)"
   record_cmd "${CA_ARGS[*]} destroy openclaw-vllm"
-  if without_proxy "${CA_ARGS[@]}" destroy openclaw-vllm; then
+  if ca_control_without_proxy "${CA_ARGS[@]}" destroy openclaw-vllm; then
     record "- destroy openclaw-vllm: ok."
   else
     record "- destroy openclaw-vllm: failed."
@@ -228,6 +230,45 @@ cleanup_on_int() {
 
 cleanup_on_term() {
   finish_e2e 143
+}
+
+resolve_shelter_rpm() {
+  if [[ -n "${E2E_SHELTER_RPM:-}" ]]; then
+    [[ -f "$E2E_SHELTER_RPM" ]] || {
+      echo "Shelter RPM does not exist: $E2E_SHELTER_RPM" >&2
+      exit 2
+    }
+    printf '%s\n' "$E2E_SHELTER_RPM"
+    return
+  fi
+
+  local rpm
+  for rpm in "$ROOT_DIR"/hack/shelter-*.rpm; do
+    [[ -f "$rpm" ]] || continue
+    printf '%s\n' "$rpm"
+    return
+  done
+  echo "Shelter command '$CA_SHELTER_BIN' is unavailable and no bundled Shelter RPM was found under $ROOT_DIR/hack" >&2
+  exit 2
+}
+
+install_bundled_shelter_rpm() {
+  local rpm pm
+  rpm="$(resolve_shelter_rpm)"
+  if [[ "$(id -u)" != "0" ]]; then
+    echo "Shelter is missing and installing $rpm requires root" >&2
+    exit 2
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    pm=dnf
+  elif command -v yum >/dev/null 2>&1; then
+    pm=yum
+  else
+    echo "yum or dnf is required to install $rpm" >&2
+    exit 2
+  fi
+  record_cmd "$pm install -y $rpm"
+  "$pm" install -y "$rpm"
 }
 
 resolve_allowed_cidr() {
@@ -334,6 +375,11 @@ if os.environ.get("OPENCLAW_ENABLE_DINGTALK") == "1":
     plugins["enabled"] = True
     allow = list(dict.fromkeys([*(plugins.get("allow") or []), "cai-pep", "cai-a2a", "dingtalk"]))
     plugins["allow"] = allow
+    entries = plugins.setdefault("entries", {})
+    entries["dingtalk"] = {
+        "enabled": True,
+        "hooks": {"allowConversationAccess": True},
+    }
     config["channels"] = {
         "dingtalk": {
             "enabled": True,
@@ -370,7 +416,7 @@ $base_image_yaml
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
   with_network: true
-  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
     - source: ./nvidia-persistenced.service
       target: /usr/local/share/cai/nvidia-persistenced.service
@@ -384,6 +430,9 @@ $base_image_yaml
       target: /home/openclaw/.openclaw/skills/tdx-remote-attestation/SKILL.md
     - source: ./files/install-cai-pep.sh
       target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/install-openclaw-runtime.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh
       executable: true
     - source: ./files/cai-pep-default-policy.json
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
@@ -429,7 +478,7 @@ EOF
 wait_status_ready() {
   local deadline=$((SECONDS + 7200))
   while (( SECONDS < deadline )); do
-    if without_proxy "${CA_ARGS[@]}" status --live --json >"$WORK_DIR/status-live.json" 2>"$WORK_DIR/status-live.err"; then
+    if ca_control_without_proxy "${CA_ARGS[@]}" status --live --json >"$WORK_DIR/status-live.json" 2>"$WORK_DIR/status-live.err"; then
       if [[ -s "$WORK_DIR/status-live.json" ]] && python3 - "$WORK_DIR/status-live.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -462,7 +511,7 @@ PY
 wait_status_debug_ready() {
   local deadline=$((SECONDS + 1800))
   while (( SECONDS < deadline )); do
-    if without_proxy "${CA_ARGS[@]}" status --live --json >"$WORK_DIR/status-live.json" 2>"$WORK_DIR/status-live.err"; then
+    if ca_control_without_proxy "${CA_ARGS[@]}" status --live --json >"$WORK_DIR/status-live.json" 2>"$WORK_DIR/status-live.err"; then
       if [[ -s "$WORK_DIR/status-live.json" ]] && python3 - "$WORK_DIR/status-live.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -562,8 +611,7 @@ start_connect() {
   local attempt
   for attempt in $(seq 1 8); do
     record "- connect attempt: $attempt"
-    setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-      "${CA_ARGS[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
+    setsid env "${CA_CONTROL_NO_PROXY[@]}" "${CA_ARGS[@]}" connect >"$WORK_DIR/connect.log" 2>&1 &
     CONNECT_PID=$!
     local connect_port=""
     for _ in $(seq 1 120); do
@@ -667,6 +715,9 @@ main() {
       export CA_SHELTER_BIN="$SHELTER_DIR/target/debug/shelter"
     fi
   fi
+  if [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "$USE_SOURCE_SHELTER" != "1" ]] && ! command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
+    install_bundled_shelter_rpm
+  fi
   if [[ "${E2E_SKIP_CARGO_BUILD:-0}" != "1" ]]; then
     log "building current host CLI, guest daemon and PEP binary"
     record_cmd "cargo build -p confidential-agent-cli -p confidential-agentd -p cai-pep"
@@ -704,23 +755,23 @@ main() {
   record "- OpenClaw gateway token generated but not printed."
 
   local ops_peering="$WORK_DIR/peering-ops.txt"
-  if "${CA_ARGS[@]}" peering show ops >"$ops_peering" 2>/dev/null; then
+  if ca_control_without_proxy "${CA_ARGS[@]}" peering show ops >"$ops_peering" 2>/dev/null; then
     if grep -Fxq "cidr: $allowed_cidr" "$ops_peering"; then
       record "- peering ops: already present for \`$allowed_cidr\`."
     else
       record_cmd "${CA_ARGS[*]} peering remove ops"
-      "${CA_ARGS[@]}" peering remove ops
+      ca_control_without_proxy "${CA_ARGS[@]}" peering remove ops
       record_cmd "${CA_ARGS[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-      "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+      ca_control_without_proxy "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
     fi
   else
     record_cmd "${CA_ARGS[*]} peering add --role operator --cidr $allowed_cidr --label ops"
-    "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
+    ca_control_without_proxy "${CA_ARGS[@]}" peering add --role operator --cidr "$allowed_cidr" --label ops
   fi
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     record_cmd "${CA_ARGS[*]} build --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
-    without_proxy "${CA_ARGS[@]}" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+    "${CA_ARGS[@]}" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
   else
     local manifest="$STATE_DIR/services/openclaw-vllm/manifest.json"
     if [[ ! -f "$manifest" ]]; then
@@ -753,7 +804,7 @@ PY
   record_manifest_variants openclaw-vllm
   DEPLOY_ATTEMPTED=1
   record_cmd "${CA_ARGS[*]} deploy --spec $WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
-  without_proxy "${CA_ARGS[@]}" deploy --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+  ca_control_without_proxy "${CA_ARGS[@]}" deploy --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
 
   wait_status_debug_ready
   record_file_as_block "Live status after debug SSH readiness:" "$WORK_DIR/status-live.json" json

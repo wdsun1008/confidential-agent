@@ -376,7 +376,7 @@ service:
 build:
   image_name: openclaw-agent
   resize: 30G
-  packages: [ca-certificates, curl, jq, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
   files:
     - source: ../../target/debug/cai-pep
       target: /usr/local/bin/cai-pep

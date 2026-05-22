@@ -86,42 +86,105 @@ function outputText(response) {
     .trim();
 }
 
+function collectObservedToolPhases(response) {
+  const phases = [];
+  const seen = new Set();
+
+  function add(value) {
+    const text = String(value ?? "").trim();
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    phases.push(text);
+  }
+
+  function visit(value) {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+
+    const type = typeof value.type === "string" ? value.type : "";
+    const name = typeof value.name === "string" ? value.name : "";
+    const toolName =
+      typeof value.tool_name === "string"
+        ? value.tool_name
+        : typeof value.toolName === "string"
+          ? value.toolName
+          : "";
+    const skillId =
+      typeof value.skill_id === "string"
+        ? value.skill_id
+        : typeof value.skillId === "string"
+          ? value.skillId
+          : "";
+    const command = typeof value.command === "string" ? value.command : "";
+
+    if (/tool|function|call|exec|skill/i.test(type)) add(type);
+    if (name && /tool|function|exec|cai-pep|attest|skill/i.test(`${type} ${name}`)) add(name);
+    if (toolName) add(toolName);
+    if (skillId) add(skillId);
+    if (command && /cai-pep\s+attest|collect-and-verify/i.test(command)) add(command);
+
+    for (const child of Object.values(value)) visit(child);
+  }
+
+  visit(response?.output ?? response);
+  return phases;
+}
+
 const baseUrl = normalizeBaseUrl(requireArg("url"));
 const token = requireArg("token");
 const message = arg("message", "请只回复 CA_E2E_OK，不要输出其他内容。");
 const expected = arg("expect", "CA_E2E_OK");
 const expectedTool = arg("expect-tool", "");
+const expectedRegex = arg("expect-regex", "");
+const rejectedRegex = arg("reject-regex", "");
+const instructions = arg("instructions", "Reply to the user message directly.");
 const sessionKey = arg("session", `confidential-agent-e2e-${Date.now()}`);
 const timeoutMs = Number(arg("timeout-ms", "180000"));
-const requestTimeoutMs = Math.min(timeoutMs, 120000);
+const requestTimeoutMs = timeoutMs;
 
 async function main() {
-  if (expectedTool) {
-    throw new Error("--expect-tool is not supported by the HTTP Responses probe");
-  }
+  const body = {
+    model: "openclaw/default",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: message }],
+      },
+    ],
+    max_output_tokens: 2048,
+    stream: false,
+  };
+  if (instructions) body.instructions = instructions;
   const response = await postJson(
     baseUrl,
     "/v1/responses",
     token,
-    {
-      model: "openclaw/default",
-      input: [
-        {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: message }],
-        },
-      ],
-      instructions: "Reply to the user message directly.",
-      max_output_tokens: 2048,
-      stream: false,
-    },
+    body,
     requestTimeoutMs,
   );
   const text = outputText(response);
   if (!text) throw new Error("OpenClaw response text is empty");
   if (expected && !text.includes(expected)) {
     throw new Error(`OpenClaw response does not include expected marker '${expected}': ${text}`);
+  }
+  if (expectedRegex && !new RegExp(expectedRegex, "i").test(text)) {
+    throw new Error(`OpenClaw response does not match expected regex '${expectedRegex}': ${text}`);
+  }
+  if (rejectedRegex && new RegExp(rejectedRegex, "i").test(text)) {
+    throw new Error(`OpenClaw response matched rejected regex '${rejectedRegex}': ${text}`);
+  }
+  const observedToolPhases = collectObservedToolPhases(response);
+  if (
+    expectedTool &&
+    !observedToolPhases.some((phase) => phase.toLowerCase().includes(expectedTool.toLowerCase()))
+  ) {
+    throw new Error(
+      `OpenClaw response did not expose expected tool '${expectedTool}'. observedToolPhases=${JSON.stringify(observedToolPhases)}`,
+    );
   }
   console.log(
     JSON.stringify(
@@ -130,7 +193,7 @@ async function main() {
         runId: response.id ?? `resp_${crypto.randomUUID()}`,
         sessionKey,
         text,
-        observedToolPhases: [],
+        observedToolPhases,
       },
       null,
       2,

@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
+  <title id="title">Confidential Agent 一键部署流程</title>
+  <desc id="desc">展示从部署机执行一键脚本到创建 TDX ECS、注入资源和建立 TNG 访问通道的流程。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .box { fill: #ffffff; stroke: #d7dde8; stroke-width: 2; rx: 12; }
+      .primary { fill: #eef4ff; stroke: #5f7fd1; stroke-width: 2; rx: 12; }
+      .secure { fill: #edf8f1; stroke: #4f9b69; stroke-width: 2; rx: 12; }
+      .cloud { fill: #fff8ec; stroke: #d6972d; stroke-width: 2; rx: 12; }
+      .text { font-family: Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #1f2937; }
+      .title { font-size: 30px; font-weight: 700; }
+      .h { font-size: 18px; font-weight: 700; }
+      .body { font-size: 14px; fill: #4b5563; }
+      .num { fill: #314f9f; font-size: 16px; font-weight: 700; }
+      .arrow { stroke: #667085; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1280" height="560"/>
+  <text class="text title" x="46" y="58">一键部署使用流程</text>
+  <text class="text body" x="46" y="86">curl | sh 后自动完成构建、部署、证明、注入和可信访问</text>
+
+  <rect class="primary" x="46" y="132" width="176" height="146"/>
+  <text class="text num" x="70" y="164">1</text>
+  <text class="text h" x="100" y="164">部署机</text>
+  <text class="text body" x="70" y="198">Alibaba Cloud Linux 3</text>
+  <text class="text body" x="70" y="224">执行 one-click 脚本</text>
+  <text class="text body" x="70" y="250">安装依赖与构建源码</text>
+
+  <rect class="box" x="272" y="132" width="176" height="146"/>
+  <text class="text num" x="296" y="164">2</text>
+  <text class="text h" x="326" y="164">可信镜像</text>
+  <text class="text body" x="296" y="198">OpenClaw + CA daemon</text>
+  <text class="text body" x="296" y="224">FDE / dm-verity / UKI</text>
+  <text class="text body" x="296" y="250">生成参考值</text>
+
+  <rect class="secure" x="498" y="132" width="176" height="146"/>
+  <text class="text num" x="522" y="164">3</text>
+  <text class="text h" x="552" y="164">Rekor</text>
+  <text class="text body" x="522" y="198">SLSA provenance</text>
+  <text class="text body" x="522" y="224">签名并上传</text>
+  <text class="text body" x="522" y="250">公开参考值</text>
+
+  <rect class="cloud" x="724" y="132" width="176" height="146"/>
+  <text class="text num" x="748" y="164">4</text>
+  <text class="text h" x="778" y="164">阿里云资源</text>
+  <text class="text body" x="748" y="198">OSS / 自定义镜像</text>
+  <text class="text body" x="748" y="224">VPC / 安全组</text>
+  <text class="text body" x="748" y="250">TDX ECS</text>
+
+  <rect class="secure" x="950" y="132" width="176" height="146"/>
+  <text class="text num" x="974" y="164">5</text>
+  <text class="text h" x="1004" y="164">资源注入</text>
+  <text class="text body" x="974" y="198">远程证明通过</text>
+  <text class="text body" x="974" y="224">注入 API Key</text>
+  <text class="text body" x="974" y="250">注入 Token / 钉钉凭据</text>
+
+  <rect class="primary" x="382" y="360" width="240" height="112"/>
+  <text class="text h" x="414" y="395">TNG connect</text>
+  <text class="text body" x="414" y="424">RATS-TLS 可信通道</text>
+  <text class="text body" x="414" y="448">127.0.0.1:18789</text>
+
+  <rect class="secure" x="702" y="360" width="240" height="112"/>
+  <text class="text h" x="734" y="395">OpenClaw 访问</text>
+  <text class="text body" x="734" y="424">Web / Desktop / TUI</text>
+  <text class="text body" x="734" y="448">DingTalk Bot</text>
+
+  <path class="arrow" d="M222 205 L272 205"/>
+  <path class="arrow" d="M448 205 L498 205"/>
+  <path class="arrow" d="M674 205 L724 205"/>
+  <path class="arrow" d="M900 205 L950 205"/>
+  <path class="arrow" d="M1038 278 C1038 330 930 338 880 360"/>
+  <path class="arrow" d="M702 416 L622 416"/>
+  <path class="arrow" d="M622 416 L702 416"/>
+  <text class="text body" x="478" y="520">部署完成后，脚本自动输出 Web URL、WebSocket URL、Gateway Token 和清理命令。</text>
+</svg>

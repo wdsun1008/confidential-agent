@@ -15,6 +15,7 @@ build:
   packages:
     - ca-certificates
     - curl
+    - git
     - jq
     - nodejs
     - npm
@@ -29,6 +30,9 @@ build:
       target: /root/.openclaw/skills/tdx-remote-attestation/SKILL.md
     - source: ./files/install-cai-pep.sh
       target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/install-openclaw-runtime.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh
       executable: true
     - source: ./files/cai-pep-default-policy.json
       target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
