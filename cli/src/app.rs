@@ -866,6 +866,21 @@ set -euo pipefail
 if [ -f /opt/confidential-agent/hack/libtdx-verify.rpm ]; then
     rpm -Uvh --replacepkgs --nodeps /opt/confidential-agent/hack/libtdx-verify.rpm
 fi
+install_attestation_challenge_client() {
+    if [ -x /usr/bin/attestation-challenge-client ]; then
+        return 0
+    fi
+    if [ ! -x /opt/confidential-agent/hack/attestation-challenge-client ]; then
+        echo "staged attestation-challenge-client is missing" >&2
+        exit 1
+    fi
+    install -m 0755 /opt/confidential-agent/hack/attestation-challenge-client /usr/bin/attestation-challenge-client
+    if [ ! -x /usr/bin/attestation-challenge-client ]; then
+        echo "attestation-challenge-client was installed but /usr/bin/attestation-challenge-client is missing" >&2
+        exit 1
+    fi
+}
+install_attestation_challenge_client
 if [ -f /opt/confidential-agent/hack/tng-2.6.0 ]; then
     install -m 0755 /opt/confidential-agent/hack/tng-2.6.0 /usr/bin/tng
 fi

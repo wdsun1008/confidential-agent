@@ -74,8 +74,10 @@ require_cmd() {
   }
 }
 
-without_proxy() {
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy "$@"
+CA_CONTROL_NO_PROXY=(-u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy)
+
+ca_control_without_proxy() {
+  env "${CA_CONTROL_NO_PROXY[@]}" "$@"
 }
 
 use_aliyun_cli_profile() {
@@ -126,7 +128,7 @@ destroy_org() {
   local ca=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir")
   log "destroying $label"
   record_cmd "${ca[*]} destroy openclaw"
-  without_proxy "${ca[@]}" destroy openclaw || true
+  ca_control_without_proxy "${ca[@]}" destroy openclaw || true
 }
 
 finish_e2e() {
@@ -252,8 +254,8 @@ config = {
                 "api": "openai-completions",
                 "models": [
                     {
-                        "id": "qwen3-max-2026-01-23",
-                        "name": "qwen3-max-2026-01-23",
+                        "id": "qwen3.7-max",
+                        "name": "qwen3.7-max",
                         "reasoning": False,
                         "input": ["text"],
                         "contextWindow": 262144,
@@ -263,7 +265,7 @@ config = {
             }
         },
     },
-    "agents": {"defaults": {"model": {"primary": "bailian/qwen3-max-2026-01-23"}}},
+    "agents": {"defaults": {"model": {"primary": "bailian/qwen3.7-max"}}},
     "plugins": {
         "enabled": True,
         "allow": ["cai-pep", "cai-a2a"],
@@ -345,7 +347,7 @@ $base_image_yaml
   image_name: ${service_name}-agent
   resize: 30G
   with_network: true
-  packages: [ca-certificates, curl, jq, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
   files:
     - source: $(yaml_quote "$ROOT_DIR/target/debug/cai-pep")
       target: /usr/local/bin/cai-pep
@@ -553,8 +555,7 @@ start_connect_until_local_port_ready() {
     cleanup_connect || true
     rm -f "$log_path"
     record "- $label connect attempt: $attempt/$attempts."
-    setsid env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
-      "$@" >"$log_path" 2>&1 &
+    setsid env "${CA_CONTROL_NO_PROXY[@]}" "$@" >"$log_path" 2>&1 &
     CONNECT_PID=$!
 
     while (( SECONDS < deadline )); do
@@ -678,7 +679,7 @@ run_from_card_probe() {
   cleanup_connect || true
 
   record_cmd "${ca[*]} connect --from-card $card_url --render-only"
-  without_proxy "${ca[@]}" connect --from-card "$card_url" --render-only \
+  ca_control_without_proxy "${ca[@]}" connect --from-card "$card_url" --render-only \
     >"$config_path" 2>"$config_stderr"
   record_file_as_block "$label connect --from-card rendered TNG config:" "$config_path" json
   if [[ -s "$config_stderr" ]]; then
@@ -808,27 +809,27 @@ main() {
   local ca_beta=("$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$BETA_STATE_DIR")
 
   record_cmd "${ca_alpha[*]} peering add --role operator --cidr $allowed_cidr --label alpha-ops"
-  "${ca_alpha[@]}" peering add --role operator --cidr "$allowed_cidr" --label alpha-ops
+  ca_control_without_proxy "${ca_alpha[@]}" peering add --role operator --cidr "$allowed_cidr" --label alpha-ops
   record_cmd "${ca_beta[*]} peering add --role operator --cidr $allowed_cidr --label beta-ops"
-  "${ca_beta[@]}" peering add --role operator --cidr "$allowed_cidr" --label beta-ops
+  ca_control_without_proxy "${ca_beta[@]}" peering add --role operator --cidr "$allowed_cidr" --label beta-ops
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     log "building alpha OpenClaw"
     record_cmd "${ca_alpha[*]} build --spec $ALPHA_DIR/openclaw/openclaw.yaml"
-    without_proxy "${ca_alpha[@]}" build --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
+    "${ca_alpha[@]}" build --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
     log "building beta OpenClaw"
     record_cmd "${ca_beta[*]} build --spec $BETA_DIR/openclaw/openclaw.yaml"
-    without_proxy "${ca_beta[@]}" build --spec "$BETA_DIR/openclaw/openclaw.yaml"
+    "${ca_beta[@]}" build --spec "$BETA_DIR/openclaw/openclaw.yaml"
   fi
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     DEPLOY_ATTEMPTED=1
     log "deploying alpha"
     record_cmd "${ca_alpha[*]} deploy --spec $ALPHA_DIR/openclaw/openclaw.yaml"
-    without_proxy "${ca_alpha[@]}" deploy --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
+    ca_control_without_proxy "${ca_alpha[@]}" deploy --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
     log "deploying beta"
     record_cmd "${ca_beta[*]} deploy --spec $BETA_DIR/openclaw/openclaw.yaml"
-    without_proxy "${ca_beta[@]}" deploy --spec "$BETA_DIR/openclaw/openclaw.yaml"
+    ca_control_without_proxy "${ca_beta[@]}" deploy --spec "$BETA_DIR/openclaw/openclaw.yaml"
   fi
 
   local alpha_ip beta_ip alpha_key beta_key
@@ -847,19 +848,19 @@ main() {
 
   log "opening cross-organization peer ingress"
   record_cmd "${ca_alpha[*]} peering add --role peer --cidr $beta_ip/32 --label beta"
-  "${ca_alpha[@]}" peering add --role peer --cidr "$beta_ip/32" --label beta
+  ca_control_without_proxy "${ca_alpha[@]}" peering add --role peer --cidr "$beta_ip/32" --label beta
   record_cmd "${ca_beta[*]} peering add --role peer --cidr $alpha_ip/32 --label alpha"
-  "${ca_beta[@]}" peering add --role peer --cidr "$alpha_ip/32" --label alpha
+  ca_control_without_proxy "${ca_beta[@]}" peering add --role peer --cidr "$alpha_ip/32" --label alpha
   record_cmd "${ca_alpha[*]} peering apply"
-  without_proxy "${ca_alpha[@]}" peering apply
+  ca_control_without_proxy "${ca_alpha[@]}" peering apply
   record_cmd "${ca_beta[*]} peering apply"
-  without_proxy "${ca_beta[@]}" peering apply
+  ca_control_without_proxy "${ca_beta[@]}" peering apply
 
   log "adding A2A peer desired state and syncing bundles"
   record_cmd "${ca_alpha[*]} a2a add --alias beta http://$beta_ip:8089/.well-known/agent-card.json"
-  without_proxy "${ca_alpha[@]}" a2a add --alias beta "http://$beta_ip:8089/.well-known/agent-card.json"
+  ca_control_without_proxy "${ca_alpha[@]}" a2a add --alias beta "http://$beta_ip:8089/.well-known/agent-card.json"
   record_cmd "${ca_beta[*]} a2a add --alias alpha http://$alpha_ip:8089/.well-known/agent-card.json"
-  without_proxy "${ca_beta[@]}" a2a add --alias alpha "http://$alpha_ip:8089/.well-known/agent-card.json"
+  ca_control_without_proxy "${ca_beta[@]}" a2a add --alias alpha "http://$alpha_ip:8089/.well-known/agent-card.json"
 
   restart_openclaw_gateway alpha "$alpha_ip" "$alpha_key"
   restart_openclaw_gateway beta "$beta_ip" "$beta_key"

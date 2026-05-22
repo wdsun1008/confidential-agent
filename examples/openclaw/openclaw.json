@@ -51,6 +51,12 @@
         "config": {
           "peers": {}
         }
+      },
+      "dingtalk": {
+        "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        }
       }
     }
   },

@@ -1035,6 +1035,15 @@ resources: {}
 }
 
 #[test]
+fn guest_setup_installs_staged_attestation_challenge_client() {
+    let script = guest_setup_script();
+    assert!(script.contains("attestation-challenge-client"));
+    assert!(script.contains("/opt/confidential-agent/hack/attestation-challenge-client"));
+    assert!(!script.contains("attestation-challenge-client package requires yum or dnf"));
+    assert!(script.contains("/usr/bin/attestation-challenge-client"));
+}
+
+#[test]
 fn deploy_uses_requested_variant_from_multi_variant_manifest() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();

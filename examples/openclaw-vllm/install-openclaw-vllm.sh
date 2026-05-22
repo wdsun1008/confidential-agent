@@ -6,8 +6,6 @@ MODEL_DIR="${OPENCLAW_VLLM_MODEL_DIR:-/opt/models/Qwen3.6-35B-A3B}"
 SERVED_MODEL_NAME="${OPENCLAW_VLLM_SERVED_MODEL_NAME:-Qwen3.6-35B-A3B}"
 VLLM_PORT="${OPENCLAW_VLLM_PORT:-8090}"
 VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.19.1}"
-OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.5.7}"
-NODE_VERSION="${OPENCLAW_NODE_VERSION:-22.19.0}"
 PYPI_INDEX_URL="${OPENCLAW_VLLM_PYPI_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-550.144.03}"
 NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://cn.download.nvidia.cn/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run}"
@@ -39,7 +37,7 @@ fi
 
 ensure_build_dependencies() {
   local missing=()
-  for cmd in curl gcc jq make npm python3.11 rpm sha256sum wget; do
+  for cmd in curl gcc git jq make npm python3.11 rpm sha256sum wget; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   command -v depmod >/dev/null 2>&1 || missing+=("kmod")
@@ -417,146 +415,7 @@ cd /root
 EOF
 chmod 0755 /usr/local/bin/cai-vllm-run.sh
 
-cat >/usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh <<EOF
-#!/bin/bash
-set -euo pipefail
-NODE_VERSION="\${OPENCLAW_NODE_VERSION:-$NODE_VERSION}"
-OPENCLAW_VERSION="\${OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
-export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-
-npm config set registry "\${NPM_REGISTRY:-https://registry.npmjs.org/}"
-
-resolve_n_bin() {
-  local candidate npm_prefix npm_root
-  candidate="\$(command -v n 2>/dev/null || true)"
-  if [[ -n "\$candidate" ]]; then
-    printf '%s\n' "\$candidate"
-    return 0
-  fi
-  npm_prefix="\$(npm prefix -g 2>/dev/null || true)"
-  npm_root="\$(npm root -g 2>/dev/null || true)"
-  for candidate in \\
-    "\$npm_prefix/bin/n" \\
-    "\$npm_root/n/bin/n" \\
-    /usr/local/bin/n \\
-    /usr/bin/n; do
-    if [[ -f "\$candidate" ]]; then
-      chmod 0755 "\$candidate" || true
-      printf '%s\n' "\$candidate"
-      return 0
-    fi
-  done
-  candidate="\$(find /usr/local /usr -path '*/node_modules/n/bin/n' -type f -print -quit 2>/dev/null || true)"
-  if [[ -n "\$candidate" ]]; then
-    chmod 0755 "\$candidate" || true
-    printf '%s\n' "\$candidate"
-    return 0
-  fi
-  return 1
-}
-
-install_node_with_retry() {
-  local node_version="\$1"
-  local attempt delay mirror mirrors timeout_sec
-  timeout_sec="\${NODE_INSTALL_TIMEOUT_SEC:-300}"
-  if [[ -n "\${N_NODE_MIRROR:-}" ]]; then
-    mirrors=("\$N_NODE_MIRROR")
-  else
-    mirrors=("https://npmmirror.com/mirrors/node" "https://nodejs.org/dist")
-  fi
-  for mirror in "\${mirrors[@]}"; do
-    export N_NODE_MIRROR="\$mirror"
-    for attempt in 1 2 3; do
-      rm -rf "/usr/local/n/versions/node/\$node_version"
-      if command -v timeout >/dev/null 2>&1; then
-        timeout "\$timeout_sec" n "\$node_version" && return 0
-      else
-        n "\$node_version" && return 0
-      fi
-      delay=\$((attempt * 15))
-      echo "Node.js \$node_version install attempt \$attempt from \$mirror failed; retrying in \${delay}s" >&2
-      sleep "\$delay"
-    done
-  done
-  echo "failed to install Node.js \$node_version after trying configured mirrors" >&2
-  return 1
-}
-
-ensure_node22() {
-  local n_bin
-  if command -v node >/dev/null 2>&1 && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' >/dev/null 2>&1; then
-    return
-  fi
-  command -v tar >/dev/null 2>&1 || { echo "tar is required to install Node.js \$NODE_VERSION" >&2; exit 1; }
-  command -v xz >/dev/null 2>&1 || { echo "xz is required to install Node.js \$NODE_VERSION" >&2; exit 1; }
-  if ! n_bin="\$(resolve_n_bin)"; then
-    npm install -g n --no-audit --no-fund
-    hash -r
-    n_bin="\$(resolve_n_bin || true)"
-  fi
-  if [[ -z "\$n_bin" ]]; then
-    echo "n was installed but its executable could not be found; npm prefix=\$(npm prefix -g 2>/dev/null || true), npm root=\$(npm root -g 2>/dev/null || true)" >&2
-    exit 1
-  fi
-  if [[ "\$n_bin" != "/usr/local/bin/n" ]]; then
-    install -d -m 0755 /usr/local/bin
-    ln -sf "\$n_bin" /usr/local/bin/n
-    hash -r
-    n_bin="\$(command -v n 2>/dev/null || printf '%s' "\$n_bin")"
-  fi
-  install_node_with_retry "\$NODE_VERSION"
-  export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-  hash -r
-}
-
-preinstall_openclaw_bundled_runtime_deps() {
-  local extensions_dir
-  extensions_dir="\$(npm root -g)/openclaw/dist/extensions"
-  [[ -d "\$extensions_dir" ]] || return 0
-
-  while IFS= read -r -d '' package_json; do
-    local plugin_dir tmp_package
-    plugin_dir="\$(dirname "\$package_json")"
-    jq -e '(.dependencies // {}) | length > 0' "\$package_json" >/dev/null || continue
-    (
-      cd "\$plugin_dir"
-      if [[ -d node_modules ]]; then
-        exit 0
-      fi
-      if jq -e '(.devDependencies // {}) | to_entries | any(.value | type == "string" and startswith("workspace:"))' package.json >/dev/null; then
-        tmp_package="\$(mktemp)"
-        jq 'del(.devDependencies)' package.json >"\$tmp_package"
-        cat "\$tmp_package" >package.json
-        rm -f "\$tmp_package"
-      fi
-      npm install --omit=dev --ignore-scripts --no-audit --no-fund
-    )
-  done < <(find "\$extensions_dir" -mindepth 2 -maxdepth 2 -name package.json -print0 | sort -z)
-}
-
-ensure_node22
-node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'
-command -v npm >/dev/null
-if ! command -v openclaw >/dev/null 2>&1; then
-  npm install -g "openclaw@\$OPENCLAW_VERSION" --no-audit --no-fund
-fi
-OPENCLAW_BIN="\$(command -v openclaw)"
-if [[ -z "\$OPENCLAW_BIN" ]]; then
-  echo "openclaw binary was not installed" >&2
-  exit 1
-fi
-if [[ "\$OPENCLAW_BIN" != "/usr/local/bin/openclaw" ]]; then
-  ln -sf "\$OPENCLAW_BIN" /usr/local/bin/openclaw
-fi
-OPENCLAW_GLOBAL_ROOT="\$(npm root -g)/openclaw"
-chmod -R a+rX "\$OPENCLAW_GLOBAL_ROOT" || true
-chmod a+rx "\$OPENCLAW_BIN" "\$(readlink -f "\$OPENCLAW_BIN")" /usr/local/bin/openclaw || true
-preinstall_openclaw_bundled_runtime_deps
-/usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh install-openclaw-plugin openclaw /home/openclaw/.openclaw
-npm cache clean --force || true
-EOF
-chmod 0755 /usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh
-/usr/local/bin/cai-openclaw-vllm-runtime-bootstrap.sh
+/usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh openclaw /home/openclaw
 
 cat >/usr/local/bin/cai-openclaw-vllm-runtime-check.sh <<'EOF'
 #!/bin/bash
@@ -566,6 +425,8 @@ command -v node >/dev/null
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'
 command -v openclaw >/dev/null
 test -d "$(npm root -g)/openclaw/dist"
+test -d /home/openclaw/.openclaw/extensions/dingtalk
+test -f /home/openclaw/.openclaw/extensions/dingtalk/dist/index.js
 test -d /home/openclaw/.openclaw/extensions/cai-pep
 test -d /home/openclaw/.openclaw/extensions/cai-a2a
 EOF

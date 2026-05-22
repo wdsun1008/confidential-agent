@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="560" viewBox="0 0 1180 560" role="img" aria-labelledby="title desc">
+  <title id="title">资源清理关系</title>
+  <desc id="desc">展示 cleanup/destroy 会删除的云资源，以及本地状态目录需要人工确认后删除。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .cloud { fill: #fff8ec; stroke: #d6972d; stroke-width: 2; rx: 12; }
+      .local { fill: #eef4ff; stroke: #5f7fd1; stroke-width: 2; rx: 12; }
+      .danger { fill: #fff1f2; stroke: #d75f6a; stroke-width: 2; rx: 12; }
+      .text { font-family: Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #1f2937; }
+      .title { font-size: 30px; font-weight: 700; }
+      .h { font-size: 19px; font-weight: 700; }
+      .body { font-size: 15px; fill: #4b5563; }
+      .small { font-size: 13px; fill: #667085; }
+      .arrow { stroke: #667085; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1180" height="560"/>
+  <text class="text title" x="52" y="58">资源清理关系</text>
+  <text class="text body" x="52" y="88">先 destroy 云资源，再按需停止本地 connect，最后确认后删除本地状态目录</text>
+
+  <rect class="danger" x="70" y="150" width="240" height="120"/>
+  <text class="text h" x="112" y="188">cleanup / destroy</text>
+  <text class="text body" x="104" y="222">confidential-agent destroy</text>
+  <text class="text small" x="104" y="248">不可逆云资源释放</text>
+
+  <rect class="cloud" x="395" y="110" width="260" height="96"/>
+  <text class="text h" x="436" y="148">计算资源</text>
+  <text class="text body" x="430" y="178">TDX ECS 实例 / 自定义镜像</text>
+
+  <rect class="cloud" x="395" y="236" width="260" height="96"/>
+  <text class="text h" x="436" y="274">网络资源</text>
+  <text class="text body" x="430" y="304">VPC / vSwitch / 安全组规则</text>
+
+  <rect class="cloud" x="395" y="362" width="260" height="96"/>
+  <text class="text h" x="436" y="400">存储资源</text>
+  <text class="text body" x="430" y="430">OSS Bucket / 镜像对象</text>
+
+  <rect class="local" x="770" y="150" width="300" height="120"/>
+  <text class="text h" x="812" y="188">本地 connect 隧道</text>
+  <text class="text body" x="812" y="222">kill $(cat connect.pid)</text>
+  <text class="text small" x="812" y="248">只停止本机 TNG Client</text>
+
+  <rect class="local" x="770" y="330" width="300" height="120"/>
+  <text class="text h" x="812" y="368">本地状态目录</text>
+  <text class="text body" x="812" y="402">$HOME/.confidential-agent</text>
+  <text class="text small" x="812" y="428">确认云资源释放后再删除</text>
+
+  <path class="arrow" d="M310 210 C350 160 360 158 395 158"/>
+  <path class="arrow" d="M310 210 C350 284 360 284 395 284"/>
+  <path class="arrow" d="M310 210 C350 412 360 410 395 410"/>
+  <path class="arrow" d="M655 206 C708 206 720 206 770 206"/>
+  <path class="arrow" d="M655 410 C708 410 720 390 770 390"/>
+  <text class="text small" x="70" y="510">建议清理后到 ECS、VPC、OSS、自定义镜像控制台复核资源状态，避免残留计费。</text>
+</svg>
