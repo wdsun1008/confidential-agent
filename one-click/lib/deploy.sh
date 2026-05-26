@@ -139,7 +139,7 @@ build_openclaw_image() {
 openclaw_is_active() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3 - "$status_json" <<'PY' >/dev/null 2>&1
+  python3.11 - "$status_json" <<'PY' >/dev/null 2>&1
 import json
 import sys
 
@@ -158,7 +158,7 @@ PY
 openclaw_public_ip() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3 - "$status_json" <<'PY'
+  python3.11 - "$status_json" <<'PY'
 import json
 import sys
 
@@ -179,7 +179,7 @@ PY
 openclaw_debug_ssh_key() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3 - "$status_json" <<'PY'
+  python3.11 - "$status_json" <<'PY'
 import json
 import sys
 
@@ -265,7 +265,7 @@ wait_for_live_status() {
   log "waiting for live guest status"
   while ((SECONDS < deadline)); do
     if ca_cmd status --live --json >"$status_json" 2>"$CA_WORK_DIR/status-live.err"; then
-      if python3 - "$status_json" <<'PY' >/dev/null 2>&1
+      if python3.11 - "$status_json" <<'PY' >/dev/null 2>&1
 import json
 import sys
 
