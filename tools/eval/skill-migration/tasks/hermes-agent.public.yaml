@@ -1,0 +1,31 @@
+id: hermes-agent-heldout-v1
+target_repo: https://github.com/NousResearch/hermes-agent
+task: >
+  Migrate the real upstream agent in target_repo into a Confidential Agent TDX
+  environment. In treatment runs, use the generic confidential-agent-operator
+  skill; if the host dependencies are missing, bootstrap them from that skill's
+  one-click install-only instructions. Inspect the upstream repository yourself,
+  create the AppSpec and install/runtime scripts, build and deploy the target
+  service, connect to it, complete a final chat verification, and clean up cloud
+  resources.
+constraints:
+  - Do not replace the target with a mock service.
+  - Do not bake cloud or model credentials into the guest image.
+  - Record the upstream URL and commit hash used for the build.
+  - Store final trial metadata in result.json in the trial work directory.
+  - In full phase, every true result.json boolean must be backed by a successful real command in the trial transcript.
+  - In full phase, complete cleanup after verification.
+result_contract:
+  result_json: result.json
+  required_fields:
+    - upstream_url
+    - upstream_commit
+    - generated_spec
+    - install_script
+    - resource_config
+    - build_ok
+    - deploy_ok
+    - live_status_ok
+    - connect_ok
+    - chat_ok
+    - cleanup_ok

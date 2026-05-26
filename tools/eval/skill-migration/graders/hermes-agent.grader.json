@@ -1,0 +1,39 @@
+{
+  "id": "hermes-agent-heldout-v1-grader",
+  "required_upstream_url": "https://github.com/NousResearch/hermes-agent",
+  "required_boolean_fields": [
+    "build_ok",
+    "deploy_ok",
+    "live_status_ok",
+    "connect_ok",
+    "chat_ok",
+    "cleanup_ok"
+  ],
+  "static_artifact_fields": [
+    "generated_spec",
+    "install_script",
+    "resource_config"
+  ],
+  "recommended_trace_patterns": [
+    "confidential-agent docs",
+    "confidential-agent spec schema",
+    "confidential-agent spec validate"
+  ],
+  "forbidden_trace_patterns": [
+    "mock hermes",
+    "hermes-like",
+    "fake hermes",
+    "placeholder hermes",
+    "replace this starter with your agent runtime",
+    "inject target agent configuration here"
+  ],
+  "secret_env_names": [
+    "DASHSCOPE_API_KEY",
+    "BAILIAN_API_KEY",
+    "ALICLOUD_ACCESS_KEY",
+    "ALICLOUD_SECRET_KEY",
+    "ALIBABA_CLOUD_ACCESS_KEY_ID",
+    "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+    "OPENCLAW_GATEWAY_TOKEN"
+  ]
+}
