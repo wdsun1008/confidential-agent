@@ -773,8 +773,11 @@ function commandMutatesInternalCaState(cmd, strippedCmd = stripHeredocBodies(cmd
     return shellTarget;
   }
   const fullTarget = internalCaStatePathMention(cmd);
+  const firstSegment = firstNonCdSegment(strippedCmd);
+  const { command } = commandNameFromWords(shellWords(firstSegment));
   if (
     fullTarget &&
+    ["python", "python3", "node", "ruby"].includes(command) &&
     /\b(?:python3?|node|ruby)\b[\s\S]*(?:open\s*\([^)]*["']w|writeFileSync\s*\(|writeFile\s*\(|File\.write\s*\(|renameSync\s*\(|rename\s*\(|unlinkSync\s*\(|unlink\s*\(|rmSync\s*\()/i.test(
       String(cmd || ""),
     )
