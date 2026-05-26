@@ -32,6 +32,7 @@ const MAX_OUTPUT_CHARS = Number(process.env.CA_EVAL_MAX_OUTPUT_CHARS || "12000")
 const DRY_EXEC = process.env.CA_EVAL_DRY_EXEC === "1";
 const ARTIFACT_FIRST_MILESTONES = [4, 8, 14, 24];
 const CONSECUTIVE_READ_ONLY_MILESTONES = [4, 8, 12];
+const PHASE_PROGRESSION_MILESTONES = [30, 45, 60, 80, 100, 130, 170, 220];
 // Runner guard exits currently use 64-70 plus 72; 71 is intentionally unused.
 const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72]);
 
@@ -907,6 +908,56 @@ function artifactFirstReminder(trialDir, step, sentReminders) {
   );
 }
 
+function commandMatches(pattern) {
+  return (event) => typeof event.cmd === "string" && pattern.test(event.cmd);
+}
+
+function phaseProgressionReminder(trialDir, step, sentReminders) {
+  if (!PHASE_PROGRESSION_MILESTONES.includes(step)) return "";
+  const result = readResultJson(trialDir);
+  if (!result) return "";
+  const events = toolEventsFromTranscript(trialDir);
+  const buildDone = result.build_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.build_ok);
+  if (!buildDone) return "";
+
+  const deployDone = result.deploy_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.deploy_ok);
+  const liveDone = result.live_status_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.live_status_ok);
+  const connectDone = result.connect_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.connect_ok);
+  const deployAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.deploy_ok));
+  const connectAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.connect_ok));
+
+  let stage = "";
+  let message = "";
+  if (!deployDone) {
+    stage = deployAttempted ? "deploy-not-done" : "deploy-not-attempted";
+    message = deployAttempted
+      ? "Phase progression: a build has succeeded but deploy is still not complete. Do not delete images, kill builders, or rerun build unless deploy/live evidence proves the image must change. Focus on the deploy error, operator peering, or AppSpec/resources needed for deploy."
+      : "Phase progression: a build has succeeded but deploy has not been attempted. Add operator peering for this controller CIDR, then run `confidential-agent deploy --spec confidential-agent.yaml`.";
+  } else if (!liveDone) {
+    stage = "live-status-not-done";
+    message =
+      "Phase progression: deploy has succeeded. Run `confidential-agent status --live --json` and update live_status_ok only from that live readiness evidence.";
+  } else if (!connectDone) {
+    stage = connectAttempted ? "connect-not-done" : "connect-not-attempted";
+    message =
+      "Phase progression: live status has succeeded. Verify through `confidential-agent connect` and its host-side port. Do not SSH into the guest to hotfix, install, or probe the service as success evidence.";
+  } else if (result.chat_ok !== true) {
+    stage = "chat-not-done";
+    message =
+      "Phase progression: connect is available. Send a real chat/API request through the connected service and capture the service response. Local echo/print/scripted marker output is not chat evidence.";
+  } else if (result.cleanup_ok !== true) {
+    stage = "cleanup-not-done";
+    message = "Phase progression: chat evidence is present. Clean up with `confidential-agent destroy <service-id>` and record cleanup_ok only after the CLI succeeds.";
+  } else {
+    return "";
+  }
+
+  const key = `phase-progression-${stage}-${step}`;
+  if (sentReminders.has(key)) return "";
+  sentReminders.add(key);
+  return message;
+}
+
 async function chat(messages, metrics) {
   const apiKey = process.env.DASHSCOPE_API_KEY || process.env.BAILIAN_API_KEY;
   if (!apiKey) throw new Error("missing DASHSCOPE_API_KEY or BAILIAN_API_KEY");
@@ -1046,6 +1097,8 @@ Rules:
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
 - Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append || true, chain another command with ;, pipe to head/tail, or redirect output to /dev/null.
+- After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
+- All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
 
 Provided skill context:
@@ -1205,6 +1258,11 @@ async function main() {
       if (readOnlyReminder) {
         appendRunnerReminder(trialDir, step, `consecutive-readonly-${consecutiveReadOnlyCount}`, readOnlyReminder);
         reminder += `\n\n${readOnlyReminder}`;
+      }
+      const phaseReminder = phaseProgressionReminder(trialDir, step, sentReminders);
+      if (phaseReminder) {
+        appendRunnerReminder(trialDir, step, "phase-progression", phaseReminder);
+        reminder += `\n\n${phaseReminder}`;
       }
     } else {
       const bootstrapReminder = hostBootstrapProgressReminder(step, sentReminders);

@@ -42,6 +42,8 @@
 - Resource files must contain concrete usable values. If the host environment exports a required key, write it from the environment without printing it; if the key is absent, record the missing secret and leave verification booleans false.
 - Use `build.with_network: true` when the build downloads packages or source.
 - Use runtime downloads only when image-time downloads are impractical. If runtime downloads affect trust claims, record hashes separately.
+- After `confidential-agent build` exits 0, preserve the built image and advance to peering and deploy. Do not delete images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself is defective.
+- Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Fixes that matter must be moved into the AppSpec, install script, or resource files, then rebuilt and redeployed.
 
 ## Common Patterns
 
@@ -73,6 +75,7 @@ Verification:
 - Prefer `/healthz`, `/health`, `/ready`, or documented status endpoints.
 - If no health endpoint exists, use TCP connect and a real chat/API call.
 - Prove the real upstream is running by recording commit hash and service process command.
+- Verify through `confidential-agent connect` or the host-side port it exposes. Direct guest SSH is diagnostic only and does not prove the reproducible migration works.
 
 ## Result Evidence
 
@@ -82,5 +85,5 @@ In full/live runs, `result.json` booleans are evidence fields, not intentions:
 - `deploy_ok`: only after `confidential-agent deploy --spec ...` exits 0.
 - `live_status_ok`: only after `confidential-agent status --live --json` succeeds and shows the app is ready.
 - `connect_ok`: only after `confidential-agent connect ...` starts successfully and a local port is reachable.
-- `chat_ok`: only after a real chat/API/tool call reaches the migrated service and returns a usable workload response. Health, status, version, config, and model-list endpoints are not enough.
+- `chat_ok`: only after a real chat/API/tool call reaches the migrated service through the connected port and returns a usable workload response. Health, status, version, config, local echo/print commands, and direct guest SSH output are not enough.
 - `cleanup_ok`: only after `confidential-agent destroy <service>` succeeds, or status proves no active service remains.

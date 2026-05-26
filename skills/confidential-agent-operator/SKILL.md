@@ -47,6 +47,9 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Do not delete host bootstrap assets such as `/usr/local/bin/confidential-agent`, Shelter, OpenClaw, or `confidential-agent-tools:latest` during cleanup. Cleanup only the Confidential Agent service deployed for the target migration.
 - Do not save or copy the one-click installer, Host Bootstrap fragments, or Confidential Agent setup scripts as the deliverable target install script. The deliverable install script installs the upstream target inside the guest image and creates its runtime service.
 - Keep the target checkout in a named subdirectory such as `upstream/`; do not copy the whole upstream repository into the trial/work directory root. The root should hold the final AppSpec, install script, resource config, `result.json`, and small support files.
+- After `confidential-agent build` exits 0, move forward to operator peering and deploy. Do not delete built images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself must change.
+- Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Runtime fixes must be made in the AppSpec, install script, or resources, then rebuilt and redeployed so the migration is reproducible.
+- `chat_ok` evidence must come from the deployed target service through `confidential-agent connect` or the host-side port it exposes. Do not use local `echo`, local scripts, direct guest SSH, or fabricated marker output as chat evidence.
 
 ## Canonical Skeleton
 
@@ -175,6 +178,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 
 4. **Build And Deploy**
    - Run `confidential-agent build --spec confidential-agent.yaml`. If your CLI version defaults to `confidential-agent.yaml`, the explicit flag is still acceptable.
+   - After a successful build, preserve the built image and advance the pipeline. Do not clean image directories or rerun build unless deploy or live status fails with evidence that requires an image change.
    - Add operator peering for the controller CIDR after build and before deploy; deploy uses peerings plus `service.connect`/`service.ports` to derive security group ingress.
    - If the controller public CIDR is not already known, discover it with a normal network tool and use a `/32` CIDR.
    - Do not try to fix missing security group ports by adding unsupported `deploy.security_group*` fields to the AppSpec.
@@ -184,7 +188,8 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 5. **Verify**
    - Run `confidential-agent status --live --json`.
    - Start `confidential-agent connect` and verify the service with `curl`, `nc`, or the workload's native client. In this CLI version, use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; do not assume `connect --service` works for local service selection.
-   - Health, status, version, config, and model-list endpoints prove reachability only; they do not prove the migrated agent works. For `chat_ok`, send a real natural-language request through the connected service and save the response. Prefer two turns when the workload supports it, and include a deterministic marker if the task provides one.
+   - All reachability and chat probes must go through `confidential-agent connect` or its exposed host-side port. Direct SSH guest probes are only diagnostics; they do not satisfy `connect_ok` or `chat_ok`, and guest-side hotfixes must be moved back into the build artifacts before rerunning the flow.
+   - Health, status, version, config, and model-list endpoints prove reachability only; they do not prove the migrated agent works. For `chat_ok`, send a real natural-language request through the connected service and save the response. Prefer two turns when the workload supports it, and include a deterministic marker if the task provides one. The marker must be produced by the target service response, not by a local command.
    - Verify that the running service is the real target upstream, using commit hash, process command, installed files, and response behavior.
 
 6. **Operate And Cleanup**
