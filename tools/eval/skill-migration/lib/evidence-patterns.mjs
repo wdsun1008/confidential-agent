@@ -1,5 +1,6 @@
 const CA_GLOBAL_ARGS = String.raw`(?:\s+--[A-Za-z0-9_-]+(?:[=\s][^\s;&|]+)?)*`;
 const CA_COMMAND = String.raw`\bconfidential-agent${CA_GLOBAL_ARGS}\s+`;
+const CA_STATUS_COMMAND = new RegExp(`${CA_COMMAND}status\\b`, "i");
 
 export const E2E_COMMAND_EVIDENCE = {
   build_ok: new RegExp(`${CA_COMMAND}build\\b`, "i"),
@@ -47,6 +48,24 @@ export function hasSuccessfulCommand(events, pattern) {
   return events.some(
     (event) => pattern.test(event.cmd) && event.result?.code === 0 && !commandLosesCriticalEvidence(event.cmd),
   );
+}
+
+function outputLooksLiveStatus(output) {
+  const text = String(output || "").trim();
+  if (!text) return false;
+  if (/"(?:phase|status|state)"\s*:\s*"(?:active|running|ready|live)"/i.test(text)) return true;
+  return text.split(/\r?\n/).some((line) => {
+    if (/\b(?:no(?:\s+longer)?|not)\s+active\b|\binactive\b/i.test(line)) return false;
+    return /\S+\s+(?:active|running|ready|live)\b/i.test(line);
+  });
+}
+
+export function hasSuccessfulLiveStatusEvidence(events) {
+  return events.some((event) => {
+    if (!CA_STATUS_COMMAND.test(event.cmd)) return false;
+    if (event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) return false;
+    return outputLooksLiveStatus(`${event.result?.stdout || ""}\n${event.result?.stderr || ""}`);
+  });
 }
 
 function looksLikeFabricatedChatCommand(cmd) {

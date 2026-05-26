@@ -7,6 +7,7 @@ import {
   commandLosesCriticalEvidence,
   hasSuccessfulChatEvidence,
   hasSuccessfulCommand,
+  hasSuccessfulLiveStatusEvidence,
 } from "./lib/evidence-patterns.mjs";
 
 function positiveIntEnv(name, fallback) {
@@ -540,9 +541,11 @@ function fullPhaseCompletionStatus(trialDir) {
 function hasE2eEvidenceForField(field, events, chatSuccessPatterns = []) {
   const pattern = E2E_COMMAND_EVIDENCE[field];
   if (!pattern) return true;
-  return field === "chat_ok"
-    ? hasSuccessfulChatEvidence(events, pattern, chatSuccessPatterns)
-    : hasSuccessfulCommand(events, pattern);
+  if (field === "chat_ok") return hasSuccessfulChatEvidence(events, pattern, chatSuccessPatterns);
+  if (field === "live_status_ok") {
+    return hasSuccessfulCommand(events, pattern) || hasSuccessfulLiveStatusEvidence(events);
+  }
+  return hasSuccessfulCommand(events, pattern);
 }
 
 function uncorroboratedResultTrueReminder(trialDir, sentReminders) {
