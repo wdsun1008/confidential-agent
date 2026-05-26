@@ -120,6 +120,7 @@ struct PreparedConfig {
 struct PrepareOptions {
     build_id: Option<String>,
     image_variant: Option<String>,
+    include_deploy: bool,
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
     peerings: PeeringsFile,
@@ -464,6 +465,7 @@ fn prepare(
             images_dir: Some(paths.artifacts_dir.clone()),
             cache_dir: Some(paths.cache_dir.clone()),
             terraform_dir: terraform_dir.clone(),
+            include_deploy: options.include_deploy,
             local_image_source: None,
             deploy_resource_name: options
                 .deploy_names

@@ -525,7 +525,7 @@ fn write_fake_shelter(path: &Path, log: &Path) {
     write_script(
         path,
         &format!(
-            r#"#!/usr/bin/env python3
+            r#"#!/usr/bin/env python3.11
 import json
 import os
 import sys
@@ -907,6 +907,7 @@ service:
   ports: [18789]
   connect: [18789]
 build:
+  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -961,7 +962,7 @@ resources: {}
 }
 
 #[test]
-fn build_render_only_keeps_selected_variant_rendered_config() {
+fn build_render_only_ignores_peerings_and_keeps_selected_variant_rendered_config() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let fake_bin = write_fake_prepare_tools(temp.path());
@@ -980,6 +981,7 @@ service:
   ports: [18789]
   connect: [18789]
 build:
+  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1029,9 +1031,190 @@ resources: {}
 
     let rendered =
         fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
-    assert!(rendered.contains("name: openclaw-agent-release-"));
+    assert!(rendered.contains("name: release"));
+    assert!(!rendered.contains("deploy:"));
+    assert!(!rendered.contains("security_group_ports:"));
+    assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
+    assert!(!rendered.contains("name: debug"));
+}
+
+#[test]
+fn deploy_render_only_includes_operator_peering_security_group_rules() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let shelter = temp.path().join("fake-shelter");
+    let log = temp.path().join("shelter.log");
+    write_fake_shelter(&shelter, &log);
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+    cli.shelter_bin = shelter;
+
+    cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false,
+        },
+    )
+    .unwrap();
+    let err = cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec: spec.clone(),
+            skip_inject: false,
+            render_only: false,
+            skip_peering_check: false,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("no operator peering"));
+
+    PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "203.0.113.10/32".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    }
+    .write_to_path(&cli.state_dir.join("peerings.yaml"))
+    .unwrap();
+
+    cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec,
+            skip_inject: true,
+            render_only: true,
+            skip_peering_check: false,
+        },
+    )
+    .unwrap();
+    std::env::set_var("PATH", old_path);
+
+    let rendered =
+        fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("deploy:"));
+    assert!(rendered.contains("backend: terraform"));
+    assert!(rendered.contains("security_group_ports: []"));
     assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
-    assert!(!rendered.contains("name: openclaw-agent-debug-"));
+    assert!(rendered.contains("status_8088_peer_203_0_113_10_32"));
+    assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
+}
+
+#[test]
+fn render_service_config_from_state_refreshes_peering_rules_without_rebuild() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let spec_path = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec_path,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.spec.path = spec_path;
+    state.deploy.terraform_dir = Some(
+        state_dir
+            .join("services")
+            .join("openclaw")
+            .join("terraform")
+            .join("active"),
+    );
+    state.deploy.image_import_name = Some("openclaw-agent-release-20260429201011".to_string());
+    write_state(&state_dir, &state);
+    write_manifest(&state_dir, "openclaw", &state.build.build_id);
+
+    PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "203.0.113.10/32".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    }
+    .write_to_path(&state_dir.join("peerings.yaml"))
+    .unwrap();
+    render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
+    let rendered =
+        fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("deploy:"));
+    assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
+    assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
+
+    PeeringsFile::empty()
+        .write_to_path(&state_dir.join("peerings.yaml"))
+        .unwrap();
+    render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
+    let rendered =
+        fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("deploy:"));
+    assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
+    assert!(!rendered.contains("connect_18789_peer_203_0_113_10_32"));
 }
 
 #[test]

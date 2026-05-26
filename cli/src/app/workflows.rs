@@ -448,6 +448,7 @@ pub(super) fn render_service_config_from_state(
             images_dir: Some(images_dir),
             cache_dir: Some(cache_dir),
             terraform_dir: state.deploy.terraform_dir.clone(),
+            include_deploy: true,
             local_image_source: None,
             deploy_resource_name: Some(state.deploy.resource_name.clone()),
             local_image_import_name: state.deploy.image_import_name.clone(),

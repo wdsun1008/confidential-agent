@@ -28,7 +28,6 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     validate_build_start(existing_state.as_ref())?;
     let run_id = current_build_run_id();
     let selected_variant = spec.image_variant().to_string();
-    let peerings = read_peerings_or_empty(&cli.state_dir)?;
     let mut selected_prepared = None;
     let mut selected_manifest = None;
     let mut selected_rendered = None;
@@ -46,7 +45,6 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
                 build_id: Some(build_id),
                 image_variant: Some(variant.clone()),
                 deploy_names: Some(DeployNames::new(&variant_spec)),
-                peerings: peerings.clone(),
                 ..PrepareOptions::default()
             },
         )?;
@@ -216,6 +214,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         PrepareOptions {
             build_id: Some(build_variant.shelter_build_id.clone()),
             image_variant: Some(deploy_variant.clone()),
+            include_deploy: true,
             deploy_names: Some(deploy_names.clone()),
             mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
             peerings,

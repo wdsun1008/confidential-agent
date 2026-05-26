@@ -513,8 +513,8 @@ run_deploy_openclaw() {
   install_confidential_agent_cli
   build_tools_image
   prepare_openclaw_specs
-  ensure_operator_peering
   build_openclaw_image
+  ensure_operator_peering
   deploy_openclaw_service
   sync_active_openclaw_resources
   restart_active_openclaw_app
