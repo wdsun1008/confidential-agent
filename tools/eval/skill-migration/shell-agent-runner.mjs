@@ -757,8 +757,7 @@ function commandMutatesInternalCaState(cmd, strippedCmd = stripHeredocBodies(cmd
   if (
     shellTarget &&
     (containsFileWriteShellSyntax(strippedCmd) ||
-      /\b(?:rm|rmdir|mv|cp|install|touch|truncate|mkdir|ln|rsync|sed|perl)\b/i.test(strippedCmd) ||
-      /\bfind\b[^\n;&|]*\s-delete\b/i.test(strippedCmd))
+      containsStateMutationCommand(strippedCmd))
   ) {
     return shellTarget;
   }
@@ -772,6 +771,60 @@ function commandMutatesInternalCaState(cmd, strippedCmd = stripHeredocBodies(cmd
     return fullTarget;
   }
   return "";
+}
+
+function shellWords(segment) {
+  const text = String(segment || "")
+    .trim()
+    .replace(/^[({]\s*/, "")
+    .replace(/\s*[)}]\s*$/g, "")
+    .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)*/, "");
+  const matches = text.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+  return matches.map((word) => word.replace(/^(['"])([\s\S]*)\1$/, "$2"));
+}
+
+function commandNameFromWords(words) {
+  const values = [...words];
+  while (values.length) {
+    const command = path.basename(values[0]);
+    if (["sudo", "command", "builtin", "nohup"].includes(command)) {
+      values.shift();
+      continue;
+    }
+    if (command === "env") {
+      values.shift();
+      while (values[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(values[0])) values.shift();
+      continue;
+    }
+    if (command === "timeout" || command === "nice") {
+      values.shift();
+      while (values[0] && /^-/.test(values[0])) values.shift();
+      if (command === "timeout" && values[0] && /^[0-9.]+[smhd]?$/.test(values[0])) values.shift();
+      continue;
+    }
+    return { command, args: values.slice(1) };
+  }
+  return { command: "", args: [] };
+}
+
+function segmentHasMutationCommand(segment) {
+  const { command, args } = commandNameFromWords(shellWords(segment));
+  const mutatingCommands = new Set(["rm", "rmdir", "mv", "cp", "install", "touch", "truncate", "mkdir", "ln", "rsync"]);
+  if (mutatingCommands.has(command)) return true;
+  const argText = ` ${args.join(" ")} `;
+  if (["sed", "perl"].includes(command)) return /(^|\s)-[A-Za-z]*i[A-Za-z]*(\s|$)/.test(argText);
+  if (command === "find") return /(^|\s)-delete(\s|$)/.test(argText);
+  if (command === "xargs") {
+    const nested = args.find((arg) => arg && !arg.startsWith("-"));
+    return nested ? mutatingCommands.has(path.basename(nested)) : false;
+  }
+  return false;
+}
+
+function containsStateMutationCommand(cmd) {
+  return String(cmd || "")
+    .split(/\s*(?:&&|\|\||[;|])\s*/)
+    .some((segment) => segmentHasMutationCommand(segment));
 }
 
 function containsFileWriteShellSyntax(cmd) {
