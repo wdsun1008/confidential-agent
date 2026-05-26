@@ -101,7 +101,9 @@ function skillContext(skillDir, bootstrapUrl, skillRef) {
       `Skill bootstrap URL: ${bootstrapUrl}`,
       base ? `Skill raw base URL: ${base}` : "",
       skillRef ? `Skill source ref: ${skillRef}` : "",
-      skillRef ? `When running the skill's Host Bootstrap command, set CA_REF='${skillRef}' so one-click install-only uses the same pinned source ref.` : "",
+      skillRef
+        ? `When running the skill's Host Bootstrap command, export CA_REF='${skillRef}' before curl, or use the literal raw URL for that ref. Do not prefix curl with CA_REF=... while expanding \${CA_REF} in the same command.`
+        : "",
       `First bash action for treatment bootstrap runs must download SKILL.md from the literal bootstrap URL, for example: curl -fsSL '${bootstrapUrl}' -o SKILL.md`,
       refs.length ? `Skill reference URLs:\n${refs.map((url) => `- ${url}`).join("\n")}` : "",
       "Read only the references that SKILL.md tells you to read for the current failure or artifact task.",

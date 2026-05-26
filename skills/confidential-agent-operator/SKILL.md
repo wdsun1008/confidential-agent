@@ -12,14 +12,15 @@ Use this skill to migrate an arbitrary agent into Confidential Agent. Treat the 
 Before migration work, ensure the controller host has the Confidential Agent CLI, Shelter, and `confidential-agent-tools:latest`. Use `confidential-agent --help`, `shelter --help`, and the local container image list for this availability check. If any of those are missing, run the one-click installer in `install-only` mode from the same source ref as this skill.
 
 ```bash
-CA_REPO="${CA_REPO:-https://github.com/wdsun1008/confidential-agent.git}"
-CA_REF="${CA_REF:-skill}"
+export CA_REPO="${CA_REPO:-https://github.com/wdsun1008/confidential-agent.git}"
+export CA_REF="${CA_REF:-skill}"
 curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_REF}/one-click/install.sh" | \
   bash -s -- --repo "$CA_REPO" --ref "$CA_REF" install-only --non-interactive --yes
 ```
 
 `install-only` is one-time Confidential Agent host preparation, not part of the target-agent migration. Run it only when dependencies are absent or stale. It installs the Confidential Agent CLI, Shelter, and tools image; it does not install or configure host OpenClaw and does not need cloud or model-provider credentials. Do not use `deploy-openclaw` for bootstrap. If the task requires an external model provider or a host OpenClaw gateway and those are absent, report that host setup is incomplete instead of trying to provision them during a target migration. Do not run host diagnostic checks as part of the migration; use the available `confidential-agent` CLI directly after bootstrap.
 Once `install-only` succeeds and `confidential-agent --help` responds, do not re-read the installer script, re-run bootstrap, or run host diagnostics. Proceed directly to the target repository migration workflow.
+If you compress the bootstrap into one shell line, separate the variable assignments from `curl` with `;` or use literal values. Do not prefix `curl` with temporary assignments while also expanding those variables in the same command.
 
 ## Hard Fail Conditions
 
