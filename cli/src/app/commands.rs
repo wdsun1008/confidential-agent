@@ -7,6 +7,8 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Commands::Build(args) => cmd_build(cli, args),
         Commands::Deploy(args) => cmd_deploy(cli, args),
+        Commands::Docs(args) => cmd_docs(args),
+        Commands::Spec(args) => cmd_spec(args),
         Commands::Inject(args) => cmd_inject(cli, args),
         Commands::Mesh(args) => cmd_mesh(cli, args),
         Commands::Connect(args) => cmd_connect(cli, args),

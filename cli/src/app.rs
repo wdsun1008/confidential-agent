@@ -1,7 +1,7 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, DeployArgs, DestroyArgs,
-    ImageArgs, ImageCommands, InjectArgs, MeshArgs, MeshCommands, MigrateArgs, PeeringArgs,
-    PeeringCommands, StatusArgs,
+    DocsArgs, DocsTopic, ImageArgs, ImageCommands, InjectArgs, MeshArgs, MeshCommands,
+    MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, SpecArgs, SpecCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -408,6 +408,9 @@ const REQUIRED_GUEST_TNG_VERSION: &str = "tng 2.6.0";
 mod commands;
 use commands::deploy_shelter_args;
 pub(crate) use commands::run;
+
+mod self_describe;
+use self_describe::*;
 
 fn prepare(
     cli: &Cli,
