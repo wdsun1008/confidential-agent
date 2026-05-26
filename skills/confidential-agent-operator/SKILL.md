@@ -33,6 +33,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Use `schema: confidential-agent/v1`; do not use `apiVersion`, `kind`, or Kubernetes-style `spec:` wrappers.
 - Do not use deprecated or foreign schema fields such as top-level `name`, `runtime`, `build.commands`, or `build.files.path`; use the canonical skeleton and read `references/appspec.md` Schema Anti-Patterns if unsure.
 - Use only the public `confidential-agent` command; do not call helper binaries or wrapper names with product-specific suffixes.
+- Do not edit Confidential Agent internal state under `.confidential-agent`, `$CA_EVAL_CLI_STATE_DIR`, or generated state files such as `build-result.json`, `deploy-result.json`, or `manifest.json`. Those files are CLI outputs, not migration inputs.
 - Use `build.files[].executable: true`; do not use `build.files[].mode`.
 - Use `build.variants.debug.ssh_public_key` only when a real public key path exists; do not use `debug_ssh_key`.
 - If no SSH public key exists, omit `build.variants.debug.ssh_public_key`; do not guess `/root/.ssh/id_rsa.pub`.
@@ -131,6 +132,7 @@ Do not spend the whole run reading. A rough but concrete first draft is better t
 - Do not bake secrets into images. Put API keys, tokens, user config, and private endpoints into `resources`.
 - Prefer pinned upstream commits, deterministic install scripts, explicit systemd units, and narrow exposed ports.
 - Use the CLI as the source of truth for workflow, schema, validation, build, deploy, connect, status, and cleanup. Use normal tools such as `curl`, `nc`, or the workload's native client for service probes.
+- If a build, deploy, status, connect, or cleanup step fails, fix the AppSpec, install script, resource files, or CLI invocation and rerun the public CLI. Do not synthesize or patch CLI state files to force progress.
 - Do not claim attestation, RATS-TLS, or measurement coverage without evidence from the CLI flow.
 
 ## Alinux/RHEL Build Package Names

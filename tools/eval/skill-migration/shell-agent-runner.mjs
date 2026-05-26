@@ -34,8 +34,10 @@ const ARTIFACT_FIRST_MILESTONES = [4, 8, 14, 24];
 const CONSECUTIVE_READ_ONLY_MILESTONES = [4, 8, 12];
 const PHASE_PROGRESSION_MILESTONES = [30, 45, 60, 80, 100, 130, 170, 220];
 const REPEATED_READONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_READONLY_STALL_BLOCKS", 3);
-// Runner guard exits currently use 64-70 plus 72; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72]);
+const REPEATED_COMMAND_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_BLOCK_THRESHOLD", 8);
+const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_STALL_BLOCKS", 3);
+// Runner guard exits currently use 64-70 and 72-75; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -359,6 +361,10 @@ function normalizeGithubRepo(value) {
   return "";
 }
 
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function targetRepoFromTask(taskText) {
   const match = String(taskText || "").match(/^\s*target_repo:\s*(\S+)\s*$/m);
   return match ? match[1].trim() : "";
@@ -557,6 +563,43 @@ function uncorroboratedResultTrueReminder(trialDir, sentReminders) {
   );
 }
 
+function commandMayWriteResultJson(cmd) {
+  const text = String(cmd || "");
+  if (!/\bresult\.json\b/i.test(text)) return false;
+  if (containsFileWriteShellSyntax(text)) return true;
+  return (
+    /\b(?:sed|perl)\b[^\n;&|]*\s-i\b[^\n;&|]*\bresult\.json\b/i.test(text) ||
+    /\b(?:jq)\b[\s\S]*\bresult\.json\b[\s\S]*\|\s*sponge\s+result\.json\b/i.test(text) ||
+    /\b(?:python3?|node|ruby)\b[\s\S]*(?:open\s*\(|writeFileSync\s*\(|writeFile\s*\(|File\.write\s*\()[\s\S]*\bresult\.json\b/i.test(
+      text,
+    )
+  );
+}
+
+function resultTrueFieldsMentioned(cmd) {
+  const text = String(cmd || "");
+  return Object.keys(E2E_COMMAND_EVIDENCE).filter((field) => {
+    const escaped = escapeRegExp(field);
+    return [
+      new RegExp(`["']?${escaped}["']?\\s*:\\s*(?:true|True)\\b`, "i"),
+      new RegExp(`\\.${escaped}\\s*=\\s*(?:true|True)\\b`, "i"),
+      new RegExp(`\\[\\s*["']${escaped}["']\\s*\\]\\s*=\\s*(?:true|True)\\b`, "i"),
+      new RegExp(`\\b${escaped}\\b\\s*=\\s*(?:true|True)\\b`, "i"),
+    ].some((pattern) => pattern.test(text));
+  });
+}
+
+function uncorroboratedResultTrueFieldsForCommand(cmd, trialDir) {
+  if (optionalEnv("CA_EVAL_PHASE", "full") !== "full") return [];
+  if (!commandMayWriteResultJson(cmd)) return [];
+  const fields = resultTrueFieldsMentioned(cmd);
+  if (!fields.length) return [];
+  const events = toolEventsFromTranscript(trialDir);
+  const grader = readJson(optionalEnv("CA_EVAL_GRADER_FILE", ""), {});
+  const chatSuccessPatterns = Array.isArray(grader.chat_success_patterns) ? grader.chat_success_patterns : [];
+  return fields.filter((field) => !hasE2eEvidenceForField(field, events, chatSuccessPatterns));
+}
+
 function specValidationForArtifacts(trialDir) {
   const result = readResultJson(trialDir);
   const specPath = artifactPathFromResult(trialDir, result, "generated_spec");
@@ -692,6 +735,40 @@ function normalizeRepeatedCommand(cmd) {
     .replace(/\s+/g, " ");
 }
 
+function internalCaStatePathMention(text) {
+  const value = String(text || "");
+  const patterns = [
+    /(?:^|[\s"'=])((?:\$HOME|~|\.|home|\/[^\s"'`;&|)]*)?\/?\.confidential-agent\/[^\s"'`;&|)]*(?:build-result|deploy-result|manifest|mesh-bundle)\.json)\b/i,
+    /(?:^|[\s"'=])((?:\$CA_EVAL_CLI_STATE_DIR|state|\.\/state|\/[^\s"'`;&|)]*\/state)\/[^\s"'`;&|)]*(?:build-result|deploy-result|manifest|mesh-bundle)\.json)\b/i,
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) return match[1];
+  }
+  return "";
+}
+
+function commandMutatesInternalCaState(cmd, strippedCmd = stripHeredocBodies(cmd)) {
+  const shellTarget = internalCaStatePathMention(strippedCmd);
+  if (
+    shellTarget &&
+    (containsFileWriteShellSyntax(strippedCmd) ||
+      /\b(?:rm|mv|cp|install|touch|truncate|sed|perl)\b/i.test(strippedCmd))
+  ) {
+    return shellTarget;
+  }
+  const fullTarget = internalCaStatePathMention(cmd);
+  if (
+    fullTarget &&
+    /\b(?:python3?|node|ruby)\b[\s\S]*(?:open\s*\([^)]*["']w|writeFileSync\s*\(|writeFile\s*\(|File\.write\s*\(|renameSync\s*\(|rename\s*\(|unlinkSync\s*\(|unlink\s*\(|rmSync\s*\()/i.test(
+      String(cmd || ""),
+    )
+  ) {
+    return fullTarget;
+  }
+  return "";
+}
+
 function containsFileWriteShellSyntax(cmd) {
   const text = String(cmd || "");
   if (/<<\s*['"]?\w+/.test(text) || /\btee\b/.test(text)) return true;
@@ -770,12 +847,15 @@ function isReadOnlyExplorationCommand(cmd) {
   return false;
 }
 
-function repeatedCommandReminder(repeatCount, blocked) {
+function repeatedCommandReminder(repeatCount, blocked, readOnly) {
   const prefix = blocked
-    ? `Repeated read-only command blocked after ${repeatCount} identical attempts.`
+    ? `Repeated command blocked after ${repeatCount} identical attempts.`
     : `Repeated command reminder: the last command has run ${repeatCount} times in a row.`;
+  const action = readOnly
+    ? "Stop repeating read-only exploration. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json, then run spec validate/build as appropriate."
+    : "Stop repeating the same shell action. Read the latest error/output, change the artifact or CLI invocation, then rerun only when something meaningful has changed.";
   return (
-    `${prefix} Stop repeating read-only exploration. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json, then run spec validate/build as appropriate.`
+    `${prefix} ${action}`
   );
 }
 
@@ -805,9 +885,27 @@ function consecutiveReadOnlyReminder(trialDir, count, sentReminders) {
 
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
   const guardCmd = stripHeredocBodies(cmd);
-  if (DRY_EXEC) {
-    return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
+  const uncorroboratedFields = uncorroboratedResultTrueFieldsForCommand(cmd, cwd);
+  if (uncorroboratedFields.length) {
+    return Promise.resolve({
+      code: 73,
+      stdout: "",
+      stderr:
+        `Blocked result.json update that sets ${uncorroboratedFields.join(", ")} true before matching transcript evidence exists. ` +
+        "Run the corresponding unwrapped confidential-agent command or service probe first, then update only the fields backed by exit 0 evidence.",
+    });
   }
+  const internalStateTarget = commandMutatesInternalCaState(cmd, guardCmd);
+  if (internalStateTarget) {
+    return Promise.resolve({
+      code: 74,
+      stdout: "",
+      stderr:
+        `Blocked manual mutation of Confidential Agent internal state (${internalStateTarget}). ` +
+        "Do not synthesize build/deploy manifests or result files under .confidential-agent/state; fix the AppSpec, install script, or resources and rerun the public CLI.",
+    });
+  }
+  if (DRY_EXEC) return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
   if (commandLosesCriticalEvidence(guardCmd)) {
     return Promise.resolve({
       code: 70,
@@ -816,7 +914,7 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
         "Blocked critical confidential-agent command that would hide or discard evidence. Rerun the command without head/tail, || fallback, ;/&& command chaining after the CLI call, or /dev/null redirection.",
     });
   }
-  if (/\/root\/(?:\.confidential-agent|confidential-agent)\b|\/var\/tmp\/mkosi-workspace[^\s;&|]*/.test(guardCmd)) {
+  if (/\/root\/confidential-agent\b|\/var\/tmp\/mkosi-workspace[^\s;&|]*/.test(guardCmd)) {
     return Promise.resolve({
       code: 65,
       stdout: "",
@@ -1132,6 +1230,7 @@ Rules:
 - ${fullBootstrapInstruction}
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
+- Do not manually edit Confidential Agent internal state files under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
 - Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append ||, chain another command after them with ; or &&, pipe to head/tail, or redirect output to /dev/null.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
@@ -1247,26 +1346,36 @@ async function main() {
       lastCommandKey = commandKey;
       repeatedCommandCount = commandKey ? 1 : 0;
     }
-    const repeatedReadOnly = repeatedCommandCount >= 5 && isReadOnlyExplorationCommand(action.cmd);
-    const blockRepeatedReadOnly = repeatedCommandCount >= 8 && repeatedReadOnly;
-    const repeatReminder = repeatedReadOnly
-      ? repeatedCommandReminder(repeatedCommandCount, blockRepeatedReadOnly)
+    const repeatedReadOnly = repeatedCommandCount >= 5 && readOnlyExploration;
+    const repeatedAny = repeatedCommandCount >= 5;
+    const blockRepeatedCommand = repeatedCommandCount >= REPEATED_COMMAND_BLOCK_THRESHOLD;
+    const blockRepeatedReadOnly = blockRepeatedCommand && readOnlyExploration;
+    const repeatReminder = repeatedAny
+      ? repeatedCommandReminder(repeatedCommandCount, blockRepeatedCommand, readOnlyExploration)
       : "";
-    if (repeatedReadOnly && (repeatedCommandCount === 5 || blockRepeatedReadOnly)) {
+    if (repeatedAny && (repeatedCommandCount === 5 || blockRepeatedCommand)) {
       appendRunnerReminder(
         trialDir,
         step,
-        blockRepeatedReadOnly ? "repeated-readonly-blocked" : "repeated-readonly",
+        blockRepeatedCommand
+          ? readOnlyExploration
+            ? "repeated-readonly-blocked"
+            : "repeated-command-blocked"
+          : readOnlyExploration
+            ? "repeated-readonly"
+            : "repeated-command",
         repeatReminder,
       );
     }
     console.error(`[agent] step ${step}: ${redact(action.cmd)}`);
-    const result = blockRepeatedReadOnly
+    const result = blockRepeatedCommand
       ? {
-          code: 72,
+          code: blockRepeatedReadOnly ? 72 : 75,
           stdout: "",
           stderr:
-            "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands.",
+            readOnlyExploration
+              ? "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands."
+              : "[runner] Command blocked: the exact same shell action has repeated too many times. Inspect the latest output, change the artifact or CLI invocation, then rerun.",
         }
       : await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos);
     if (RUNNER_GUARD_CODES.has(Number(result.code))) {
@@ -1291,6 +1400,22 @@ async function main() {
         error: message,
       });
       writeRunnerResultFailure(trialDir, "stalled_repeated_readonly", message);
+      throw new Error(message);
+    }
+    if (
+      Number(result.code) === 75 &&
+      usageNumber(metrics.guard_blocks?.["75"]) >= REPEATED_COMMAND_STALL_BLOCKS
+    ) {
+      const message =
+        `stalled_repeated_command: repeated command guard fired ${metrics.guard_blocks["75"]} times ` +
+        `for the same non-progress pattern`;
+      writeAgentMetrics(trialDir, metrics, {
+        completed: false,
+        finish_reason: "stalled_repeated_command",
+        last_step: step,
+        error: message,
+      });
+      writeRunnerResultFailure(trialDir, "stalled_repeated_command", message);
       throw new Error(message);
     }
     messages.push({ role: "assistant", content: JSON.stringify(action) });
