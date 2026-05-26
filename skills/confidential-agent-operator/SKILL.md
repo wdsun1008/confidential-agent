@@ -158,6 +158,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Write the AppSpec and install/runtime files yourself from the inspected upstream repository. The final deliverables belong in the original working directory.
    - The runtime script must install the real upstream service and configure it to start at boot.
    - Write a systemd unit whose `ExecStart` runs the real target agent, create it under `/etc/systemd/system/<unit>.service`, and enable that same unit.
+   - If the upstream provides a Dockerfile, entrypoint, s6, supervisor, compose, or init script, translate that real long-running startup path into systemd before guessing a different module or CLI command.
    - Make install scripts idempotent and rebuild-safe. Before cloning or extracting into a target directory, remove or reuse that directory; image builds and debugging runs may execute the script more than once.
    - Ensure the declared `service.connect` port is configured in `ExecStart`, an Environment line, or a resource file that the service reads.
    - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
@@ -169,6 +170,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Pin the full upstream commit in the install script or copied source path; `result.json.upstream_commit` must be the 40-hex commit that the runtime installs.
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.
+   - Install scripts and systemd units run inside the guest image. Do not reference controller-only absolute paths such as trial directories, `/root/ca-eval-runs`, or the current host checkout; copy inputs with `build.files` to guest paths or clone the pinned upstream inside the image.
    - Move runtime configuration and secrets to resource files. Use environment variable references or injected files for secrets; do not leave `placeholder`, `YOUR_API_KEY_HERE`, `TODO`, `changeme`, example-only tokens, or fake ids in final resources.
    - If a required provider key exists in the host environment, write it to the resource file without printing the value. If it is absent, record the missing secret and leave the corresponding verification boolean false; do not invent a fake value.
    - Produce these artifacts early in one batch: AppSpec YAML, install script, resource config, and a result/evidence file with upstream URL and pinned commit.

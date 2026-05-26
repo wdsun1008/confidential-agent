@@ -516,11 +516,7 @@ function fullPhaseCompletionStatus(trialDir) {
       issues.push(`${field} is not true`);
       continue;
     }
-    const ok =
-      field === "chat_ok"
-        ? hasSuccessfulChatEvidence(events, pattern, chatSuccessPatterns)
-        : hasSuccessfulCommand(events, pattern);
-    if (!ok) {
+    if (!hasE2eEvidenceForField(field, events, chatSuccessPatterns)) {
       issues.push(`${field} lacks a successful command in the transcript`);
     }
   }
@@ -531,6 +527,34 @@ function fullPhaseCompletionStatus(trialDir) {
       `Full phase is not complete: ${issues.join("; ")}. ` +
       "Run the missing real CLI/probe/cleanup steps before final. Only set a result.json boolean to true after the corresponding command exits 0.",
   };
+}
+
+function hasE2eEvidenceForField(field, events, chatSuccessPatterns = []) {
+  const pattern = E2E_COMMAND_EVIDENCE[field];
+  if (!pattern) return true;
+  return field === "chat_ok"
+    ? hasSuccessfulChatEvidence(events, pattern, chatSuccessPatterns)
+    : hasSuccessfulCommand(events, pattern);
+}
+
+function uncorroboratedResultTrueReminder(trialDir, sentReminders) {
+  if (optionalEnv("CA_EVAL_PHASE", "full") !== "full") return "";
+  const result = readResultJson(trialDir);
+  if (!result) return "";
+  const events = toolEventsFromTranscript(trialDir);
+  const grader = readJson(optionalEnv("CA_EVAL_GRADER_FILE", ""), {});
+  const chatSuccessPatterns = Array.isArray(grader.chat_success_patterns) ? grader.chat_success_patterns : [];
+  const fields = Object.keys(E2E_COMMAND_EVIDENCE).filter(
+    (field) => result[field] === true && !hasE2eEvidenceForField(field, events, chatSuccessPatterns),
+  );
+  if (!fields.length) return "";
+  const key = `uncorroborated-result-${fields.join(",")}`;
+  if (sentReminders.has(key)) return "";
+  sentReminders.add(key);
+  return (
+    `Result evidence mismatch: result.json sets ${fields.join(", ")} true without matching successful ` +
+    "transcript evidence. Revert those fields to false until the real CLI command or service probe exits 0; result.json is an evidence ledger, not a TODO list."
+  );
 }
 
 function specValidationForArtifacts(trialDir) {
@@ -920,19 +944,23 @@ function phaseProgressionReminder(trialDir, step, sentReminders) {
   const result = readResultJson(trialDir);
   if (!result) return "";
   const events = toolEventsFromTranscript(trialDir);
-  const buildDone = result.build_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.build_ok);
+  const grader = readJson(optionalEnv("CA_EVAL_GRADER_FILE", ""), {});
+  const chatSuccessPatterns = Array.isArray(grader.chat_success_patterns) ? grader.chat_success_patterns : [];
+  const buildDone = hasE2eEvidenceForField("build_ok", events, chatSuccessPatterns);
   if (!buildDone) return "";
 
-  const deployDone = result.deploy_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.deploy_ok);
-  const liveDone = result.live_status_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.live_status_ok);
-  const connectDone = result.connect_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.connect_ok);
+  const deployDone = hasE2eEvidenceForField("deploy_ok", events, chatSuccessPatterns);
+  const liveDone = hasE2eEvidenceForField("live_status_ok", events, chatSuccessPatterns);
+  const connectDone = hasE2eEvidenceForField("connect_ok", events, chatSuccessPatterns);
+  const chatDone = hasE2eEvidenceForField("chat_ok", events, chatSuccessPatterns);
+  const cleanupDone = hasE2eEvidenceForField("cleanup_ok", events, chatSuccessPatterns);
   const deployAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.deploy_ok));
   const connectAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.connect_ok));
   const cleanupAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.cleanup_ok));
 
   let stage = "";
   let message = "";
-  if (result.chat_ok !== true && (result.cleanup_ok === true || cleanupAttempted)) {
+  if (!chatDone && (result.cleanup_ok === true || cleanupAttempted)) {
     stage = "cleanup-before-chat";
     message =
       "Phase progression: cleanup was attempted before chat_ok was verified. Cleanup is the last success-phase step; if you are abandoning a failed run, keep unfinished success booleans false. Otherwise rebuild/redeploy as needed and do not destroy again until real chat evidence exists.";
@@ -949,11 +977,11 @@ function phaseProgressionReminder(trialDir, step, sentReminders) {
     stage = connectAttempted ? "connect-not-done" : "connect-not-attempted";
     message =
       "Phase progression: live status has succeeded. Verify through `confidential-agent connect` and its host-side port. Do not SSH into the guest to hotfix, install, or probe the service as success evidence.";
-  } else if (result.chat_ok !== true) {
+  } else if (!chatDone) {
     stage = "chat-not-done";
     message =
       "Phase progression: connect is available. Send a real chat/API request through the connected service and capture the service response. Local echo/print/scripted marker output is not chat evidence.";
-  } else if (result.cleanup_ok !== true) {
+  } else if (!cleanupDone) {
     stage = "cleanup-not-done";
     message = "Phase progression: chat evidence is present. Clean up with `confidential-agent destroy <service-id>` and record cleanup_ok only after the CLI succeeds.";
   } else {
@@ -1289,6 +1317,11 @@ async function main() {
       if (phaseReminder) {
         appendRunnerReminder(trialDir, step, "phase-progression", phaseReminder);
         reminder += `\n\n${phaseReminder}`;
+      }
+      const resultEvidenceReminder = uncorroboratedResultTrueReminder(trialDir, sentReminders);
+      if (resultEvidenceReminder) {
+        appendRunnerReminder(trialDir, step, "result-evidence", resultEvidenceReminder);
+        reminder += `\n\n${resultEvidenceReminder}`;
       }
     } else {
       const bootstrapReminder = hostBootstrapProgressReminder(step, sentReminders);
