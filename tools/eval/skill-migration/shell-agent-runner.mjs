@@ -738,8 +738,10 @@ function normalizeRepeatedCommand(cmd) {
 function internalCaStatePathMention(text) {
   const value = String(text || "");
   const patterns = [
-    /(?:^|[\s"'=])((?:\$HOME|~|\.|home|\/[^\s"'`;&|)]*)?\/?\.confidential-agent\/[^\s"'`;&|)]*(?:build-result|deploy-result|manifest|mesh-bundle)\.json)\b/i,
-    /(?:^|[\s"'=])((?:\$CA_EVAL_CLI_STATE_DIR|state|\.\/state|\/[^\s"'`;&|)]*\/state)\/[^\s"'`;&|)]*(?:build-result|deploy-result|manifest|mesh-bundle)\.json)\b/i,
+    /(?:^|[\s"'=])((?:\$HOME|\$\{HOME\}|~|\.|home|\/[^\s"'`;&|)]*)?\/?\.confidential-agent(?:\/[^\s"'`;&|)]*)?)\b/i,
+    /(?:^|[\s"'=])((?:\$CA_EVAL_CLI_STATE_DIR|\$\{CA_EVAL_CLI_STATE_DIR\})(?:\/[^\s"'`;&|)]*)?)\b/i,
+    /(?:^|[\s"'=])((?:\.\/)?state(?:\/[^\s"'`;&|)]*)?)\b/i,
+    /(?:^|[\s"'=])(\/[^\s"'`;&|)]*\/state(?:\/[^\s"'`;&|)]*)?)\b/i,
   ];
   for (const pattern of patterns) {
     const match = value.match(pattern);
@@ -753,7 +755,8 @@ function commandMutatesInternalCaState(cmd, strippedCmd = stripHeredocBodies(cmd
   if (
     shellTarget &&
     (containsFileWriteShellSyntax(strippedCmd) ||
-      /\b(?:rm|mv|cp|install|touch|truncate|sed|perl)\b/i.test(strippedCmd))
+      /\b(?:rm|rmdir|mv|cp|install|touch|truncate|mkdir|ln|rsync|sed|perl)\b/i.test(strippedCmd) ||
+      /\bfind\b[^\n;&|]*\s-delete\b/i.test(strippedCmd))
   ) {
     return shellTarget;
   }
@@ -1230,7 +1233,7 @@ Rules:
 - ${fullBootstrapInstruction}
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
-- Do not manually edit Confidential Agent internal state files under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
+- Do not manually edit, delete, or recreate Confidential Agent internal state files or directories under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
 - Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append ||, chain another command after them with ; or &&, pipe to head/tail, or redirect output to /dev/null.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.

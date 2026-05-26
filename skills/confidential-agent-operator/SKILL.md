@@ -33,7 +33,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Use `schema: confidential-agent/v1`; do not use `apiVersion`, `kind`, or Kubernetes-style `spec:` wrappers.
 - Do not use deprecated or foreign schema fields such as top-level `name`, `runtime`, `build.commands`, or `build.files.path`; use the canonical skeleton and read `references/appspec.md` Schema Anti-Patterns if unsure.
 - Use only the public `confidential-agent` command; do not call helper binaries or wrapper names with product-specific suffixes.
-- Do not edit Confidential Agent internal state under `.confidential-agent`, `$CA_EVAL_CLI_STATE_DIR`, or generated state files such as `build-result.json`, `deploy-result.json`, or `manifest.json`. Those files are CLI outputs, not migration inputs.
+- Do not edit, delete, or recreate Confidential Agent internal state under `.confidential-agent`, `$CA_EVAL_CLI_STATE_DIR`, or generated state files such as `build-result.json`, `deploy-result.json`, or `manifest.json`. Those files are CLI outputs, not migration inputs.
 - Use `build.files[].executable: true`; do not use `build.files[].mode`.
 - Use `build.variants.debug.ssh_public_key` only when a real public key path exists; do not use `debug_ssh_key`.
 - If no SSH public key exists, omit `build.variants.debug.ssh_public_key`; do not guess `/root/.ssh/id_rsa.pub`.
