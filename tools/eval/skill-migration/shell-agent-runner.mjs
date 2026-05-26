@@ -727,6 +727,8 @@ function isReadOnlyExplorationCommand(cmd) {
       "wc",
       "awk",
       "jq",
+      "echo",
+      "printf",
       "pwd",
       "which",
       "file",

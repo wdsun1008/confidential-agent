@@ -15,6 +15,7 @@ const CRITICAL_CLI = new RegExp(
   `${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n]*`,
   "i",
 );
+const CRITICAL_CLI_VERB = String.raw`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\b`;
 
 function criticalCommandPipedToNonTee(text) {
   const match = String(text || "").match(
@@ -24,14 +25,17 @@ function criticalCommandPipedToNonTee(text) {
   return !/^tee(?:$|\\s)/i.test(match[1]);
 }
 
+function stripFdDupRedirects(text) {
+  return String(text || "").replace(/\b[012]?>&[012]\b/g, "");
+}
+
 export function commandLosesCriticalEvidence(cmd) {
   const text = String(cmd || "");
   if (!CRITICAL_CLI.test(text)) return false;
+  const shellOperatorsText = stripFdDupRedirects(text);
   return (
     criticalCommandPipedToNonTee(text) ||
-    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*\\|\\|`, "i").test(text) ||
-    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*&&`, "i").test(text) ||
-    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*;`, "i").test(text) ||
+    new RegExp(`${CRITICAL_CLI_VERB}[^\\n;&|]*(?:\\|\\||&&|;)`, "i").test(shellOperatorsText) ||
     new RegExp(
       `${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*(?:1?>\\s*\\/dev\\/null|2>\\s*\\/dev\\/null|&>\\s*\\/dev\\/null)`,
       "i",
