@@ -678,6 +678,14 @@ function artifactContractIssues(trialDir) {
       "build scripts must not rely on implicit user-local helper CLI paths; install helper CLIs into a stable prefix or set HOME/PATH explicitly and verify command -v before using them.",
     );
   }
+  if (
+    /\bgit\s+clone\b/i.test(installText) &&
+    !/(?:\brm\s+-rf\b|\bmktemp\s+-d\b|\bgit\s+-C\b|\bif\s+\[[^\]]*-d\b|\bif\s+\[[^\]]*!\s*-d\b|\btest\s+-d\b|\[\[[^\]]*-d\b)/i.test(installText)
+  ) {
+    issues.push(
+      "install_script clones into a directory without removing, using a temporary directory, or guarding the destination first; make clone/extract steps idempotent before build.",
+    );
+  }
   if (resourceText.trim().length > 0 && /your[_ -]?[a-z0-9_ -]*key[_ -]?here|changeme|todo|placeholder/i.test(resourceText)) {
     issues.push("resource_config still contains placeholder values; use concrete non-secret runtime config or environment/file references for secrets.");
   }
@@ -734,7 +742,7 @@ function stripHeredocBodies(cmd) {
 }
 
 function normalizeRepeatedCommand(cmd) {
-  return String(cmd || "")
+  return stripHeredocBodies(String(cmd || ""))
     .trim()
     .replace(/[;\s]+$/g, "")
     .replace(/\s+/g, " ");

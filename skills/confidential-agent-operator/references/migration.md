@@ -22,6 +22,7 @@
 - Use `git clone --depth 1` or shallow fetch for discovery and runtime install unless the upstream requires full history.
 - Keep the install script non-interactive and fail-fast: `set -euo pipefail`.
 - Make install scripts idempotent and rebuild-safe. Before cloning or extracting into a target directory, remove or reuse that directory; the image builder or a debugging run may execute the script more than once.
+- Match upstream runtime versions from Dockerfile, `pyproject.toml`, `package.json` engines, lockfiles, or CI config before selecting OS packages. Do not downgrade a project that pins a modern runtime to a distro default.
 - Put OS packages in `build.packages`; install scripts run inside the image buildroot and must not use `yum`, `dnf`, `apt-get`, `apk`, or other OS package manager commands.
 - If an install script bootstraps helper CLIs such as `uv`, `poetry`, or `pnpm`, install them into a stable prefix or set `HOME` and `PATH` explicitly, then verify `command -v <tool>` before using them. mkosi postinstall may not have the interactive `$HOME` expected by curl-piped installers.
 - Keep `build.packages` minimal: include only the OS runtime/build prerequisites needed before the target's own installer can run. Do not include optional troubleshooting or media/search/browser tools unless the real startup command requires them.
@@ -50,7 +51,8 @@
 ## Common Patterns
 
 Python:
-- Install `python3`, `python3-pip`, and only the build tools required by upstream. On Alinux/RHEL, prefer packages such as `python3`, `python3-pip`, `python3-devel`, `gcc`, `gcc-c++`, `make`, `pkgconf-pkg-config`, `openssl-devel`, and `libffi-devel` when native wheels are possible.
+- On Alinux, bare `python3` can be Python 3.6. If upstream requires Python 3.8 or newer, use explicit versioned packages such as `python3.11`, `python3.11-pip`, and `python3.11-devel`, and run venv/pip commands with that same interpreter.
+- Install only the build tools required by upstream. On Alinux/RHEL, prefer packages such as `gcc`, `gcc-c++`, `make`, `pkgconf-pkg-config`, `openssl-devel`, and `libffi-devel` when native wheels are possible.
 - Use virtualenv only if the base image has the required tooling; otherwise install into a dedicated path.
 - Prefer `python -m <module>` over fragile relative script paths when upstream supports it.
 

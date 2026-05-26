@@ -9,12 +9,15 @@ confidential-agent spec validate --spec confidential-agent.yaml --format json
 confidential-agent build --spec confidential-agent.yaml
 ```
 
+`confidential-agent build` accepts `--spec <path>`; image variant selection belongs in `deploy.image_variant` in the AppSpec, not in build flags. Do not pass `--variant`, `--debug`, or `--release` to build.
+
 If build fails:
 - Confirm all `build.files[].source` paths exist.
 - Enable `build.with_network` if package downloads happen.
 - Make install scripts non-interactive.
 - Replace hidden local paths with files copied into the template directory.
 - Treat `confidential-agent build` exit code as authoritative. Image directories or `build-result.json` files left after a nonzero build are diagnostics, not deployable success.
+- Read the complete build output and locate the final meaningful error line before editing. Name that error, make one causally related artifact change, validate, then rerun build; do not batch speculative fixes.
 - If build reports missing `security_group_ports` or security group rules, treat it as a CLI/Shelter workflow bug; build should not depend on peerings.
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec; those are not AppSpec fields.
 
