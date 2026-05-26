@@ -42,6 +42,7 @@
 - Resource files must contain concrete usable values. If the host environment exports a required key, write it from the environment without printing it; if the key is absent, record the missing secret and leave verification booleans false.
 - Use `build.with_network: true` when the build downloads packages or source.
 - Use runtime downloads only when image-time downloads are impractical. If runtime downloads affect trust claims, record hashes separately.
+- After `confidential-agent spec validate` passes and artifacts are internally consistent, run build instead of continuing speculative artifact rewrites; use real build/deploy/status output for the next fix.
 - After `confidential-agent build` exits 0, preserve the built image and advance to peering and deploy. Do not delete images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself is defective.
 - Do not write, patch, delete, or recreate `.confidential-agent`/state-dir internals such as `build-result.json`, `deploy-result.json`, or `manifest.json`; those files are produced by the CLI. If they are missing or wrong, fix the migration artifacts and rerun the corresponding CLI command.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Fixes that matter must be moved into the AppSpec, install script, or resource files, then rebuilt and redeployed.

@@ -36,8 +36,10 @@ const PHASE_PROGRESSION_MILESTONES = [30, 45, 60, 80, 100, 130, 170, 220];
 const REPEATED_READONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_READONLY_STALL_BLOCKS", 3);
 const REPEATED_COMMAND_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_BLOCK_THRESHOLD", 8);
 const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_STALL_BLOCKS", 3);
-// Runner guard exits currently use 64-70 and 72-75; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75]);
+const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
+const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
+// Runner guard exits currently use 64-70 and 72-76; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -862,6 +864,13 @@ function repeatedCommandReminder(repeatCount, blocked, readOnly) {
   );
 }
 
+function blockedReadOnlyWithoutArtifactsMessage(count) {
+  return (
+    `[runner] Command blocked: ${count} consecutive read-only commands ran while confidential-agent.yaml or result.json is still missing. ` +
+    "Write confidential-agent.yaml, the target install script, resource config, and result.json in the trial directory before reading more files."
+  );
+}
+
 function hostBootstrapProgressReminder(step, sentReminders) {
   if (!ARTIFACT_FIRST_MILESTONES.includes(step)) return "";
   const key = `host-bootstrap-${step}`;
@@ -1001,6 +1010,11 @@ function artifactSnapshot(trialDir) {
     .filter((entry) => entry.isFile() && /\.(sh|mjs|js|py)$/.test(entry.name))
     .map((entry) => entry.name);
   return { exists, scripts };
+}
+
+function missingCoreArtifacts(trialDir) {
+  const snapshot = artifactSnapshot(trialDir);
+  return !snapshot.exists["confidential-agent.yaml"] || !snapshot.exists["result.json"];
 }
 
 function appendRunnerReminder(trialDir, step, kind, message) {
@@ -1353,6 +1367,12 @@ async function main() {
     const repeatedAny = repeatedCommandCount >= 5;
     const blockRepeatedCommand = repeatedCommandCount >= REPEATED_COMMAND_BLOCK_THRESHOLD;
     const blockRepeatedReadOnly = blockRepeatedCommand && readOnlyExploration;
+    const bootstrapReadyBeforeCommand = hostBootstrapReady();
+    const blockReadOnlyWithoutArtifacts =
+      readOnlyExploration &&
+      bootstrapReadyBeforeCommand &&
+      missingCoreArtifacts(trialDir) &&
+      consecutiveReadOnlyCount >= CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD;
     const repeatReminder = repeatedAny
       ? repeatedCommandReminder(repeatedCommandCount, blockRepeatedCommand, readOnlyExploration)
       : "";
@@ -1370,11 +1390,25 @@ async function main() {
         repeatReminder,
       );
     }
+    if (blockReadOnlyWithoutArtifacts) {
+      appendRunnerReminder(
+        trialDir,
+        step,
+        "consecutive-readonly-blocked",
+        blockedReadOnlyWithoutArtifactsMessage(consecutiveReadOnlyCount),
+      );
+    }
     console.error(`[agent] step ${step}: ${redact(action.cmd)}`);
-    const result = blockRepeatedCommand
+    const result = blockReadOnlyWithoutArtifacts
       ? {
-          code: blockRepeatedReadOnly ? 72 : 75,
+          code: 76,
           stdout: "",
+          stderr: blockedReadOnlyWithoutArtifactsMessage(consecutiveReadOnlyCount),
+        }
+      : blockRepeatedCommand
+        ? {
+            code: blockRepeatedReadOnly ? 72 : 75,
+            stdout: "",
           stderr:
             readOnlyExploration
               ? "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands."
@@ -1419,6 +1453,22 @@ async function main() {
         error: message,
       });
       writeRunnerResultFailure(trialDir, "stalled_repeated_command", message);
+      throw new Error(message);
+    }
+    if (
+      Number(result.code) === 76 &&
+      usageNumber(metrics.guard_blocks?.["76"]) >= CONSECUTIVE_READ_ONLY_STALL_BLOCKS
+    ) {
+      const message =
+        `stalled_readonly_without_artifacts: consecutive read-only guard fired ${metrics.guard_blocks["76"]} times ` +
+        `while core deliverables were missing`;
+      writeAgentMetrics(trialDir, metrics, {
+        completed: false,
+        finish_reason: "stalled_readonly_without_artifacts",
+        last_step: step,
+        error: message,
+      });
+      writeRunnerResultFailure(trialDir, "stalled_readonly_without_artifacts", message);
       throw new Error(message);
     }
     messages.push({ role: "assistant", content: JSON.stringify(action) });

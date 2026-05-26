@@ -185,6 +185,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Confirm the declared `service.connect` port is consumed by the real startup path, such as a command-line flag, environment variable, or config file that the startup command actually reads. A passive JSON field that the service never loads is not enough.
    - Run these static checks before `confidential-agent build`, not after.
    - Record static validation results in `result.json`.
+   - Once `confidential-agent spec validate` passes and the artifact contract is consistent, stop polishing the same artifacts and run build. Let concrete build/deploy/status errors drive later edits.
 
 4. **Build And Deploy**
    - Run `confidential-agent build --spec confidential-agent.yaml`. If your CLI version defaults to `confidential-agent.yaml`, the explicit flag is still acceptable.
