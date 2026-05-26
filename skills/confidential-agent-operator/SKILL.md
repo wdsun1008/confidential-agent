@@ -178,6 +178,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Produce these artifacts early in one batch: AppSpec YAML, install script, resource config, and a result/evidence file with upstream URL and pinned commit.
 
 3. **Validate Static Artifacts**
+   - Do not rewrite a deliverable unless a deterministic check has run since your last write of that file and you can name the concrete error you are fixing.
    - Run `confidential-agent spec validate --spec confidential-agent.yaml --format json`.
    - If the CLI exposes a non-cloud render/static mode, run it before real build/deploy.
    - Confirm referenced local files exist.
