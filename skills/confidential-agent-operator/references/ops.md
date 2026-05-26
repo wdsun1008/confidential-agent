@@ -17,12 +17,16 @@ If build fails:
 - Make install scripts non-interactive.
 - Replace hidden local paths with files copied into the template directory.
 - Treat `confidential-agent build` exit code as authoritative. Image directories or `build-result.json` files left after a nonzero build are diagnostics, not deployable success.
+- After a nonzero build exit, do not parse generated image paths or `build-result.json` as inputs for deploy. The next step is diagnosis, not deployment.
 - Read the complete build output and locate the final meaningful error line before editing. Name that error, make one causally related artifact change, validate, then rerun build; do not batch speculative fixes.
+- Before retrying a failed build, make sure the previous build process has really exited. If the error is a transient builder lock, busy mount, or stale temporary workspace from the prior attempt, treat that as controller build-environment cleanup rather than a target artifact defect; do not change the AppSpec or install script unless the final error names a real artifact problem.
 - If build reports missing `security_group_ports` or security group rules, treat it as a CLI/Shelter workflow bug; build should not depend on peerings.
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec; those are not AppSpec fields.
 
 After build exits 0, keep the built image and move forward to peering and deploy. Do not remove local image directories, kill builder processes, or rerun build unless a later deploy or live status command shows an image defect.
 Do not run `shelter clean` or other direct Shelter operations during migration; use the public `confidential-agent` commands so state, evidence, and cleanup stay consistent.
+
+If a critical CLI command is rejected or loses evidence because it was piped, chained, redirected, or wrapped with a fallback, recover by running the bare `confidential-agent` command alone as the next shell action. Let it print stdout/stderr naturally, then decide the next step from that output.
 
 ## Deploy
 

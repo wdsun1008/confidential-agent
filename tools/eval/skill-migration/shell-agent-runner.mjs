@@ -1357,6 +1357,7 @@ Rules:
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
 - Do not manually edit, delete, or recreate Confidential Agent internal state files or directories under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
 - Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append ||, chain another command after them with ; or &&, pipe to head/tail, or redirect output to /dev/null.
+- If a confidential-agent command is rejected because it was piped, chained, redirected, or wrapped with a fallback, rerun the bare confidential-agent command alone and inspect its natural output before making the next decision.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
 - confidential-agent connect is a long-running tunnel. In this single-shell eval, run it in the background with stdout/stderr saved to a log, capture its PID, probe the host-side port, and stop the tunnel after chat verification.
