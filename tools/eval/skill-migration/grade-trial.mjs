@@ -2,7 +2,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { E2E_COMMAND_EVIDENCE, commandLosesCriticalEvidence } from "./lib/evidence-patterns.mjs";
+import {
+  E2E_COMMAND_EVIDENCE,
+  commandLosesCriticalEvidence,
+  hasSuccessfulChatEvidence,
+} from "./lib/evidence-patterns.mjs";
 
 function arg(name, fallback = undefined) {
   const idx = process.argv.indexOf(`--${name}`);
@@ -132,19 +136,6 @@ function hasSuccessfulCommand(events, pattern) {
   return events.some(
     (event) => pattern.test(event.cmd) && event.result?.code === 0 && !commandLosesCriticalEvidence(event.cmd),
   );
-}
-
-function hasSuccessfulChatEvidence(events, pattern) {
-  return events.some((event) => {
-    if (!pattern.test(event.cmd) || event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) {
-      return false;
-    }
-    const output = `${event.result?.stdout || ""}\n${event.result?.stderr || ""}`.trim().toLowerCase();
-    if (!output) return false;
-    return !/(method not allowed|unauthorized|connection refused|failed to connect|not found|404|curl:\s*\(\d+\))/i.test(
-      output,
-    );
-  });
 }
 
 function regexForTracePattern(pattern) {
@@ -365,13 +356,22 @@ addFinding(
   "install_script_not_mock_http_service",
   "install script must not create a replacement HTTP service in place of the target agent",
 );
-const realHermesRuntimePattern =
-  /(?:^|\n)\s*(?:ExecStart=|exec\s+)?(?:uv\s+run\s+)?(?:[^\s;&|]+\/)?hermes(?:[-_][a-z0-9]+)?(?=\s|$)|bash\s+-c\s+["'][^"']*(?:uv\s+run\s+)?hermes(?:[-_][a-z0-9]+)?(?=\s|["'])|python3?\s+-m\s+hermes(?:[-_.][a-z0-9_]+)*\b|uvicorn\s+hermes(?:[-_.][a-z0-9_]+)*:/im;
+const runtimePatterns = Array.isArray(grader.required_runtime_patterns) ? grader.required_runtime_patterns : [];
+const runtimeReferenced =
+  !runtimePatterns.length ||
+  runtimePatterns.some((pattern) => {
+    try {
+      return new RegExp(pattern, "im").test(serviceDefinitionText);
+    } catch {
+      return false;
+    }
+  });
 addFinding(
   findings,
-  realHermesRuntimePattern.test(serviceDefinitionText),
-  "real_hermes_runtime_referenced",
-  "systemd service or runtime wrapper must execute the real Hermes runtime, not only a generic listener",
+  runtimeReferenced,
+  "target_runtime_referenced",
+  "systemd service or runtime wrapper must execute the target runtime declared by the grader, not only a generic listener",
+  { soft: runtimePatterns.length === 0 },
 );
 addFinding(
   findings,
@@ -429,7 +429,7 @@ for (const field of grader.required_boolean_fields) {
   const evidence = E2E_COMMAND_EVIDENCE[field];
   const corroborated = evidence
     ? field === "chat_ok"
-      ? hasSuccessfulChatEvidence(events, evidence)
+      ? hasSuccessfulChatEvidence(events, evidence, grader.chat_success_patterns || [])
       : hasSuccessfulCommand(events, evidence)
     : true;
   addFinding(
@@ -494,7 +494,7 @@ const stageFindings = {
     "install_script_exists",
     "resource_config_exists",
     "install_script_not_mock_http_service",
-    "real_hermes_runtime_referenced",
+    ...(runtimePatterns.length ? ["target_runtime_referenced"] : []),
   ],
   e2e: grader.required_boolean_fields || [],
 };

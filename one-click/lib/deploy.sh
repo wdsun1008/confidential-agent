@@ -491,7 +491,6 @@ EOF
 
 run_install_only() {
   install_os_dependencies
-  ensure_host_openclaw_runtime
   ensure_sigstore_tools
   ensure_shelter
   build_confidential_agent

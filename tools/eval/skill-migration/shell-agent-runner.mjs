@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { E2E_COMMAND_EVIDENCE, hasSuccessfulCommand } from "./lib/evidence-patterns.mjs";
+import { E2E_COMMAND_EVIDENCE, hasSuccessfulChatEvidence, hasSuccessfulCommand } from "./lib/evidence-patterns.mjs";
 
 function positiveIntEnv(name, fallback) {
   const raw = process.env[name];
@@ -87,7 +87,12 @@ function skillContext(skillDir, bootstrapUrl, skillRef) {
       .filter(Boolean)
       .join("\n");
   }
-  if (!skillDir) return "No skill is provided for this baseline run.";
+  if (!skillDir) {
+    return [
+      "No skill is provided for this baseline run.",
+      "Public CLI discovery is allowed: confidential-agent docs, confidential-agent spec schema, confidential-agent spec validate, confidential-agent build, deploy, peering, status, connect, and destroy.",
+    ].join("\n");
+  }
   const files = [path.join(skillDir, "SKILL.md")].filter((file) => fs.existsSync(file));
   const body = files
     .map((file) => {
@@ -447,13 +452,19 @@ function fullPhaseCompletionStatus(trialDir) {
   const result = readResultJson(trialDir);
   if (!result) return { ok: false, message: "result.json is missing." };
   const events = toolEventsFromTranscript(trialDir);
+  const grader = readJson(optionalEnv("CA_EVAL_GRADER_FILE", ""), {});
+  const chatSuccessPatterns = Array.isArray(grader.chat_success_patterns) ? grader.chat_success_patterns : [];
   const issues = [];
   for (const [field, pattern] of Object.entries(E2E_COMMAND_EVIDENCE)) {
     if (result[field] !== true) {
       issues.push(`${field} is not true`);
       continue;
     }
-    if (!hasSuccessfulCommand(events, pattern)) {
+    const ok =
+      field === "chat_ok"
+        ? hasSuccessfulChatEvidence(events, pattern, chatSuccessPatterns)
+        : hasSuccessfulCommand(events, pattern);
+    if (!ok) {
       issues.push(`${field} lacks a successful command in the transcript`);
     }
   }
@@ -650,7 +661,8 @@ Rules:
 - ${fullBootstrapInstruction}
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
-- Shell commands run with pipefail enabled. Run confidential-agent build/deploy/peering/status/connect/destroy directly; do not pipe them through head, tail, grep, sed, awk, cut, jq, or cat, append || true, append another command with ;, or redirect them to /dev/null.
+- Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append || true, chain another command with ;, pipe to head/tail, or redirect output to /dev/null.
+- Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
 
 Provided skill context:
 ${skillContext(skillDir, skillBootstrapUrl, skillRef)}`;

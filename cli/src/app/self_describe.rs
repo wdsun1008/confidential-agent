@@ -78,12 +78,22 @@ fn cmd_spec_validate(spec_path: &Path, format: OutputFormat) -> Result<()> {
 
 fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
     let mut checks = Vec::new();
+    let spec_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
     match AgentSpec::from_path(spec_path) {
         Ok(spec) => {
             push_check(&mut checks, "parse", true, "AppSpec parsed");
             match spec.ensure_mvp_supported() {
                 Ok(()) => push_check(&mut checks, "supported", true, "uses supported features"),
                 Err(err) => push_check(&mut checks, "supported", false, err.to_string()),
+            }
+            if let Some(base_image) = &spec.build.base_image {
+                if !base_image.contains("://") {
+                    push_path_check(
+                        &mut checks,
+                        "build.base_image",
+                        Path::new(base_image.as_str()),
+                    );
+                }
             }
             for (index, file) in spec.build.files.iter().enumerate() {
                 push_path_check(
@@ -94,6 +104,15 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
             }
             for (index, script) in spec.build.scripts.iter().enumerate() {
                 push_path_check(&mut checks, format!("build.scripts[{index}]"), script);
+            }
+            if let Some(debug) = &spec.build.variants.debug {
+                if let Some(ssh_public_key) = &debug.ssh_public_key {
+                    push_path_check(
+                        &mut checks,
+                        "build.variants.debug.ssh_public_key",
+                        ssh_public_key,
+                    );
+                }
             }
             for (name, resource) in &spec.resources {
                 push_path_check(
@@ -109,6 +128,12 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
                 if let Some(cosign_key) = &rekor.cosign_key {
                     push_path_check(&mut checks, "attestation.rekor.cosign_key", cosign_key);
                 }
+                push_host_tool_path_check(
+                    &mut checks,
+                    "attestation.rekor.slsa_generator",
+                    &rekor.slsa_generator,
+                    spec_dir,
+                );
             }
             let ok = checks.iter().all(|check| check.ok);
             SpecValidationReport {
@@ -155,6 +180,27 @@ fn push_path_check(checks: &mut Vec<SpecValidationCheck>, name: impl Into<String
     push_check(checks, name, ok, message);
 }
 
+fn push_host_tool_path_check(
+    checks: &mut Vec<SpecValidationCheck>,
+    name: impl Into<String>,
+    path: &Path,
+    spec_dir: &Path,
+) {
+    if path.starts_with(spec_dir) {
+        push_path_check(checks, name, path);
+        return;
+    }
+    let message = if path.exists() {
+        format!("{} exists", path.display())
+    } else {
+        format!(
+            "{} is not present on this host; install the host tool before running a Rekor build",
+            path.display()
+        )
+    };
+    push_check(checks, name, true, message);
+}
+
 fn docs_topic(topic: DocsTopic) -> MarkdownDoc {
     match topic {
         DocsTopic::Overview => MarkdownDoc {
@@ -183,7 +229,7 @@ fn docs_topic(topic: DocsTopic) -> MarkdownDoc {
 fn spec_schema_json() -> serde_json::Value {
     serde_json::json!({
         "schema": "confidential-agent/v1",
-        "required_top_level": ["schema", "service", "build", "deploy", "attestation"],
+        "required_top_level": ["schema", "service", "build", "deploy", "attestation", "resources"],
         "service": {
             "id": "stable service name",
             "ports": "guest TCP ports exposed by the workload",
@@ -226,10 +272,10 @@ Required top-level keys:
 - `build`: image name, packages, copied files, build scripts, and optional variants.
 - `deploy`: cloud provider and Aliyun TDX ECS placement/shape.
 - `attestation`: TDX mode and reference value policy.
+- `resources`: files injected after deploy; use `{}` if no runtime files are needed.
 
 Common optional keys:
 
-- `resources`: files injected after deploy, such as model or agent config.
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
@@ -279,8 +325,8 @@ Core commands:
 - `build --spec <path>` creates the confidential image.
 - `deploy --spec <path>` provisions the cloud instance.
 - `status --service <id> --live --json` checks local and guest state.
-- `connect --service <id>` opens local forwards to guest ports.
-- `destroy --service <id>` tears down provisioned resources.
+- `connect` opens local forwards to active guest ports.
+- `destroy <service-id>` tears down provisioned resources.
 
 For probes, use standard tools such as `curl`, `nc`, the controller agent API, or the workload's native client. Keep probe logic in evaluation scripts or skills rather than expanding the CLI surface.
 "#;
@@ -304,5 +350,61 @@ mod self_describe_tests {
             .unwrap();
         assert!(required.iter().any(|value| value == "service"));
         assert!(required.iter().any(|value| value == "build"));
+        assert!(required.iter().any(|value| value == "resources"));
+    }
+
+    #[test]
+    fn spec_validate_checks_all_local_path_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec_path = temp.path().join("agent.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+build:
+  base_image: ./missing-base.qcow2
+  image_name: openclaw-agent
+  scripts: [./missing-install.sh]
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+      ssh_public_key: ./missing-debug.pub
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: rekor
+  rekor:
+    cosign_key: ./missing-cosign.key
+    slsa_generator: ./missing-slsa-generator
+resources: {}
+"#,
+        )
+        .unwrap();
+
+        let report = validate_spec_file(&spec_path);
+        let failed: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| check.name.as_str())
+            .collect();
+
+        assert!(!report.ok);
+        assert!(failed.contains(&"build.base_image"));
+        assert!(failed.contains(&"build.scripts[0]"));
+        assert!(failed.contains(&"build.variants.debug.ssh_public_key"));
+        assert!(failed.contains(&"attestation.rekor.cosign_key"));
+        assert!(failed.contains(&"attestation.rekor.slsa_generator"));
     }
 }

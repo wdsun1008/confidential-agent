@@ -15,6 +15,7 @@ USE_LOCAL_CLI="${CA_EVAL_USE_LOCAL_CLI:-1}"
 SKILL_BOOTSTRAP_URL="${CA_EVAL_SKILL_BOOTSTRAP_URL:-}"
 SKILL_REF="${CA_EVAL_SKILL_REF:-}"
 RESET_HOST_BOOTSTRAP="${CA_EVAL_RESET_HOST_BOOTSTRAP:-0}"
+YES_RESET_HOST_BOOTSTRAP="${CA_EVAL_YES_RESET_HOST_BOOTSTRAP:-0}"
 
 usage() {
   cat <<'EOF'
@@ -33,6 +34,7 @@ Options:
   --skill-bootstrap-url URL Treatment runs receive only this SKILL.md URL, not a local skill copy.
   --skill-ref REF           Commit/branch/tag recorded with the skill bootstrap URL.
   --reset-host-bootstrap    Before each trial, remove host CLI/tools image bootstrap residue.
+  --yes-reset-host-bootstrap Required with --reset-host-bootstrap; confirms shared host assets may be removed.
 
 The agent command receives:
   CA_EVAL_MODEL
@@ -57,6 +59,7 @@ while (($# > 0)); do
     --skill-bootstrap-url) SKILL_BOOTSTRAP_URL="${2:?missing value for --skill-bootstrap-url}"; shift 2 ;;
     --skill-ref) SKILL_REF="${2:?missing value for --skill-ref}"; shift 2 ;;
     --reset-host-bootstrap) RESET_HOST_BOOTSTRAP=1; shift ;;
+    --yes-reset-host-bootstrap) YES_RESET_HOST_BOOTSTRAP=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -119,12 +122,20 @@ model_available() {
   if [[ -z "$key" ]]; then
     return 1
   fi
-  if ! command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-  curl -fsSL --max-time 20 \
+  command -v curl >/dev/null 2>&1 || return 1
+  local python_bin
+  python_bin="$(command -v python3.11 || command -v python3 || true)"
+  [[ -n "$python_bin" ]] || return 1
+  local body
+  body="$(curl -fsSL --max-time 20 \
     -H "Authorization: Bearer $key" \
-    "$base/models" 2>/dev/null | grep -Fq "\"$model\"" || return 1
+    "$base/models" 2>/dev/null)" || return 1
+  MODEL_ID="$model" "$python_bin" -c 'import json, os, sys
+data = json.load(sys.stdin)
+want = os.environ["MODEL_ID"]
+models = data.get("data", data if isinstance(data, list) else [])
+sys.exit(0 if any(isinstance(item, dict) and item.get("id") == want for item in models) else 1)
+' <<<"$body"
 }
 
 write_prompt() {
@@ -152,6 +163,7 @@ Rules:
 - In static phase, do not perform live cloud operations. Produce migration artifacts and set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless actually verified.
 - In full phase, if Confidential Agent CLI/Shelter/tools image dependencies are missing, bootstrap them with the one-click installer install-only flow before the real build/deploy/connect/chat flow.
 - In full phase, do not finish until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are all backed by successful commands in this trial.
+- In full phase, chat_ok requires a real conversation through confidential-agent connect. Health, status, config, version, or model-list probes are not enough. Ask the running target agent to reply with CA_CONFIDENTIAL_AGENT_EVAL_OK and capture that response.
 - Write final trial metadata to:
   $trial_dir/result.json
 EOF
@@ -161,6 +173,10 @@ EOF
 reset_host_bootstrap_assets() {
   [[ "$RESET_HOST_BOOTSTRAP" == "1" ]] || return 0
   [[ "$USE_LOCAL_CLI" == "0" ]] || return 0
+  [[ "$YES_RESET_HOST_BOOTSTRAP" == "1" ]] || {
+    echo "--reset-host-bootstrap requires --yes-reset-host-bootstrap because it removes shared host CLI/tools assets" >&2
+    return 2
+  }
   rm -f /usr/local/bin/confidential-agent /usr/local/bin/confidential-agentd /usr/local/bin/cai-pep
   if command -v docker >/dev/null 2>&1; then
     docker image rm -f confidential-agent-tools:latest >/dev/null 2>&1 || true
@@ -272,6 +288,7 @@ run_trial() {
     CA_EVAL_PHASE="$EVAL_PHASE" \
     CA_EVAL_TASK_FILE="$public_task" \
     CA_EVAL_PROMPT_FILE="$prompt" \
+    CA_EVAL_GRADER_FILE="$GRADER_FILE" \
     CA_EVAL_TRIAL_DIR="$trial_dir" \
     CA_EVAL_SKILL_DIR="$public_skill_dir" \
     CA_EVAL_SKILL_BOOTSTRAP_URL="$SKILL_BOOTSTRAP_URL" \

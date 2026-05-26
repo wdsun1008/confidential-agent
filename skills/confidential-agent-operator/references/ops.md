@@ -50,7 +50,7 @@ nc -vz 127.0.0.1 <port>
 ```
 
 For chat or agent APIs, use the workload's documented client or a `curl` request against its real endpoint. If `app_ready` is false, inspect `service.app_service`, guest unit logs, config resource targets, and whether the app listens on the declared port.
-Set `live_status_ok` only from a successful live status check that proves readiness, and set `chat_ok` only after saving evidence from a real request to the migrated service.
+Set `live_status_ok` only from a successful live status check that proves readiness, and set `chat_ok` only after saving evidence from a real conversation or workload API call to the migrated service. Health, status, version, config, and model-list endpoints are reachability checks only.
 
 ## Update Resources
 

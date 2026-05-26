@@ -14,6 +14,14 @@
     "install_script",
     "resource_config"
   ],
+  "required_runtime_patterns": [
+    "(?:^|\\n)\\s*(?:ExecStart=|exec\\s+)?(?:uv\\s+run\\s+)?(?:[^\\s;&|]+/)?hermes(?:[-_][a-z0-9]+)?(?=\\s|$)",
+    "python3?\\s+-m\\s+hermes(?:[-_.][a-z0-9_]+)*\\b",
+    "uvicorn\\s+hermes(?:[-_.][a-z0-9_]+)*:"
+  ],
+  "chat_success_patterns": [
+    "CA_CONFIDENTIAL_AGENT_EVAL_OK"
+  ],
   "recommended_trace_patterns": [
     "confidential-agent docs",
     "confidential-agent spec schema",

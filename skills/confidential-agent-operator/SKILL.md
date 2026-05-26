@@ -14,20 +14,16 @@ Before migration work, ensure the controller host has the Confidential Agent CLI
 ```bash
 CA_REPO="${CA_REPO:-https://github.com/wdsun1008/confidential-agent.git}"
 CA_REF="${CA_REF:-skill}"
-host_openclaw_flag=""
-if command -v openclaw >/dev/null 2>&1; then
-  host_openclaw_flag="--skip-host-openclaw"
-fi
 curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_REF}/one-click/install.sh" | \
-  bash -s -- --repo "$CA_REPO" --ref "$CA_REF" install-only --non-interactive --yes $host_openclaw_flag
+  bash -s -- --repo "$CA_REPO" --ref "$CA_REF" install-only --non-interactive --yes
 ```
 
-`install-only` is one-time host preparation, not part of the target-agent migration. Run it only when dependencies are absent or stale. It does not need cloud or model-provider credentials. Do not use `deploy-openclaw` for bootstrap. If host OpenClaw is already installed or configured for a model provider, reuse it and pass `--skip-host-openclaw`; do not reinstall, upgrade, or edit host OpenClaw or Bailian/DashScope configuration during a target migration. If host OpenClaw or model-provider configuration is absent, report that host bootstrap is incomplete instead of trying to provision it. Do not run host diagnostic checks as part of the migration; use the available `confidential-agent` CLI directly after bootstrap.
+`install-only` is one-time Confidential Agent host preparation, not part of the target-agent migration. Run it only when dependencies are absent or stale. It installs the Confidential Agent CLI, Shelter, and tools image; it does not install or configure host OpenClaw and does not need cloud or model-provider credentials. Do not use `deploy-openclaw` for bootstrap. If the task requires an external model provider or a host OpenClaw gateway and those are absent, report that host setup is incomplete instead of trying to provision them during a target migration. Do not run host diagnostic checks as part of the migration; use the available `confidential-agent` CLI directly after bootstrap.
 
 ## Hard Fail Conditions
 
 - Before repository migration work, check whether `confidential-agent`, Shelter, and `confidential-agent-tools:latest` are available; if any are missing, run Host Bootstrap before inspecting or cloning the target repository.
-- Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must be run directly so useful stdout, stderr, and command status are preserved. Do not pipe them to `head`, `tail`, `grep`, `sed`, `awk`, `cut`, `jq`, or `cat`; do not append `|| true` or another command with `;`; do not redirect them to `/dev/null`.
+- Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to truncating filters such as `head` or `tail`, or redirect output to `/dev/null`.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - Use `schema: confidential-agent/v1`; do not use `apiVersion`, `kind`, or Kubernetes-style `spec:` wrappers.
 - Use only the public `confidential-agent` command; do not call helper binaries or wrapper names with product-specific suffixes.
@@ -160,7 +156,8 @@ Confidential Agent images use Alinux/RHEL-style packages. In `build.packages`, u
 
 5. **Verify**
    - Run `confidential-agent status --live --json`.
-   - Start `confidential-agent connect` and verify the service with `curl`, `nc`, or the workload's native client.
+   - Start `confidential-agent connect` and verify the service with `curl`, `nc`, or the workload's native client. In this CLI version, use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; do not assume `connect --service` works for local service selection.
+   - Health, status, version, config, and model-list endpoints prove reachability only; they do not prove the migrated agent works. For `chat_ok`, send a real natural-language request through the connected service and save the response. Prefer two turns when the workload supports it, and include a deterministic marker if the task provides one.
    - Verify that the running service is the real target upstream, using commit hash, process command, installed files, and response behavior.
 
 6. **Operate And Cleanup**
