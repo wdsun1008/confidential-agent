@@ -468,6 +468,7 @@ fn alinux_package_substitution(package: &str) -> Option<&'static str> {
         "procps" => Some("'procps-ng'"),
         "xz-utils" => Some("'xz'"),
         "docker-cli" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
+        "ffmpeg" => Some("a custom base image or repository that provides ffmpeg; otherwise remove it from build.packages"),
         _ => None,
     }
 }
@@ -686,6 +687,18 @@ resources:
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
         assert!(err.to_string().contains("use 'libffi-devel' instead"));
+    }
+
+    #[test]
+    fn rejects_packages_unavailable_in_default_alinux_repos() {
+        let yaml = SPEC
+            .replace("  base_image: ./base.qcow2\n", "")
+            .replace("    - nodejs", "    - ffmpeg");
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("custom base image or repository that provides ffmpeg"));
     }
 
     #[test]
