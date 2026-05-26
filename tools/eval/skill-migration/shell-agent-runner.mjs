@@ -39,8 +39,8 @@ const REPEATED_COMMAND_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_REPEATED_COMMAN
 const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_STALL_BLOCKS", 3);
 const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
 const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
-// Runner guard exits currently use 64-70 and 72-76; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76]);
+// Runner guard exits currently use 64-70 and 72-78; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -951,6 +951,34 @@ function consecutiveReadOnlyReminder(trialDir, count, sentReminders) {
   );
 }
 
+function containsForegroundConnectCommand(cmd) {
+  return String(cmd || "")
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(/\s*(?:&&|\|\||;)\s*/))
+    .some((segment) => {
+      const match = segment.match(/\bconfidential-agent(?:\s+--[A-Za-z0-9_-]+(?:[=\s][^\s;&|]+)?)*\s+connect\b/i);
+      if (!match) return false;
+      if (/\b--render-only\b/i.test(segment)) return false;
+      const tail = segment.slice(match.index + match[0].length);
+      return !/(^|[^0-9])&(?:\s|$)/.test(tail);
+    });
+}
+
+function containsBlockedShelterInvocation(cmd) {
+  return String(cmd || "")
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(/\s*(?:&&|\|\||[;|])\s*/))
+    .some((segment) => {
+      const trimmed = segment.trim();
+      if (!trimmed) return false;
+      const { command, subcommand } = readOnlyCommandToken(trimmed);
+      if (command === "shelter") {
+        return !["--help", "-h", "help", "--version", "version"].includes(subcommand);
+      }
+      return false;
+    });
+}
+
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
   const guardCmd = stripHeredocBodies(cmd);
   const uncorroboratedFields = uncorroboratedResultTrueFieldsForCommand(cmd, cwd);
@@ -974,6 +1002,22 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
     });
   }
   if (DRY_EXEC) return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
+  if (containsForegroundConnectCommand(guardCmd)) {
+    return Promise.resolve({
+      code: 77,
+      stdout: "",
+      stderr:
+        "Blocked foreground confidential-agent connect. connect is a long-running tunnel; start it in the background, preserve stdout/stderr in a log, capture the PID, probe the host-side port, then stop the tunnel before destroy.",
+    });
+  }
+  if (containsBlockedShelterInvocation(guardCmd)) {
+    return Promise.resolve({
+      code: 78,
+      stdout: "",
+      stderr:
+        "Blocked direct Shelter migration operation. Use the public confidential-agent CLI for build, deploy, status, connect, and destroy; Shelter is only checked with --help during host bootstrap.",
+    });
+  }
   if (commandLosesCriticalEvidence(guardCmd)) {
     return Promise.resolve({
       code: 70,
@@ -1307,6 +1351,7 @@ Rules:
 - Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append ||, chain another command after them with ; or &&, pipe to head/tail, or redirect output to /dev/null.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
+- confidential-agent connect is a long-running tunnel. In this single-shell eval, run it in the background with stdout/stderr saved to a log, capture its PID, probe the host-side port, and stop the tunnel after chat verification.
 - Use plain confidential-agent connect unless the task provides an agent card for --from-card. Do not use connect --service for local service selection in this CLI version.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
 - Destroy is the last success-phase step. Do not run confidential-agent destroy until chat_ok has real evidence; if you abandon a failed run, leave unfinished success booleans false.

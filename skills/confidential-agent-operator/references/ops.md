@@ -14,10 +14,12 @@ If build fails:
 - Enable `build.with_network` if package downloads happen.
 - Make install scripts non-interactive.
 - Replace hidden local paths with files copied into the template directory.
+- Treat `confidential-agent build` exit code as authoritative. Image directories or `build-result.json` files left after a nonzero build are diagnostics, not deployable success.
 - If build reports missing `security_group_ports` or security group rules, treat it as a CLI/Shelter workflow bug; build should not depend on peerings.
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec; those are not AppSpec fields.
 
 After build exits 0, keep the built image and move forward to peering and deploy. Do not remove local image directories, kill builder processes, or rerun build unless a later deploy or live status command shows an image defect.
+Do not run `shelter clean` or other direct Shelter operations during migration; use the public `confidential-agent` commands so state, evidence, and cleanup stay consistent.
 
 ## Deploy
 
@@ -60,6 +62,7 @@ nc -vz 127.0.0.1 <port>
 ```
 
 Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`. Do not use `connect --service <name>` for local service selection.
+`connect` is long-running. In a noninteractive shell, start it as a background job, keep stdout/stderr in a log so the selected local port is visible, probe that host-side port, and stop the background PID before `destroy`.
 
 For chat or agent APIs, use the workload's documented client or a `curl` request against its real endpoint. If `app_ready` is false, inspect `service.app_service`, guest unit logs, config resource targets, and whether the app listens on the declared port.
 Set `live_status_ok` only from a successful live status check that proves readiness, and set `chat_ok` only after saving evidence from a real conversation or workload API call to the migrated service through the connected host-side port. Health, status, version, config, model-list endpoints, direct guest SSH, and local marker generation are not enough.
