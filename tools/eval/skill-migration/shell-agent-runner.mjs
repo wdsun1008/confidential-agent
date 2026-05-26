@@ -33,6 +33,7 @@ const DRY_EXEC = process.env.CA_EVAL_DRY_EXEC === "1";
 const ARTIFACT_FIRST_MILESTONES = [4, 8, 14, 24];
 const CONSECUTIVE_READ_ONLY_MILESTONES = [4, 8, 12];
 const PHASE_PROGRESSION_MILESTONES = [30, 45, 60, 80, 100, 130, 170, 220];
+const REPEATED_READONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_READONLY_STALL_BLOCKS", 3);
 // Runner guard exits currently use 64-70 plus 72; 71 is intentionally unused.
 const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72]);
 
@@ -1246,6 +1247,22 @@ async function main() {
       transcript,
       JSON.stringify({ step, role: "tool", cmd: redact(action.cmd), result }) + "\n",
     );
+    if (
+      Number(result.code) === 72 &&
+      usageNumber(metrics.guard_blocks?.["72"]) >= REPEATED_READONLY_STALL_BLOCKS
+    ) {
+      const message =
+        `stalled_repeated_readonly: repeated read-only guard fired ${metrics.guard_blocks["72"]} times ` +
+        `for the same non-progress pattern`;
+      writeAgentMetrics(trialDir, metrics, {
+        completed: false,
+        finish_reason: "stalled_repeated_readonly",
+        last_step: step,
+        error: message,
+      });
+      writeRunnerResultFailure(trialDir, "stalled_repeated_readonly", message);
+      throw new Error(message);
+    }
     messages.push({ role: "assistant", content: JSON.stringify(action) });
     let reminder = "";
     if (remaining <= 3) {

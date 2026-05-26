@@ -109,6 +109,10 @@ If you only inspect the repository but do not write these artifacts, the migrati
 Keep the final deliverables in the original task working directory. If you generate a template in a subdirectory, copy or rewrite the final AppSpec, install script, resource file, and `result.json` back to the original working directory.
 For a full/live evaluation, do not finalize after static artifacts only. Final completion requires successful build, operator peering, deploy, live status, connect, real chat/API probe, and cleanup.
 
+## Evidence State Machine
+
+Treat `result.json` booleans as evidence state, not progress notes. Initialize runtime booleans to `false`; change one to `true` only immediately after the matching command or probe exits 0 and its output is visible in the transcript. Do not set later fields to `true` to compensate for an earlier failure, and do not mark a failed or skipped phase as successful because you plan to continue. If you abandon a failed run and clean up, keep unfinished booleans `false` and report the concrete blocking evidence.
+
 ## Artifact-First Rule
 
 Follow this execution order unless the caller gives stricter instructions. In step-limited automation, all four deliverables should exist by your third target-migration bash action after Host Bootstrap is complete.
@@ -159,6 +163,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
    - Do not use `yum`, `dnf`, `apt-get`, or `apk` to install OS packages inside build scripts. Put OS packages in `build.packages`; the script should install/configure the target application.
+   - When an install script writes a systemd unit or config file with a heredoc, use a single-quoted delimiter such as `<<'EOF'` unless you intentionally substitute variables at build time. This prevents `$MAINPID`, `$PORT`, `$HOME`, and similar runtime variables from being expanded accidentally during image build.
    - If the install script installs helper CLIs such as `uv`, `poetry`, `pnpm`, or language toolchains, install them into a stable prefix or set `HOME` and `PATH` explicitly, then verify `command -v <tool>` before using them. Do not assume `$HOME/.local/bin` or `/home/<service-user>/.local/bin` exists during mkosi postinstall.
    - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
    - Pin the full upstream commit in the install script or copied source path; `result.json.upstream_commit` must be the 40-hex commit that the runtime installs.
