@@ -27,6 +27,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Before repository migration work, check whether `confidential-agent`, Shelter, and `confidential-agent-tools:latest` are available; if any are missing, run Host Bootstrap before inspecting or cloning the target repository.
 - Do not draft or validate the target AppSpec before Host Bootstrap is complete. If `confidential-agent --help` does not work, install host dependencies first, then use CLI schema/docs as the source of truth.
 - Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `||`, chain another command after them with `;` or `&&`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
+- Do not put a long `sleep` before `confidential-agent build`, `deploy`, `status`, `connect`, or `destroy`. Run the CLI command directly, let it finish or fail, and use its complete output as the next decision point.
 - Do not invoke Shelter directly for migration operations such as build, deploy, destroy, or clean. Use the public `confidential-agent` CLI; it orchestrates Shelter and keeps local state consistent. `shelter --help` is only a bootstrap availability check.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
@@ -71,7 +72,7 @@ service:
 build:
   image_name: my-agent
   with_network: true
-  packages: [ca-certificates, curl]
+  packages: [ca-certificates, curl, tar, gzip]
   files:
     - source: ./install-service.sh
       target: /usr/local/libexec/confidential-agent/my-agent/install-service.sh
@@ -144,6 +145,7 @@ Do not spend the whole run reading. A rough but concrete first draft is better t
 Confidential Agent images use Alinux/RHEL-style packages. In `build.packages`, use dnf names such as `python3`, `python3-pip`, `python3-devel`, `gcc`, `gcc-c++`, `make`, `nodejs`, `npm`, `openssh-clients`, `procps-ng`, `tar`, `gzip`, and `git`. Do not use Debian names such as `build-essential`, `python3-dev`, `openssh-client`, `procps`, `libffi-dev`, or `docker-cli`.
 
 Keep `build.packages` minimal: include only OS packages needed before the target's own installer can run, such as language runtimes, compilers for native wheels, certificates, and the real startup command's direct dependencies. Do not add optional troubleshooting, media, browser, editor, or search tools just because they appear in docs. If build fails with a package-manager "No match for argument" or equivalent package-not-found error, remove or substitute the missing nonessential package and rerun build.
+Before build, reread the install script once as a package-closure check: every OS command it invokes must either come from `build.packages` or be installed earlier in the same script into a stable prefix. Common examples are `curl`, `git`, `tar`, `gzip`, `xz`, `unzip`, `nodejs`/`npm`, `gcc`/`gcc-c++`, `make`, and `podman`.
 
 ## Base Image Discipline
 
@@ -174,7 +176,8 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - When an install script writes a systemd unit or config file with a heredoc, use a single-quoted delimiter such as `<<'EOF'` unless you intentionally substitute variables at build time. This prevents `$MAINPID`, `$PORT`, `$HOME`, and similar runtime variables from being expanded accidentally during image build.
    - If the install script installs helper CLIs such as `uv`, `poetry`, `pnpm`, or language toolchains, install them into a stable prefix or set `HOME` and `PATH` explicitly, then verify `command -v <tool>` before using them. Do not assume `$HOME/.local/bin` or `/home/<service-user>/.local/bin` exists during mkosi postinstall.
    - Before choosing language runtime packages, inspect upstream Dockerfile, `pyproject.toml`, `package.json` engines, lockfiles, or CI config for required runtime versions. Use the same major/minor version or a compatible newer one; do not replace a pinned modern runtime with bare distro defaults such as `python3` or `node`.
-   - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
+- Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
+- Close the loop between the install script and `build.packages`: if the script calls an external OS command before it creates that command itself, the matching Alinux/RHEL package must be listed. Do not assume the mkosi buildroot has archive, source-control, compiler, or language-package tools unless you declared them.
    - Pin the full upstream commit in the install script or copied source path; `result.json.upstream_commit` must be the 40-hex commit that the runtime installs.
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.

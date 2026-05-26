@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Serialize)]
 struct MarkdownDoc {
@@ -105,6 +106,7 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
             for (index, script) in spec.build.scripts.iter().enumerate() {
                 push_path_check(&mut checks, format!("build.scripts[{index}]"), script);
             }
+            push_script_package_checks(&mut checks, &spec);
             if let Some(debug) = &spec.build.variants.debug {
                 if let Some(ssh_public_key) = &debug.ssh_public_key {
                     push_path_check(
@@ -155,6 +157,156 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
             }
         }
     }
+}
+
+struct ScriptToolRequirement {
+    command: &'static str,
+    packages: &'static [&'static str],
+    hint: &'static str,
+}
+
+const SCRIPT_TOOL_REQUIREMENTS: &[ScriptToolRequirement] = &[
+    ScriptToolRequirement {
+        command: "curl",
+        packages: &["curl"],
+        hint: "`curl`",
+    },
+    ScriptToolRequirement {
+        command: "wget",
+        packages: &["wget"],
+        hint: "`wget`",
+    },
+    ScriptToolRequirement {
+        command: "git",
+        packages: &["git"],
+        hint: "`git`",
+    },
+    ScriptToolRequirement {
+        command: "tar",
+        packages: &["tar"],
+        hint: "`tar`",
+    },
+    ScriptToolRequirement {
+        command: "gzip",
+        packages: &["gzip"],
+        hint: "`gzip`",
+    },
+    ScriptToolRequirement {
+        command: "gunzip",
+        packages: &["gzip"],
+        hint: "`gzip`",
+    },
+    ScriptToolRequirement {
+        command: "xz",
+        packages: &["xz"],
+        hint: "`xz`",
+    },
+    ScriptToolRequirement {
+        command: "unxz",
+        packages: &["xz"],
+        hint: "`xz`",
+    },
+    ScriptToolRequirement {
+        command: "unzip",
+        packages: &["unzip"],
+        hint: "`unzip`",
+    },
+    ScriptToolRequirement {
+        command: "node",
+        packages: &["nodejs", "npm"],
+        hint: "`nodejs`",
+    },
+    ScriptToolRequirement {
+        command: "npm",
+        packages: &["npm"],
+        hint: "`npm`",
+    },
+    ScriptToolRequirement {
+        command: "npx",
+        packages: &["npm"],
+        hint: "`npm`",
+    },
+    ScriptToolRequirement {
+        command: "corepack",
+        packages: &["nodejs"],
+        hint: "`nodejs`",
+    },
+    ScriptToolRequirement {
+        command: "gcc",
+        packages: &["gcc"],
+        hint: "`gcc`",
+    },
+    ScriptToolRequirement {
+        command: "g++",
+        packages: &["gcc-c++"],
+        hint: "`gcc-c++`",
+    },
+    ScriptToolRequirement {
+        command: "make",
+        packages: &["make"],
+        hint: "`make`",
+    },
+    ScriptToolRequirement {
+        command: "podman",
+        packages: &["podman"],
+        hint: "`podman`",
+    },
+];
+
+fn push_script_package_checks(checks: &mut Vec<SpecValidationCheck>, spec: &AgentSpec) {
+    if spec.build.base_image.is_some() || spec.build.scripts.is_empty() {
+        return;
+    }
+    let packages = spec
+        .build
+        .packages
+        .iter()
+        .map(|package| package.trim().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut issues = Vec::new();
+    for script in &spec.build.scripts {
+        let Ok(text) = fs::read_to_string(script) else {
+            continue;
+        };
+        for requirement in SCRIPT_TOOL_REQUIREMENTS {
+            if !script_mentions_command(&text, requirement.command) {
+                continue;
+            }
+            if requirement
+                .packages
+                .iter()
+                .any(|package| packages.contains(*package))
+            {
+                continue;
+            }
+            issues.push(format!(
+                "{} uses `{}` but build.packages does not include {}",
+                script.display(),
+                requirement.command,
+                requirement.hint
+            ));
+        }
+    }
+    if issues.is_empty() {
+        push_check(
+            checks,
+            "build.scripts.packages",
+            true,
+            "common script commands are covered by build.packages",
+        );
+    } else {
+        push_check(checks, "build.scripts.packages", false, issues.join("; "));
+    }
+}
+
+fn script_mentions_command(script: &str, command: &str) -> bool {
+    script
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '+'))
+        })
+        .filter(|token| !token.is_empty())
+        .map(|token| token.rsplit('/').next().unwrap_or(token))
+        .any(|basename| basename == command)
 }
 
 fn push_check(
@@ -280,7 +432,7 @@ Common optional keys:
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
-Use `confidential-agent spec validate --spec <path>` before build/deploy. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
+Use `confidential-agent spec validate --spec <path>` before build/deploy. Validation checks local file paths and common install-script command/package mismatches. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
 For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 "#;
@@ -412,5 +564,96 @@ resources: {}
         assert!(failed.contains(&"build.variants.debug.ssh_public_key"));
         assert!(failed.contains(&"attestation.rekor.cosign_key"));
         assert!(failed.contains(&"attestation.rekor.slsa_generator"));
+    }
+
+    #[test]
+    fn spec_validate_rejects_missing_script_tool_packages() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("install.sh"),
+            "#!/usr/bin/env bash\ncurl -fsSL https://example.invalid/app.tar.gz | tar -xz -C /opt\n",
+        )
+        .unwrap();
+        let spec_path = temp.path().join("agent.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema: confidential-agent/v1
+service:
+  id: sample
+  ports: [8080]
+  connect: [8080]
+build:
+  image_name: sample
+  with_network: true
+  packages: [ca-certificates, curl]
+  scripts: [./install.sh]
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g9i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-i
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        )
+        .unwrap();
+
+        let report = validate_spec_file(&spec_path);
+        let package_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "build.scripts.packages")
+            .unwrap();
+
+        assert!(!report.ok);
+        assert!(!package_check.ok);
+        assert!(package_check.message.contains("`tar`"));
+    }
+
+    #[test]
+    fn spec_validate_accepts_script_tool_packages() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("install.sh"),
+            "#!/usr/bin/env bash\ncurl -fsSL https://example.invalid/app.tar.gz | tar -xz -C /opt\n",
+        )
+        .unwrap();
+        let spec_path = temp.path().join("agent.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema: confidential-agent/v1
+service:
+  id: sample
+  ports: [8080]
+  connect: [8080]
+build:
+  image_name: sample
+  with_network: true
+  packages: [ca-certificates, curl, tar]
+  scripts: [./install.sh]
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g9i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-i
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        )
+        .unwrap();
+
+        let report = validate_spec_file(&spec_path);
+
+        assert!(report.ok);
     }
 }

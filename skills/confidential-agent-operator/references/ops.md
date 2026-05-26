@@ -10,6 +10,8 @@ confidential-agent build --spec confidential-agent.yaml
 ```
 
 `confidential-agent build` accepts `--spec <path>`; image variant selection belongs in `deploy.image_variant` in the AppSpec, not in build flags. Do not pass `--variant`, `--debug`, or `--release` to build.
+Run build directly. Do not prepend long sleeps or background waits before build/deploy/status commands; wait only for the command you actually started, then diagnose from its complete output.
+Full image builds commonly take 5-20 minutes. A quiet build is not automatically hung; wait for the build process to exit and trust its exit code. Exit 0 means move to operator peering and deploy. Exit nonzero means use the final causal error from the build output for exactly one artifact fix.
 
 If build fails:
 - Confirm all `build.files[].source` paths exist.
@@ -22,6 +24,7 @@ If build fails:
 - Before retrying a failed build, make sure the previous build process has really exited. If the error is a transient builder lock, busy mount, or stale temporary workspace from the prior attempt, treat that as controller build-environment cleanup rather than a target artifact defect; do not change the AppSpec or install script unless the final error names a real artifact problem.
 - If build reports missing `security_group_ports` or security group rules, treat it as a CLI/Shelter workflow bug; build should not depend on peerings.
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec; those are not AppSpec fields.
+- If build fails with NBD busy, qemu image lock, FUSE mount, or `failed to get shared "write" lock`, treat it as transient controller build-environment contention, not a target artifact defect. Do not rewrite the AppSpec or install script for that error. Wait briefly, rerun the bare `confidential-agent build --spec confidential-agent.yaml`, and report the controller issue if it persists after two retries.
 
 After build exits 0, keep the built image and move forward to peering and deploy. Do not remove local image directories, kill builder processes, or rerun build unless a later deploy or live status command shows an image defect.
 Do not run `shelter clean` or other direct Shelter operations during migration; use the public `confidential-agent` commands so state, evidence, and cleanup stay consistent.

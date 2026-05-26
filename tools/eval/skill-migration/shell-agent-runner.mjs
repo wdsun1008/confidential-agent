@@ -39,8 +39,8 @@ const REPEATED_COMMAND_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_REPEATED_COMMAN
 const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_STALL_BLOCKS", 3);
 const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
 const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
-// Runner guard exits currently use 64-70 and 72-78; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78]);
+// Runner guard exits currently use 64-70 and 72-79; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -990,6 +990,24 @@ function containsBlockedShelterInvocation(cmd) {
     });
 }
 
+function sleepDurationSeconds(value, unit) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) return 0;
+  if (unit === "h") return amount * 3600;
+  if (unit === "m") return amount * 60;
+  return amount;
+}
+
+function containsDelayedCriticalCliCommand(cmd) {
+  const pattern =
+    /(?:^|[;&|]\s*)sleep\s+([0-9]+)([smh]?)\s*(?:&&|;)\s*(?:(?:cd\s+[^\n;&|]+\s*&&\s*)*)confidential-agent\s+(build|deploy|status|connect|destroy)\b/gi;
+  let match;
+  while ((match = pattern.exec(String(cmd || "")))) {
+    if (sleepDurationSeconds(match[1], match[2]) >= 30) return true;
+  }
+  return false;
+}
+
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
   const guardCmd = stripHeredocBodies(cmd);
   const uncorroboratedFields = uncorroboratedResultTrueFieldsForCommand(cmd, cwd);
@@ -1027,6 +1045,14 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
       stdout: "",
       stderr:
         "Blocked direct Shelter migration operation. Use the public confidential-agent CLI for build, deploy, status, connect, and destroy; Shelter is only checked with --help during host bootstrap.",
+    });
+  }
+  if (containsDelayedCriticalCliCommand(guardCmd)) {
+    return Promise.resolve({
+      code: 79,
+      stdout: "",
+      stderr:
+        "Blocked delayed confidential-agent command. Do not prepend long sleeps before build/deploy/status/connect/destroy; run the CLI command directly and diagnose from its complete output.",
     });
   }
   if (commandLosesCriticalEvidence(guardCmd)) {
@@ -1361,6 +1387,7 @@ Rules:
 - Do not manually edit, delete, or recreate Confidential Agent internal state files or directories under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
 - Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append ||, chain another command after them with ; or &&, pipe to head/tail, or redirect output to /dev/null.
 - If a confidential-agent command is rejected because it was piped, chained, redirected, or wrapped with a fallback, rerun the bare confidential-agent command alone and inspect its natural output before making the next decision.
+- Do not prepend long sleeps before confidential-agent build/deploy/status/connect/destroy. Run the command directly; if it is still running, wait for that command or inspect its real log from a separate read-only command.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
 - confidential-agent connect is a long-running tunnel. In this single-shell eval, run it in the background with stdout/stderr saved to a log, capture its PID, probe the host-side port, and stop the tunnel after chat verification.

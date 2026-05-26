@@ -461,13 +461,18 @@ fn alinux_package_substitution(package: &str) -> Option<&'static str> {
     match package {
         "build-essential" => Some("'gcc', 'gcc-c++', and 'make'"),
         "python3-dev" => Some("'python3-devel' or a versioned devel package such as 'python3.11-devel'"),
+        "python3-venv" => Some("the matching Alinux Python runtime package; remove this package unless a custom repository provides it"),
         "python-dev" => Some("'python3-devel' or a versioned devel package such as 'python3.11-devel'"),
+        "python-dev-is-python3" => Some("'python3-devel' or a versioned devel package such as 'python3.11-devel'"),
+        "libc-dev" => Some("'glibc-devel'"),
+        "libc6-dev" => Some("'glibc-devel'"),
         "libffi-dev" => Some("'libffi-devel'"),
         "libssl-dev" => Some("'openssl-devel'"),
         "openssh-client" => Some("'openssh-clients'"),
         "procps" => Some("'procps-ng'"),
         "xz-utils" => Some("'xz'"),
         "docker-cli" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
+        "docker.io" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
         "ffmpeg" => Some("a custom base image or repository that provides ffmpeg; otherwise remove it from build.packages"),
         _ => None,
     }
@@ -687,6 +692,20 @@ resources:
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
         assert!(err.to_string().contains("use 'libffi-devel' instead"));
+    }
+
+    #[test]
+    fn rejects_additional_debian_package_names() {
+        for package in ["python3-venv", "python-dev-is-python3", "libc-dev", "docker.io"] {
+            let yaml = SPEC
+                .replace("  base_image: ./base.qcow2\n", "")
+                .replace("    - nodejs", &format!("    - {package}"));
+            let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains(&format!("build.packages[0]='{package}'")));
+        }
     }
 
     #[test]

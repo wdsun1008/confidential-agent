@@ -26,6 +26,7 @@
 - Put OS packages in `build.packages`; install scripts run inside the image buildroot and must not use `yum`, `dnf`, `apt-get`, `apk`, or other OS package manager commands.
 - If an install script bootstraps helper CLIs such as `uv`, `poetry`, or `pnpm`, install them into a stable prefix or set `HOME` and `PATH` explicitly, then verify `command -v <tool>` before using them. mkosi postinstall may not have the interactive `$HOME` expected by curl-piped installers.
 - Keep `build.packages` minimal: include only the OS runtime/build prerequisites needed before the target's own installer can run. Do not include optional troubleshooting or media/search/browser tools unless the real startup command requires them.
+- Check package closure before every build: if the install script calls an OS-provided command such as `curl`, `git`, `tar`, `gzip`, `xz`, `unzip`, `npm`, `node`, `gcc`, `g++`, `make`, or `podman`, include the corresponding Alinux/RHEL package in `build.packages` unless the script installs that tool earlier into a stable prefix.
 - If image build fails with a package-manager package-not-found error, remove or substitute the missing nonessential package and rerun build. Do not keep adding repositories or unrelated packages before confirming the service actually needs that package.
 - Omit `build.base_image` for normal mkosi builds. Use it only for a provided qcow2/raw disk-image path or URL; it is not a Docker/Podman image reference.
 - If upstream docs are ambiguous, choose the simplest documented server mode and record the assumption.
@@ -48,6 +49,23 @@
 - After `confidential-agent build` exits 0, preserve the built image and advance to peering and deploy. Do not delete images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself is defective.
 - Do not write, patch, delete, or recreate `.confidential-agent`/state-dir internals such as `build-result.json`, `deploy-result.json`, or `manifest.json`; those files are produced by the CLI. If they are missing or wrong, fix the migration artifacts and rerun the corresponding CLI command.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Fixes that matter must be moved into the AppSpec, install script, or resource files, then rebuilt and redeployed.
+
+## Package Name Translation
+
+Use Alinux/RHEL names in `build.packages`:
+
+| Debian/Ubuntu | Alinux/RHEL |
+| --- | --- |
+| `build-essential` | `gcc`, `gcc-c++`, `make` |
+| `python3-dev` | `python3-devel` or versioned `python3.11-devel` |
+| `python3-venv` | remove unless a custom repo provides it |
+| `libffi-dev` | `libffi-devel` |
+| `libssl-dev` | `openssl-devel` |
+| `openssh-client` | `openssh-clients` |
+| `procps` | `procps-ng` |
+| `xz-utils` | `xz` |
+| `docker.io` / `docker-cli` | `podman`, only if the workload needs containers |
+| `ffmpeg` | omit unless a custom base image/repo provides it |
 
 ## Common Patterns
 
