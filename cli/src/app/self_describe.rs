@@ -282,7 +282,7 @@ Common optional keys:
 
 Use `confidential-agent spec validate --spec <path>` before build/deploy. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
-For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to OS runtime/build prerequisites and let the target's package manager install application dependencies.
+For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 "#;
 
 const OVERVIEW_DOC: &str = r#"
@@ -320,7 +320,7 @@ The AppSpec is the contract between the agent migration workflow and the Confide
 
 Prefer copied scripts and structured resource files over ad hoc shell snippets in prompts. Keep secrets out of the image; inject them as resources or secret files during deploy/ops.
 
-For mkosi builds, omit `build.base_image`; it is only for disk image paths/URLs. Start with a minimal OS package set and refine after package-manager errors instead of adding optional tools by default.
+For mkosi builds, omit `build.base_image`; it is only for disk image paths/URLs. Use Alinux/RHEL package names, start minimal, and refine after package-manager errors instead of adding optional tools by default.
 "#;
 
 const OPS_DOC: &str = r#"
