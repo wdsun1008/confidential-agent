@@ -16,7 +16,7 @@
 - Generate a first migration draft after reading the README, primary manifest, Dockerfile or equivalent startup script, and at most one focused entrypoint/port file. Refine after tests fail; do not spend the whole run only reading.
 - Once you know the probable install command, service command, port, and config/secrets, stop discovery and write artifacts immediately. Missing details should be recorded as assumptions in `result.json`, not used as a reason to keep grepping.
 - In step-limited automation, write the first AppSpec, script, config, and result file in a single shell command. This prevents losing the trial after creating only one or two artifacts.
-- Pin the upstream commit before build and reference the same commit in the install script or copied source path.
+- Pin the upstream commit before build and reference the full 40-hex commit from `git rev-parse HEAD` in the install script or copied source path.
 - Use `git clone --depth 1` or shallow fetch for discovery and runtime install unless the upstream requires full history.
 - Keep the install script non-interactive and fail-fast: `set -euo pipefail`.
 - Make install scripts idempotent and rebuild-safe. Before cloning or extracting into a target directory, remove or reuse that directory; the image builder or a debugging run may execute the script more than once.
@@ -28,6 +28,7 @@
 - Bind services to `0.0.0.0` inside the guest so TNG can reach them.
 - Create a systemd service under `/etc/systemd/system/<unit>.service`, enable that exact unit, and set `service.app_service` to the same unit name.
 - `ExecStart` must run a long-lived service that listens on at least one declared `service.connect` port. One-shot commands, interactive stdin-only sessions, and help/status commands are not valid services.
+- Every `ExecStart` and `WorkingDirectory` path must be created or installed by the install script. If you install into a virtualenv or project-local prefix, reference that same prefix in the unit.
 - If the target has no built-in server mode, expose a persistent listener that delegates to the real target runtime for each request. Do not return canned responses.
 - Ensure the declared connect port appears in the service command, an Environment line, or a resource file that the service reads.
 - Do not call `systemctl start` during image build. Run `systemctl daemon-reload` and `systemctl enable <unit>.service`; the guest starts enabled units on boot.
@@ -61,7 +62,7 @@ Systemd:
 - Run `systemctl daemon-reload` before `systemctl enable`; do not start the unit during image build.
 
 Pinned upstream:
-- Use a variable such as `UPSTREAM_COMMIT=<sha>` in the install script, then shallow clone/fetch and checkout that exact commit.
+- Use a variable such as `UPSTREAM_COMMIT=<40-hex-sha>` in the install script, then shallow clone/fetch and checkout that exact commit.
 - Ensure `result.json.upstream_commit` matches the commit the runtime install script checks out.
 
 Verification:

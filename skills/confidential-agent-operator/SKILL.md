@@ -26,6 +26,8 @@ Once `install-only` succeeds and `confidential-agent --help` responds, do not re
 - Before repository migration work, check whether `confidential-agent`, Shelter, and `confidential-agent-tools:latest` are available; if any are missing, run Host Bootstrap before inspecting or cloning the target repository.
 - Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to truncating filters such as `head` or `tail`, or redirect output to `/dev/null`.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
+- `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
+- `result.json.upstream_commit` must be the full 40-hex output of `git rev-parse HEAD`, not a short hash, branch name, or tag.
 - Use `schema: confidential-agent/v1`; do not use `apiVersion`, `kind`, or Kubernetes-style `spec:` wrappers.
 - Do not use deprecated or foreign schema fields such as top-level `name`, `runtime`, `build.commands`, or `build.files.path`; use the canonical skeleton and read `references/appspec.md` Schema Anti-Patterns if unsure.
 - Use only the public `confidential-agent` command; do not call helper binaries or wrapper names with product-specific suffixes.
@@ -38,6 +40,7 @@ Once `install-only` succeeds and `confidential-agent --help` responds, do not re
 - Do not finalize until `confidential-agent spec validate --spec confidential-agent.yaml --format json` succeeds after the latest edit.
 - `service.app_service` must exactly match the systemd unit created and enabled by the install script.
 - `service.app_service` must start a long-running process that listens on at least one `service.connect` port. One-shot CLI invocations, interactive stdin-only sessions, `--help`/`--version` commands, and batch scripts that exit immediately are not valid service commands.
+- Every path in systemd `ExecStart` and `WorkingDirectory` must be created or installed by the install script. If the install uses a venv or project-local prefix, `ExecStart` must reference that same prefix.
 - Do not write expected command output, `exit_code`, stdout, or stderr in prose before executing the command. Evidence must come from real shell actions and the transcript produced by those actions.
 - Do not delete host bootstrap assets such as `/usr/local/bin/confidential-agent`, Shelter, OpenClaw, or `confidential-agent-tools:latest` during cleanup. Cleanup only the Confidential Agent service deployed for the target migration.
 
@@ -148,7 +151,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
    - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
-   - Pin the exact upstream commit in the install script or copied source path; `result.json.upstream_commit` must match what the runtime installs.
+   - Pin the full upstream commit in the install script or copied source path; `result.json.upstream_commit` must be the 40-hex commit that the runtime installs.
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.
    - Move runtime configuration and secrets to resource files. Use environment variable references or injected files for secrets; do not leave `placeholder`, `YOUR_API_KEY_HERE`, `TODO`, `changeme`, example-only tokens, or fake ids in final resources.
@@ -159,6 +162,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Run `confidential-agent spec validate --spec confidential-agent.yaml --format json`.
    - If the CLI exposes a non-cloud render/static mode, run it before real build/deploy.
    - Confirm referenced local files exist.
+   - Run these static checks before `confidential-agent build`, not after.
    - Record static validation results in `result.json`.
 
 4. **Build And Deploy**

@@ -66,6 +66,13 @@ function fileExistsFromTrial(trialDir, value) {
   });
 }
 
+function isRelativeArtifactPath(value) {
+  if (typeof value !== "string" || !value.trim() || value.includes("\n")) return false;
+  if (path.isAbsolute(value)) return false;
+  const normalized = path.normalize(value);
+  return normalized !== "." && !normalized.startsWith("..") && !path.isAbsolute(normalized);
+}
+
 function readArtifact(trialDir, value) {
   if (typeof value !== "string" || !value.trim()) return "";
   for (const file of [value, path.join(trialDir, value)]) {
@@ -230,9 +237,9 @@ addFinding(
 );
 addFinding(
   findings,
-  typeof result.upstream_commit === "string" && /^[0-9a-f]{7,40}$/i.test(result.upstream_commit),
+  typeof result.upstream_commit === "string" && /^[0-9a-f]{40}$/i.test(result.upstream_commit),
   "upstream_commit",
-  "result.json must contain a git commit hash",
+  "result.json must contain the full 40-hex git commit hash",
 );
 addFinding(
   findings,
@@ -397,7 +404,7 @@ addFinding(
 const commit = String(result.upstream_commit || "").toLowerCase();
 addFinding(
   findings,
-  /^[0-9a-f]{7,40}$/i.test(commit) &&
+  /^[0-9a-f]{40}$/i.test(commit) &&
     (installText.toLowerCase().includes(commit.slice(0, 7)) || specText.toLowerCase().includes(commit.slice(0, 7))),
   "upstream_commit_pinned",
   "install script or spec must reference the recorded upstream_commit",
@@ -416,6 +423,12 @@ addFinding(
 );
 
 for (const field of grader.static_artifact_fields || []) {
+  addFinding(
+    findings,
+    isRelativeArtifactPath(result[field]),
+    `${field}_relative_path`,
+    `${field} must be a relative file path in the trial directory, not inline file content`,
+  );
   if (field === "generated_spec") continue;
   addFinding(
     findings,
