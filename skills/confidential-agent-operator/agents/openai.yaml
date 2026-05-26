@@ -1,0 +1,6 @@
+interface:
+  display_name: "Confidential Agent Operator"
+  short_description: "Migrate and operate agents in Confidential Agent"
+  default_prompt: "Use $confidential-agent-operator to migrate this agent repo into Confidential Agent and verify it end to end."
+policy:
+  allow_implicit_invocation: true

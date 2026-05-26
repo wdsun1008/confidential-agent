@@ -1,0 +1,60 @@
+# AppSpec Guidance
+
+Use `confidential-agent spec schema --format markdown` for the canonical schema summary before writing YAML. Run `confidential-agent spec validate --spec confidential-agent.yaml --format json` after writing YAML.
+
+## Minimum Shape
+
+```yaml
+schema: confidential-agent/v1
+service:
+  id: my-agent
+  ports: [8080]
+  connect: [8080]
+  app_service: my-agent.service
+build:
+  image_name: my-agent
+  with_network: true
+  packages: [ca-certificates, curl]
+  files:
+    - source: ./install-service.sh
+      target: /usr/local/libexec/confidential-agent/my-agent/install-service.sh
+      executable: true
+  scripts: [./install-service.sh]
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.g9i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-i
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+```
+
+## Decisions
+
+- `service.ports` is the actual guest listener set.
+- `service.connect` is the subset exposed to host clients through RATS-TLS connect.
+- `service.app_service` must match the systemd unit that proves the app is ready.
+- `build.packages` are resolved by mkosi through the guest image package manager; for Alinux/RHEL images, use dnf package names rather than Debian names.
+- `resources` must be explicit even when empty.
+- Relative host paths are resolved from the spec file directory.
+- Release images must not include SSH. Use debug only for development/evaluation.
+- `build.scripts` entries are script file paths. Do not write inline shell snippets under `build.scripts`.
+
+## Resource Injection
+
+Use resources for files that differ per deployment or contain secrets:
+
+```yaml
+resources:
+  app_config:
+    source: ./config.json
+    target: /etc/my-agent/config.json
+    mode: "0600"
+    required: true
+```
+
+The CLI hashes resources and the guest daemon verifies hash, mode, owner, and group before writing.
