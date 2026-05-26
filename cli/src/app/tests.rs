@@ -6,6 +6,7 @@ use super::commands::{
 };
 use super::*;
 use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
+use clap::Parser;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -22,6 +23,29 @@ fn test_cli() -> Cli {
         shelter_bin: PathBuf::from("shelter"),
         state_dir: PathBuf::from("/work/.confidential-agent"),
         tools_image: "confidential-agent-tools:test".to_string(),
+    }
+}
+
+#[test]
+fn common_commands_default_to_confidential_agent_yaml() {
+    let build = Cli::parse_from(["confidential-agent", "build"]);
+    match build.command {
+        Commands::Build(args) => assert_eq!(args.spec, PathBuf::from("confidential-agent.yaml")),
+        other => panic!("expected build command, got {other:?}"),
+    }
+
+    let deploy = Cli::parse_from(["confidential-agent", "deploy"]);
+    match deploy.command {
+        Commands::Deploy(args) => assert_eq!(args.spec, PathBuf::from("confidential-agent.yaml")),
+        other => panic!("expected deploy command, got {other:?}"),
+    }
+
+    let validate = Cli::parse_from(["confidential-agent", "spec", "validate"]);
+    match validate.command {
+        Commands::Spec(SpecArgs {
+            command: SpecCommands::Validate { spec, .. },
+        }) => assert_eq!(spec, PathBuf::from("confidential-agent.yaml")),
+        other => panic!("expected spec validate command, got {other:?}"),
     }
 }
 

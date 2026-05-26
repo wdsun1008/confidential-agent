@@ -280,7 +280,7 @@ Common optional keys:
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
-Use `confidential-agent spec validate --spec <path>` before build/deploy.
+Use `confidential-agent spec validate --spec <path>` before build/deploy. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
 For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to OS runtime/build prerequisites and let the target's package manager install application dependencies.
 "#;
@@ -296,7 +296,7 @@ Useful self-description commands:
 - `confidential-agent docs workflow`
 - `confidential-agent docs appspec`
 - `confidential-agent spec schema`
-- `confidential-agent spec validate --spec <path>`
+- `confidential-agent spec validate --spec <path>` or just `confidential-agent spec validate` (defaults to `confidential-agent.yaml`)
 "#;
 
 const WORKFLOW_DOC: &str = r#"
@@ -328,8 +328,8 @@ const OPS_DOC: &str = r#"
 
 Core commands:
 
-- `build --spec <path>` creates the confidential image.
-- `deploy --spec <path>` provisions the cloud instance.
+- `build --spec <path>` creates the confidential image; `build` defaults to `confidential-agent.yaml`.
+- `deploy --spec <path>` provisions the cloud instance; `deploy` defaults to `confidential-agent.yaml`.
 - `status --service <id> --live --json` checks local and guest state.
 - `connect` opens local forwards to active guest ports.
 - `destroy <service-id>` tears down provisioned resources.

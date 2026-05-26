@@ -30,7 +30,10 @@ const MODEL_RETRY_TOTAL_TIMEOUT_MS = Number(
 );
 const MAX_OUTPUT_CHARS = Number(process.env.CA_EVAL_MAX_OUTPUT_CHARS || "12000");
 const DRY_EXEC = process.env.CA_EVAL_DRY_EXEC === "1";
-const ARTIFACT_FIRST_MILESTONES = [6, 12, 24];
+const ARTIFACT_FIRST_MILESTONES = [4, 8, 14, 24];
+const CONSECUTIVE_READ_ONLY_MILESTONES = [4, 8, 12];
+// Runner guard exits currently use 64-70 plus 72; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -182,6 +185,12 @@ function addUsage(total, usage) {
 function addModelRetry(metrics, waitMs) {
   metrics.model_retry_count = (metrics.model_retry_count || 0) + 1;
   metrics.model_retry_sleep_ms = (metrics.model_retry_sleep_ms || 0) + waitMs;
+}
+
+function addGuardBlock(metrics, code) {
+  const key = String(code);
+  metrics.guard_blocks = metrics.guard_blocks || {};
+  metrics.guard_blocks[key] = (metrics.guard_blocks[key] || 0) + 1;
 }
 
 function writeAgentMetrics(trialDir, metrics, extra = {}) {
@@ -400,7 +409,7 @@ function hasRequiredArtifacts(trialDir) {
   ];
   if (!requiredFields.every((field) => Object.hasOwn(result, field))) return false;
   if (typeof result.upstream_url !== "string" || !result.upstream_url.trim()) return false;
-  if (typeof result.upstream_commit !== "string" || !/^[0-9a-f]{7,40}$/i.test(result.upstream_commit)) {
+  if (typeof result.upstream_commit !== "string" || !/^[0-9a-f]{40}$/i.test(result.upstream_commit)) {
     return false;
   }
   const booleanFields = [
@@ -430,6 +439,23 @@ function artifactPathFromResult(trialDir, result, field) {
   const value = result?.[field];
   if (typeof value !== "string" || !value.trim()) return "";
   return path.isAbsolute(value) ? value : path.join(trialDir, value);
+}
+
+function isRelativeArtifactPathValue(value) {
+  if (typeof value !== "string" || !value.trim() || value.includes("\n")) return false;
+  if (path.isAbsolute(value)) return false;
+  const normalized = path.normalize(value);
+  return normalized !== "." && !normalized.startsWith("..") && !path.isAbsolute(normalized);
+}
+
+function readArtifactFromResult(trialDir, result, field) {
+  const artifactPath = artifactPathFromResult(trialDir, result, field);
+  if (!artifactPath) return "";
+  try {
+    return fs.readFileSync(artifactPath, "utf8");
+  } catch {
+    return "";
+  }
 }
 
 function readResultJson(trialDir) {
@@ -518,6 +544,48 @@ function specValidationForArtifacts(trialDir) {
   return { ok: child.status === 0, message: output || `spec validate exited ${child.status}` };
 }
 
+function artifactContractIssues(trialDir) {
+  const result = readResultJson(trialDir);
+  if (!result) return [];
+  const issues = [];
+  if (typeof result.upstream_commit !== "string" || !/^[0-9a-f]{40}$/i.test(result.upstream_commit)) {
+    issues.push("result.json upstream_commit must be the full 40-hex commit hash.");
+  }
+  for (const field of ["generated_spec", "install_script", "resource_config"]) {
+    if (!isRelativeArtifactPathValue(result[field])) {
+      issues.push(`${field} must be a relative file path in the trial directory, not inline content or an absolute path.`);
+    }
+  }
+  const specText = readArtifactFromResult(trialDir, result, "generated_spec");
+  const installText = readArtifactFromResult(trialDir, result, "install_script");
+  const resourceText = readArtifactFromResult(trialDir, result, "resource_config");
+  const appService = specText.match(/^\s*app_service:\s*['"]?([^'"\s#]+)['"]?\s*$/m)?.[1] || "";
+  if (installText.trim().length < 80) {
+    issues.push("install_script is empty or too small; it must install the target upstream and create its runtime service.");
+  }
+  if (/(one-click|install-only|deploy-openclaw|CA_ONE_CLICK|\bCA_REF\b)/i.test(installText)) {
+    issues.push("install_script appears to contain host-bootstrap or one-click installer content; replace it with the target agent runtime installer.");
+  }
+  if (!/\[Service\][\s\S]*ExecStart=/i.test(installText)) {
+    issues.push("install_script must create a systemd unit with an ExecStart for the target runtime.");
+  }
+  if (appService && !new RegExp(`systemctl\\s+enable\\s+${appService.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i").test(installText)) {
+    issues.push(`install_script must enable the same service named by service.app_service (${appService}).`);
+  }
+  if (/\b(?:apt-get|apk|yum|dnf)\s+(?:install|update)\b/i.test(installText)) {
+    issues.push("do not install OS packages inside build scripts; put OS packages in build.packages and keep the install script focused on the target application.");
+  }
+  if (/(?:^|\/)\.local\/bin\/(?:uv|poetry|pnpm|yarn|npm|node)\b|astral\.sh\/uv\/install\.sh/i.test(installText)) {
+    issues.push(
+      "build scripts must not rely on implicit user-local helper CLI paths; install helper CLIs into a stable prefix or set HOME/PATH explicitly and verify command -v before using them.",
+    );
+  }
+  if (resourceText.trim().length > 0 && /your[_ -]?[a-z0-9_ -]*key[_ -]?here|changeme|todo|placeholder/i.test(resourceText)) {
+    issues.push("resource_config still contains placeholder values; use concrete non-secret runtime config or environment/file references for secrets.");
+  }
+  return issues;
+}
+
 function forbiddenEvalWorkspaceReference(cmd, cwd) {
   const current = path.resolve(cwd);
   const re = /\/root\/ca-eval-runs(?:\/[^\s"'`;&|)]*)?/g;
@@ -534,8 +602,37 @@ function forbiddenEvalWorkspaceReference(cmd, cwd) {
 function artifactValidationReminder(trialDir) {
   if (!fs.existsSync(path.join(trialDir, "result.json"))) return "";
   const validation = specValidationForArtifacts(trialDir);
-  if (validation.ok) return "Artifact validation: confidential-agent spec validate currently passes.";
-  return `Artifact validation failed. Fix confidential-agent.yaml and rerun spec validate before final:\n${validation.message}`;
+  const issues = artifactContractIssues(trialDir);
+  if (validation.ok && !issues.length) return "Artifact validation: confidential-agent spec validate currently passes and the artifact contract looks consistent.";
+  const parts = [];
+  if (!validation.ok) {
+    parts.push(`confidential-agent spec validate failed:\n${validation.message}`);
+  }
+  if (issues.length) {
+    parts.push(`artifact contract issues:\n- ${issues.join("\n- ")}`);
+  }
+  return `Artifact validation failed. Fix the deliverables before build/deploy/final:\n${parts.join("\n\n")}`;
+}
+
+function stripHeredocBodies(cmd) {
+  const lines = String(cmd || "").split(/\r?\n/);
+  const output = [];
+  const pendingDelimiters = [];
+  const heredocRe = /<<-?\s*(?:"([^"]+)"|'([^']+)'|\\?([A-Za-z_][A-Za-z0-9_]*))/g;
+  for (const line of lines) {
+    if (pendingDelimiters.length) {
+      const delimiter = pendingDelimiters[0];
+      if (line.trim() === delimiter) pendingDelimiters.shift();
+      continue;
+    }
+    output.push(line);
+    heredocRe.lastIndex = 0;
+    let match;
+    while ((match = heredocRe.exec(line))) {
+      pendingDelimiters.push(match[1] || match[2] || match[3]);
+    }
+  }
+  return output.join("\n");
 }
 
 function normalizeRepeatedCommand(cmd) {
@@ -630,11 +727,25 @@ function repeatedCommandReminder(repeatCount, blocked) {
   );
 }
 
+function consecutiveReadOnlyReminder(trialDir, count, sentReminders) {
+  if (!CONSECUTIVE_READ_ONLY_MILESTONES.includes(count)) return "";
+  const key = `consecutive-readonly-${count}`;
+  if (sentReminders.has(key)) return "";
+  const snapshot = artifactSnapshot(trialDir);
+  if (snapshot.exists["confidential-agent.yaml"] && snapshot.exists["result.json"]) return "";
+  sentReminders.add(key);
+  return (
+    `Read-only exploration reminder: you have run ${count} read-only commands in a row without completing the core deliverables. ` +
+    "Stop reading and write confidential-agent.yaml, the target install script, resource config, and result.json in the trial directory."
+  );
+}
+
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
+  const guardCmd = stripHeredocBodies(cmd);
   if (DRY_EXEC) {
     return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
   }
-  if (commandLosesCriticalEvidence(cmd)) {
+  if (commandLosesCriticalEvidence(guardCmd)) {
     return Promise.resolve({
       code: 70,
       stdout: "",
@@ -642,14 +753,14 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
         "Blocked critical confidential-agent command that would hide or discard evidence. Rerun the command without head/tail, || true, command chaining after the CLI call, or /dev/null redirection.",
     });
   }
-  if (/\/root\/(?:\.confidential-agent|confidential-agent)\b|\/var\/tmp\/mkosi-workspace[^\s;&|]*/.test(cmd)) {
+  if (/\/root\/(?:\.confidential-agent|confidential-agent)\b|\/var\/tmp\/mkosi-workspace[^\s;&|]*/.test(guardCmd)) {
     return Promise.resolve({
       code: 65,
       stdout: "",
       stderr: "Blocked command that references host state, source checkout, or stale build workspace outside the isolated trial.",
     });
   }
-  if (/(?:^|[;&|]\s*)cd\s+\.\.(?:\s|\/|;|&|\||$)|(?:^|[\s"'=])\.\.\//.test(cmd)) {
+  if (/(?:^|[;&|]\s*)cd\s+\.\.(?:\s|\/|;|&|\||$)|(?:^|[\s"'=])\.\.\//.test(guardCmd)) {
     return Promise.resolve({
       code: 66,
       stdout: "",
@@ -657,8 +768,8 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
     });
   }
   if (
-    /\bfind\s+\/(?:\s|$)[^\n;&|]*(confidential-agent|SKILL\.md|target\/(?:debug|release))/i.test(cmd) ||
-    /\b(?:locate|mdfind)\b[^\n;&|]*(confidential-agent|SKILL\.md|target\/(?:debug|release))/i.test(cmd)
+    /\bfind\s+\/(?:\s|$)[^\n;&|]*(confidential-agent|SKILL\.md|target\/(?:debug|release))/i.test(guardCmd) ||
+    /\b(?:locate|mdfind)\b[^\n;&|]*(confidential-agent|SKILL\.md|target\/(?:debug|release))/i.test(guardCmd)
   ) {
     return Promise.resolve({
       code: 69,
@@ -666,14 +777,14 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
       stderr: "Blocked host-wide search for local source, skill, or build artifacts. Use the task repository and provided raw skill URL.",
     });
   }
-  if (/\bconfidential-agent\.real\b/.test(cmd)) {
+  if (/\bconfidential-agent\.real\b/.test(guardCmd)) {
     return Promise.resolve({
       code: 67,
       stdout: "",
       stderr: "Blocked internal eval wrapper binary. Use the public confidential-agent CLI.",
     });
   }
-  const staleEvalPath = forbiddenEvalWorkspaceReference(cmd, cwd);
+  const staleEvalPath = forbiddenEvalWorkspaceReference(guardCmd, cwd);
   if (staleEvalPath) {
     return Promise.resolve({
       code: 68,
@@ -681,7 +792,7 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
       stderr: `Blocked access to eval workspace outside this isolated trial: ${staleEvalPath}`,
     });
   }
-  const blocked = forbiddenClone(cmd, expectedRepo, extraAllowedRepos);
+  const blocked = forbiddenClone(guardCmd, expectedRepo, extraAllowedRepos);
   if (blocked) {
     return Promise.resolve({
       code: 64,
@@ -894,6 +1005,7 @@ Rules:
 - Eval phase: ${phase}.
 - The only valid upstream target repository is exactly: ${expectedRepo || "the target_repo field in the task file"}.
 - If your result upstream_url differs from the task target_repo, the trial fails.
+- Artifact-first: by your third bash action, confidential-agent.yaml, the target install script, the resource config, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
@@ -932,10 +1044,12 @@ async function main() {
     total_tokens: 0,
     model_retry_count: 0,
     model_retry_sleep_ms: 0,
+    guard_blocks: {},
   };
   const sentReminders = new Set();
   let lastCommandKey = "";
   let repeatedCommandCount = 0;
+  let consecutiveReadOnlyCount = 0;
   writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "started", last_step: 0 });
 
   for (let step = 1; step <= MAX_STEPS; step += 1) {
@@ -998,6 +1112,8 @@ async function main() {
       messages.push({ role: "user", content: "Unsupported action. Use bash or final." });
       continue;
     }
+    const readOnlyExploration = isReadOnlyExplorationCommand(action.cmd);
+    consecutiveReadOnlyCount = readOnlyExploration ? consecutiveReadOnlyCount + 1 : 0;
     const commandKey = normalizeRepeatedCommand(action.cmd);
     if (commandKey && commandKey === lastCommandKey) {
       repeatedCommandCount += 1;
@@ -1027,6 +1143,10 @@ async function main() {
             "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands.",
         }
       : await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos);
+    if (RUNNER_GUARD_CODES.has(Number(result.code))) {
+      addGuardBlock(metrics, result.code);
+      writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "running", last_step: step });
+    }
     fs.appendFileSync(
       transcript,
       JSON.stringify({ step, role: "tool", cmd: redact(action.cmd), result }) + "\n",
@@ -1044,6 +1164,11 @@ async function main() {
     if (earlyArtifactReminder) {
       appendRunnerReminder(trialDir, step, "artifact-first", earlyArtifactReminder);
       reminder += `\n\n${earlyArtifactReminder}`;
+    }
+    const readOnlyReminder = consecutiveReadOnlyReminder(trialDir, consecutiveReadOnlyCount, sentReminders);
+    if (readOnlyReminder) {
+      appendRunnerReminder(trialDir, step, `consecutive-readonly-${consecutiveReadOnlyCount}`, readOnlyReminder);
+      reminder += `\n\n${readOnlyReminder}`;
     }
     if (repeatReminder) reminder += `\n\n${repeatReminder}`;
     messages.push({

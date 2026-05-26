@@ -16,13 +16,19 @@ const CRITICAL_CLI = new RegExp(
   "i",
 );
 
+function criticalCommandPipedToNonTee(text) {
+  const match = String(text || "").match(
+    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n|]*\\|\\s*(\\S+)`, "i"),
+  );
+  if (!match) return false;
+  return !/^tee(?:$|\\s)/i.test(match[1]);
+}
+
 export function commandLosesCriticalEvidence(cmd) {
   const text = String(cmd || "");
   if (!CRITICAL_CLI.test(text)) return false;
   return (
-    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n|]*\\|\\s*(?:head|tail)\\b`, "i").test(
-      text,
-    ) ||
+    criticalCommandPipedToNonTee(text) ||
     new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*\\|\\|\\s*(?:true|echo)\\b`, "i").test(
       text,
     ) ||

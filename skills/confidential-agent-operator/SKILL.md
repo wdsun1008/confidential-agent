@@ -24,7 +24,7 @@ Once `install-only` succeeds and `confidential-agent --help` responds, do not re
 ## Hard Fail Conditions
 
 - Before repository migration work, check whether `confidential-agent`, Shelter, and `confidential-agent-tools:latest` are available; if any are missing, run Host Bootstrap before inspecting or cloning the target repository.
-- Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to truncating filters such as `head` or `tail`, or redirect output to `/dev/null`.
+- Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
 - `result.json.upstream_commit` must be the full 40-hex output of `git rev-parse HEAD`, not a short hash, branch name, or tag.
@@ -43,6 +43,8 @@ Once `install-only` succeeds and `confidential-agent --help` responds, do not re
 - Every path in systemd `ExecStart` and `WorkingDirectory` must be created or installed by the install script. If the install uses a venv or project-local prefix, `ExecStart` must reference that same prefix.
 - Do not write expected command output, `exit_code`, stdout, or stderr in prose before executing the command. Evidence must come from real shell actions and the transcript produced by those actions.
 - Do not delete host bootstrap assets such as `/usr/local/bin/confidential-agent`, Shelter, OpenClaw, or `confidential-agent-tools:latest` during cleanup. Cleanup only the Confidential Agent service deployed for the target migration.
+- Do not save or copy the one-click installer, Host Bootstrap fragments, or Confidential Agent setup scripts as the deliverable target install script. The deliverable install script installs the upstream target inside the guest image and creates its runtime service.
+- Keep the target checkout in a named subdirectory such as `upstream/`; do not copy the whole upstream repository into the trial/work directory root. The root should hold the final AppSpec, install script, resource config, `result.json`, and small support files.
 
 ## Canonical Skeleton
 
@@ -150,6 +152,8 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Ensure the declared `service.connect` port is configured in `ExecStart`, an Environment line, or a resource file that the service reads.
    - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
+   - Do not use `yum`, `dnf`, `apt-get`, or `apk` to install OS packages inside build scripts. Put OS packages in `build.packages`; the script should install/configure the target application.
+   - If the install script installs helper CLIs such as `uv`, `poetry`, `pnpm`, or language toolchains, install them into a stable prefix or set `HOME` and `PATH` explicitly, then verify `command -v <tool>` before using them. Do not assume `$HOME/.local/bin` or `/home/<service-user>/.local/bin` exists during mkosi postinstall.
    - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
    - Pin the full upstream commit in the install script or copied source path; `result.json.upstream_commit` must be the 40-hex commit that the runtime installs.
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
@@ -162,15 +166,17 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Run `confidential-agent spec validate --spec confidential-agent.yaml --format json`.
    - If the CLI exposes a non-cloud render/static mode, run it before real build/deploy.
    - Confirm referenced local files exist.
+   - Confirm the install script is not the Host Bootstrap installer, creates `service.app_service`, enables that exact unit, and has an `ExecStart` for the real target runtime.
+   - Confirm the declared `service.connect` port is consumed by the real startup path, such as a command-line flag, environment variable, or config file that the startup command actually reads. A passive JSON field that the service never loads is not enough.
    - Run these static checks before `confidential-agent build`, not after.
    - Record static validation results in `result.json`.
 
 4. **Build And Deploy**
-   - Run `confidential-agent build --spec <spec>`.
+   - Run `confidential-agent build --spec confidential-agent.yaml`. If your CLI version defaults to `confidential-agent.yaml`, the explicit flag is still acceptable.
    - Add operator peering for the controller CIDR after build and before deploy; deploy uses peerings plus `service.connect`/`service.ports` to derive security group ingress.
    - If the controller public CIDR is not already known, discover it with a normal network tool and use a `/32` CIDR.
    - Do not try to fix missing security group ports by adding unsupported `deploy.security_group*` fields to the AppSpec.
-   - Run `confidential-agent deploy --spec <spec>`.
+   - Run `confidential-agent deploy --spec confidential-agent.yaml`.
    - After later `peering add` or `peering remove` changes, run `confidential-agent peering apply` to refresh active service security groups.
 
 5. **Verify**

@@ -59,7 +59,7 @@ pub(crate) enum Commands {
 
 #[derive(Debug, Args)]
 pub(crate) struct BuildArgs {
-    #[arg(long)]
+    #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
     #[arg(long, hide = true)]
     pub(crate) render_only: bool,
@@ -67,7 +67,7 @@ pub(crate) struct BuildArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct DeployArgs {
-    #[arg(long)]
+    #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
     #[arg(long, hide = true)]
     pub(crate) skip_inject: bool,
@@ -112,7 +112,7 @@ pub(crate) enum SpecCommands {
         format: OutputFormat,
     },
     Validate {
-        #[arg(long)]
+        #[arg(long, default_value = "confidential-agent.yaml")]
         spec: PathBuf,
         #[arg(long, value_enum, default_value = "markdown")]
         format: OutputFormat,
