@@ -238,8 +238,9 @@ fn spec_schema_json() -> serde_json::Value {
         },
         "build": {
             "image_name": "base Shelter image name",
+            "base_image": "optional qcow2/raw disk image path or URL; omit for normal mkosi builds; not a Docker image",
             "with_network": "allow network during image build",
-            "packages": "OS packages installed by Shelter/mkosi",
+            "packages": "minimal OS packages installed by Shelter/mkosi",
             "files": "host files copied into the guest image",
             "scripts": "guest build scripts executed inside the image",
             "variants": "optional release/debug variant map"
@@ -280,6 +281,8 @@ Common optional keys:
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
 Use `confidential-agent spec validate --spec <path>` before build/deploy.
+
+For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to OS runtime/build prerequisites and let the target's package manager install application dependencies.
 "#;
 
 const OVERVIEW_DOC: &str = r#"
@@ -289,6 +292,7 @@ This CLI builds, deploys, connects to, and operates agents in a TDX-backed Confi
 
 Useful self-description commands:
 
+- `confidential-agent --version` or `confidential-agent version`
 - `confidential-agent docs workflow`
 - `confidential-agent docs appspec`
 - `confidential-agent spec schema`
@@ -315,6 +319,8 @@ const APPSPEC_DOC: &str = r#"
 The AppSpec is the contract between the agent migration workflow and the Confidential Agent CLI. Keep it service-oriented: one workload, explicit ports, deterministic build scripts, and a systemd unit that can be checked after boot.
 
 Prefer copied scripts and structured resource files over ad hoc shell snippets in prompts. Keep secrets out of the image; inject them as resources or secret files during deploy/ops.
+
+For mkosi builds, omit `build.base_image`; it is only for disk image paths/URLs. Start with a minimal OS package set and refine after package-manager errors instead of adding optional tools by default.
 "#;
 
 const OPS_DOC: &str = r#"

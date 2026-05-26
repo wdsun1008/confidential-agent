@@ -39,6 +39,8 @@ resources: {}
 - `service.connect` is the subset exposed to host clients through RATS-TLS connect.
 - `service.app_service` must match the systemd unit that proves the app is ready.
 - `build.packages` are resolved by mkosi through the guest image package manager; for Alinux/RHEL images, use dnf package names rather than Debian names.
+- Keep `build.packages` minimal. Use it for OS runtime/build prerequisites, not optional tools. Application dependencies usually belong in the install script through the upstream package manager.
+- Omit `build.base_image` unless the task gives a real qcow2/raw disk-image path or URL. It is not a Docker/Podman image name and registry pull/tag operations do not make it valid.
 - `resources` must be explicit even when empty.
 - Relative host paths are resolved from the spec file directory.
 - Release images must not include SSH. Use debug only for development/evaluation.

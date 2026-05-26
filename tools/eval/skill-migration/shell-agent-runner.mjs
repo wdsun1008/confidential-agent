@@ -2,7 +2,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { E2E_COMMAND_EVIDENCE, hasSuccessfulChatEvidence, hasSuccessfulCommand } from "./lib/evidence-patterns.mjs";
+import {
+  E2E_COMMAND_EVIDENCE,
+  commandLosesCriticalEvidence,
+  hasSuccessfulChatEvidence,
+  hasSuccessfulCommand,
+} from "./lib/evidence-patterns.mjs";
 
 function positiveIntEnv(name, fallback) {
   const raw = process.env[name];
@@ -39,6 +44,15 @@ function readFileIfExists(file) {
     return fs.readFileSync(file, "utf8");
   } catch {
     return "";
+  }
+}
+
+function readJson(file, fallback = undefined) {
+  if (!file) return fallback;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
   }
 }
 
@@ -516,6 +530,14 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
   if (DRY_EXEC) {
     return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
   }
+  if (commandLosesCriticalEvidence(cmd)) {
+    return Promise.resolve({
+      code: 70,
+      stdout: "",
+      stderr:
+        "Blocked critical confidential-agent command that would hide or discard evidence. Rerun the command without head/tail, || true, command chaining after the CLI call, or /dev/null redirection.",
+    });
+  }
   if (/\/root\/(?:\.confidential-agent|confidential-agent)\b|\/var\/tmp\/mkosi-workspace[^\s;&|]*/.test(cmd)) {
     return Promise.resolve({
       code: 65,
@@ -600,6 +622,37 @@ function artifactSnapshot(trialDir) {
     .filter((entry) => entry.isFile() && /\.(sh|mjs|js|py)$/.test(entry.name))
     .map((entry) => entry.name);
   return { exists, scripts };
+}
+
+function appendRunnerReminder(trialDir, step, kind, message) {
+  try {
+    fs.appendFileSync(
+      path.join(trialDir, "runner-reminders.jsonl"),
+      JSON.stringify({ step, kind, message, created_at: new Date().toISOString() }) + "\n",
+    );
+  } catch {}
+}
+
+function looksLikeNarratedToolOutput(text) {
+  const value = String(text || "");
+  return (
+    /```(?:bash|sh|shell)?\s*[\s\S]*?\b(?:confidential-agent|curl|git|python3?|node|bash|cat|grep|ls|ssh)\b[\s\S]*?```/i.test(
+      value,
+    ) ||
+    /\bexit_code\s*=\s*\d+\b[\s\S]{0,400}\b(?:stdout|stderr)\s*:/i.test(value) ||
+    /\b(?:stdout|stderr)\s*:\s*[\s\S]{0,400}\bexit_code\s*=\s*\d+\b/i.test(value)
+  );
+}
+
+function artifactFirstReminder(trialDir, step, sentReminders) {
+  if (step < 6 || sentReminders.has("artifact-first")) return "";
+  const snapshot = artifactSnapshot(trialDir);
+  if (snapshot.exists["confidential-agent.yaml"] && snapshot.exists["result.json"]) return "";
+  sentReminders.add("artifact-first");
+  return (
+    `Artifact-first reminder: confidential-agent.yaml and result.json are still missing at step ${step}. ` +
+    "Stop broad read-only exploration and write the AppSpec, install script, resource config, and result.json in the trial directory before continuing."
+  );
 }
 
 async function chat(messages) {
@@ -694,6 +747,7 @@ async function main() {
     completion_tokens: 0,
     total_tokens: 0,
   };
+  const sentReminders = new Set();
   writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "started", last_step: 0 });
 
   for (let step = 1; step <= MAX_STEPS; step += 1) {
@@ -721,11 +775,16 @@ async function main() {
     );
     const action = extractJson(content);
     if (!action || typeof action.action !== "string") {
+      const narratedOutput = looksLikeNarratedToolOutput(content);
+      const formatReminder = narratedOutput
+        ? "You wrote command/output prose instead of a JSON action. Do not fabricate stdout, stderr, or exit_code. Execute the next real command by replying with exactly one JSON object."
+        : 'Reply with exactly one JSON object: {"action":"bash","cmd":"...","why":"..."} or {"action":"final","summary":"..."}';
+      if (narratedOutput && !sentReminders.has("narrated-tool-output")) {
+        sentReminders.add("narrated-tool-output");
+        appendRunnerReminder(trialDir, step, "narrated-tool-output", formatReminder);
+      }
       messages.push({ role: "assistant", content });
-      messages.push({
-        role: "user",
-        content: 'Reply with exactly one JSON object: {"action":"bash","cmd":"...","why":"..."} or {"action":"final","summary":"..."}',
-      });
+      messages.push({ role: "user", content: formatReminder });
       continue;
     }
     if (action.action === "final") {
@@ -766,6 +825,11 @@ async function main() {
     }
     const validationReminder = artifactValidationReminder(trialDir);
     if (validationReminder) reminder += `\n\n${validationReminder}`;
+    const earlyArtifactReminder = artifactFirstReminder(trialDir, step, sentReminders);
+    if (earlyArtifactReminder) {
+      appendRunnerReminder(trialDir, step, "artifact-first", earlyArtifactReminder);
+      reminder += `\n\n${earlyArtifactReminder}`;
+    }
     messages.push({
       role: "user",
       content: `Command result:\nexit_code=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}${reminder}`,

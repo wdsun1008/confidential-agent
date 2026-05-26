@@ -9,7 +9,7 @@ Use this skill to migrate an arbitrary agent into Confidential Agent. Treat the 
 
 ## Host Bootstrap
 
-Before migration work, ensure the controller host has the Confidential Agent CLI, Shelter, and `confidential-agent-tools:latest`. If any of those are missing, run the one-click installer in `install-only` mode from the same source ref as this skill.
+Before migration work, ensure the controller host has the Confidential Agent CLI, Shelter, and `confidential-agent-tools:latest`. Use `confidential-agent --help`, `shelter --help`, and the local container image list for this availability check. If any of those are missing, run the one-click installer in `install-only` mode from the same source ref as this skill.
 
 ```bash
 CA_REPO="${CA_REPO:-https://github.com/wdsun1008/confidential-agent.git}"
@@ -35,6 +35,7 @@ curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec. Security group ports come from `confidential-agent peering`, not AppSpec fields.
 - Do not finalize until `confidential-agent spec validate --spec confidential-agent.yaml --format json` succeeds after the latest edit.
 - `service.app_service` must exactly match the systemd unit created and enabled by the install script.
+- Do not write expected command output, `exit_code`, stdout, or stderr in prose before executing the command. Evidence must come from real shell actions and the transcript produced by those actions.
 - Do not delete host bootstrap assets such as `/usr/local/bin/confidential-agent`, Shelter, OpenClaw, or `confidential-agent-tools:latest` during cleanup. Cleanup only the Confidential Agent service deployed for the target migration.
 
 ## Canonical Skeleton
@@ -118,6 +119,14 @@ Do not spend the whole run reading. A rough but concrete first draft is better t
 
 Confidential Agent images use Alinux/RHEL-style packages. In `build.packages`, use dnf names such as `python3`, `python3-pip`, `python3-devel`, `gcc`, `gcc-c++`, `make`, `nodejs`, `npm`, `openssh-clients`, `procps-ng`, `tar`, `gzip`, and `git`. Do not use Debian names such as `build-essential`, `python3-dev`, `openssh-client`, `procps`, `libffi-dev`, or `docker-cli`.
 
+Keep `build.packages` minimal: include only OS packages needed before the target's own installer can run, such as language runtimes, compilers for native wheels, certificates, and the real startup command's direct dependencies. Do not add optional troubleshooting, media, browser, editor, or search tools just because they appear in docs. If build fails with a package-manager "No match for argument" or equivalent package-not-found error, remove or substitute the missing nonessential package and rerun build.
+
+## Base Image Discipline
+
+For normal migrations, omit `build.base_image` and let Shelter use the mkosi build path from `build.packages`, `build.files`, and `build.scripts`.
+
+Only set `build.base_image` when the task provides a real disk-image path or URL such as qcow2/raw. It is not a Docker/Podman image name, not a registry reference, and cannot be fixed with `podman pull`, `docker pull`, or image retagging.
+
 ## Workflow
 
 1. **Discover**
@@ -133,6 +142,7 @@ Confidential Agent images use Alinux/RHEL-style packages. In `build.packages`, u
    - Write a systemd unit whose `ExecStart` runs the real target agent, create it under `/etc/systemd/system/<unit>.service`, and enable that same unit.
    - Ensure the declared `service.connect` port is configured in `ExecStart`, an Environment line, or a resource file that the service reads.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
+   - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
    - Pin the exact upstream commit in the install script or copied source path; `result.json.upstream_commit` must match what the runtime installs.
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.

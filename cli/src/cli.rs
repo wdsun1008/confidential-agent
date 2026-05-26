@@ -11,6 +11,7 @@ fn default_state_dir() -> PathBuf {
 #[derive(Debug, Parser)]
 #[command(name = "confidential-agent")]
 #[command(about = "Confidential Agent host CLI")]
+#[command(version)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -53,6 +54,7 @@ pub(crate) enum Commands {
     Image(ImageArgs),
     Status(StatusArgs),
     Destroy(DestroyArgs),
+    Version,
 }
 
 #[derive(Debug, Args)]

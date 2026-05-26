@@ -20,6 +20,9 @@
 - Use `git clone --depth 1` or shallow fetch for discovery and runtime install unless the upstream requires full history.
 - Keep the install script non-interactive and fail-fast: `set -euo pipefail`.
 - Put OS packages in `build.packages`; install scripts run inside the image buildroot and must not use `apt-get`, `apk`, or other distro-specific commands that do not match the base image.
+- Keep `build.packages` minimal: include only the OS runtime/build prerequisites needed before the target's own installer can run. Do not include optional troubleshooting or media/search/browser tools unless the real startup command requires them.
+- If image build fails with a package-manager package-not-found error, remove or substitute the missing nonessential package and rerun build. Do not keep adding repositories or unrelated packages before confirming the service actually needs that package.
+- Omit `build.base_image` for normal mkosi builds. Use it only for a provided qcow2/raw disk-image path or URL; it is not a Docker/Podman image reference.
 - If upstream docs are ambiguous, choose the simplest documented server mode and record the assumption.
 - Bind services to `0.0.0.0` inside the guest so TNG can reach them.
 - Create a systemd service under `/etc/systemd/system/<unit>.service`, enable that exact unit, and set `service.app_service` to the same unit name.
@@ -34,7 +37,7 @@
 ## Common Patterns
 
 Python:
-- Install `python3`, `python3-pip`, and build tools required by upstream. On Alinux/RHEL, prefer packages such as `python3`, `python3-pip`, `python3-devel`, `gcc`, `gcc-c++`, `make`, `pkgconf-pkg-config`, `openssl-devel`, and `libffi-devel` when native wheels are possible.
+- Install `python3`, `python3-pip`, and only the build tools required by upstream. On Alinux/RHEL, prefer packages such as `python3`, `python3-pip`, `python3-devel`, `gcc`, `gcc-c++`, `make`, `pkgconf-pkg-config`, `openssl-devel`, and `libffi-devel` when native wheels are possible.
 - Use virtualenv only if the base image has the required tooling; otherwise install into a dedicated path.
 - Prefer `python -m <module>` over fragile relative script paths when upstream supports it.
 
