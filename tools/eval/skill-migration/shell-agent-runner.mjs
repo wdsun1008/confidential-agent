@@ -538,6 +538,98 @@ function artifactValidationReminder(trialDir) {
   return `Artifact validation failed. Fix confidential-agent.yaml and rerun spec validate before final:\n${validation.message}`;
 }
 
+function normalizeRepeatedCommand(cmd) {
+  return String(cmd || "")
+    .trim()
+    .replace(/[;\s]+$/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function containsFileWriteShellSyntax(cmd) {
+  const text = String(cmd || "");
+  if (/<<\s*['"]?\w+/.test(text) || /\btee\b/.test(text)) return true;
+  const withoutFdRedirects = text
+    .replace(/\b[012]?>&[012]\b/g, "")
+    .replace(/\b[012]?>\s*\/dev\/(?:null|stdout|stderr)\b/g, "");
+  return /(^|[^&])>>?\s*[^&\s]/.test(withoutFdRedirects) || /(^|\s)&>\s*[^&\s]/.test(withoutFdRedirects);
+}
+
+function firstNonCdSegment(cmd) {
+  const segments = String(cmd || "")
+    .split(/\s*(?:&&|;)\s*/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  for (const segment of segments) {
+    if (/^cd\s+\S+(?:\s|$)/.test(segment)) continue;
+    return segment;
+  }
+  return segments[0] || String(cmd || "").trim();
+}
+
+function readOnlyCommandToken(segment) {
+  const firstPipelineStage = String(segment || "").split("|")[0].trim();
+  const withoutEnv = firstPipelineStage.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)*/, "");
+  const match = withoutEnv.match(/^([A-Za-z0-9_.\/-]+)(?:\s+([A-Za-z0-9_.\/-]+))?/);
+  if (!match) return { command: "", subcommand: "" };
+  return {
+    command: path.basename(match[1]),
+    subcommand: match[2] || "",
+  };
+}
+
+function isReadOnlyExplorationCommand(cmd) {
+  const text = String(cmd || "");
+  if (!text.trim() || containsFileWriteShellSyntax(text)) return false;
+  if (
+    /\b(?:confidential-agent\s+(?:build|deploy|peering|status|connect|destroy|inject)|rm|mv|cp|install|chmod|chown|mkdir|rmdir|touch|curl\s+[^|&;]*\s+-o\b|git\s+(?:clone|fetch|checkout|reset|pull|merge|apply)|npm\s+(?:install|run)|pip(?:3)?\s+install|python3?\s+-m\s+pip\s+install)\b/i.test(
+      text,
+    )
+  ) {
+    return false;
+  }
+  const segment = firstNonCdSegment(text);
+  const { command, subcommand } = readOnlyCommandToken(segment);
+  if (command === "sed") return !/(^|\s)-[A-Za-z]*i[A-Za-z]*(\s|$)/.test(segment);
+  if (
+    [
+      "cat",
+      "grep",
+      "egrep",
+      "fgrep",
+      "rg",
+      "find",
+      "ls",
+      "head",
+      "tail",
+      "wc",
+      "awk",
+      "jq",
+      "pwd",
+      "which",
+      "file",
+      "strings",
+      "sort",
+      "tr",
+    ].includes(command)
+  ) {
+    return true;
+  }
+  if (command === "git") {
+    return ["log", "status", "show", "diff", "rev-parse", "grep", "branch", "remote"].includes(subcommand);
+  }
+  if (["docker", "podman"].includes(command)) return ["images", "image", "ps"].includes(subcommand);
+  return false;
+}
+
+function repeatedCommandReminder(repeatCount, blocked) {
+  const prefix = blocked
+    ? `Repeated read-only command blocked after ${repeatCount} identical attempts.`
+    : `Repeated command reminder: the last command has run ${repeatCount} times in a row.`;
+  return (
+    `${prefix} Stop repeating read-only exploration. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json, then run spec validate/build as appropriate.`
+  );
+}
+
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
   if (DRY_EXEC) {
     return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
@@ -842,6 +934,8 @@ async function main() {
     model_retry_sleep_ms: 0,
   };
   const sentReminders = new Set();
+  let lastCommandKey = "";
+  let repeatedCommandCount = 0;
   writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "started", last_step: 0 });
 
   for (let step = 1; step <= MAX_STEPS; step += 1) {
@@ -904,8 +998,35 @@ async function main() {
       messages.push({ role: "user", content: "Unsupported action. Use bash or final." });
       continue;
     }
+    const commandKey = normalizeRepeatedCommand(action.cmd);
+    if (commandKey && commandKey === lastCommandKey) {
+      repeatedCommandCount += 1;
+    } else {
+      lastCommandKey = commandKey;
+      repeatedCommandCount = commandKey ? 1 : 0;
+    }
+    const repeatedReadOnly = repeatedCommandCount >= 5 && isReadOnlyExplorationCommand(action.cmd);
+    const blockRepeatedReadOnly = repeatedCommandCount >= 8 && repeatedReadOnly;
+    const repeatReminder = repeatedReadOnly
+      ? repeatedCommandReminder(repeatedCommandCount, blockRepeatedReadOnly)
+      : "";
+    if (repeatedReadOnly && (repeatedCommandCount === 5 || blockRepeatedReadOnly)) {
+      appendRunnerReminder(
+        trialDir,
+        step,
+        blockRepeatedReadOnly ? "repeated-readonly-blocked" : "repeated-readonly",
+        repeatReminder,
+      );
+    }
     console.error(`[agent] step ${step}: ${redact(action.cmd)}`);
-    const result = await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos);
+    const result = blockRepeatedReadOnly
+      ? {
+          code: 72,
+          stdout: "",
+          stderr:
+            "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands.",
+        }
+      : await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos);
     fs.appendFileSync(
       transcript,
       JSON.stringify({ step, role: "tool", cmd: redact(action.cmd), result }) + "\n",
@@ -924,6 +1045,7 @@ async function main() {
       appendRunnerReminder(trialDir, step, "artifact-first", earlyArtifactReminder);
       reminder += `\n\n${earlyArtifactReminder}`;
     }
+    if (repeatReminder) reminder += `\n\n${repeatReminder}`;
     messages.push({
       role: "user",
       content: `Command result:\nexit_code=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}${reminder}`,
