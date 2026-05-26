@@ -192,7 +192,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 4. **Build And Deploy**
    - Run `confidential-agent build --spec confidential-agent.yaml`. If your CLI version defaults to `confidential-agent.yaml`, the explicit flag is still acceptable.
    - After a successful build, preserve the built image and advance the pipeline. Do not clean image directories or rerun build unless deploy or live status fails with evidence that requires an image change.
-   - Add operator peering for the controller CIDR after build and before deploy; deploy uses peerings plus `service.connect`/`service.ports` to derive security group ingress.
+   - Add one operator peering for the controller `/32` after build and before deploy. This peering must cover both control and status scopes; omit `--scope` for the CLI default, or pass `--scope control --scope status` on the same command. Separate control-only and status-only peerings do not satisfy deploy. Deploy uses peerings plus `service.connect`/`service.ports` to derive security group ingress.
    - If the controller public CIDR is not already known, discover it with a normal network tool and use a `/32` CIDR.
    - Do not try to fix missing security group ports by adding unsupported `deploy.security_group*` fields to the AppSpec.
    - Run `confidential-agent deploy --spec confidential-agent.yaml`.

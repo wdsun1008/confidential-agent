@@ -27,6 +27,14 @@ Before deploy, add operator peering for the controller CIDR:
 confidential-agent peering add --role operator --cidr <controller-cidr> --label ops
 ```
 
+Deploy requires a single operator peering entry that covers both control and status scopes. Omitting `--scope` gives the full operator default and satisfies this. If you specify scopes explicitly, pass both on the same command:
+
+```bash
+confidential-agent peering add --role operator --cidr <controller-cidr> --label ops --scope control --scope status
+```
+
+Two separate peering entries, one control-only and one status-only, do not satisfy the deploy check.
+
 Then:
 
 ```bash
