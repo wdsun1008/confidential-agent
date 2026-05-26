@@ -35,6 +35,7 @@ curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec. Security group ports come from `confidential-agent peering`, not AppSpec fields.
 - Do not finalize until `confidential-agent spec validate --spec confidential-agent.yaml --format json` succeeds after the latest edit.
 - `service.app_service` must exactly match the systemd unit created and enabled by the install script.
+- `service.app_service` must start a long-running process that listens on at least one `service.connect` port. One-shot CLI invocations, interactive stdin-only sessions, `--help`/`--version` commands, and batch scripts that exit immediately are not valid service commands.
 - Do not write expected command output, `exit_code`, stdout, or stderr in prose before executing the command. Evidence must come from real shell actions and the transcript produced by those actions.
 - Do not delete host bootstrap assets such as `/usr/local/bin/confidential-agent`, Shelter, OpenClaw, or `confidential-agent-tools:latest` during cleanup. Cleanup only the Confidential Agent service deployed for the target migration.
 
@@ -140,14 +141,16 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Write the AppSpec and install/runtime files yourself from the inspected upstream repository. The final deliverables belong in the original working directory.
    - The runtime script must install the real upstream service and configure it to start at boot.
    - Write a systemd unit whose `ExecStart` runs the real target agent, create it under `/etc/systemd/system/<unit>.service`, and enable that same unit.
+   - Make install scripts idempotent and rebuild-safe. Before cloning or extracting into a target directory, remove or reuse that directory; image builds and debugging runs may execute the script more than once.
    - Ensure the declared `service.connect` port is configured in `ExecStart`, an Environment line, or a resource file that the service reads.
+   - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
    - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
    - Pin the exact upstream commit in the install script or copied source path; `result.json.upstream_commit` must match what the runtime installs.
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.
-   - Move runtime configuration and secrets to resource files. Use environment variable references or injected files for secrets; do not leave `YOUR_API_KEY_HERE`, `TODO`, or `changeme` placeholders in final resources.
-   - Remove placeholder text such as TODO, changeme, fake ids, and example-only secrets before finalizing.
+   - Move runtime configuration and secrets to resource files. Use environment variable references or injected files for secrets; do not leave `placeholder`, `YOUR_API_KEY_HERE`, `TODO`, `changeme`, example-only tokens, or fake ids in final resources.
+   - If a required provider key exists in the host environment, write it to the resource file without printing the value. If it is absent, record the missing secret and leave the corresponding verification boolean false; do not invent a fake value.
    - Produce these artifacts early in one batch: AppSpec YAML, install script, resource config, and a result/evidence file with upstream URL and pinned commit.
 
 3. **Validate Static Artifacts**

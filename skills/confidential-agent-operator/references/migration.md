@@ -19,6 +19,7 @@
 - Pin the upstream commit before build and reference the same commit in the install script or copied source path.
 - Use `git clone --depth 1` or shallow fetch for discovery and runtime install unless the upstream requires full history.
 - Keep the install script non-interactive and fail-fast: `set -euo pipefail`.
+- Make install scripts idempotent and rebuild-safe. Before cloning or extracting into a target directory, remove or reuse that directory; the image builder or a debugging run may execute the script more than once.
 - Put OS packages in `build.packages`; install scripts run inside the image buildroot and must not use `apt-get`, `apk`, or other distro-specific commands that do not match the base image.
 - Keep `build.packages` minimal: include only the OS runtime/build prerequisites needed before the target's own installer can run. Do not include optional troubleshooting or media/search/browser tools unless the real startup command requires them.
 - If image build fails with a package-manager package-not-found error, remove or substitute the missing nonessential package and rerun build. Do not keep adding repositories or unrelated packages before confirming the service actually needs that package.
@@ -26,11 +27,14 @@
 - If upstream docs are ambiguous, choose the simplest documented server mode and record the assumption.
 - Bind services to `0.0.0.0` inside the guest so TNG can reach them.
 - Create a systemd service under `/etc/systemd/system/<unit>.service`, enable that exact unit, and set `service.app_service` to the same unit name.
+- `ExecStart` must run a long-lived service that listens on at least one declared `service.connect` port. One-shot commands, interactive stdin-only sessions, and help/status commands are not valid services.
+- If the target has no built-in server mode, expose a persistent listener that delegates to the real target runtime for each request. Do not return canned responses.
 - Ensure the declared connect port appears in the service command, an Environment line, or a resource file that the service reads.
 - Do not call `systemctl start` during image build. Run `systemctl daemon-reload` and `systemctl enable <unit>.service`; the guest starts enabled units on boot.
 - Put resource targets under `/etc/<service>/`, `/root/.config/<service>/`, or the documented upstream config path.
 - Always create these artifacts before attempting cloud operations: `confidential-agent.yaml`, install script, resource config, and `result.json`.
-- Remove placeholder text such as TODO, changeme, fake ids, and example-only secrets; leaving them means the migration is still a placeholder.
+- Remove placeholder text such as TODO, changeme, placeholder, fake ids, and example-only secrets; leaving them means the migration is still a placeholder.
+- Resource files must contain concrete usable values. If the host environment exports a required key, write it from the environment without printing it; if the key is absent, record the missing secret and leave verification booleans false.
 - Use `build.with_network: true` when the build downloads packages or source.
 - Use runtime downloads only when image-time downloads are impractical. If runtime downloads affect trust claims, record hashes separately.
 

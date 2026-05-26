@@ -24,6 +24,7 @@ const COMMAND_TIMEOUT_MS = Number(process.env.CA_EVAL_COMMAND_TIMEOUT_MS || "600
 const MODEL_TIMEOUT_MS = Number(process.env.CA_EVAL_MODEL_TIMEOUT_MS || "180000");
 const MAX_OUTPUT_CHARS = Number(process.env.CA_EVAL_MAX_OUTPUT_CHARS || "12000");
 const DRY_EXEC = process.env.CA_EVAL_DRY_EXEC === "1";
+const ARTIFACT_FIRST_MILESTONES = [6, 12, 24];
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -645,12 +646,14 @@ function looksLikeNarratedToolOutput(text) {
 }
 
 function artifactFirstReminder(trialDir, step, sentReminders) {
-  if (step < 6 || sentReminders.has("artifact-first")) return "";
+  if (!ARTIFACT_FIRST_MILESTONES.includes(step)) return "";
+  const key = `artifact-first-${step}`;
+  if (sentReminders.has(key)) return "";
   const snapshot = artifactSnapshot(trialDir);
   if (snapshot.exists["confidential-agent.yaml"] && snapshot.exists["result.json"]) return "";
-  sentReminders.add("artifact-first");
+  sentReminders.add(key);
   return (
-    `Artifact-first reminder: confidential-agent.yaml and result.json are still missing at step ${step}. ` +
+    `Artifact-first reminder (step ${step}): confidential-agent.yaml and result.json are still missing. ` +
     "Stop broad read-only exploration and write the AppSpec, install script, resource config, and result.json in the trial directory before continuing."
   );
 }
