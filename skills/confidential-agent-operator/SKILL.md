@@ -26,7 +26,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 
 - Before repository migration work, check whether `confidential-agent`, Shelter, and `confidential-agent-tools:latest` are available; if any are missing, run Host Bootstrap before inspecting or cloning the target repository.
 - Do not draft or validate the target AppSpec before Host Bootstrap is complete. If `confidential-agent --help` does not work, install host dependencies first, then use CLI schema/docs as the source of truth.
-- Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
+- Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `||`, chain another command after them with `;` or `&&`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
 - `result.json.upstream_commit` must be the full 40-hex output of `git rev-parse HEAD`, not a short hash, branch name, or tag.
@@ -50,6 +50,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - After `confidential-agent build` exits 0, move forward to operator peering and deploy. Do not delete built images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself must change.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Runtime fixes must be made in the AppSpec, install script, or resources, then rebuilt and redeployed so the migration is reproducible.
 - `chat_ok` evidence must come from the deployed target service through `confidential-agent connect` or the host-side port it exposes. Do not use local `echo`, local scripts, direct guest SSH, or fabricated marker output as chat evidence.
+- `confidential-agent destroy <service>` is the last success-phase operation. Do not destroy the deployed service until real `chat_ok` evidence exists. If you abandon a failed run and clean up, keep unfinished success booleans false.
 
 ## Canonical Skeleton
 
@@ -187,14 +188,14 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 
 5. **Verify**
    - Run `confidential-agent status --live --json`.
-   - Start `confidential-agent connect` and verify the service with `curl`, `nc`, or the workload's native client. In this CLI version, use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; do not assume `connect --service` works for local service selection.
+   - Start `confidential-agent connect` and verify the service with `curl`, `nc`, or the workload's native client. In this CLI version, use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; `connect --service <name>` is not supported for local service selection.
    - All reachability and chat probes must go through `confidential-agent connect` or its exposed host-side port. Direct SSH guest probes are only diagnostics; they do not satisfy `connect_ok` or `chat_ok`, and guest-side hotfixes must be moved back into the build artifacts before rerunning the flow.
    - Health, status, version, config, and model-list endpoints prove reachability only; they do not prove the migrated agent works. For `chat_ok`, send a real natural-language request through the connected service and save the response. Prefer two turns when the workload supports it, and include a deterministic marker if the task provides one. The marker must be produced by the target service response, not by a local command.
    - Verify that the running service is the real target upstream, using commit hash, process command, installed files, and response behavior.
 
 6. **Operate And Cleanup**
    - Use `inject` only to update resources, not image-baked code.
-   - Use `destroy <service>` for cleanup and audit cloud resources after failures.
+   - Use `destroy <service>` only after chat verification succeeds, or when abandoning a failed run with remaining success booleans left false.
    - Record `cleanup_ok: true` only after `confidential-agent destroy <service>` succeeds or the live status proves no deployed service remains.
 
 ## References

@@ -86,4 +86,4 @@ In full/live runs, `result.json` booleans are evidence fields, not intentions:
 - `live_status_ok`: only after `confidential-agent status --live --json` succeeds and shows the app is ready.
 - `connect_ok`: only after `confidential-agent connect ...` starts successfully and a local port is reachable.
 - `chat_ok`: only after a real chat/API/tool call reaches the migrated service through the connected port and returns a usable workload response. Health, status, version, config, local echo/print commands, and direct guest SSH output are not enough.
-- `cleanup_ok`: only after `confidential-agent destroy <service>` succeeds, or status proves no active service remains.
+- `cleanup_ok`: only after `chat_ok` is true and `confidential-agent destroy <service>` succeeds, or status proves no active service remains after successful verification. If you clean up an abandoned failed run, keep unfinished success booleans false.

@@ -51,6 +51,8 @@ curl -fsS http://127.0.0.1:<port>/healthz
 nc -vz 127.0.0.1 <port>
 ```
 
+Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`. Do not use `connect --service <name>` for local service selection.
+
 For chat or agent APIs, use the workload's documented client or a `curl` request against its real endpoint. If `app_ready` is false, inspect `service.app_service`, guest unit logs, config resource targets, and whether the app listens on the declared port.
 Set `live_status_ok` only from a successful live status check that proves readiness, and set `chat_ok` only after saving evidence from a real conversation or workload API call to the migrated service through the connected host-side port. Health, status, version, config, model-list endpoints, direct guest SSH, and local marker generation are not enough.
 
@@ -70,5 +72,7 @@ Restart the app only if the target service does not reload config automatically.
 confidential-agent destroy <service-id>
 confidential-agent image list
 ```
+
+Treat cleanup as the last success-phase step, after chat verification. If you destroy a failed attempt to avoid leftovers, do not mark `cleanup_ok` as proof that the migration succeeded.
 
 After failed evals, audit cloud resources by tags and remove leftovers before running a new matrix.

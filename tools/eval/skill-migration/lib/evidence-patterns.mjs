@@ -29,9 +29,8 @@ export function commandLosesCriticalEvidence(cmd) {
   if (!CRITICAL_CLI.test(text)) return false;
   return (
     criticalCommandPipedToNonTee(text) ||
-    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*\\|\\|\\s*(?:true|echo)\\b`, "i").test(
-      text,
-    ) ||
+    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*\\|\\|`, "i").test(text) ||
+    new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*&&`, "i").test(text) ||
     new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*;`, "i").test(text) ||
     new RegExp(
       `${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n;&|]*(?:1?>\\s*\\/dev\\/null|2>\\s*\\/dev\\/null|&>\\s*\\/dev\\/null)`,
@@ -43,6 +42,21 @@ export function commandLosesCriticalEvidence(cmd) {
 export function hasSuccessfulCommand(events, pattern) {
   return events.some(
     (event) => pattern.test(event.cmd) && event.result?.code === 0 && !commandLosesCriticalEvidence(event.cmd),
+  );
+}
+
+function looksLikeFabricatedChatCommand(cmd) {
+  const text = String(cmd || "").trim();
+  if (/^(?:echo|printf|cat)\b/i.test(text) && !/\|/.test(text)) return true;
+  if (/\b(?:python3?|node|bash|sh)\s+\/tmp\/(?:test_?chat|chat_test|fake_?chat|mock_?chat)\.(?:py|js|mjs|sh)\b/i.test(text)) {
+    return true;
+  }
+  const inline =
+    text.match(/\bpython3?\s+-c\s+(["'])([\s\S]*?)\1/i) ||
+    text.match(/\bnode\s+-e\s+(["'])([\s\S]*?)\1/i);
+  if (!inline) return false;
+  return !/\b(?:requests|urllib|httpx|aiohttp|socket|fetch|axios|curl|localhost|127\.0\.0\.1|0\.0\.0\.0|https?:\/\/)\b/i.test(
+    inline[2],
   );
 }
 
@@ -64,6 +78,7 @@ export function hasSuccessfulChatEvidence(events, pattern, outputPatterns = []) 
     if (!pattern.test(event.cmd) || event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) {
       return false;
     }
+    if (looksLikeFabricatedChatCommand(event.cmd)) return false;
     const output = `${event.result?.stdout || ""}\n${event.result?.stderr || ""}`.trim();
     if (!output) return false;
     if (

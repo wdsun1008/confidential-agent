@@ -786,7 +786,7 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
       code: 70,
       stdout: "",
       stderr:
-        "Blocked critical confidential-agent command that would hide or discard evidence. Rerun the command without head/tail, || true, command chaining after the CLI call, or /dev/null redirection.",
+        "Blocked critical confidential-agent command that would hide or discard evidence. Rerun the command without head/tail, || fallback, ;/&& command chaining after the CLI call, or /dev/null redirection.",
     });
   }
   if (/\/root\/(?:\.confidential-agent|confidential-agent)\b|\/var\/tmp\/mkosi-workspace[^\s;&|]*/.test(guardCmd)) {
@@ -925,10 +925,15 @@ function phaseProgressionReminder(trialDir, step, sentReminders) {
   const connectDone = result.connect_ok === true || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.connect_ok);
   const deployAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.deploy_ok));
   const connectAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.connect_ok));
+  const cleanupAttempted = events.some(commandMatches(E2E_COMMAND_EVIDENCE.cleanup_ok));
 
   let stage = "";
   let message = "";
-  if (!deployDone) {
+  if (result.chat_ok !== true && (result.cleanup_ok === true || cleanupAttempted)) {
+    stage = "cleanup-before-chat";
+    message =
+      "Phase progression: cleanup was attempted before chat_ok was verified. Cleanup is the last success-phase step; if you are abandoning a failed run, keep unfinished success booleans false. Otherwise rebuild/redeploy as needed and do not destroy again until real chat evidence exists.";
+  } else if (!deployDone) {
     stage = deployAttempted ? "deploy-not-done" : "deploy-not-attempted";
     message = deployAttempted
       ? "Phase progression: a build has succeeded but deploy is still not complete. Do not delete images, kill builders, or rerun build unless deploy/live evidence proves the image must change. Focus on the deploy error, operator peering, or AppSpec/resources needed for deploy."
@@ -1096,10 +1101,12 @@ Rules:
 - ${fullBootstrapInstruction}
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
-- Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append || true, chain another command with ;, pipe to head/tail, or redirect output to /dev/null.
+- Shell commands run with pipefail enabled. Preserve stdout/stderr and command status for confidential-agent build/deploy/peering/status/connect/destroy; do not append ||, chain another command after them with ; or &&, pipe to head/tail, or redirect output to /dev/null.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
+- Use plain confidential-agent connect unless the task provides an agent card for --from-card. Do not use connect --service for local service selection in this CLI version.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
+- Destroy is the last success-phase step. Do not run confidential-agent destroy until chat_ok has real evidence; if you abandon a failed run, leave unfinished success booleans false.
 
 Provided skill context:
 ${skillContext(skillDir, skillBootstrapUrl, skillRef)}`;
