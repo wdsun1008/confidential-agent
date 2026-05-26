@@ -3,6 +3,7 @@
 ## Discovery Checklist
 
 - Run `confidential-agent docs workflow` and `confidential-agent spec schema` before writing the first AppSpec.
+- If `confidential-agent` is unavailable, complete Host Bootstrap first. Do not draft the target AppSpec from memory before CLI schema/docs are available.
 - Repository identity: upstream URL, selected branch/tag/commit, license constraints.
 - Runtime: Python, Node, container, binary, or mixed stack.
 - Install sources: `requirements*.txt`, `pyproject.toml`, `package.json`, lockfiles, Dockerfile, Makefile, scripts.

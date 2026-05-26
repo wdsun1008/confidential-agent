@@ -24,6 +24,7 @@ Once `install-only` succeeds and `confidential-agent --help` responds, do not re
 ## Hard Fail Conditions
 
 - Before repository migration work, check whether `confidential-agent`, Shelter, and `confidential-agent-tools:latest` are available; if any are missing, run Host Bootstrap before inspecting or cloning the target repository.
+- Do not draft or validate the target AppSpec before Host Bootstrap is complete. If `confidential-agent --help` does not work, install host dependencies first, then use CLI schema/docs as the source of truth.
 - Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
@@ -105,9 +106,9 @@ For a full/live evaluation, do not finalize after static artifacts only. Final c
 
 ## Artifact-First Rule
 
-Follow this execution order unless the caller gives stricter instructions. In step-limited automation, all four deliverables should exist by your third bash action.
+Follow this execution order unless the caller gives stricter instructions. In step-limited automation, all four deliverables should exist by your third target-migration bash action after Host Bootstrap is complete.
 
-0. If the Confidential Agent CLI, Shelter, or tools image is unavailable, run Host Bootstrap once.
+0. If the Confidential Agent CLI, Shelter, or tools image is unavailable, run Host Bootstrap once. The "third bash action" budget starts after this bootstrap succeeds and `confidential-agent --help` works.
 1. One command for CLI discovery: read schema docs first, then workflow docs.
 2. One command to clone/pin the upstream and inspect only README, primary manifest, Dockerfile or equivalent startup script, and one focused entrypoint/port file.
 3. The next command must write all four deliverables with heredocs: `confidential-agent.yaml`, install/runtime script, resource config, and `result.json`.

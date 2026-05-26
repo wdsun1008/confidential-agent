@@ -544,6 +544,28 @@ function specValidationForArtifacts(trialDir) {
   return { ok: child.status === 0, message: output || `spec validate exited ${child.status}` };
 }
 
+function hostBootstrapReady() {
+  const child = spawnSync(
+    "bash",
+    [
+      "-lc",
+      [
+        "command -v confidential-agent >/dev/null",
+        "command -v shelter >/dev/null",
+        "command -v podman >/dev/null",
+        "podman image inspect confidential-agent-tools:latest >/dev/null 2>&1",
+      ].join(" && "),
+    ],
+    {
+      env: process.env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: Number(process.env.CA_EVAL_BOOTSTRAP_READY_TIMEOUT_MS || "30000"),
+    },
+  );
+  return child.status === 0;
+}
+
 function artifactContractIssues(trialDir) {
   const result = readResultJson(trialDir);
   if (!result) return [];
@@ -724,6 +746,17 @@ function repeatedCommandReminder(repeatCount, blocked) {
     : `Repeated command reminder: the last command has run ${repeatCount} times in a row.`;
   return (
     `${prefix} Stop repeating read-only exploration. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json, then run spec validate/build as appropriate.`
+  );
+}
+
+function hostBootstrapProgressReminder(step, sentReminders) {
+  if (!ARTIFACT_FIRST_MILESTONES.includes(step)) return "";
+  const key = `host-bootstrap-${step}`;
+  if (sentReminders.has(key)) return "";
+  sentReminders.add(key);
+  return (
+    `Host Bootstrap reminder (step ${step}): Confidential Agent CLI, Shelter, or the tools image is still unavailable. ` +
+    "Run the skill's one-click install-only Host Bootstrap once. Do not draft the target AppSpec until `confidential-agent` works and CLI schema/workflow docs are available."
   );
 }
 
@@ -1005,7 +1038,7 @@ Rules:
 - Eval phase: ${phase}.
 - The only valid upstream target repository is exactly: ${expectedRepo || "the target_repo field in the task file"}.
 - If your result upstream_url differs from the task target_repo, the trial fails.
-- Artifact-first: by your third bash action, confidential-agent.yaml, the target install script, the resource config, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
+- Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
@@ -1160,15 +1193,23 @@ async function main() {
     }
     const validationReminder = artifactValidationReminder(trialDir);
     if (validationReminder) reminder += `\n\n${validationReminder}`;
-    const earlyArtifactReminder = artifactFirstReminder(trialDir, step, sentReminders);
-    if (earlyArtifactReminder) {
-      appendRunnerReminder(trialDir, step, "artifact-first", earlyArtifactReminder);
-      reminder += `\n\n${earlyArtifactReminder}`;
-    }
-    const readOnlyReminder = consecutiveReadOnlyReminder(trialDir, consecutiveReadOnlyCount, sentReminders);
-    if (readOnlyReminder) {
-      appendRunnerReminder(trialDir, step, `consecutive-readonly-${consecutiveReadOnlyCount}`, readOnlyReminder);
-      reminder += `\n\n${readOnlyReminder}`;
+    if (hostBootstrapReady()) {
+      const earlyArtifactReminder = artifactFirstReminder(trialDir, step, sentReminders);
+      if (earlyArtifactReminder) {
+        appendRunnerReminder(trialDir, step, "artifact-first", earlyArtifactReminder);
+        reminder += `\n\n${earlyArtifactReminder}`;
+      }
+      const readOnlyReminder = consecutiveReadOnlyReminder(trialDir, consecutiveReadOnlyCount, sentReminders);
+      if (readOnlyReminder) {
+        appendRunnerReminder(trialDir, step, `consecutive-readonly-${consecutiveReadOnlyCount}`, readOnlyReminder);
+        reminder += `\n\n${readOnlyReminder}`;
+      }
+    } else {
+      const bootstrapReminder = hostBootstrapProgressReminder(step, sentReminders);
+      if (bootstrapReminder) {
+        appendRunnerReminder(trialDir, step, "host-bootstrap", bootstrapReminder);
+        reminder += `\n\n${bootstrapReminder}`;
+      }
     }
     if (repeatReminder) reminder += `\n\n${repeatReminder}`;
     messages.push({
