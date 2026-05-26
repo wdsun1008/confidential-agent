@@ -20,6 +20,7 @@
 - Keep the upstream checkout in a subdirectory such as `upstream/`. Do not copy the whole repository into the work directory root; keep root deliverables easy to audit.
 - Pin the upstream commit before build and reference the full 40-hex commit from `git rev-parse HEAD` in the install script or copied source path.
 - Use `git clone --depth 1` or shallow fetch for discovery and runtime install unless the upstream requires full history.
+- Prefer clone/fetch of a pinned commit over guessed release/archive URLs. If an archive URL is necessary, verify the URL and archive contents before `confidential-agent build`, and keep `curl -f`/extraction checks in the install script so HTTP failures stop at the source-acquisition step.
 - Keep the install script non-interactive and fail-fast: `set -euo pipefail`.
 - Make install scripts idempotent and rebuild-safe. Before cloning or extracting into a target directory, remove or reuse that directory; the image builder or a debugging run may execute the script more than once.
 - Match upstream runtime versions from Dockerfile, `pyproject.toml`, `package.json` engines, lockfiles, or CI config before selecting OS packages. Do not downgrade a project that pins a modern runtime to a distro default.
@@ -76,7 +77,7 @@ Python:
 - Prefer `python -m <module>` over fragile relative script paths when upstream supports it.
 
 Node:
-- Install `nodejs` and `npm`. On Alinux/RHEL, use dnf package names such as `nodejs` and `npm`; if upstream requires a newer LTS than the base repo provides, enable the documented module stream in the install script before dependency installation.
+- Install `nodejs` and `npm`. On Alinux/RHEL, use dnf package names such as `nodejs` and `npm`; do not run `dnf`, `yum`, `apt`, or `apk` from the install script to add Node packages. If the required Node version is not available through `build.packages`, use a custom build input or report the concrete version gap.
 - Use `npm ci` when a lockfile exists; otherwise use `npm install --omit=dev`.
 - Avoid dev servers that bind only to localhost or require a TTY.
 

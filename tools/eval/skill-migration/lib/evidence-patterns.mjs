@@ -18,6 +18,31 @@ const CRITICAL_CLI = new RegExp(
 );
 const CRITICAL_CLI_VERB = String.raw`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\b`;
 
+export function evidenceCommandText(cmd) {
+  return stripHeredocBodies(cmd);
+}
+
+function stripHeredocBodies(cmd) {
+  const lines = String(cmd || "").split(/\r?\n/);
+  const output = [];
+  const pendingDelimiters = [];
+  const heredocRe = /<<-?\s*(?:"([^"]+)"|'([^']+)'|\\?([A-Za-z_][A-Za-z0-9_]*))/g;
+  for (const line of lines) {
+    if (pendingDelimiters.length) {
+      const delimiter = pendingDelimiters[0];
+      if (line.trim() === delimiter) pendingDelimiters.shift();
+      continue;
+    }
+    output.push(line);
+    heredocRe.lastIndex = 0;
+    let match;
+    while ((match = heredocRe.exec(line))) {
+      pendingDelimiters.push(match[1] || match[2] || match[3]);
+    }
+  }
+  return output.join("\n");
+}
+
 function criticalCommandPipedToNonTee(text) {
   const match = String(text || "").match(
     new RegExp(`${CA_COMMAND}(?:build|deploy|peering|status|connect|destroy)\\b[^\\n|]*\\|\\s*(\\S+)`, "i"),
@@ -31,7 +56,7 @@ function stripFdDupRedirects(text) {
 }
 
 export function commandLosesCriticalEvidence(cmd) {
-  const text = String(cmd || "");
+  const text = evidenceCommandText(cmd);
   if (!CRITICAL_CLI.test(text)) return false;
   const shellOperatorsText = stripFdDupRedirects(text);
   return (
@@ -46,7 +71,10 @@ export function commandLosesCriticalEvidence(cmd) {
 
 export function hasSuccessfulCommand(events, pattern) {
   return events.some(
-    (event) => pattern.test(event.cmd) && event.result?.code === 0 && !commandLosesCriticalEvidence(event.cmd),
+    (event) =>
+      pattern.test(evidenceCommandText(event.cmd)) &&
+      event.result?.code === 0 &&
+      !commandLosesCriticalEvidence(event.cmd),
   );
 }
 
@@ -62,7 +90,7 @@ function outputLooksLiveStatus(output) {
 
 export function hasSuccessfulLiveStatusEvidence(events) {
   return events.some((event) => {
-    if (!CA_STATUS_COMMAND.test(event.cmd)) return false;
+    if (!CA_STATUS_COMMAND.test(evidenceCommandText(event.cmd))) return false;
     if (event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) return false;
     return outputLooksLiveStatus(`${event.result?.stdout || ""}\n${event.result?.stderr || ""}`);
   });
@@ -98,10 +126,11 @@ export function compileOutputPatterns(patterns = []) {
 export function hasSuccessfulChatEvidence(events, pattern, outputPatterns = []) {
   const compiledOutputPatterns = Array.isArray(outputPatterns) ? compileOutputPatterns(outputPatterns) : [];
   return events.some((event) => {
-    if (!pattern.test(event.cmd) || event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) {
+    const commandText = evidenceCommandText(event.cmd);
+    if (!pattern.test(commandText) || event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) {
       return false;
     }
-    if (looksLikeFabricatedChatCommand(event.cmd)) return false;
+    if (looksLikeFabricatedChatCommand(commandText)) return false;
     const output = `${event.result?.stdout || ""}\n${event.result?.stderr || ""}`.trim();
     if (!output) return false;
     if (

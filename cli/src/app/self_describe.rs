@@ -107,6 +107,7 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
                 push_path_check(&mut checks, format!("build.scripts[{index}]"), script);
             }
             push_script_package_checks(&mut checks, &spec);
+            push_script_package_manager_checks(&mut checks, &spec);
             if let Some(debug) = &spec.build.variants.debug {
                 if let Some(ssh_public_key) = &debug.ssh_public_key {
                     push_path_check(
@@ -299,6 +300,79 @@ fn push_script_package_checks(checks: &mut Vec<SpecValidationCheck>, spec: &Agen
     }
 }
 
+fn push_script_package_manager_checks(checks: &mut Vec<SpecValidationCheck>, spec: &AgentSpec) {
+    if spec.build.base_image.is_some() || spec.build.scripts.is_empty() {
+        return;
+    }
+    let mut issues = Vec::new();
+    for script in &spec.build.scripts {
+        let Ok(text) = fs::read_to_string(script) else {
+            continue;
+        };
+        let uses = script_os_package_manager_uses(&text);
+        if !uses.is_empty() {
+            issues.push(format!(
+                "{} uses {}; put OS packages in build.packages instead",
+                script.display(),
+                uses.join(", ")
+            ));
+        }
+    }
+    if issues.is_empty() {
+        push_check(
+            checks,
+            "build.scripts.no_os_pkg_manager",
+            true,
+            "build scripts do not install OS packages with package managers",
+        );
+    } else {
+        push_check(
+            checks,
+            "build.scripts.no_os_pkg_manager",
+            false,
+            issues.join("; "),
+        );
+    }
+}
+
+fn script_os_package_manager_uses(script: &str) -> Vec<String> {
+    let mut uses = BTreeSet::new();
+    for line in script.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let words = script_words(line);
+        for window in words.windows(2) {
+            let command = window[0].as_str();
+            let subcommand = window[1].as_str();
+            let phrase = match (command, subcommand) {
+                ("apt-get" | "apt", "install" | "update" | "upgrade") => {
+                    Some(format!("{command} {subcommand}"))
+                }
+                ("yum" | "dnf" | "microdnf", "install" | "update" | "upgrade" | "module") => {
+                    Some(format!("{command} {subcommand}"))
+                }
+                ("apk", "add" | "update" | "upgrade") => Some(format!("{command} {subcommand}")),
+                _ => None,
+            };
+            if let Some(phrase) = phrase {
+                uses.insert(phrase);
+            }
+        }
+    }
+    uses.into_iter().collect()
+}
+
+fn script_words(line: &str) -> Vec<String> {
+    line.split(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '+'))
+    })
+    .filter(|token| !token.is_empty())
+    .map(|token| token.rsplit('/').next().unwrap_or(token).to_string())
+    .collect()
+}
+
 fn script_mentions_command(script: &str, command: &str) -> bool {
     script
         .split(|ch: char| {
@@ -432,7 +506,7 @@ Common optional keys:
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
-Use `confidential-agent spec validate --spec <path>` before build/deploy. Validation checks local file paths and common install-script command/package mismatches. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
+Use `confidential-agent spec validate --spec <path>` before build/deploy. Validation checks local file paths, common install-script command/package mismatches, and OS package-manager use inside build scripts. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
 For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 "#;
@@ -655,5 +729,55 @@ resources: {}
         let report = validate_spec_file(&spec_path);
 
         assert!(report.ok);
+    }
+
+    #[test]
+    fn spec_validate_rejects_script_os_package_install() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("install.sh"),
+            "#!/usr/bin/env bash\n# Do not run dnf install here.\ndnf install -y nodejs\n",
+        )
+        .unwrap();
+        let spec_path = temp.path().join("agent.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema: confidential-agent/v1
+service:
+  id: sample
+  ports: [8080]
+  connect: [8080]
+build:
+  image_name: sample
+  with_network: true
+  packages: [ca-certificates]
+  scripts: [./install.sh]
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g9i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-i
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        )
+        .unwrap();
+
+        let report = validate_spec_file(&spec_path);
+        let package_manager_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "build.scripts.no_os_pkg_manager")
+            .unwrap();
+
+        assert!(!report.ok);
+        assert!(!package_manager_check.ok);
+        assert!(package_manager_check.message.contains("dnf install"));
+        assert!(!package_manager_check.message.contains("# Do not run"));
     }
 }

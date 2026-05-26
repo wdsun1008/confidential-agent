@@ -18,6 +18,8 @@ curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_
   bash -s -- --repo "$CA_REPO" --ref "$CA_REF" install-only --non-interactive --yes
 ```
 
+There is no `install.sh` inside the skill directory. The bootstrap path is the one-click installer URL above; do not search for or construct installer paths under the skill source tree.
+
 `install-only` is one-time Confidential Agent host preparation, not part of the target-agent migration. Run it only when dependencies are absent or stale. It installs the Confidential Agent CLI, Shelter, and tools image; it does not install or configure host OpenClaw and does not need cloud or model-provider credentials. Do not use `deploy-openclaw` for bootstrap. If the task requires an external model provider or a host OpenClaw gateway and those are absent, report that host setup is incomplete instead of trying to provision them during a target migration. Do not run host diagnostic checks as part of the migration; use the available `confidential-agent` CLI directly after bootstrap.
 Once `install-only` succeeds and `confidential-agent --help` responds, do not re-read the installer script, re-run bootstrap, or run host diagnostics. Proceed directly to the target repository migration workflow.
 If you compress the bootstrap into one shell line, separate the variable assignments from `curl` with `;` or use literal values. Do not prefix `curl` with temporary assignments while also expanding those variables in the same command.
@@ -179,7 +181,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 - Keep `build.packages` to the minimum host OS packages needed to run the target install/startup path. Let pip, npm, uv, cargo, or the upstream installer handle application dependencies.
 - Close the loop between the install script and `build.packages`: if the script calls an external OS command before it creates that command itself, the matching Alinux/RHEL package must be listed. Do not assume the mkosi buildroot has archive, source-control, compiler, or language-package tools unless you declared them.
    - Pin the full upstream commit in the install script or copied source path; `result.json.upstream_commit` must be the 40-hex commit that the runtime installs.
-   - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history.
+   - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history. Prefer clone/fetch of the pinned commit over guessed release/archive URLs; if you use an archive URL, verify it before build and fail fast on HTTP or extraction errors.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.
    - Install scripts and systemd units run inside the guest image. Do not reference controller-only absolute paths such as trial directories, `/root/ca-eval-runs`, or the current host checkout; copy inputs with `build.files` to guest paths or clone the pinned upstream inside the image.
    - Move runtime configuration and secrets to resource files. Use environment variable references or injected files for secrets; do not leave `placeholder`, `YOUR_API_KEY_HERE`, `TODO`, `changeme`, example-only tokens, or fake ids in final resources.

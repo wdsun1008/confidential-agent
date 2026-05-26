@@ -39,8 +39,8 @@ const REPEATED_COMMAND_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_REPEATED_COMMAN
 const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_STALL_BLOCKS", 3);
 const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
 const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
-// Runner guard exits currently use 64-70 and 72-79; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79]);
+// Runner guard exits currently use 64-70 and 72-80; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -397,6 +397,35 @@ function forbiddenClone(cmd, expectedRepo, extraAllowedRepos = []) {
     if (actual && !allowed.has(actual)) return `${match[0]} (allowed ${Array.from(allowed).join(", ")})`;
   }
   return "";
+}
+
+function clonedGithubRepoNames(cmd) {
+  const repos = [];
+  const cloneRegex =
+    /\b(?:git(?:\s+-C\s+\S+)?\s+clone|gh\s+repo\s+clone)\b[^\n;&|]*?((?:https?:\/\/(?:[^@\s/]+@)?github\.com\/[^\s'"]+)|(?:git@github\.com:[^\s'"]+)|(?:(?:git\+)?ssh:\/\/git@github\.com\/[^\s'"]+))/gi;
+  let match;
+  while ((match = cloneRegex.exec(cmd))) {
+    const repo = normalizeGithubRepo(match[1]);
+    if (repo) repos.push(repo);
+  }
+  const ghBareRegex = /\bgh\s+repo\s+clone\s+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?)(?:\s|$)/gi;
+  while ((match = ghBareRegex.exec(cmd))) {
+    const repo = normalizeGithubRepo(match[1]);
+    if (repo) repos.push(repo);
+  }
+  const tarRegex =
+    /https?:\/\/(?:codeload\.)?github\.com\/([^/\s'"]+)\/([^/\s'"]+?)(?:\.git)?\/(?:archive|tarball|zipball|releases\/download)\b[^\s'"]*/gi;
+  while ((match = tarRegex.exec(cmd))) {
+    const repo = normalizeGithubRepo(`${match[1]}/${match[2]}`);
+    if (repo) repos.push(repo);
+  }
+  return repos;
+}
+
+function commandClonesExpectedRepo(cmd, expectedRepo) {
+  const expected = normalizeGithubRepo(expectedRepo);
+  if (!expected) return false;
+  return clonedGithubRepoNames(cmd).includes(expected);
 }
 
 function hasRequiredArtifacts(trialDir) {
@@ -971,6 +1000,7 @@ function containsForegroundConnectCommand(cmd) {
       if (!match) return false;
       if (/\b--render-only\b/i.test(segment)) return false;
       const tail = segment.slice(match.index + match[0].length);
+      if (/(^|\s)(?:--help|-h|help)(?:\s|$)/i.test(tail)) return false;
       return !/(^|[^0-9])&(?:\s|$)/.test(tail);
     });
 }
@@ -1008,8 +1038,35 @@ function containsDelayedCriticalCliCommand(cmd) {
   return false;
 }
 
-function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = []) {
+function targetMigrationArtifactPattern() {
+  return /(?:^|[\s"'`=:/])(?:\.\/)?(?:confidential-agent\.ya?ml|result\.json|install-[A-Za-z0-9_.-]+\.sh|[A-Za-z0-9_.-]*-service\.sh|resource[_-]?config\.(?:json|ya?ml)|app-config\.(?:json|ya?ml)|[A-Za-z0-9_.-]+-config\.ya?ml)\b/i;
+}
+
+function writesTargetMigrationArtifact(cmd) {
+  const stripped = stripHeredocBodies(cmd);
+  const targetArtifact = targetMigrationArtifactPattern();
+  if ((containsFileWriteShellSyntax(stripped) || commandMayWriteResultJson(stripped)) && targetArtifact.test(stripped)) {
+    return true;
+  }
+  const full = String(cmd || "");
+  return (
+    targetArtifact.test(full) &&
+    /\b(?:python3?|node|ruby)\b[\s\S]*(?:open\s*\([^)]*["']w|writeFileSync\s*\(|writeFile\s*\(|File\.write\s*\()/i.test(
+      full,
+    )
+  );
+}
+
+function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapReady = hostBootstrapReady()) {
   const guardCmd = stripHeredocBodies(cmd);
+  if (!bootstrapReady && (writesTargetMigrationArtifact(cmd) || commandClonesExpectedRepo(guardCmd, expectedRepo))) {
+    return Promise.resolve({
+      code: 80,
+      stdout: "",
+      stderr:
+        "Blocked target migration work before Host Bootstrap is ready. First install/verify the Confidential Agent CLI, Shelter, and tools image with the skill's one-click install-only flow; then read CLI docs/schema and create target artifacts.",
+    });
+  }
   const uncorroboratedFields = uncorroboratedResultTrueFieldsForCommand(cmd, cwd);
   if (uncorroboratedFields.length) {
     return Promise.resolve({
@@ -1220,7 +1277,7 @@ function phaseProgressionReminder(trialDir, step, sentReminders) {
     stage = deployAttempted ? "deploy-not-done" : "deploy-not-attempted";
     message = deployAttempted
       ? "Phase progression: a build has succeeded but deploy is still not complete. Do not delete images, kill builders, or rerun build unless deploy/live evidence proves the image must change. Focus on the deploy error, operator peering, or AppSpec/resources needed for deploy."
-      : "Phase progression: a build has succeeded but deploy has not been attempted. Add operator peering for this controller CIDR, then run `confidential-agent deploy --spec confidential-agent.yaml`.";
+      : "Phase progression: a build command has succeeded. Confirm the local build covers the selected `deploy.image_variant`, add operator peering for this controller CIDR, then run `confidential-agent deploy --spec confidential-agent.yaml`.";
   } else if (!liveDone) {
     stage = "live-status-not-done";
     message =
@@ -1382,6 +1439,7 @@ Rules:
 - Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
+- Do not construct GitHub raw URLs, release/archive URLs, or API URLs by guessing path conventions. Use URLs explicitly provided in the skill context, or clone/fetch repositories with git and verify the selected commit.
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
 - Do not manually edit, delete, or recreate Confidential Agent internal state files or directories under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
@@ -1549,12 +1607,12 @@ async function main() {
         ? {
             code: blockRepeatedReadOnly ? 72 : 75,
             stdout: "",
-          stderr:
-            readOnlyExploration
-              ? "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands."
-              : "[runner] Command blocked: the exact same shell action has repeated too many times. Inspect the latest output, change the artifact or CLI invocation, then rerun.",
-        }
-      : await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos);
+            stderr:
+              readOnlyExploration
+                ? "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands."
+                : "[runner] Command blocked: the exact same shell action has repeated too many times. Inspect the latest output, change the artifact or CLI invocation, then rerun.",
+          }
+      : await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos, bootstrapReadyBeforeCommand);
     if (RUNNER_GUARD_CODES.has(Number(result.code))) {
       addGuardBlock(metrics, result.code);
       writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "running", last_step: step });

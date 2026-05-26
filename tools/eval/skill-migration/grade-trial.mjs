@@ -6,6 +6,7 @@ import {
   E2E_COMMAND_EVIDENCE,
   commandLosesCriticalEvidence,
   hasSuccessfulChatEvidence,
+  hasSuccessfulCommand,
 } from "./lib/evidence-patterns.mjs";
 
 function arg(name, fallback = undefined) {
@@ -137,12 +138,6 @@ function toolResultText(events) {
     .map((event) => `${event.result?.stdout || ""}\n${event.result?.stderr || ""}`)
     .join("\n")
     .toLowerCase();
-}
-
-function hasSuccessfulCommand(events, pattern) {
-  return events.some(
-    (event) => pattern.test(event.cmd) && event.result?.code === 0 && !commandLosesCriticalEvidence(event.cmd),
-  );
 }
 
 function regexForTracePattern(pattern) {
