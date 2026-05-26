@@ -39,8 +39,9 @@ const REPEATED_COMMAND_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_REPEATED_COMMAN
 const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_STALL_BLOCKS", 3);
 const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
 const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
-// Runner guard exits currently use 64-70 and 72-80; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80]);
+const CONSECUTIVE_NO_ACTION_STALL_LIMIT = positiveIntEnv("CA_EVAL_CONSECUTIVE_NO_ACTION_STALL_LIMIT", 5);
+// Runner guard exits currently use 64-70 and 72-81; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -500,6 +501,31 @@ function readArtifactFromResult(trialDir, result, field) {
   }
 }
 
+function rawBuildFileTargets(specText) {
+  const targets = [];
+  for (const match of String(specText || "").matchAll(/^\s*target:\s*['"]?([^'"\s#]+)['"]?\s*$/gm)) {
+    targets.push(match[1]);
+  }
+  return targets;
+}
+
+function stagedSourcePathRefs(scriptText) {
+  const refs = new Set();
+  const sourcePathRe =
+    /\b(?:cp|rsync|tar|install)\b[^\n]*?(\/(?:tmp|opt|srv|app|workspace)[A-Za-z0-9_./-]*(?:source|src|upstream)[A-Za-z0-9_./-]*)/gi;
+  for (const match of String(scriptText || "").matchAll(sourcePathRe)) {
+    refs.add(match[1].replace(/[/.]+$/, ""));
+  }
+  return [...refs];
+}
+
+function pathCoveredByBuildTarget(ref, targets) {
+  return targets.some((target) => {
+    const clean = String(target || "").replace(/[/.]+$/, "");
+    return clean && (ref === clean || ref.startsWith(`${clean}/`) || clean.startsWith(`${ref}/`));
+  });
+}
+
 function readResultJson(trialDir) {
   try {
     return JSON.parse(fs.readFileSync(path.join(trialDir, "result.json"), "utf8"));
@@ -686,9 +712,15 @@ function artifactContractIssues(trialDir) {
   const specText = readArtifactFromResult(trialDir, result, "generated_spec");
   const installText = readArtifactFromResult(trialDir, result, "install_script");
   const resourceText = readArtifactFromResult(trialDir, result, "resource_config");
+  const deliverableText = `${specText}\n${installText}\n${resourceText}`;
   const appService = specText.match(/^\s*app_service:\s*['"]?([^'"\s#]+)['"]?\s*$/m)?.[1] || "";
   if (installText.trim().length < 80) {
     issues.push("install_script is empty or too small; it must install the target upstream and create its runtime service.");
+  }
+  if (/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/.test(deliverableText)) {
+    issues.push(
+      "do not bake the evaluation marker CA_CONFIDENTIAL_AGENT_EVAL_OK into the AppSpec, install script, service code, or resource config; it must appear only as live chat evidence from the deployed target.",
+    );
   }
   if (/(one-click|install-only|deploy-openclaw|CA_ONE_CLICK|\bCA_REF\b)/i.test(installText)) {
     issues.push("install_script appears to contain host-bootstrap or one-click installer content; replace it with the target agent runtime installer.");
@@ -706,6 +738,27 @@ function artifactContractIssues(trialDir) {
     issues.push(
       "build scripts must not rely on implicit user-local helper CLI paths; install helper CLIs into a stable prefix or set HOME/PATH explicitly and verify command -v before using them.",
     );
+  }
+  const commit = typeof result.upstream_commit === "string" ? result.upstream_commit : "";
+  if (
+    /^[0-9a-f]{40}$/i.test(commit) &&
+    !new RegExp(commit.slice(0, 12), "i").test(`${specText}\n${installText}`) &&
+    !/\bgit\s+(?:clone|fetch|checkout)\b/i.test(installText) &&
+    !/\bcurl\b[^\n]*(?:archive|\.tar|\.tgz|\.zip)/i.test(installText)
+  ) {
+    issues.push(
+      "install_script or spec must prove upstream provenance by referencing the pinned upstream commit, cloning/fetching it, or staging source copied from the pinned checkout; do not deploy a standalone replacement.",
+    );
+  }
+  const buildTargets = rawBuildFileTargets(specText);
+  for (const ref of stagedSourcePathRefs(installText)) {
+    const escapedRef = ref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const clonedToRef = new RegExp(`git\\s+clone[^\\n]*\\s${escapedRef}(?:\\s|$)`, "i").test(installText);
+    if (!pathCoveredByBuildTarget(ref, buildTargets) && !clonedToRef) {
+      issues.push(
+        `install_script reads ${ref}, but no build.files target stages that guest path; add a build.files entry for the upstream source or clone/download the pinned source inside the script.`,
+      );
+    }
   }
   if (
     /\bgit\s+clone\b/i.test(installText) &&
@@ -1057,6 +1110,17 @@ function writesTargetMigrationArtifact(cmd) {
   );
 }
 
+function commandBakesEvalMarkerIntoArtifact(cmd) {
+  const full = String(cmd || "");
+  if (!/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/.test(full)) return false;
+  if (!targetMigrationArtifactPattern().test(full)) return false;
+  return (
+    containsFileWriteShellSyntax(full) ||
+    containsStateMutationCommand(full) ||
+    /\b(?:python3?|node|ruby)\b[\s\S]*(?:writeFile|open\s*\()/i.test(full)
+  );
+}
+
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapReady = hostBootstrapReady()) {
   const guardCmd = stripHeredocBodies(cmd);
   if (!bootstrapReady && (writesTargetMigrationArtifact(cmd) || commandClonesExpectedRepo(guardCmd, expectedRepo))) {
@@ -1065,6 +1129,15 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
       stdout: "",
       stderr:
         "Blocked target migration work before Host Bootstrap is ready. First install/verify the Confidential Agent CLI, Shelter, and tools image with the skill's one-click install-only flow; then read CLI docs/schema and create target artifacts.",
+    });
+  }
+  if (commandBakesEvalMarkerIntoArtifact(cmd)) {
+    return Promise.resolve({
+      code: 81,
+      stdout: "",
+      stderr:
+        "Blocked artifact write that bakes CA_CONFIDENTIAL_AGENT_EVAL_OK into the deployed service or migration artifacts. " +
+        "The marker must appear only in the final chat request/response evidence through confidential-agent connect, not in app code, scripts, resources, or result metadata.",
     });
   }
   const uncorroboratedFields = uncorroboratedResultTrueFieldsForCommand(cmd, cwd);
@@ -1430,6 +1503,7 @@ When the task is complete, reply:
 
 Rules:
 - Do not use mock services or placeholder replacements for the target agent.
+- Do not write the eval marker, canned success responses, or standalone compatibility servers into the deployed app. If a wrapper is required, it must delegate to the real upstream runtime and surface upstream failures.
 - Do not print secrets.
 - Work in the current trial directory.
 - Keep final evidence in result.json as requested by the task result contract.
@@ -1440,6 +1514,7 @@ Rules:
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - Do not construct GitHub raw URLs, release/archive URLs, or API URLs by guessing path conventions. Use URLs explicitly provided in the skill context, or clone/fetch repositories with git and verify the selected commit.
+- Always run spec validation as: confidential-agent spec validate --spec confidential-agent.yaml --format json. The JSON output carries the actionable parse and artifact details.
 - In full phase, do not final until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are true and each true value is backed by a successful real command in this trial transcript.
 - Do not set result.json booleans to true optimistically. Update each one only after the matching CLI/probe/cleanup command exits 0.
 - Do not manually edit, delete, or recreate Confidential Agent internal state files or directories under .confidential-agent, CA_EVAL_CLI_STATE_DIR, or state/; use the public CLI and fix migration artifacts when a phase fails.
@@ -1490,6 +1565,7 @@ async function main() {
   let lastCommandKey = "";
   let repeatedCommandCount = 0;
   let consecutiveReadOnlyCount = 0;
+  let consecutiveNoActionCount = 0;
   writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "started", last_step: 0 });
 
   for (let step = 1; step <= MAX_STEPS; step += 1) {
@@ -1517,18 +1593,36 @@ async function main() {
     );
     const action = extractJson(content);
     if (!action || typeof action.action !== "string") {
+      consecutiveNoActionCount += 1;
       const narratedOutput = looksLikeNarratedToolOutput(content);
+      const remainingNoAction = Math.max(0, CONSECUTIVE_NO_ACTION_STALL_LIMIT - consecutiveNoActionCount);
+      const stallWarning =
+        consecutiveNoActionCount >= 3
+          ? ` Warning: ${remainingNoAction} more non-action response(s) will terminate this run.`
+          : "";
       const formatReminder = narratedOutput
-        ? "You wrote command/output prose instead of a JSON action. Do not fabricate stdout, stderr, or exit_code. Execute the next real command by replying with exactly one JSON object."
-        : 'Reply with exactly one JSON object: {"action":"bash","cmd":"...","why":"..."} or {"action":"final","summary":"..."}';
+        ? `You wrote command/output prose instead of a JSON action. Do not fabricate stdout, stderr, or exit_code. Execute the next real command by replying with exactly one JSON object.${stallWarning}`
+        : `Reply with exactly one JSON object: {"action":"bash","cmd":"...","why":"..."} or {"action":"final","summary":"..."}${stallWarning}`;
       if (narratedOutput && !sentReminders.has("narrated-tool-output")) {
         sentReminders.add("narrated-tool-output");
         appendRunnerReminder(trialDir, step, "narrated-tool-output", formatReminder);
+      }
+      if (consecutiveNoActionCount >= CONSECUTIVE_NO_ACTION_STALL_LIMIT) {
+        const message = `stalled_no_action: agent emitted ${consecutiveNoActionCount} consecutive non-action responses`;
+        writeAgentMetrics(trialDir, metrics, {
+          completed: false,
+          finish_reason: "stalled_no_action",
+          last_step: step,
+          error: message,
+        });
+        writeRunnerResultFailure(trialDir, "stalled_no_action", message);
+        throw new Error(message);
       }
       messages.push({ role: "assistant", content });
       messages.push({ role: "user", content: formatReminder });
       continue;
     }
+    consecutiveNoActionCount = 0;
     if (action.action === "final") {
       const artifactsOk = hasRequiredArtifacts(trialDir);
       const fullStatus = fullPhaseCompletionStatus(trialDir);

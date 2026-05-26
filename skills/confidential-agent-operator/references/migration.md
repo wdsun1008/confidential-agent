@@ -37,6 +37,7 @@
 - Do not reuse a host bootstrap or one-click installer as the target install script. The target install script must install the upstream application and create the unit named by `service.app_service`.
 - Every `ExecStart` and `WorkingDirectory` path must be created or installed by the install script. If you install into a virtualenv or project-local prefix, reference that same prefix in the unit.
 - If the target has no built-in server mode, expose a persistent listener that delegates to the real target runtime for each request. Do not return canned responses.
+- Do not write evaluator markers, canned success responses, or fallback acknowledgements into the deployed service. Verification text must come from a live request to the real target runtime.
 - Ensure the declared connect port appears in the service command, an Environment line, or a resource file that the service reads.
 - Do not call `systemctl start` during image build. Run `systemctl daemon-reload` and `systemctl enable <unit>.service`; the guest starts enabled units on boot.
 - Put resource targets under `/etc/<service>/`, `/root/.config/<service>/`, or the documented upstream config path.
@@ -44,6 +45,7 @@
 - Remove placeholder text such as TODO, changeme, placeholder, fake ids, and example-only secrets; leaving them means the migration is still a placeholder.
 - Resource files must contain concrete usable values. If the host environment exports a required key, write it from the environment without printing it; if the key is absent, record the missing secret and leave verification booleans false.
 - Use `build.with_network: true` when the build downloads packages or source.
+- `build.scripts` entries are local controller paths such as `./install-service.sh`; do not point them at the guest copy target. If a script reads a guest source directory such as `/tmp/<name>-source`, `/opt/<name>-src`, or `/opt/upstream`, add a matching `build.files[].target` or clone/fetch the pinned source inside the script first.
 - Use runtime downloads only when image-time downloads are impractical. If runtime downloads affect trust claims, record hashes separately.
 - Do not rewrite a deliverable unless a specific error from the latest validation, build, deploy, or verification output explains why that rewrite is needed. Cosmetic or identical heredoc rewrites are not progress.
 - After `confidential-agent spec validate` passes and artifacts are internally consistent, run build instead of continuing speculative artifact rewrites; use real build/deploy/status output for the next fix.

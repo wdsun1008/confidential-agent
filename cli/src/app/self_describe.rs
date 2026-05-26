@@ -148,7 +148,7 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
             }
         }
         Err(err) => {
-            push_check(&mut checks, "parse", false, err.to_string());
+            push_check(&mut checks, "parse", false, format_error_chain(&err));
             SpecValidationReport {
                 ok: false,
                 spec: spec_path.display().to_string(),
@@ -157,6 +157,19 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
                 checks,
             }
         }
+    }
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts = err.chain().map(|cause| cause.to_string());
+    let Some(first) = parts.next() else {
+        return err.to_string();
+    };
+    let rest = parts.collect::<Vec<_>>();
+    if rest.is_empty() {
+        first
+    } else {
+        format!("{first}: {}", rest.join(": "))
     }
 }
 
@@ -468,7 +481,7 @@ fn spec_schema_json() -> serde_json::Value {
             "with_network": "allow network during image build",
             "packages": "minimal OS packages installed by Shelter/mkosi",
             "files": "host files copied into the guest image",
-            "scripts": "guest build scripts executed inside the image",
+            "scripts": "controller-local script paths executed inside the guest image build; use relative paths such as ./install-service.sh, not guest target paths such as /tmp/install.sh",
             "variants": "optional release/debug variant map"
         },
         "deploy": {
@@ -506,9 +519,10 @@ Common optional keys:
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
-Use `confidential-agent spec validate --spec <path>` before build/deploy. Validation checks local file paths, common install-script command/package mismatches, and OS package-manager use inside build scripts. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
+Use `confidential-agent spec validate --spec <path> --format json` before build/deploy. Validation checks local file paths, common install-script command/package mismatches, OS package-manager use inside build scripts, and parse error details. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
 For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
+`build.scripts` entries are local script paths from the controller work directory, usually the same file listed in `build.files[].source`; they are not the guest `build.files[].target` path.
 "#;
 
 const OVERVIEW_DOC: &str = r#"
@@ -522,7 +536,7 @@ Useful self-description commands:
 - `confidential-agent docs workflow`
 - `confidential-agent docs appspec`
 - `confidential-agent spec schema`
-- `confidential-agent spec validate --spec <path>` or just `confidential-agent spec validate` (defaults to `confidential-agent.yaml`)
+- `confidential-agent spec validate --spec <path> --format json` or just `confidential-agent spec validate` (defaults to `confidential-agent.yaml`)
 "#;
 
 const WORKFLOW_DOC: &str = r#"
@@ -638,6 +652,48 @@ resources: {}
         assert!(failed.contains(&"build.variants.debug.ssh_public_key"));
         assert!(failed.contains(&"attestation.rekor.cosign_key"));
         assert!(failed.contains(&"attestation.rekor.slsa_generator"));
+    }
+
+    #[test]
+    fn spec_validate_parse_check_includes_source_chain() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec_path = temp.path().join("agent.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema: confidential-agent/v1
+service:
+  id: sample
+  ports: [8080]
+build:
+  image_name: sample
+  commands: []
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g9i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-i
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        )
+        .unwrap();
+
+        let report = validate_spec_file(&spec_path);
+        let parse_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "parse")
+            .unwrap();
+
+        assert!(!report.ok);
+        assert!(!parse_check.ok);
+        assert!(parse_check.message.contains("failed to parse agent spec"));
+        assert!(parse_check.message.contains("commands"));
     }
 
     #[test]

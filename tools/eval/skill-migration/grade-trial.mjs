@@ -329,6 +329,7 @@ addFinding(
 
 const appService = specText.match(/^\s*app_service:\s*['"]?([^'"\s#]+)['"]?\s*$/m)?.[1] || "";
 const serviceDefinitionText = `${installText}\n${serviceFileText}`;
+const deliverableTextNoResult = `${specText}\n${installText}\n${resourceText}`;
 const installCreatesAppService =
   Boolean(appService) &&
   serviceDefinitionText.includes(appService) &&
@@ -357,6 +358,12 @@ addFinding(
   !mockHttpServicePattern.test(serviceDefinitionText),
   "install_script_not_mock_http_service",
   "install script must not create a replacement HTTP service in place of the target agent",
+);
+addFinding(
+  findings,
+  !/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/.test(deliverableTextNoResult),
+  "eval_marker_not_baked",
+  "evaluation marker must not be baked into the spec, install script, resource config, or deployed app code",
 );
 const runtimePatterns = Array.isArray(grader.required_runtime_patterns) ? grader.required_runtime_patterns : [];
 const runtimeReferenced =
@@ -502,6 +509,7 @@ const stageFindings = {
     "install_script_exists",
     "resource_config_exists",
     "install_script_not_mock_http_service",
+    "eval_marker_not_baked",
     ...(runtimePatterns.length ? ["target_runtime_referenced"] : []),
   ],
   e2e: grader.required_boolean_fields || [],

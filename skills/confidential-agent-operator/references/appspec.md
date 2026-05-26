@@ -44,7 +44,8 @@ resources: {}
 - `resources` must be explicit even when empty.
 - Relative host paths are resolved from the spec file directory.
 - Release images must not include SSH. Use debug only for development/evaluation.
-- `build.scripts` entries are script file paths. Do not write inline shell snippets under `build.scripts`.
+- `build.scripts` entries are controller-local script file paths, usually the same files named by `build.files[].source`. Do not write inline shell snippets or guest target paths such as `/tmp/install.sh` under `build.scripts`.
+- If a build script reads a guest source directory, that directory must be created earlier in the script or staged with a matching `build.files[].target`.
 
 ## Resource Injection
 

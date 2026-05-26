@@ -45,6 +45,8 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Omit optional cloud ids such as `vpc_id`, `vswitch_id`, `security_group_id`, and `private_ip` unless real values are provided. Never write `fake-*`, `your-*`, or empty ids.
 - Do not add `deploy.security_group`, `deploy.security_group_ports`, or `deploy.security_group.rules` to the AppSpec. Security group ports come from `confidential-agent peering`, not AppSpec fields.
 - Do not finalize until `confidential-agent spec validate --spec confidential-agent.yaml --format json` succeeds after the latest edit.
+- Always use `--format json` with `confidential-agent spec validate`; use the JSON check message as the concrete reason for the next edit.
+- `build.scripts` entries are controller-local script paths such as `./install-service.sh`, usually the same file named by `build.files[].source`; do not use guest target paths such as `/tmp/install.sh` or `/usr/local/.../install-service.sh` there.
 - `service.app_service` must exactly match the systemd unit created and enabled by the install script.
 - `service.app_service` must start a long-running process that listens on at least one `service.connect` port. One-shot CLI invocations, interactive stdin-only sessions, `--help`/`--version` commands, and batch scripts that exit immediately are not valid service commands.
 - Every path in systemd `ExecStart` and `WorkingDirectory` must be created or installed by the install script. If the install uses a venv or project-local prefix, `ExecStart` must reference that same prefix.
@@ -58,6 +60,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - After a nonzero build, identify the final causal error before editing: the last package-manager failure, postinstall script error, missing dependency, or compilation failure. Make one artifact change that directly addresses that named error, validate, then rerun build; do not batch speculative fixes or rerun build without a named reason.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Runtime fixes must be made in the AppSpec, install script, or resources, then rebuilt and redeployed so the migration is reproducible.
 - `chat_ok` evidence must come from the deployed target service through `confidential-agent connect` or the host-side port it exposes. Do not use local `echo`, local scripts, direct guest SSH, or fabricated marker output as chat evidence.
+- Do not write the evaluation marker, canned success text, or generic compatibility-server responses into the AppSpec, install script, resource config, or deployed app code. The marker must only appear in the final live chat request/response transcript.
 - `confidential-agent destroy <service>` is the last success-phase operation. Do not destroy the deployed service until real `chat_ok` evidence exists. If you abandon a failed run and clean up, keep unfinished success booleans false.
 
 ## Canonical Skeleton
@@ -184,6 +187,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Use shallow clone/fetch such as `git clone --depth 1` unless the upstream requires history. Prefer clone/fetch of the pinned commit over guessed release/archive URLs; if you use an archive URL, verify it before build and fail fast on HTTP or extraction errors.
    - In `build.scripts`, reference script file paths such as `./install-service.sh`; do not put inline shell snippets there.
    - Install scripts and systemd units run inside the guest image. Do not reference controller-only absolute paths such as trial directories, `/root/ca-eval-runs`, or the current host checkout; copy inputs with `build.files` to guest paths or clone the pinned upstream inside the image.
+   - If the install script reads a guest source path such as `/tmp/<name>-source`, `/opt/<name>-src`, or `/opt/upstream`, the AppSpec must stage that exact path with `build.files[].target`, or the script must clone/fetch/download the pinned source itself before reading it.
    - Move runtime configuration and secrets to resource files. Use environment variable references or injected files for secrets; do not leave `placeholder`, `YOUR_API_KEY_HERE`, `TODO`, `changeme`, example-only tokens, or fake ids in final resources.
    - If a required provider key exists in the host environment, write it to the resource file without printing the value. If it is absent, record the missing secret and leave the corresponding verification boolean false; do not invent a fake value.
    - Produce these artifacts early in one batch: AppSpec YAML, install script, resource config, and a result/evidence file with upstream URL and pinned commit.
