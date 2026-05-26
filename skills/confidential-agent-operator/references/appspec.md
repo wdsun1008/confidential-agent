@@ -60,3 +60,15 @@ resources:
 ```
 
 The CLI hashes resources and the guest daemon verifies hash, mode, owner, and group before writing.
+
+## Schema Anti-Patterns
+
+| Wrong field | Correct replacement |
+| --- | --- |
+| Top-level `name` | `service.id` |
+| `apiVersion`, `kind`, or Kubernetes-style `spec` wrapper | Top-level `schema: confidential-agent/v1` |
+| `runtime` | `service.app_service` plus a systemd unit created by `build.scripts` |
+| `build.commands` | `build.scripts` containing script file paths |
+| `build.files.path` or `build.files[].path` | `build.files[].source` and `build.files[].target` |
+| `build.base_image: <docker-image>` | Omit it, unless using a real qcow2/raw disk image path or URL |
+| `deploy.security_group*` | Operator peering plus `service.ports` and `service.connect` |

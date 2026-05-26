@@ -22,6 +22,12 @@ const REQUESTED_MAX_STEPS = positiveIntEnv("CA_EVAL_MAX_STEPS", 150);
 const MAX_STEPS = Math.min(REQUESTED_MAX_STEPS, MAX_STEPS_CEILING);
 const COMMAND_TIMEOUT_MS = Number(process.env.CA_EVAL_COMMAND_TIMEOUT_MS || "600000");
 const MODEL_TIMEOUT_MS = Number(process.env.CA_EVAL_MODEL_TIMEOUT_MS || "180000");
+const MODEL_RETRY_MAX_ATTEMPTS = positiveIntEnv("CA_EVAL_MODEL_RETRY_MAX_ATTEMPTS", 5);
+const MODEL_RETRY_BASE_MS = Number(process.env.CA_EVAL_MODEL_RETRY_BASE_MS || "10000");
+const MODEL_RETRY_MAX_WAIT_MS = Number(process.env.CA_EVAL_MODEL_RETRY_MAX_WAIT_MS || "120000");
+const MODEL_RETRY_TOTAL_TIMEOUT_MS = Number(
+  process.env.CA_EVAL_MODEL_RETRY_TOTAL_TIMEOUT_MS || String(MODEL_TIMEOUT_MS * 4),
+);
 const MAX_OUTPUT_CHARS = Number(process.env.CA_EVAL_MAX_OUTPUT_CHARS || "12000");
 const DRY_EXEC = process.env.CA_EVAL_DRY_EXEC === "1";
 const ARTIFACT_FIRST_MILESTONES = [6, 12, 24];
@@ -171,6 +177,11 @@ function addUsage(total, usage) {
   total.prompt_tokens += usage.prompt_tokens;
   total.completion_tokens += usage.completion_tokens;
   total.total_tokens += usage.total_tokens;
+}
+
+function addModelRetry(metrics, waitMs) {
+  metrics.model_retry_count = (metrics.model_retry_count || 0) + 1;
+  metrics.model_retry_sleep_ms = (metrics.model_retry_sleep_ms || 0) + waitMs;
 }
 
 function writeAgentMetrics(trialDir, metrics, extra = {}) {
@@ -658,13 +669,53 @@ function artifactFirstReminder(trialDir, step, sentReminders) {
   );
 }
 
-async function chat(messages) {
+async function chat(messages, metrics) {
   const apiKey = process.env.DASHSCOPE_API_KEY || process.env.BAILIAN_API_KEY;
   if (!apiKey) throw new Error("missing DASHSCOPE_API_KEY or BAILIAN_API_KEY");
   const base = optionalEnv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/+$/, "");
   const model = requiredEnv("CA_EVAL_MODEL");
+  return chatWithRetry({ apiKey, base, model, messages, metrics });
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryAfterMs(headerValue) {
+  if (!headerValue) return null;
+  const seconds = Number(headerValue);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const dateMs = Date.parse(headerValue);
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  return null;
+}
+
+function isRetryableModelHttp(status) {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+function isRetryableModelError(error) {
+  const name = error?.name || "";
+  const code = error?.code || error?.cause?.code || "";
+  const message = String(error?.message || error || "");
+  return (
+    name === "AbortError" ||
+    ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN", "UND_ERR_SOCKET"].includes(code) ||
+    /\b(?:timeout|timed out|ECONNRESET|ETIMEDOUT|socket|fetch failed)\b/i.test(message)
+  );
+}
+
+function modelRetryDelayMs(attemptIndex, retryAfterHeader = "") {
+  const retryAfter = retryAfterMs(retryAfterHeader);
+  const exponential = MODEL_RETRY_BASE_MS * 2 ** attemptIndex;
+  const jitter = retryAfter == null ? Math.floor(Math.random() * 2000) : 0;
+  const raw = (retryAfter ?? exponential) + jitter;
+  return Math.max(0, Math.min(raw, MODEL_RETRY_MAX_WAIT_MS));
+}
+
+async function chatOnce({ apiKey, base, model, messages, timeoutMs }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(`${base}/chat/completions`, {
       method: "POST",
@@ -681,7 +732,12 @@ async function chat(messages) {
       signal: controller.signal,
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`model HTTP ${res.status}: ${truncate(text, 2000)}`);
+    if (!res.ok) {
+      const error = new Error(`model HTTP ${res.status}: ${truncate(text, 2000)}`);
+      error.status = res.status;
+      error.retryAfter = res.headers.get("retry-after") || "";
+      throw error;
+    }
     const parsed = JSON.parse(text);
     return {
       content: parsed.choices?.[0]?.message?.content || "",
@@ -690,6 +746,39 @@ async function chat(messages) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function chatWithRetry({ apiKey, base, model, messages, metrics }) {
+  const startedAt = Date.now();
+  let lastError;
+  for (let attempt = 0; attempt < MODEL_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    const elapsed = Date.now() - startedAt;
+    const remaining = MODEL_RETRY_TOTAL_TIMEOUT_MS - elapsed;
+    if (remaining <= 0) break;
+    try {
+      return await chatOnce({
+        apiKey,
+        base,
+        model,
+        messages,
+        timeoutMs: Math.max(1000, Math.min(MODEL_TIMEOUT_MS, remaining)),
+      });
+    } catch (error) {
+      lastError = error;
+      const retryable =
+        isRetryableModelHttp(error?.status) || (!error?.status && isRetryableModelError(error));
+      if (!retryable || attempt === MODEL_RETRY_MAX_ATTEMPTS - 1) break;
+      const waitMs = Math.min(modelRetryDelayMs(attempt, error?.retryAfter), Math.max(0, remaining));
+      if (metrics) addModelRetry(metrics, waitMs);
+      console.error(
+        `[agent] model request retry ${attempt + 1}/${MODEL_RETRY_MAX_ATTEMPTS - 1} after ${waitMs}ms: ${
+          error instanceof Error ? redact(error.message) : redact(String(error))
+        }`,
+      );
+      if (waitMs > 0) await sleepMs(waitMs);
+    }
+  }
+  throw lastError || new Error("model request retry budget exhausted");
 }
 
 function systemPrompt(skillDir, expectedRepo, skillBootstrapUrl, skillRef) {
@@ -749,6 +838,8 @@ async function main() {
     prompt_tokens: 0,
     completion_tokens: 0,
     total_tokens: 0,
+    model_retry_count: 0,
+    model_retry_sleep_ms: 0,
   };
   const sentReminders = new Set();
   writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "started", last_step: 0 });
@@ -757,7 +848,7 @@ async function main() {
     const remaining = MAX_STEPS - step + 1;
     let response;
     try {
-      response = await chat(messages);
+      response = await chat(messages, metrics);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       writeAgentMetrics(trialDir, metrics, {

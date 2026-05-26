@@ -19,6 +19,7 @@ curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_
 ```
 
 `install-only` is one-time Confidential Agent host preparation, not part of the target-agent migration. Run it only when dependencies are absent or stale. It installs the Confidential Agent CLI, Shelter, and tools image; it does not install or configure host OpenClaw and does not need cloud or model-provider credentials. Do not use `deploy-openclaw` for bootstrap. If the task requires an external model provider or a host OpenClaw gateway and those are absent, report that host setup is incomplete instead of trying to provision them during a target migration. Do not run host diagnostic checks as part of the migration; use the available `confidential-agent` CLI directly after bootstrap.
+Once `install-only` succeeds and `confidential-agent --help` responds, do not re-read the installer script, re-run bootstrap, or run host diagnostics. Proceed directly to the target repository migration workflow.
 
 ## Hard Fail Conditions
 
@@ -26,6 +27,7 @@ curl -fsSL "https://raw.githubusercontent.com/wdsun1008/confidential-agent/${CA_
 - Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `|| true`, chain another command with `;`, pipe to truncating filters such as `head` or `tail`, or redirect output to `/dev/null`.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - Use `schema: confidential-agent/v1`; do not use `apiVersion`, `kind`, or Kubernetes-style `spec:` wrappers.
+- Do not use deprecated or foreign schema fields such as top-level `name`, `runtime`, `build.commands`, or `build.files.path`; use the canonical skeleton and read `references/appspec.md` Schema Anti-Patterns if unsure.
 - Use only the public `confidential-agent` command; do not call helper binaries or wrapper names with product-specific suffixes.
 - Use `build.files[].executable: true`; do not use `build.files[].mode`.
 - Use `build.variants.debug.ssh_public_key` only when a real public key path exists; do not use `debug_ssh_key`.

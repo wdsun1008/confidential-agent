@@ -159,6 +159,8 @@ const rows = trials(workDir).map((dir) => {
     agent_failed_before_grading: runnerResult.agent_failed_before_grading ?? null,
     graded_after_agent_failure: runnerResult.graded_after_agent_failure ?? null,
     model_requests: agentMetrics.model_requests ?? null,
+    model_retry_count: agentMetrics.model_retry_count ?? null,
+    model_retry_sleep_ms: agentMetrics.model_retry_sleep_ms ?? null,
     prompt_tokens: agentMetrics.prompt_tokens ?? null,
     completion_tokens: agentMetrics.completion_tokens ?? null,
     total_tokens: agentMetrics.total_tokens ?? null,
@@ -192,6 +194,8 @@ let e2ePass = 0;
 let promptTokens = 0;
 let completionTokens = 0;
 let totalTokens = 0;
+let modelRetryCount = 0;
+let modelRetrySleepMs = 0;
 for (const row of rows) {
   const key = row.condition || "unknown";
   byCondition[key] ||= { total: 0, pass: 0, static_pass: 0, e2e_pass: 0 };
@@ -208,16 +212,22 @@ for (const row of rows) {
   promptTokens += Number(row.prompt_tokens || 0);
   completionTokens += Number(row.completion_tokens || 0);
   totalTokens += Number(row.total_tokens || 0);
+  modelRetryCount += Number(row.model_retry_count || 0);
+  modelRetrySleepMs += Number(row.model_retry_sleep_ms || 0);
   const modelKey = row.model || "unknown";
   tokensByModel[modelKey] ||= {
     trials: 0,
     model_requests: 0,
+    model_retry_count: 0,
+    model_retry_sleep_ms: 0,
     prompt_tokens: 0,
     completion_tokens: 0,
     total_tokens: 0,
   };
   tokensByModel[modelKey].trials += 1;
   tokensByModel[modelKey].model_requests += Number(row.model_requests || 0);
+  tokensByModel[modelKey].model_retry_count += Number(row.model_retry_count || 0);
+  tokensByModel[modelKey].model_retry_sleep_ms += Number(row.model_retry_sleep_ms || 0);
   tokensByModel[modelKey].prompt_tokens += Number(row.prompt_tokens || 0);
   tokensByModel[modelKey].completion_tokens += Number(row.completion_tokens || 0);
   tokensByModel[modelKey].total_tokens += Number(row.total_tokens || 0);
@@ -239,6 +249,8 @@ const report = {
     completion_tokens: completionTokens,
     total_tokens: totalTokens,
     avg_tokens_per_trial: rows.length ? Math.round(totalTokens / rows.length) : 0,
+    model_retry_count: modelRetryCount,
+    model_retry_sleep_ms: modelRetrySleepMs,
   },
   by_condition: Object.fromEntries(
     Object.entries(byCondition).map(([condition, value]) => [
@@ -271,6 +283,7 @@ lines.push(`- Pass: ${report.totals.pass} (${report.totals.pass_rate})`);
 lines.push(`- Static pass: ${report.totals.static_pass} (${report.totals.static_pass_rate})`);
 lines.push(`- E2E pass: ${report.totals.e2e_pass} (${report.totals.e2e_pass_rate})`);
 lines.push(`- Tokens: ${report.totals.total_tokens} total (${report.totals.prompt_tokens} prompt, ${report.totals.completion_tokens} completion), avg ${report.totals.avg_tokens_per_trial}/trial`);
+lines.push(`- Model retries: ${report.totals.model_retry_count} (${report.totals.model_retry_sleep_ms} ms sleep)`);
 lines.push(`- Skips: ${report.totals.skips}`);
 lines.push("");
 lines.push("## By Condition");
@@ -313,21 +326,21 @@ for (const row of rows) {
 lines.push("");
 lines.push("## Token Usage");
 lines.push("");
-lines.push("| Model | Condition | Model Requests | Prompt Tokens | Completion Tokens | Total Tokens |");
-lines.push("|---|---|---:|---:|---:|---:|");
+lines.push("| Model | Condition | Model Requests | Retries | Retry Sleep Ms | Prompt Tokens | Completion Tokens | Total Tokens |");
+lines.push("|---|---|---:|---:|---:|---:|---:|---:|");
 for (const row of rows) {
   lines.push(
-    `| ${row.model || "-"} | ${row.condition || "-"} | ${row.model_requests ?? "-"} | ${row.prompt_tokens ?? "-"} | ${row.completion_tokens ?? "-"} | ${row.total_tokens ?? "-"} |`,
+    `| ${row.model || "-"} | ${row.condition || "-"} | ${row.model_requests ?? "-"} | ${row.model_retry_count ?? "-"} | ${row.model_retry_sleep_ms ?? "-"} | ${row.prompt_tokens ?? "-"} | ${row.completion_tokens ?? "-"} | ${row.total_tokens ?? "-"} |`,
   );
 }
 lines.push("");
 lines.push("## Tokens By Model");
 lines.push("");
-lines.push("| Model | Trials | Model Requests | Prompt Tokens | Completion Tokens | Total Tokens |");
-lines.push("|---|---:|---:|---:|---:|---:|");
+lines.push("| Model | Trials | Model Requests | Retries | Retry Sleep Ms | Prompt Tokens | Completion Tokens | Total Tokens |");
+lines.push("|---|---:|---:|---:|---:|---:|---:|---:|");
 for (const [model, value] of Object.entries(report.tokens_by_model)) {
   lines.push(
-    `| ${model} | ${value.trials} | ${value.model_requests} | ${value.prompt_tokens} | ${value.completion_tokens} | ${value.total_tokens} |`,
+    `| ${model} | ${value.trials} | ${value.model_requests} | ${value.model_retry_count} | ${value.model_retry_sleep_ms} | ${value.prompt_tokens} | ${value.completion_tokens} | ${value.total_tokens} |`,
   );
 }
 if (skips.length) {
