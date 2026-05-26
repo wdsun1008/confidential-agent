@@ -16,7 +16,8 @@ service:
 Run the automated demo:
 
 ```bash
-tools/e2e/run-cmaas-e2e.sh
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+  tools/e2e/run.sh cmaas
 ```
 
 `install-cmaas.sh` installs `mcp-proxy` and `@modelcontextprotocol/server-memory`

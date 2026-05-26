@@ -158,7 +158,7 @@ confidential-agent/
 ├── tools/
 │   ├── Dockerfile         # confidential-agent-tools 镜像（hack/tng-2.6.0 + attestation-challenge-client）
 │   ├── policies/          # Trustee/OPA rego（生产 + dev）
-│   └── e2e/               # 端到端测试脚本
+│   └── e2e/               # 端到端测试 runner、case 模板与探针
 ├── hack/                  # 严格 pin 的 TNG 二进制、Shelter RPM、libtdx-verify RPM
 └── examples/
     ├── openclaw/          # OpenClaw + cai-pep（推荐起步）

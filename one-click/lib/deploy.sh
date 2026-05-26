@@ -365,7 +365,7 @@ run_chat_probe() {
     return
   fi
   log "running OpenClaw chat probe through connect"
-  if node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
+  if node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
     --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
     --token "$CA_GATEWAY_TOKEN" \
     --message "$CA_CHAT_MESSAGE" \
@@ -410,7 +410,7 @@ run_tdx_attestation_probe() {
   local out="$CA_WORK_DIR/tdx-skill-probe.json"
   local err="$CA_WORK_DIR/tdx-skill-probe.err"
   log "triggering OpenClaw tdx-remote-attestation skill"
-  if ! node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
+  if ! node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
     --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
     --token "$CA_GATEWAY_TOKEN" \
     --message "请使用 tdx-remote-attestation skill 验证当前 TDX 运行环境。必须执行 skill 文档中的 cai-pep attest collect-and-verify 命令；如果工具调用失败，请直接报告失败，不要改用 CPU flags、/dev/tdx_guest 或系统日志推断。" \

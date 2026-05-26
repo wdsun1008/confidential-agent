@@ -1,0 +1,14 @@
+{
+  "assets": [
+    {"source": "examples/openclaw/install-openclaw.sh", "target": "org-alpha/openclaw/install-openclaw.sh"},
+    {"source": "examples/openclaw/files", "target": "org-alpha/openclaw/files"},
+    {"source": "examples/openclaw/install-openclaw.sh", "target": "org-beta/openclaw/install-openclaw.sh"},
+    {"source": "examples/openclaw/files", "target": "org-beta/openclaw/files"}
+  ],
+  "templates": [
+    {"source": "templates/openclaw-alpha.yaml.tmpl", "target": "org-alpha/openclaw/openclaw.yaml"},
+    {"source": "templates/openclaw-alpha.json.tmpl", "target": "org-alpha/openclaw/openclaw.json", "mode": "0600"},
+    {"source": "templates/openclaw-beta.yaml.tmpl", "target": "org-beta/openclaw/openclaw.yaml"},
+    {"source": "templates/openclaw-beta.json.tmpl", "target": "org-beta/openclaw/openclaw.json", "mode": "0600"}
+  ]
+}

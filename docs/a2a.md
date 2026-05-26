@@ -215,7 +215,7 @@ export CA_TRUSTED_REKOR_URLS="https://rekor.sigstore.dev,https://rekor.example.c
 
 以下示例展示两个组织 alpha 与 beta 各自部署 OpenClaw confidential agent 并互相 A2A 调用的完整流程。
 
-> 完整的端到端脚本：[`tools/e2e/run-openclaw-a2a-e2e.sh`](../tools/e2e/run-openclaw-a2a-e2e.sh)。
+> 完整的端到端脚本：`tools/e2e/run.sh openclaw-a2a`。
 
 ### 5.1 前置条件
 
@@ -345,7 +345,7 @@ CLI fetch 失败不阻塞写入；daemon 端 fetch 是权威结果。
 confidential-agent --state-dir ./alpha-state connect &
 # stdout 示例：connect 127.0.0.1:18789 -> <alpha-public-ip>:18789 (openclaw)
 
-node tools/e2e/openclaw-a2a-responses-probe.mjs \
+node tools/e2e/probes/openclaw-a2a-responses-probe.mjs \
   --url http://127.0.0.1:18789 \
   --token "$ALPHA_TOKEN" \
   --peer beta \
@@ -662,4 +662,4 @@ a2a add ...     || true
 - [`architecture.md`](architecture.md) — 单组织 mesh 与远程证明通道
 - [A2A Protocol Spec v0.3.0](https://a2a-protocol.org/v0.3.0/specification/) — AgentCard 标准字段
 - [Sigstore Rekor](https://docs.sigstore.dev/logging/overview/) — transparency log 信任根
-- [`tools/e2e/run-openclaw-a2a-e2e.sh`](../tools/e2e/run-openclaw-a2a-e2e.sh) — 跨组织接入端到端脚本
+- `tools/e2e/run.sh openclaw-a2a` — 跨组织接入端到端脚本
