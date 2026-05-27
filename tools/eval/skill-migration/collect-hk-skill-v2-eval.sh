@@ -131,6 +131,20 @@ while IFS= read -r row; do
   collect_node "$row"
 done <"$RUN_DIR/nodes.jsonl"
 
+summarizer="$ROOT_DIR/tools/eval/skill-migration/summarize-results.mjs"
+if [[ -f "$summarizer" ]]; then
+  while IFS= read -r work_dir; do
+    [[ -n "$work_dir" ]] || continue
+    node "$summarizer" --work-dir "$work_dir" \
+      >"$work_dir/summary.stdout.local" \
+      2>"$work_dir/summary.stderr.local" || true
+  done < <(
+    find "$OUT_DIR" -name trial.json -print \
+      | while IFS= read -r trial_json; do dirname "$(dirname "$trial_json")"; done \
+      | sort -u
+  )
+fi
+
 find "$OUT_DIR" \
   \( -name report.md -o -name summary.json -o -name result.json -o -name grade.json -o -name trial.json -o -name agent-transcript.jsonl -o -name transcript.jsonl -o -name connect-ready.json -o -name verification.json \) \
   -print | sort >"$OUT_DIR/report-index.txt"
