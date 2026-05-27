@@ -52,7 +52,9 @@ run_case() {
   INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.gn8v-tee.4xlarge}"
   DISK_GB="${E2E_DISK_GB:-512}"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-vllm-$E2E_RUN_ID}"
+  WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
+  STATE_DIR="$(absolute_dir "$STATE_DIR")"
   CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-300000}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请用一句简短中文回复，说明 OpenClaw vLLM 服务可用。}"
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-}"
@@ -67,7 +69,6 @@ run_case() {
   require_cmd node
   require_cmd openssl
   require_cmd python3.11
-  require_cmd setsid
   require_cmd ssh
   require_cmd timeout
   require_cmd aliyun
@@ -125,7 +126,7 @@ run_case() {
   record_file_as_block "Live status:" "$WORK_DIR/status-live.json" json
 
   local connect_port
-  connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw-vllm /openclaw/ 4 180)"
+  connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw-vllm /openclaw/ 4 180 --service openclaw-vllm)"
   record "Connect mapped OpenClaw vLLM to \`127.0.0.1:$connect_port\`."
 
   local attempt

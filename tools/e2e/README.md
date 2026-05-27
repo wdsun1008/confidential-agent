@@ -28,6 +28,10 @@ confidential-agent spec validate --spec <case-spec>
 confidential-agent build --spec <case-spec>
 confidential-agent peering add --role operator --cidr <operator-cidr> --label ops
 confidential-agent deploy --spec <case-spec>
+confidential-agent status --live
+confidential-agent connect start --service <service-id> --ready-json <ready-json> --wait-ready <seconds>
+<case chat probe against the ready-json 127.0.0.1 endpoint>
+confidential-agent connect stop --ready-json <ready-json>
 ```
 
 Business peers are added only after deployment, followed by `confidential-agent peering apply`.
@@ -56,6 +60,8 @@ Provider credentials:
 - Aliyun: environment AK/SK or a usable active `aliyun` CLI profile.
 - Bailian cases: `DASHSCOPE_API_KEY` or `BAILIAN_API_KEY`.
 - Rekor mode: `cosign`, `rekor-cli`, and `E2E_COSIGN_KEY` or an auto-generated key under the work dir.
+
+Relative `E2E_WORK_DIR`, `E2E_STATE_DIR`, and `E2E_COSIGN_KEY` inputs are normalized to absolute paths before rendering AppSpecs, so validation behaves the same from any caller working directory.
 
 Keep local secret files such as `env.sh` outside the runner. If you use one, source it in your shell or translate it into the `export ...` commands above before invoking `tools/e2e/run.sh`; the E2E scripts must not source secret files themselves.
 

@@ -52,7 +52,7 @@ run_a2a_chat_probe() {
   local guest_host="$6"
   local guest_key="$7"
   local connect_port
-  connect_port="$(start_connect_until_local_port_ready "$state_dir" "$label")"
+  connect_port="$(start_connect_until_local_port_ready "$state_dir" "$label" --service openclaw)"
   record_cmd "node tools/e2e/probes/openclaw-a2a-responses-probe.mjs --url http://127.0.0.1:$connect_port --token '<redacted>' --peer $peer_id --message '<redacted>' --expect $marker"
   if ! node "$ROOT_DIR/tools/e2e/probes/openclaw-a2a-responses-probe.mjs" \
     --url "http://127.0.0.1:$connect_port" \
@@ -106,6 +106,7 @@ fetch_guest_a2a_diagnostics() {
 run_case() {
   INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.g8i.xlarge}"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-a2a-$E2E_RUN_ID}"
+  WORK_DIR="$(absolute_dir "$WORK_DIR")"
   ALPHA_DIR="$WORK_DIR/org-alpha"
   BETA_DIR="$WORK_DIR/org-beta"
   ALPHA_STATE_DIR="$ALPHA_DIR/state"
@@ -121,7 +122,6 @@ run_case() {
   require_cmd node
   require_cmd openssl
   require_cmd python3.11
-  require_cmd setsid
   require_cmd ssh
   require_cmd aliyun
   if [[ "$REFERENCE_VALUES" == "rekor" ]]; then

@@ -3,7 +3,9 @@
 run_case() {
   INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.g8i.xlarge}"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-bailian-$E2E_RUN_ID}"
+  WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
+  STATE_DIR="$(absolute_dir "$STATE_DIR")"
   CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-180000}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请只回复 CA_E2E_OK，不要输出其他内容。}"
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-CA_E2E_OK}"
@@ -17,7 +19,6 @@ run_case() {
   require_cmd node
   require_cmd openssl
   require_cmd python3.11
-  require_cmd setsid
   require_cmd ssh
   require_cmd aliyun
   if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
@@ -84,7 +85,7 @@ run_case() {
   record_file_as_block "Rendered connect TNG config stderr:" "$connect_render_err" text
 
   local connect_port
-  connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw /openclaw/ 4 180)"
+  connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw /openclaw/ 4 180 --service openclaw)"
   record "Connect mapped OpenClaw to \`127.0.0.1:$connect_port\`."
   if (( OPENCLAW_STABILIZE_SEC > 0 )); then
     log "waiting ${OPENCLAW_STABILIZE_SEC}s for OpenClaw gateway stabilization"

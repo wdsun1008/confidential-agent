@@ -332,7 +332,9 @@ run_case() {
   BASELINE_INSTANCE_TYPE="${E2E_BASELINE_INSTANCE_TYPE:-$INSTANCE_TYPE}"
   DISK_GB="${E2E_CMAAS_DISK_GB:-40}"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/cmaas-$E2E_RUN_ID}"
+  WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
+  STATE_DIR="$(absolute_dir "$STATE_DIR")"
   CMAAS_DIR="$WORK_DIR/cmaas"
   AGENT_DIR="$WORK_DIR/agent"
 

@@ -19,6 +19,7 @@ STEP_LOG="${STEP_LOG:-}"
 E2E_EXIT_CLEANUP_STARTED=0
 E2E_DEPLOY_ATTEMPTED=0
 E2E_CONNECT_PIDS=()
+E2E_CONNECT_READY_FILES=()
 E2E_DESTROY_TARGETS=()
 
 log() {
@@ -81,6 +82,23 @@ validate_modes() {
   esac
 }
 
+absolute_dir() {
+  local dir="$1"
+  mkdir -p "$dir"
+  (cd "$dir" && pwd -P)
+}
+
+absolute_existing_path() {
+  local file="$1"
+  [[ -e "$file" ]] || {
+    echo "path does not exist: $file" >&2
+    exit 2
+  }
+  local parent
+  parent="$(dirname "$file")"
+  printf '%s/%s' "$(cd "$parent" && pwd -P)" "$(basename "$file")"
+}
+
 init_step_log() {
   local title="$1"
   mkdir -p "$WORK_DIR"
@@ -111,6 +129,12 @@ register_destroy_target() {
 }
 
 cleanup_connects() {
+  local ready_file
+  for ready_file in "${E2E_CONNECT_READY_FILES[@]:-}"; do
+    cleanup_connect_ready "$ready_file"
+  done
+  E2E_CONNECT_READY_FILES=()
+
   local pid
   for pid in "${E2E_CONNECT_PIDS[@]:-}"; do
     [[ -n "$pid" ]] || continue
@@ -262,7 +286,7 @@ resolve_cosign_key() {
     return
   fi
   if [[ -n "${E2E_COSIGN_KEY:-}" ]]; then
-    printf '%s' "$E2E_COSIGN_KEY"
+    absolute_existing_path "$E2E_COSIGN_KEY"
     return
   fi
   mkdir -p "$WORK_DIR/secrets"
@@ -370,7 +394,7 @@ verify_cai_pep_binary() {
   }
 
   local tmp_dir socket stdout stderr pid ok
-  tmp_dir="$(mktemp -d "$WORK_DIR/cai-pep-verify.XXXXXX")"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ca-pep-verify.XXXXXX")"
   socket="$tmp_dir/pep.sock"
   stdout="$tmp_dir/stdout.log"
   stderr="$tmp_dir/stderr.log"
@@ -578,6 +602,28 @@ parse_connect_port() {
   awk '/^connect 127\.0\.0\.1:/ { split($2, a, ":"); print a[2]; exit }' "$log_path"
 }
 
+connect_ready_ports() {
+  local ready_json="$1"
+  [[ -s "$ready_json" ]] || return 0
+  python3.11 - "$ready_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    ready = json.load(f)
+for endpoint in ready.get("client_endpoints", []):
+    port = endpoint.get("local_port")
+    if port:
+        print(port)
+PY
+}
+
+cleanup_connect_ready() {
+  local ready_json="$1"
+  [[ -n "$ready_json" && -f "$ready_json" ]] || return 0
+  "$CA_BIN" --tools-image "$TOOLS_IMAGE" connect stop --ready-json "$ready_json" >/dev/null 2>&1 || true
+}
+
 cleanup_connect_pid() {
   local pid="$1"
   [[ -n "$pid" ]] || return 0
@@ -591,31 +637,41 @@ start_connect_until_http_ready() {
   local http_path="${3:-/openclaw}"
   local attempts="${4:-4}"
   local wait_seconds="${5:-180}"
+  if (($# >= 5)); then
+    shift 5
+  else
+    shift "$#"
+  fi
+  local extra_args=("$@")
   local attempt
   for attempt in $(seq 1 "$attempts"); do
     local log_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.log"
-    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" connect)
+    local stdout_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stdout"
+    local stderr_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stderr"
+    local ready_json="$WORK_DIR/$path_prefix-connect-attempt-$attempt-ready.json"
+    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" connect start "${extra_args[@]}" --ready-json "$ready_json" --wait-ready "$wait_seconds" --log-file "$log_path")
     record_cmd "$(cmd_string "${cmd[@]}")"
-    setsid "${cmd[@]}" >"$log_path" 2>&1 &
-    local pid=$!
-    E2E_CONNECT_PIDS+=("$pid")
-    local deadline=$((SECONDS + wait_seconds))
-    while (( SECONDS < deadline )); do
-      local port
-      port="$(parse_connect_port "$log_path" || true)"
-      if [[ -n "$port" ]] &&
-         curl -fsS --max-time 5 "http://127.0.0.1:$port$http_path" >/dev/null 2>&1; then
-        record_file_as_block "$path_prefix connect log:" "$log_path" text
+    if ! "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"; then
+      record_file_as_block "$path_prefix connect start stdout:" "$stdout_path" text
+      record_file_as_block "$path_prefix connect start stderr:" "$stderr_path" text
+      record_file_as_block "$path_prefix connect log:" "$log_path" text
+      sleep 10
+      continue
+    fi
+    E2E_CONNECT_READY_FILES+=("$ready_json")
+    record_file_as_block "$path_prefix connect start stdout:" "$stdout_path" text
+    record_file_as_block "$path_prefix connect start stderr:" "$stderr_path" text
+    record_file_as_block "$path_prefix connect ready:" "$ready_json" json
+    record_file_as_block "$path_prefix connect log:" "$log_path" text
+
+    local port
+    while IFS= read -r port; do
+      if [[ -n "$port" ]] && curl -fsS --max-time 5 "http://127.0.0.1:$port$http_path" >/dev/null 2>&1; then
         printf '%s\n' "$port"
         return 0
       fi
-      if ! kill -0 "$pid" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 2
-    done
-    record_file_as_block "$path_prefix connect attempt $attempt log:" "$log_path" text
-    cleanup_connect_pid "$pid"
+    done < <(connect_ready_ports "$ready_json")
+    cleanup_connect_ready "$ready_json"
     sleep 10
   done
   echo "connect did not become HTTP-ready after $attempts attempts" >&2
@@ -632,33 +688,31 @@ start_connect_until_local_port_ready() {
   local attempt
   for attempt in $(seq 1 "$attempts"); do
     local log_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.log"
-    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" connect "${extra_args[@]}")
+    local stdout_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stdout"
+    local stderr_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stderr"
+    local ready_json="$WORK_DIR/$path_prefix-connect-attempt-$attempt-ready.json"
+    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" connect start "${extra_args[@]}" --ready-json "$ready_json" --wait-ready "$wait_seconds" --log-file "$log_path")
     record_cmd "$(cmd_string "${cmd[@]}")"
-    setsid "${cmd[@]}" >"$log_path" 2>&1 &
-    local pid=$!
-    E2E_CONNECT_PIDS+=("$pid")
-    local deadline=$((SECONDS + wait_seconds))
-    while (( SECONDS < deadline )); do
-      local port
-      port="$(parse_connect_port "$log_path" || true)"
-      if [[ -n "$port" ]] && python3.11 - "$port" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1):
-    pass
-PY
-      then
-        record_file_as_block "$path_prefix connect log:" "$log_path" text
+    if ! "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"; then
+      record_file_as_block "$path_prefix connect start stdout:" "$stdout_path" text
+      record_file_as_block "$path_prefix connect start stderr:" "$stderr_path" text
+      record_file_as_block "$path_prefix connect log:" "$log_path" text
+      sleep 10
+      continue
+    fi
+    E2E_CONNECT_READY_FILES+=("$ready_json")
+    record_file_as_block "$path_prefix connect start stdout:" "$stdout_path" text
+    record_file_as_block "$path_prefix connect start stderr:" "$stderr_path" text
+    record_file_as_block "$path_prefix connect ready:" "$ready_json" json
+    record_file_as_block "$path_prefix connect log:" "$log_path" text
+
+    local port
+    port="$(connect_ready_ports "$ready_json" | head -n 1 || true)"
+    if [[ -n "$port" ]]; then
         printf '%s\n' "$port"
         return 0
-      fi
-      if ! kill -0 "$pid" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 2
-    done
-    record_file_as_block "$path_prefix connect attempt $attempt log:" "$log_path" text
-    cleanup_connect_pid "$pid"
+    fi
+    cleanup_connect_ready "$ready_json"
     sleep 10
   done
   echo "connect did not become local-port-ready after $attempts attempts" >&2
