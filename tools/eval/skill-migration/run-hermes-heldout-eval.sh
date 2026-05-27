@@ -164,6 +164,7 @@ Rules:
 - In full phase, if Confidential Agent CLI/Shelter/tools image dependencies are missing, bootstrap them with the one-click installer install-only flow before the real build/deploy/connect/chat flow.
 - In full phase, do not finish until build_ok, deploy_ok, live_status_ok, connect_ok, chat_ok, and cleanup_ok are all backed by successful commands in this trial.
 - In full phase, chat_ok requires a real conversation through confidential-agent connect. Health, status, config, version, or model-list probes are not enough. Ask the running target agent to reply with CA_CONFIDENTIAL_AGENT_EVAL_OK and capture that response.
+- Keep a Service Surface Proof: the startup command, dependency closure, declared connect port, and final chat endpoint must all describe the same upstream service mode or bridge chain.
 - Write final trial metadata to:
   $trial_dir/result.json
 EOF

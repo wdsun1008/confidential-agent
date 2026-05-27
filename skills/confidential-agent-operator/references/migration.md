@@ -32,6 +32,8 @@
 - Omit `build.base_image` for normal mkosi builds. Use it only for a provided qcow2/raw disk-image path or URL; it is not a Docker/Podman image reference.
 - If upstream docs are ambiguous, choose the simplest documented server mode and record the assumption.
 - Identify the startup path in this order before guessing: Dockerfile `CMD`/`ENTRYPOINT` or compose command, upstream init/supervisor scripts, `pyproject.toml` `[project.scripts]`, `package.json` server/start scripts, README server quick start, then focused source files that define routes or ports.
+- Keep a Service Surface Proof before build: the `ExecStart` command, optional dependency closure, declared listen port, and `verification.json.chat_path` must describe the same upstream service mode or bridge chain.
+- If the selected mode requires optional extras, plugins, adapters, or provider packages that are not installed by the default dependency command, install them explicitly and add an import or command check to the install script.
 - Bind services to `0.0.0.0` inside the guest so TNG can reach them.
 - Create a systemd service under `/etc/systemd/system/<unit>.service`, enable that exact unit, and set `service.app_service` to the same unit name.
 - `ExecStart` must run a long-lived service that listens on at least one declared `service.connect` port. One-shot commands, interactive stdin-only sessions, and help/status commands are not valid services.

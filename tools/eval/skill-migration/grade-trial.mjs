@@ -85,6 +85,24 @@ function readArtifact(trialDir, value) {
   return "";
 }
 
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function chatPathEvidenceSegments(chatPath) {
+  return String(chatPath || "")
+    .split(/[^A-Za-z0-9_]+/)
+    .filter((segment) => segment.length > 3 && !/^(?:api|chat|message|messages|completion|completions|response|responses|generate|invoke|query|prompt|predict|models?)$/i.test(segment));
+}
+
+function textMentionsChatPath(text, chatPath) {
+  if (!chatPath) return false;
+  const haystack = String(text || "");
+  if (haystack.includes(chatPath)) return true;
+  const segments = chatPathEvidenceSegments(chatPath);
+  return segments.length > 0 && segments.some((segment) => new RegExp(escapeRegExp(segment), "i").test(haystack));
+}
+
 function readTopLevelServiceFiles(trialDir) {
   try {
     return fs
@@ -500,6 +518,18 @@ addFinding(
   Boolean(chatPath),
   "verification_chat_path",
   "verification.json must declare the chat request path",
+);
+const serviceSurfaceText = `${installText}\n${resourceText}`;
+const verificationPort = String(verificationPlan?.chat_guest_port || "").trim();
+const surfacePortMentioned =
+  verificationPort && new RegExp(`\\b${escapeRegExp(verificationPort)}\\b`).test(serviceSurfaceText);
+const surfacePathMentioned = textMentionsChatPath(serviceSurfaceText, chatPath);
+addFinding(
+  findings,
+  Boolean(surfacePortMentioned || surfacePathMentioned),
+  "surface_proof_coherent",
+  "install script or runtime config should reference the declared chat port or endpoint path, proving they trace to the same service mode",
+  { detail: `port=${verificationPort || "<missing>"} path=${chatPath || "<missing>"}`, soft: true },
 );
 const chatEvidenceOptions = { renderedLocalPorts, chatPath };
 const chatCandidateEvents = events.filter(

@@ -948,6 +948,60 @@ function artifactContractIssues(trialDir) {
   return issues;
 }
 
+function chatPathEvidenceSegments(chatPath) {
+  return String(chatPath || "")
+    .split(/[^A-Za-z0-9_]+/)
+    .filter((segment) => segment.length > 3 && !/^(?:api|chat|message|messages|completion|completions|response|responses|generate|invoke|query|prompt|predict|models?)$/i.test(segment));
+}
+
+function textMentionsChatPath(text, chatPath) {
+  if (!chatPath) return false;
+  const haystack = String(text || "");
+  if (haystack.includes(chatPath)) return true;
+  const segments = chatPathEvidenceSegments(chatPath);
+  return segments.length > 0 && segments.some((segment) => new RegExp(escapeRegExp(segment), "i").test(haystack));
+}
+
+function artifactContractWarnings(trialDir) {
+  const result = readResultJson(trialDir);
+  if (!result) return [];
+  const warnings = [];
+  const installText = readArtifactFromResult(trialDir, result, "install_script");
+  const resourceText = readArtifactFromResult(trialDir, result, "resource_config");
+  const verification = readJson(path.join(trialDir, "verification.json"), null);
+  if (!verification || typeof verification !== "object") return warnings;
+
+  const chatPath = String(verification.chat_path || "").trim();
+  const chatPort = String(verification.chat_guest_port || "").trim();
+  const serviceSurfaceText = `${installText}\n${resourceText}`;
+  const observedOutputText = toolEventsFromTranscript(trialDir)
+    .map((event) => `${event.result?.stdout || ""}\n${event.result?.stderr || ""}`)
+    .join("\n")
+    .slice(-200_000);
+  const portInServiceSurface =
+    chatPort && new RegExp(`\\b${escapeRegExp(chatPort)}\\b`).test(serviceSurfaceText);
+  const pathInServiceSurface = textMentionsChatPath(serviceSurfaceText, chatPath);
+  const pathObservedInOutput = textMentionsChatPath(observedOutputText, chatPath);
+
+  if (chatPath && chatPort && !pathInServiceSurface && !pathObservedInOutput && !portInServiceSurface) {
+    warnings.push(
+      "Service Surface Proof: startup command, declared port, and chat endpoint have no shared evidence in command output or runtime artifacts. Re-check that they describe the same service process.",
+    );
+  } else {
+    if (chatPath && !pathInServiceSurface && !pathObservedInOutput) {
+      warnings.push(
+        "Service Surface Proof: verification.json.chat_path was not observed in command output or the install/runtime files. Confirm it comes from the selected upstream service mode instead of endpoint naming intuition.",
+      );
+    }
+    if (chatPort && !portInServiceSurface) {
+      warnings.push(
+        "Service Surface Proof: verification.json.chat_guest_port is not visible in the install script or runtime config. Confirm ExecStart or a loaded config makes the selected process listen on that port.",
+      );
+    }
+  }
+  return warnings;
+}
+
 function forbiddenEvalWorkspaceReference(cmd, cwd) {
   const current = path.resolve(cwd);
   const re = /\/root\/ca-eval-runs(?:\/[^\s"'`;&|)]*)?/g;
@@ -965,7 +1019,10 @@ function artifactValidationReminder(trialDir) {
   if (!fs.existsSync(path.join(trialDir, "result.json"))) return "";
   const validation = specValidationForArtifacts(trialDir);
   const issues = artifactContractIssues(trialDir);
-  if (validation.ok && !issues.length) return "Artifact validation: confidential-agent spec validate currently passes and the artifact contract looks consistent.";
+  const warnings = artifactContractWarnings(trialDir);
+  if (validation.ok && !issues.length && !warnings.length) {
+    return "Artifact validation: confidential-agent spec validate currently passes and the artifact contract looks consistent.";
+  }
   const parts = [];
   if (!validation.ok) {
     parts.push(`confidential-agent spec validate failed:\n${validation.message}`);
@@ -973,7 +1030,13 @@ function artifactValidationReminder(trialDir) {
   if (issues.length) {
     parts.push(`artifact contract issues:\n- ${issues.join("\n- ")}`);
   }
-  return `Artifact validation failed. Fix the deliverables before build/deploy/final:\n${parts.join("\n\n")}`;
+  if (warnings.length) {
+    parts.push(`artifact contract warnings:\n- ${warnings.join("\n- ")}`);
+  }
+  if (!validation.ok || issues.length) {
+    return `Artifact validation failed. Fix the deliverables before build/deploy/final:\n${parts.join("\n\n")}`;
+  }
+  return `Artifact validation warning:\n${parts.join("\n\n")}`;
 }
 
 function stripHeredocBodies(cmd) {
@@ -1666,7 +1729,7 @@ function phaseProgressionReminder(trialDir, step, sentReminders) {
   } else if (!chatDone) {
     stage = "chat-not-done";
     message =
-      "Phase progression: connect is available. Send a real chat/API request through the connected service and capture the service response. Local echo/print/scripted marker output is not chat evidence.";
+      "Phase progression: connect is available. Send a real chat/API request through the connected service and capture the service response; if it fails, return to Service Surface Proof by checking service logs, the ExecStart process, dependency/import checks for the selected mode, and whether verification.json.chat_path exists on the declared listener before rebuilding the inconsistent artifact.";
   } else if (!cleanupDone) {
     stage = "cleanup-not-done";
     message = "Phase progression: chat evidence is present. Clean up with `confidential-agent destroy <service-id>` and record cleanup_ok only after the CLI succeeds.";
@@ -1817,6 +1880,7 @@ Rules:
 - Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, verification.json, verify-chat.sh, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
 - result.json.resource_config must be the guest runtime config file declared under confidential-agent.yaml resources.*.source. It must not be verification.json, verify-chat.sh, result.json, the AppSpec, or the install script.
 - verification.json must be a flat top-level object with service_id, chat_guest_port, chat_method, and chat_path. Do not nest those keys under chat_probe, request, or another wrapper.
+- Service Surface Proof: the startup command in ExecStart, its dependency closure, the listen port in service.connect, and the chat endpoint in verification.json must all trace to the same upstream service mode or bridge chain. If that mode needs optional extras, plugins, or adapters, install them explicitly and include an import or command check.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - Do not construct GitHub raw URLs, release/archive URLs, or API URLs by guessing path conventions. Use URLs explicitly provided in the skill context, or clone/fetch repositories with git and verify the selected commit.
