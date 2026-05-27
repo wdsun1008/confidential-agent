@@ -601,6 +601,10 @@ pub(super) fn render_connect_config(state_dir: &Path) -> Result<serde_json::Valu
                 "connect 127.0.0.1:{} -> {}:{} ({})",
                 local_port, host, remote_port, service.service_id
             );
+            eprintln!(
+                "CONNECT_FORWARD host=127.0.0.1 port={} remote_host={} remote_port={} service={}",
+                local_port, host, remote_port, service.service_id
+            );
             ingress.push(serde_json::json!({
                 "mapping": {
                     "in": {
@@ -646,6 +650,10 @@ pub(super) fn render_agent_card_connect_config_with_port_checker(
             used_local_ports.insert(local_port);
             eprintln!(
                 "connect 127.0.0.1:{} -> {}:{} ({})",
+                local_port, ext.public_ip, remote_port, ext.id
+            );
+            eprintln!(
+                "CONNECT_FORWARD host=127.0.0.1 port={} remote_host={} remote_port={} service={}",
                 local_port, ext.public_ip, remote_port, ext.id
             );
             Ok(local_port)

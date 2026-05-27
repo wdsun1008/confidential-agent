@@ -40,8 +40,10 @@ const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_S
 const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
 const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
 const CONSECUTIVE_NO_ACTION_STALL_LIMIT = positiveIntEnv("CA_EVAL_CONSECUTIVE_NO_ACTION_STALL_LIMIT", 5);
-// Runner guard exits currently use 64-70 and 72-81; 71 is intentionally unused.
-const RUNNER_GUARD_CODES = new Set([64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]);
+// Runner guard exits currently use 64-70 and 72-83; 71 is intentionally unused.
+const RUNNER_GUARD_CODES = new Set([
+  64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83,
+]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
   console.error(`[agent] CA_EVAL_MAX_STEPS=${REQUESTED_MAX_STEPS} capped at ${MAX_STEPS_CEILING}`);
@@ -509,6 +511,18 @@ function rawBuildFileTargets(specText) {
   return targets;
 }
 
+function rawLocalSourcePaths(specText) {
+  const sources = [];
+  for (const match of String(specText || "").matchAll(/^\s*source:\s*['"]?([^'"\s#]+)['"]?\s*$/gm)) {
+    const value = match[1];
+    if (!value || /^[a-z][a-z0-9+.-]*:\/\//i.test(value) || path.isAbsolute(value)) continue;
+    const normalized = path.normalize(value);
+    if (normalized === "." || normalized.startsWith("..")) continue;
+    sources.push(normalized);
+  }
+  return [...new Set(sources)];
+}
+
 function stagedSourcePathRefs(scriptText) {
   const refs = new Set();
   const sourcePathRe =
@@ -734,6 +748,25 @@ function artifactContractIssues(trialDir) {
   if (/\b(?:apt-get|apk|yum|dnf)\s+(?:install|update)\b/i.test(installText)) {
     issues.push("do not install OS packages inside build scripts; put OS packages in build.packages and keep the install script focused on the target application.");
   }
+  if (
+    /\b(?:(?:python3?|pip3?)\s+(?:-m\s+)?pip\s+install|pip3?\s+install|uv\s+(?:pip\s+install|sync)|npm\s+(?:install|ci)|cargo\s+build)\b[^\n]*(?:\|\|\s*(?:true|:)|;\s*true\b)/i.test(
+      installText,
+    )
+  ) {
+    issues.push(
+      "required dependency installs must be fail-fast; remove `|| true` or ignored exits from main pip/npm/uv/cargo install commands and scope fallbacks only to optional extras.",
+    );
+  }
+  const runtimeConfigText = `${installText}\n${resourceText}`;
+  if (
+    /(?:\b(?:--host|--bind|HOST|BIND|LISTEN_HOST)\b\s*[=:]?\s*['"]?(?:127\.0\.0\.1|localhost)\b|["']?(?:host|bind|listen_host|listenHost|address)["']?\s*:\s*["'](?:127\.0\.0\.1|localhost)["'])/i.test(
+      runtimeConfigText,
+    )
+  ) {
+    issues.push(
+      "the runtime service appears to bind only to 127.0.0.1/localhost; services exposed through service.connect must listen on 0.0.0.0 or all interfaces.",
+    );
+  }
   if (/(?:^|\/)\.local\/bin\/(?:uv|poetry|pnpm|yarn|npm|node)\b|astral\.sh\/uv\/install\.sh/i.test(installText)) {
     issues.push(
       "build scripts must not rely on implicit user-local helper CLI paths; install helper CLIs into a stable prefix or set HOME/PATH explicitly and verify command -v before using them.",
@@ -751,6 +784,12 @@ function artifactContractIssues(trialDir) {
     );
   }
   const buildTargets = rawBuildFileTargets(specText);
+  for (const source of rawLocalSourcePaths(specText)) {
+    const sourcePath = path.join(trialDir, source);
+    if (!fs.existsSync(sourcePath)) {
+      issues.push(`AppSpec source path '${source}' does not exist in the trial directory; create it before build or remove the build/resource reference.`);
+    }
+  }
   for (const ref of stagedSourcePathRefs(installText)) {
     const escapedRef = ref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const clonedToRef = new RegExp(`git\\s+clone[^\\n]*\\s${escapedRef}(?:\\s|$)`, "i").test(installText);
@@ -1058,6 +1097,40 @@ function containsForegroundConnectCommand(cmd) {
     });
 }
 
+function containsUnsafeBackgroundConnectCommand(cmd) {
+  return String(cmd || "")
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(/\s*(?:&&|\|\||;)\s*/))
+    .some((segment) => {
+      if (!/\bconfidential-agent(?:\s+--[A-Za-z0-9_-]+(?:[=\s][^\s;&|]+)?)*\s+connect\b/i.test(segment)) {
+        return false;
+      }
+      if (/\b--render-only\b|(?:^|\s)(?:--help|-h|help)(?:\s|$)/i.test(segment)) return false;
+      if (!/(^|[^0-9])&(?:\s|$)/.test(segment)) return false;
+      const hasNohup = /\bnohup\s+confidential-agent\b/i.test(segment);
+      const hasStdinDetach = /(?:^|\s)(?:0?<\s*\/dev\/null)(?:\s|$)/.test(segment);
+      const hasStdoutFile = /(?:^|\s)(?:1?>|&>)\s*(?!&|\/dev\/(?:null|stdout|stderr)\b)\S+/.test(segment);
+      const hasStderrToStdout = /\b2>&1\b|(?:^|\s)&>\s*\S+/.test(segment);
+      return !(hasNohup && hasStdinDetach && hasStdoutFile && hasStderrToStdout);
+    });
+}
+
+function commandKillsInfrastructureProcess(cmd) {
+  const stripped = stripHeredocBodies(cmd);
+  return String(stripped || "")
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(/\s*(?:&&|\|\||;)\s*/))
+    .some((segment) => {
+      const text = segment.trim();
+      if (!text) return false;
+      const broadKill = /\b(?:pkill|killall)\b/.test(text) || /\bkill\s+-9\b[\s\S]*\b(?:pgrep|pidof)\b/.test(text);
+      if (!broadKill) return false;
+      return /\b(?:confidential-agent|shelter|mkosi|terraform|runner|run-hermes-heldout-eval|shell-agent-runner)\b/i.test(
+        text,
+      );
+    });
+}
+
 function containsBlockedShelterInvocation(cmd) {
   return String(cmd || "")
     .split(/\r?\n/)
@@ -1161,12 +1234,30 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
     });
   }
   if (DRY_EXEC) return Promise.resolve({ code: 0, stdout: "", stderr: `DRY_EXEC skipped: ${cmd}` });
+  if (commandKillsInfrastructureProcess(guardCmd)) {
+    return Promise.resolve({
+      code: 82,
+      stdout: "",
+      stderr:
+        "Blocked broad process-kill command targeting Confidential Agent, Shelter, mkosi, Terraform, or runner process names. " +
+        "Only stop a PID that this trial explicitly started and recorded, such as a saved connect tunnel PID.",
+    });
+  }
   if (containsForegroundConnectCommand(guardCmd)) {
     return Promise.resolve({
       code: 77,
       stdout: "",
       stderr:
         "Blocked foreground confidential-agent connect. connect is a long-running tunnel; start it in the background, preserve stdout/stderr in a log, capture the PID, probe the host-side port, then stop the tunnel before destroy.",
+    });
+  }
+  if (containsUnsafeBackgroundConnectCommand(guardCmd)) {
+    return Promise.resolve({
+      code: 83,
+      stdout: "",
+      stderr:
+        "Blocked unsafe background confidential-agent connect. Use `confidential-agent connect --render-only` to get the local port, then start the tunnel as `nohup confidential-agent connect </dev/null >connect.log 2>&1 &` and save `$!`. " +
+        "Background connect commands that inherit the shell action stdout/stderr can hang the controller instead of returning to the next probe.",
     });
   }
   if (containsBlockedShelterInvocation(guardCmd)) {
@@ -1523,7 +1614,7 @@ Rules:
 - Do not prepend long sleeps before confidential-agent build/deploy/status/connect/destroy. Run the command directly; if it is still running, wait for that command or inspect its real log from a separate read-only command.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
-- confidential-agent connect is a long-running tunnel. In this single-shell eval, run it in the background with stdout/stderr saved to a log, capture its PID, probe the host-side port, and stop the tunnel after chat verification.
+- confidential-agent connect is a long-running tunnel. In this single-shell eval, first run "confidential-agent connect --render-only > connect-config.json" and parse ".add_ingress[0].mapping.in.port" as the host-side port. Start the tunnel only with "nohup confidential-agent connect </dev/null >connect.log 2>&1 &", save "$!", probe the parsed host-side port, and stop only that saved PID after chat verification.
 - Use plain confidential-agent connect unless the task provides an agent card for --from-card. Do not use connect --service for local service selection in this CLI version.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
 - Destroy is the last success-phase step. Do not run confidential-agent destroy until chat_ok has real evidence; if you abandon a failed run, leave unfinished success booleans false.

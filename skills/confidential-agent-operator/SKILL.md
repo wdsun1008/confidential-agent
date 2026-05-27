@@ -31,6 +31,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `||`, chain another command after them with `;` or `&&`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
 - Do not put a long `sleep` before `confidential-agent build`, `deploy`, `status`, `connect`, or `destroy`. Run the CLI command directly, let it finish or fail, and use its complete output as the next decision point.
 - Do not invoke Shelter directly for migration operations such as build, deploy, destroy, or clean. Use the public `confidential-agent` CLI; it orchestrates Shelter and keeps local state consistent. `shelter --help` is only a bootstrap availability check.
+- Do not run broad process-kill commands such as `pkill`, `killall`, or `kill -9` against infrastructure names like `confidential-agent`, `shelter`, `mkosi`, `terraform`, or `runner`. If you started a background process yourself, save its exact PID and stop only that PID.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
 - `result.json.upstream_commit` must be the full 40-hex output of `git rev-parse HEAD`, not a short hash, branch name, or tag.
@@ -61,6 +62,8 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Runtime fixes must be made in the AppSpec, install script, or resources, then rebuilt and redeployed so the migration is reproducible.
 - `chat_ok` evidence must come from the deployed target service through `confidential-agent connect` or the host-side port it exposes. Do not use local `echo`, local scripts, direct guest SSH, or fabricated marker output as chat evidence.
 - Do not write the evaluation marker, canned success text, or generic compatibility-server responses into the AppSpec, install script, resource config, or deployed app code. The marker must only appear in the final live chat request/response transcript.
+- Do not hide core dependency installation failures with `|| true`, `set +e`, or ignored exit codes. Main package installs such as `pip install -e .`, `npm install`, `npm ci`, `uv sync`, or `cargo build` must fail the image build if they fail. Use fallbacks only for known optional extras, and keep those fallbacks visibly scoped.
+- Guest services exposed through `service.connect` must listen on `0.0.0.0` or all interfaces. Do not bind the workload server only to `127.0.0.1` or `localhost`.
 - `confidential-agent destroy <service>` is the last success-phase operation. Do not destroy the deployed service until real `chat_ok` evidence exists. If you abandon a failed run and clean up, keep unfinished success booleans false.
 
 ## Canonical Skeleton
@@ -164,6 +167,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Run product-discovery commands first: CLI workflow docs and schema docs.
    - Inspect README, package manifests, lockfiles, Dockerfiles, service scripts, examples, and tests.
    - Identify language/runtime, install command, startup command, listening host/port, health endpoint, chat/API endpoint, config files, and required secrets.
+   - Find the startup path in this priority order: Dockerfile `CMD`/`ENTRYPOINT` or compose service command, upstream init/supervisor scripts, `pyproject.toml` `[project.scripts]`, `package.json` `start`/server scripts, README quick-start server instructions, then focused source files that define ports or HTTP routes. Do not guess a module or CLI subcommand until these are checked.
    - Use a fixed discovery budget before the first draft: after CLI docs/schema, clone/pin the repo, then read at most README, the primary manifest, Dockerfile or equivalent startup script, and one file that defines ports/entrypoints.
    - Do not run more read-only exploration commands until `confidential-agent.yaml`, an install/runtime script, a resource config, and `result.json` exist. If details are still ambiguous, write the best draft with explicit assumptions and refine it after static checks fail.
 
@@ -176,6 +180,8 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Ensure the declared `service.connect` port is configured in `ExecStart`, an Environment line, or a resource file that the service reads.
    - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
    - If you write a bridge/wrapper around a CLI or stdin-only target, propagate target failures as caller-visible errors such as a non-200 status, error body, or connection refusal. Do not catch target errors, timeouts, or non-zero exits and replace them with echo, acknowledgements, canned text, or success-shaped output.
+   - A bridge/wrapper must call a documented upstream command or import path with the correct request shape. Before building, verify that the referenced executable, Python module, package entry point, or JS module exists in the installed upstream tree; do not invent paths such as `agent.core`, `server.py`, or `gateway run` from naming intuition.
+   - Configure service commands and bridge listeners to bind `0.0.0.0`, not `127.0.0.1`, so the TNG connect tunnel can reach the workload from outside the guest loopback namespace.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
    - Do not use `yum`, `dnf`, `apt-get`, or `apk` to install OS packages inside build scripts. Put OS packages in `build.packages`; the script should install/configure the target application.
    - When an install script writes a systemd unit or config file with a heredoc, use a single-quoted delimiter such as `<<'EOF'` unless you intentionally substitute variables at build time. This prevents `$MAINPID`, `$PORT`, `$HOME`, and similar runtime variables from being expanded accidentally during image build.
@@ -197,8 +203,10 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Run `confidential-agent spec validate --spec confidential-agent.yaml --format json`.
    - If the CLI exposes a non-cloud render/static mode, run it before real build/deploy.
    - Confirm referenced local files exist.
+   - Confirm every `build.files[].source` path exists in the working directory before build. If the AppSpec references `./upstream.tar.gz`, `./upstream`, or another staged source, create it first or change the install script to clone/fetch the pinned upstream itself.
    - Confirm the install script is not the Host Bootstrap installer, creates `service.app_service`, enables that exact unit, and has an `ExecStart` for the real target runtime.
    - Confirm the declared `service.connect` port is consumed by the real startup path, such as a command-line flag, environment variable, or config file that the startup command actually reads. A passive JSON field that the service never loads is not enough.
+   - Confirm the main dependency install commands are fail-fast. Remove `|| true` from required `pip`, `npm`, `uv`, `cargo`, or upstream build/install commands.
    - Run these static checks before `confidential-agent build`, not after.
    - Record static validation results in `result.json`.
    - Once `confidential-agent spec validate` passes and the artifact contract is consistent, stop polishing the same artifacts and run build. Let concrete build/deploy/status errors drive later edits.
@@ -214,7 +222,41 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 
 5. **Verify**
    - Run `confidential-agent status --live --json`.
-   - Start `confidential-agent connect` and verify the service with `curl`, `nc`, or the workload's native client. `connect` is a long-running tunnel process; in single-shell or noninteractive automation, run it in the background, preserve stdout/stderr in a log, capture its PID, probe the host-side port, and stop the tunnel after chat verification. In this CLI version, use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; `connect --service <name>` is not supported for local service selection.
+   - Render the connect mapping, start `confidential-agent connect`, and verify the service with `curl`, `nc`, or the workload's native client. `connect` is a long-running tunnel process; in single-shell or noninteractive automation, use this shape so the tunnel cannot hold the shell action's stdout/stderr open:
+
+```bash
+confidential-agent connect --render-only > connect-config.json
+HOST_PORT="$(python3 - <<'PY'
+import json
+data = json.load(open("connect-config.json", encoding="utf-8"))
+ingress = data.get("add_ingress") or []
+if not ingress:
+    raise SystemExit("connect config has no add_ingress entries")
+print(ingress[0]["mapping"]["in"]["port"])
+PY
+)"
+nohup confidential-agent connect </dev/null >connect.log 2>&1 &
+CONNECT_PID=$!
+CONNECTED=0
+for _ in $(seq 1 30); do
+  if nc -z 127.0.0.1 "$HOST_PORT"; then
+    CONNECTED=1
+    break
+  fi
+  sleep 2
+done
+if [ "$CONNECTED" != 1 ]; then
+  tail -n 200 connect.log || true
+  kill "$CONNECT_PID" 2>/dev/null || true
+  wait "$CONNECT_PID" 2>/dev/null || true
+  exit 1
+fi
+# Send the real chat/API request through http://127.0.0.1:${HOST_PORT}/...
+kill "$CONNECT_PID" 2>/dev/null || true
+wait "$CONNECT_PID" 2>/dev/null || true
+```
+
+   - Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; `connect --service <name>` is not supported for local service selection.
    - All reachability and chat probes must go through `confidential-agent connect` or its exposed host-side port. Direct SSH guest probes are only diagnostics; they do not satisfy `connect_ok` or `chat_ok`, and guest-side hotfixes must be moved back into the build artifacts before rerunning the flow.
    - Health, status, version, config, and model-list endpoints prove reachability only; they do not prove the migrated agent works. For `chat_ok`, send a real natural-language request through the connected service and save the response. Prefer two turns when the workload supports it, and include a deterministic marker if the task provides one. The marker must be produced by the target service response, not by a local command.
    - Verify that the running service is the real target upstream, using commit hash, process command, installed files, and response behavior.

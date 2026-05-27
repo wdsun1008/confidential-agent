@@ -6,7 +6,7 @@ export const E2E_COMMAND_EVIDENCE = {
   build_ok: new RegExp(`${CA_COMMAND}build\\b`, "i"),
   deploy_ok: new RegExp(`${CA_COMMAND}deploy\\b`, "i"),
   live_status_ok: new RegExp(`${CA_COMMAND}status\\b[^\\n;&|]*--live\\b`, "i"),
-  connect_ok: new RegExp(`${CA_COMMAND}connect\\b`, "i"),
+  connect_ok: new RegExp(`${CA_COMMAND}connect\\b(?![^\\n;&|]*(?:--render-only|--help|-h|\\bhelp\\b))`, "i"),
   chat_ok:
     /\b(curl|python3?|node|wget|nc|ncat|socat|grpcurl|http|hermes|openclaw)\b[\s\S]*(chat|message|messages|completion|completions|responses|invoke|query|prompt|ask|\/v1\/(?:chat|messages|completions|responses)|\/api\/(?:chat|messages?|generate|completion|completions|invoke|query|prompt|ask))\b/i,
   cleanup_ok: new RegExp(`${CA_COMMAND}destroy\\b`, "i"),

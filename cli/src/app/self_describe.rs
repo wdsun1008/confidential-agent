@@ -571,7 +571,7 @@ Core commands:
 - `build --spec <path>` creates the confidential image; `build` defaults to `confidential-agent.yaml`.
 - `deploy --spec <path>` provisions the cloud instance; `deploy` defaults to `confidential-agent.yaml`.
 - `status --service <id> --live --json` checks local and guest state.
-- `connect` opens local forwards to active guest ports and runs until stopped; use another terminal or a background job for probes.
+- `connect --render-only` prints the local forwarding config without starting the long-running tunnel. `connect` opens local forwards to active guest ports and runs until stopped; in automation, parse the render-only JSON first, then start `nohup confidential-agent connect </dev/null >connect.log 2>&1 &` and probe the parsed local port.
 - `destroy <service-id>` tears down provisioned resources.
 
 For probes, use standard tools such as `curl`, `nc`, the controller agent API, or the workload's native client. Keep probe logic in evaluation scripts or skills rather than expanding the CLI surface.

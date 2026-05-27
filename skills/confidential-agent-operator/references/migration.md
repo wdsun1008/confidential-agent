@@ -31,14 +31,17 @@
 - If image build fails with a package-manager package-not-found error, remove or substitute the missing nonessential package and rerun build. Do not keep adding repositories or unrelated packages before confirming the service actually needs that package.
 - Omit `build.base_image` for normal mkosi builds. Use it only for a provided qcow2/raw disk-image path or URL; it is not a Docker/Podman image reference.
 - If upstream docs are ambiguous, choose the simplest documented server mode and record the assumption.
+- Identify the startup path in this order before guessing: Dockerfile `CMD`/`ENTRYPOINT` or compose command, upstream init/supervisor scripts, `pyproject.toml` `[project.scripts]`, `package.json` server/start scripts, README server quick start, then focused source files that define routes or ports.
 - Bind services to `0.0.0.0` inside the guest so TNG can reach them.
 - Create a systemd service under `/etc/systemd/system/<unit>.service`, enable that exact unit, and set `service.app_service` to the same unit name.
 - `ExecStart` must run a long-lived service that listens on at least one declared `service.connect` port. One-shot commands, interactive stdin-only sessions, and help/status commands are not valid services.
 - Do not reuse a host bootstrap or one-click installer as the target install script. The target install script must install the upstream application and create the unit named by `service.app_service`.
 - Every `ExecStart` and `WorkingDirectory` path must be created or installed by the install script. If you install into a virtualenv or project-local prefix, reference that same prefix in the unit.
 - If the target has no built-in server mode, expose a persistent listener that delegates to the real target runtime for each request. Do not return canned responses.
+- If you write a bridge or wrapper, verify that every executable, module, import path, and request shape it uses exists in the installed upstream tree. Do not invent likely-looking entrypoints; surface upstream import or command failures as non-success responses.
 - Do not write evaluator markers, canned success responses, or fallback acknowledgements into the deployed service. Verification text must come from a live request to the real target runtime.
 - Ensure the declared connect port appears in the service command, an Environment line, or a resource file that the service reads.
+- Do not append `|| true` to required dependency installation or build commands. The main package install must fail the image build if it fails; only explicitly optional extras may have scoped fallbacks.
 - Do not call `systemctl start` during image build. Run `systemctl daemon-reload` and `systemctl enable <unit>.service`; the guest starts enabled units on boot.
 - Put resource targets under `/etc/<service>/`, `/root/.config/<service>/`, or the documented upstream config path.
 - Always create these artifacts before attempting cloud operations: `confidential-agent.yaml`, install script, resource config, and `result.json`.
@@ -51,6 +54,7 @@
 - After `confidential-agent spec validate` passes and artifacts are internally consistent, run build instead of continuing speculative artifact rewrites; use real build/deploy/status output for the next fix.
 - After `confidential-agent build` exits 0, preserve the built image and advance to peering and deploy. Do not delete images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself is defective.
 - Do not write, patch, delete, or recreate `.confidential-agent`/state-dir internals such as `build-result.json`, `deploy-result.json`, or `manifest.json`; those files are produced by the CLI. If they are missing or wrong, fix the migration artifacts and rerun the corresponding CLI command.
+- Do not use `pkill`, `killall`, or broad `kill -9` patterns against `confidential-agent`, Shelter, mkosi, Terraform, or runner process names. Stop only a PID you started and recorded, such as a saved connect tunnel PID.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Fixes that matter must be moved into the AppSpec, install script, or resource files, then rebuilt and redeployed.
 
 ## Package Name Translation

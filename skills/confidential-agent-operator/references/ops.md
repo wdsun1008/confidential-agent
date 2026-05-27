@@ -72,7 +72,43 @@ nc -vz 127.0.0.1 <port>
 ```
 
 Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`. Do not use `connect --service <name>` for local service selection.
-`connect` is long-running. In a noninteractive shell, start it as a background job, keep stdout/stderr in a log so the selected local port is visible, probe that host-side port, and stop the background PID before `destroy`.
+`connect` is long-running. In a noninteractive shell, first render the local mapping, then start the tunnel with stdin/stdout/stderr detached from the shell action:
+
+```bash
+confidential-agent connect --render-only > connect-config.json
+HOST_PORT="$(python3 - <<'PY'
+import json
+data = json.load(open("connect-config.json", encoding="utf-8"))
+ingress = data.get("add_ingress") or []
+if not ingress:
+    raise SystemExit("connect config has no add_ingress entries")
+print(ingress[0]["mapping"]["in"]["port"])
+PY
+)"
+nohup confidential-agent connect </dev/null >connect.log 2>&1 &
+CONNECT_PID=$!
+CONNECTED=0
+for _ in $(seq 1 30); do
+  if nc -z 127.0.0.1 "$HOST_PORT"; then
+    CONNECTED=1
+    break
+  fi
+  sleep 2
+done
+if [ "$CONNECTED" != 1 ]; then
+  tail -n 200 connect.log || true
+  kill "$CONNECT_PID" 2>/dev/null || true
+  wait "$CONNECT_PID" 2>/dev/null || true
+  exit 1
+fi
+```
+
+Probe the host-side port from `HOST_PORT`, run the real chat/API request through that local address, then stop only the saved PID:
+
+```bash
+kill "$CONNECT_PID" 2>/dev/null || true
+wait "$CONNECT_PID" 2>/dev/null || true
+```
 
 For chat or agent APIs, use the workload's documented client or a `curl` request against its real endpoint. If `app_ready` is false, inspect `service.app_service`, guest unit logs, config resource targets, and whether the app listens on the declared port.
 Set `live_status_ok` only from a successful live status check that proves readiness, and set `chat_ok` only after saving evidence from a real conversation or workload API call to the migrated service through the connected host-side port. Health, status, version, config, model-list endpoints, direct guest SSH, and local marker generation are not enough.
