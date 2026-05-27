@@ -133,6 +133,8 @@ Before stopping, write these files in the working directory:
 - `verify-chat.sh`: an executable probe that reads `connect-ready.json` and `verification.json`, calls only the rendered `127.0.0.1:<local_port>` endpoint, and prints the full response.
 - `result.json`: write every field named in the task's `result_contract.required_fields`; keep values consistent with the artifacts you created.
 
+`result.json.resource_config` must be the relative path of the runtime config file declared in `confidential-agent.yaml` under `resources.<name>.source`, for example `app-config.json`. It is not `verification.json`, `verify-chat.sh`, `result.json`, the AppSpec, or the install script. `verification.json` and `verify-chat.sh` are controller-side verification artifacts; do not inject them into the guest as AppSpec resources.
+
 If you only inspect the repository but do not write these artifacts, the migration is incomplete.
 Keep the final deliverables in the original task working directory. If you generate a template in a subdirectory, copy or rewrite the final AppSpec, install script, resource file, verification files, and `result.json` back to the original working directory.
 For a full/live evaluation, do not finalize after static artifacts only. Final completion requires successful build, operator peering, deploy, live status, connect, real chat/API probe, and cleanup.
@@ -194,6 +196,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
    - Ensure the declared `service.connect` port is configured in `ExecStart`, an Environment line, or a resource file that the service reads.
    - If the upstream only provides a CLI/stdin interface and no built-in server mode, expose a persistent listener on the declared port that delegates each request to the real target runtime. Do not return canned or hard-coded responses.
    - If you write a bridge/wrapper around a CLI or stdin-only target, propagate target failures as caller-visible errors such as a non-200 status, error body, or connection refusal. Do not catch target errors, timeouts, or non-zero exits and replace them with echo, acknowledgements, canned text, or success-shaped output.
+   - Bridge validity test: a bridge must import, exec, or spawn a documented upstream module/binary from the installed tree; it must propagate upstream stdout/stderr and exit status; and deleting the upstream install step must make the service fail instead of continuing to answer. If any of these checks fail, delete the bridge and use the upstream server command or documented SDK import.
    - A bridge/wrapper must call a documented upstream command or import path with the correct request shape. Before building, verify that the referenced executable, Python module, package entry point, or JS module exists in the installed upstream tree; do not invent paths such as `agent.core`, `server.py`, or `gateway run` from naming intuition.
    - Configure service commands and bridge listeners to bind `0.0.0.0`, not `127.0.0.1`, so the TNG connect tunnel can reach the workload from outside the guest loopback namespace.
    - During image build scripts, do not use `apt-get`, `apk`, or `systemctl start`. Put OS packages in `build.packages`, create the unit, run `systemctl daemon-reload`, and enable the unit for boot.
@@ -245,6 +248,7 @@ confidential-agent connect stop --ready-json connect-ready.json
 ```
 
    - `verify-chat.sh` must read `connect-ready.json` and select the endpoint matching `verification.json.service_id` and `verification.json.chat_guest_port`. Use this pattern inside the script:
+   - Always pass `--service <service-id>` to `connect start`; the service id must match `verification.json.service_id` and AppSpec `service.id`.
 
 ```bash
 BASE_URL="$(python3 - <<'PY'

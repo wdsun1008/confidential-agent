@@ -533,6 +533,93 @@ function rawLocalSourcePaths(specText) {
   return [...new Set(sources)];
 }
 
+function normalizedRelativePath(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || path.isAbsolute(value)) return "";
+  const normalized = path.normalize(value.trim().replace(/^['"]|['"]$/g, ""));
+  if (normalized === "." || normalized.startsWith("..") || path.isAbsolute(normalized)) return "";
+  return normalized.replace(/^\.\//, "");
+}
+
+function rawResourceSources(specText) {
+  const sources = [];
+  const lines = String(specText || "").split(/\r?\n/);
+  const resourcesLine = lines.findIndex((line) => /^resources:\s*(?:#.*)?$/.test(line));
+  if (resourcesLine < 0) return sources;
+  for (let idx = resourcesLine + 1; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+    if (/^\S/.test(line)) break;
+    const match = line.match(/^\s+source:\s*['"]?([^'"\s#]+)['"]?\s*(?:#.*)?$/);
+    if (!match) continue;
+    const normalized = normalizedRelativePath(match[1]);
+    if (normalized) sources.push(normalized);
+  }
+  return [...new Set(sources)];
+}
+
+function forbiddenResourceConfigNames(result) {
+  return new Set(
+    [
+      "verification.json",
+      "verify-chat.sh",
+      "result.json",
+      normalizedRelativePath(result?.generated_spec || ""),
+      normalizedRelativePath(result?.install_script || ""),
+    ].filter(Boolean),
+  );
+}
+
+function inlineGeneratedFiles(scriptText) {
+  const files = [];
+  const heredocRe =
+    /(?:^|\n)\s*cat\s*>\s*([^\s;&|]+)\s*<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*\n([\s\S]*?)\n\t*\2(?:\s|$)/g;
+  for (const match of String(scriptText || "").matchAll(heredocRe)) {
+    files.push({ path: match[1].replace(/^['"]|['"]$/g, ""), body: match[3] || "" });
+  }
+  return files;
+}
+
+function inlineHttpBridgeFiles(scriptText) {
+  const httpPattern =
+    /(basehttprequesthandler|http\.server|socketserver|do_GET\s*\(|do_POST\s*\(|send_response\s*\(|http\.createserver|express\s*\(|app\.(?:get|post|use)\s*\(|fastapi\s*\(|uvicorn\.run)/i;
+  return inlineGeneratedFiles(scriptText).filter((file) => httpPattern.test(file.body));
+}
+
+function repoRuntimeTerms(upstreamUrl) {
+  const raw = String(upstreamUrl || "")
+    .replace(/\/+$/, "")
+    .split("/")
+    .pop()
+    ?.replace(/\.git$/i, "");
+  if (!raw) return ["upstream"];
+  const terms = new Set(["upstream"]);
+  const stem = raw.toLowerCase();
+  terms.add(stem);
+  terms.add(stem.replace(/[-.]+/g, "_"));
+  for (const token of stem.split(/[-_.]+/)) {
+    if (token.length > 2 && !["agent", "server", "service", "app", "api"].includes(token)) terms.add(token);
+  }
+  return [...terms].filter(Boolean);
+}
+
+function inlineHttpBridgeLooksClosedLoop(scriptText, upstreamUrl) {
+  const moduleTerms = repoRuntimeTerms(upstreamUrl)
+    .map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const moduleRefRe = new RegExp(
+    `(?:^|\\n)\\s*(?:from\\s+(?:${moduleTerms})\\b|import\\s+(?:${moduleTerms})\\b|(?:const|let|var)\\s+\\w+\\s*=\\s*require\\(["'](?:${moduleTerms})\\b)`,
+    "i",
+  );
+  return inlineHttpBridgeFiles(scriptText).some(
+    (file) =>
+      !(
+        /\b(?:subprocess|Popen|exec(?:v|ve|le|lp)?|spawn|system)\b[\s\S]{0,300}(?:\/opt|\/srv|\/app|\/usr\/local\/bin)\//i.test(
+          file.body,
+        ) || moduleRefRe.test(file.body)
+      ),
+  );
+}
+
 function stagedSourcePathRefs(scriptText) {
   const refs = new Set();
   const sourcePathRe =
@@ -736,6 +823,9 @@ function artifactContractIssues(trialDir) {
   const specText = readArtifactFromResult(trialDir, result, "generated_spec");
   const installText = readArtifactFromResult(trialDir, result, "install_script");
   const resourceText = readArtifactFromResult(trialDir, result, "resource_config");
+  const resourceSources = rawResourceSources(specText);
+  const resourceConfigPath = normalizedRelativePath(result.resource_config || "");
+  const forbiddenResourceNames = forbiddenResourceConfigNames(result);
   const verificationPath = path.join(trialDir, "verification.json");
   const verifyChatPath = path.join(trialDir, "verify-chat.sh");
   const deliverableText = `${specText}\n${installText}\n${resourceText}`;
@@ -750,6 +840,18 @@ function artifactContractIssues(trialDir) {
   }
   if (/(one-click|install-only|deploy-openclaw|CA_ONE_CLICK|\bCA_REF\b)/i.test(installText)) {
     issues.push("install_script appears to contain host-bootstrap or one-click installer content; replace it with the target agent runtime installer.");
+  }
+  if (!resourceConfigPath || forbiddenResourceNames.has(resourceConfigPath)) {
+    issues.push(
+      "result.json resource_config must point to the guest runtime config file, not verification.json, verify-chat.sh, result.json, the AppSpec, or the install script.",
+    );
+  } else if (!resourceSources.includes(resourceConfigPath)) {
+    issues.push(
+      `result.json resource_config (${resourceConfigPath}) must match one AppSpec resources.*.source path. Current resource sources: ${resourceSources.join(", ") || "<none>"}.`,
+    );
+  }
+  if (resourceSources.some((source) => forbiddenResourceNames.has(source))) {
+    issues.push("AppSpec resources must not inject verification.json, verify-chat.sh, result.json, the AppSpec, or the install script into the guest.");
   }
   if (!/\[Service\][\s\S]*ExecStart=/i.test(installText)) {
     issues.push("install_script must create a systemd unit with an ExecStart for the target runtime.");
@@ -821,6 +923,11 @@ function artifactContractIssues(trialDir) {
   }
   if (resourceText.trim().length > 0 && /your[_ -]?[a-z0-9_ -]*key[_ -]?here|changeme|todo|placeholder/i.test(resourceText)) {
     issues.push("resource_config still contains placeholder values; use concrete non-secret runtime config or environment/file references for secrets.");
+  }
+  if (inlineHttpBridgeLooksClosedLoop(installText, result.upstream_url)) {
+    issues.push(
+      "install_script creates an inline HTTP bridge that appears closed-loop. A bridge is valid only if it imports, execs, or spawns the real upstream runtime from the installed tree and surfaces upstream failures; otherwise delete it and run the upstream server/CLI directly.",
+    );
   }
   const verification = readJson(verificationPath, null);
   if (!verification || typeof verification !== "object") {
@@ -1661,6 +1768,7 @@ Rules:
 - The only valid upstream target repository is exactly: ${expectedRepo || "the target_repo field in the task file"}.
 - If your result upstream_url differs from the task target_repo, the trial fails.
 - Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, verification.json, verify-chat.sh, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
+- result.json.resource_config must be the guest runtime config file declared under confidential-agent.yaml resources.*.source. It must not be verification.json, verify-chat.sh, result.json, the AppSpec, or the install script.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - Do not construct GitHub raw URLs, release/archive URLs, or API URLs by guessing path conventions. Use URLs explicitly provided in the skill context, or clone/fetch repositories with git and verify the selected commit.
@@ -1677,6 +1785,7 @@ Rules:
 - If you use old foreground connect manually, it is a long-running tunnel. Do not run foreground connect in this single-shell eval; render first, background safely, save the exact PID, probe the parsed local port, and stop only that saved PID.
 - "connect --service <service-id>" selects the active local service by exact id. Do not use direct guest IPs for chat evidence.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
+- If you create an HTTP bridge because the upstream has no server mode, the bridge must import, exec, or spawn the real upstream runtime from the installed tree and propagate upstream failures. A bridge that can answer without the upstream runtime is a mock and fails.
 - Destroy is the last success-phase step. Do not run confidential-agent destroy until chat_ok has real evidence; if you abandon a failed run, leave unfinished success booleans false.
 
 Provided skill context:

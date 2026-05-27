@@ -39,12 +39,14 @@
 - Every `ExecStart` and `WorkingDirectory` path must be created or installed by the install script. If you install into a virtualenv or project-local prefix, reference that same prefix in the unit.
 - If the target has no built-in server mode, expose a persistent listener that delegates to the real target runtime for each request. Do not return canned responses.
 - If you write a bridge or wrapper, verify that every executable, module, import path, and request shape it uses exists in the installed upstream tree. Do not invent likely-looking entrypoints; surface upstream import or command failures as non-success responses.
+- A bridge is valid only if it imports, execs, or spawns the real upstream runtime from the installed tree, propagates upstream stdout/stderr and exit status, and fails when the upstream install is removed. A listener that can answer without the upstream runtime is a mock.
 - Do not write evaluator markers, canned success responses, or fallback acknowledgements into the deployed service. Verification text must come from a live request to the real target runtime.
 - Ensure the declared connect port appears in the service command, an Environment line, or a resource file that the service reads.
 - Do not append `|| true` to required dependency installation or build commands. The main package install must fail the image build if it fails; only explicitly optional extras may have scoped fallbacks.
 - Do not call `systemctl start` during image build. Run `systemctl daemon-reload` and `systemctl enable <unit>.service`; the guest starts enabled units on boot.
 - Put resource targets under `/etc/<service>/`, `/root/.config/<service>/`, or the documented upstream config path.
-- Always create these artifacts before attempting cloud operations: `confidential-agent.yaml`, install script, resource config, and `result.json`.
+- Always create these artifacts before attempting cloud operations: `confidential-agent.yaml`, install script, runtime resource config, `verification.json`, `verify-chat.sh`, and `result.json`.
+- `result.json.resource_config` must point to the runtime config file declared under AppSpec `resources.*.source`. It must not point to `verification.json`, `verify-chat.sh`, `result.json`, the AppSpec, or the install script.
 - Remove placeholder text such as TODO, changeme, placeholder, fake ids, and example-only secrets; leaving them means the migration is still a placeholder.
 - Resource files must contain concrete usable values. If the host environment exports a required key, write it from the environment without printing it; if the key is absent, record the missing secret and leave verification booleans false.
 - Use `build.with_network: true` when the build downloads packages or source.

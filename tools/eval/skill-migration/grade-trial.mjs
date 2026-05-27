@@ -239,6 +239,74 @@ function parseYamlPorts(text, field) {
   return (block[1].match(/\d+/g) || []).map(Number);
 }
 
+function normalizedRelativePath(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) || path.isAbsolute(value)) return "";
+  const normalized = path.normalize(value.trim().replace(/^['"]|['"]$/g, ""));
+  if (normalized === "." || normalized.startsWith("..") || path.isAbsolute(normalized)) return "";
+  return normalized.replace(/^\.\//, "");
+}
+
+function parseYamlResourceSources(text) {
+  const sources = [];
+  const lines = String(text || "").split(/\r?\n/);
+  const resourcesLine = lines.findIndex((line) => /^resources:\s*(?:#.*)?$/.test(line));
+  if (resourcesLine < 0) return sources;
+  for (let idx = resourcesLine + 1; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+    if (/^\S/.test(line)) break;
+    const match = line.match(/^\s+source:\s*['"]?([^'"\s#]+)['"]?\s*(?:#.*)?$/);
+    if (!match) continue;
+    const normalized = normalizedRelativePath(match[1]);
+    if (normalized) sources.push(normalized);
+  }
+  return [...new Set(sources)];
+}
+
+function forbiddenResourceConfigNames(result) {
+  return new Set(
+    [
+      "verification.json",
+      "verify-chat.sh",
+      "result.json",
+      normalizedRelativePath(result?.generated_spec || ""),
+      normalizedRelativePath(result?.install_script || ""),
+    ].filter(Boolean),
+  );
+}
+
+function inlineGeneratedFiles(scriptText) {
+  const files = [];
+  const heredocRe =
+    /(?:^|\n)\s*cat\s*>\s*([^\s;&|]+)\s*<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*\n([\s\S]*?)\n\t*\2(?:\s|$)/g;
+  for (const match of String(scriptText || "").matchAll(heredocRe)) {
+    files.push({ path: match[1].replace(/^['"]|['"]$/g, ""), body: match[3] || "" });
+  }
+  return files;
+}
+
+function inlineHttpBridgeFiles(scriptText) {
+  const httpPattern =
+    /(basehttprequesthandler|http\.server|socketserver|do_GET\s*\(|do_POST\s*\(|send_response\s*\(|http\.createserver|express\s*\(|app\.(?:get|post|use)\s*\(|fastapi\s*\(|uvicorn\.run)/i;
+  return inlineGeneratedFiles(scriptText).filter((file) => httpPattern.test(file.body));
+}
+
+function bodyReferencesTargetRuntime(body, runtimePatterns) {
+  const runtimeRegexes = runtimePatterns
+    .map((pattern) => {
+      try {
+        return new RegExp(pattern, "im");
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  if (runtimeRegexes.some((regex) => regex.test(body))) return true;
+  return /\b(?:subprocess|Popen|exec(?:v|ve|le|lp)?|spawn|system)\b[\s\S]{0,300}(?:\/opt|\/srv|\/app|\/usr\/local\/bin)\//i.test(
+    body,
+  );
+}
+
 const trialDir = arg("trial-dir");
 const graderFile = arg(
   "grader",
@@ -332,6 +400,9 @@ const installText = readArtifact(trialDir, result.install_script);
 const resourceText = readArtifact(trialDir, result.resource_config);
 const serviceFileText = readTopLevelServiceFiles(trialDir);
 const specPath = artifactPath(trialDir, result.generated_spec);
+const resourceSources = parseYamlResourceSources(specText);
+const resourceConfigPath = normalizedRelativePath(result.resource_config || "");
+const forbiddenResourceNames = forbiddenResourceConfigNames(result);
 const artifactText = `${specText}\n${installText}\n${resourceText}\n${serviceFileText}\n${JSON.stringify(result)}`.toLowerCase();
 const observedText = `${collectText(trialDir)}\n${commands}\n${toolResults}\n${artifactText}`.toLowerCase();
 const secretLeakText = `${collectText(trialDir)}\n${commands}\n${toolResults}\n${specText}\n${installText}\n${JSON.stringify(result)}`.toLowerCase();
@@ -463,6 +534,17 @@ addFinding(
 );
 addFinding(
   findings,
+  Boolean(resourceConfigPath) &&
+    !forbiddenResourceNames.has(resourceConfigPath) &&
+    resourceSources.includes(resourceConfigPath),
+  "resource_config_matches_spec_resource",
+  "result.json resource_config must point to the runtime config file declared under AppSpec resources.*.source, not verification or evaluation artifacts",
+  {
+    detail: `resource_config=${resourceConfigPath || "<missing>"} resources=[${resourceSources.join(", ")}]`,
+  },
+);
+addFinding(
+  findings,
   /schema:\s*confidential-agent\/v1/.test(specText) &&
     /resources:\s*\n/.test(specText) &&
     /app_service:/.test(specText),
@@ -485,6 +567,7 @@ addFinding(
 const appService = specText.match(/^\s*app_service:\s*['"]?([^'"\s#]+)['"]?\s*$/m)?.[1] || "";
 const serviceDefinitionText = `${installText}\n${serviceFileText}`;
 const deliverableTextNoResult = `${specText}\n${installText}\n${resourceText}`;
+const runtimePatterns = Array.isArray(grader.required_runtime_patterns) ? grader.required_runtime_patterns : [];
 const installCreatesAppService =
   Boolean(appService) &&
   serviceDefinitionText.includes(appService) &&
@@ -507,12 +590,26 @@ addFinding(
   "systemd ExecStart must not use help commands, inert processes, or generic starter servers",
 );
 const mockHttpServicePattern =
-  /(basehttprequesthandler|python3?\s+-m\s+http\.server|\bhttp\.server\b|socketserver|\bdo_GET\s*\(|send_response\s*\(|health[-_ ]?check server|health probe|healthz handler|readiness endpoint|liveness server|stub server|mock endpoint|fake endpoint)/i;
+  /(basehttprequesthandler|python3?\s+-m\s+http\.server|\bhttp\.server\b|socketserver|\bdo_GET\s*\(|send_response\s*\(|http\.createserver|express\s*\(|app\.(?:get|post|use)\s*\(|health[-_ ]?check server|health probe|healthz handler|readiness endpoint|liveness server|stub server|mock endpoint|fake endpoint)/i;
+const inlineHttpFiles = inlineHttpBridgeFiles(installText);
+const inlineBridgeDelegates =
+  inlineHttpFiles.length > 0 &&
+  inlineHttpFiles.every((file) => bodyReferencesTargetRuntime(file.body, runtimePatterns));
 addFinding(
   findings,
-  !mockHttpServicePattern.test(serviceDefinitionText),
+  !mockHttpServicePattern.test(serviceDefinitionText) || inlineBridgeDelegates,
   "install_script_not_mock_http_service",
   "install script must not create a replacement HTTP service in place of the target agent",
+);
+addFinding(
+  findings,
+  inlineHttpFiles.length === 0 || inlineBridgeDelegates,
+  "inline_bridge_delegates_to_target_runtime",
+  "an install-created HTTP bridge must import, exec, or spawn the real upstream runtime instead of serving a closed-loop response",
+  {
+    detail: inlineHttpFiles.map((file) => file.path).join(", ") || undefined,
+    soft: runtimePatterns.length === 0,
+  },
 );
 addFinding(
   findings,
@@ -520,7 +617,6 @@ addFinding(
   "eval_marker_not_baked",
   "evaluation marker must not be baked into the spec, install script, resource config, or deployed app code",
 );
-const runtimePatterns = Array.isArray(grader.required_runtime_patterns) ? grader.required_runtime_patterns : [];
 const runtimeReferenced =
   !runtimePatterns.length ||
   runtimePatterns.some((pattern) => {

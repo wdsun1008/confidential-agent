@@ -71,7 +71,7 @@ confidential-agent connect start --service <service-id> --ready-json connect-rea
 confidential-agent connect stop --ready-json connect-ready.json
 ```
 
-`connect --service <service-id>` selects the active local service by exact id. Without it, connect covers every active service with `service.connect` ports.
+`connect --service <service-id>` selects the active local service by exact id. Always pass it to `connect start`, and keep the value equal to AppSpec `service.id` and `verification.json.service_id`.
 
 `connect start` writes `connect-ready.json`; use `client_endpoints[]` from that file to build the local URL. `connect --render-only` prints the same mapping without starting the tunnel.
 
