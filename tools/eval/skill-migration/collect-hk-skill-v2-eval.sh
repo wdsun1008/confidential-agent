@@ -94,6 +94,10 @@ tar -C / \
   --exclude='*/.venv/*' \
   --exclude='*/target' \
   --exclude='*/target/*' \
+  --exclude='*/xdg-cache' \
+  --exclude='*/xdg-cache/*' \
+  --exclude='*/home/.cache' \
+  --exclude='*/home/.cache/*' \
   --exclude='*/__pycache__' \
   --exclude='*/__pycache__/*' \
   --exclude='*/home/.confidential-agent' \
