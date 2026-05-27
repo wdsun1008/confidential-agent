@@ -47,6 +47,7 @@
 - Put resource targets under `/etc/<service>/`, `/root/.config/<service>/`, or the documented upstream config path.
 - Always create these artifacts before attempting cloud operations: `confidential-agent.yaml`, install script, runtime resource config, `verification.json`, `verify-chat.sh`, and `result.json`.
 - `result.json.resource_config` must point to the runtime config file declared under AppSpec `resources.*.source`. It must not point to `verification.json`, `verify-chat.sh`, `result.json`, the AppSpec, or the install script.
+- `verification.json` must use flat top-level keys such as `service_id`, `chat_guest_port`, `chat_method`, and `chat_path`; do not wrap them in `chat_probe` or `request`. Evaluation markers are allowed only in `verification.json`, `verify-chat.sh`, and live chat transcripts, not in deployed code or runtime resources.
 - Remove placeholder text such as TODO, changeme, placeholder, fake ids, and example-only secrets; leaving them means the migration is still a placeholder.
 - Resource files must contain concrete usable values. If the host environment exports a required key, write it from the environment without printing it; if the key is absent, record the missing secret and leave verification booleans false.
 - Use `build.with_network: true` when the build downloads packages or source.

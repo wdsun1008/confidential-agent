@@ -73,7 +73,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - After a nonzero build, identify the final causal error before editing: the last package-manager failure, postinstall script error, missing dependency, or compilation failure. Make one artifact change that directly addresses that named error, validate, then rerun build; do not batch speculative fixes or rerun build without a named reason.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Runtime fixes must be made in the AppSpec, install script, or resources, then rebuilt and redeployed so the migration is reproducible.
 - `chat_ok` evidence must come from the deployed target service through `confidential-agent connect` or the host-side port it exposes. Do not use local `echo`, local scripts, direct guest SSH, or fabricated marker output as chat evidence.
-- Do not write the evaluation marker, canned success text, or generic compatibility-server responses into the AppSpec, install script, resource config, or deployed app code. The marker must only appear in the final live chat request/response transcript.
+- Do not write the evaluation marker, canned success text, or generic compatibility-server responses into the AppSpec, install script, resource config, or deployed app code. The marker may appear in controller-side `verification.json` or `verify-chat.sh` as the prompt you will send, and in the final live chat request/response transcript.
 - Do not hide core dependency installation failures with `|| true`, `set +e`, or ignored exit codes. Main package installs such as `pip install -e .`, `npm install`, `npm ci`, `uv sync`, or `cargo build` must fail the image build if they fail. Use fallbacks only for known optional extras, and keep those fallbacks visibly scoped.
 - Guest services exposed through `service.connect` must listen on `0.0.0.0` or all interfaces. Do not bind the workload server only to `127.0.0.1` or `localhost`.
 - `confidential-agent destroy <service>` is the last success-phase operation. Do not destroy the deployed service until real `chat_ok` evidence exists. If you abandon a failed run and clean up, keep unfinished success booleans false.
@@ -129,7 +129,7 @@ Before stopping, write these files in the working directory:
 - `confidential-agent.yaml`: AppSpec for the real target agent.
 - Install/runtime script referenced by the AppSpec.
 - Resource config file referenced under `resources`.
-- `verification.json`: a target-agnostic chat probe contract with `service_id`, `chat_guest_port`, `chat_method`, `chat_path`, headers/body shape, and success predicate.
+- `verification.json`: a target-agnostic chat probe contract with flat top-level keys `service_id`, `chat_guest_port`, `chat_method`, `chat_path`, headers/body shape, and success predicate. Do not nest these keys inside `chat_probe`, `request`, or another wrapper object.
 - `verify-chat.sh`: an executable probe that reads `connect-ready.json` and `verification.json`, calls only the rendered `127.0.0.1:<local_port>` endpoint, and prints the full response.
 - `result.json`: write every field named in the task's `result_contract.required_fields`; keep values consistent with the artifacts you created.
 

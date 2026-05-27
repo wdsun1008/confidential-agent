@@ -15,9 +15,10 @@ constraints:
   - Store final trial metadata in result.json in the trial work directory.
   - In full phase, every true result.json boolean must be backed by a successful real command in the trial transcript.
   - In full phase, chat_ok requires a real natural-language request through confidential-agent connect to the migrated Hermes service. Health, status, config, version, or model-list endpoints are not sufficient.
-  - Declare the final chat probe in verification.json and use verify-chat.sh through the rendered 127.0.0.1 connect endpoint.
+  - Declare the final chat probe in verification.json as flat top-level keys service_id, chat_guest_port, chat_method, and chat_path; do not nest them under chat_probe or request.
+  - Use verify-chat.sh through the rendered 127.0.0.1 connect endpoint; verify-chat.sh must read connect-ready.json and verification.json.
   - result.json resource_config must point to the guest runtime config declared under AppSpec resources.*.source, not to verification.json or other evaluation artifacts.
-  - For the final chat verification, ask the running Hermes service to reply with CA_CONFIDENTIAL_AGENT_EVAL_OK and capture that response in the transcript.
+  - For the final chat verification, ask the running Hermes service to reply with CA_CONFIDENTIAL_AGENT_EVAL_OK and capture that response in the transcript. This marker may appear in verification.json and verify-chat.sh, but not in AppSpec, install scripts, resources, result metadata, or deployed app code.
   - In full phase, complete cleanup after verification.
 result_contract:
   result_json: result.json

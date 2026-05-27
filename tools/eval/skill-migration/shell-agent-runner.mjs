@@ -828,6 +828,7 @@ function artifactContractIssues(trialDir) {
   const forbiddenResourceNames = forbiddenResourceConfigNames(result);
   const verificationPath = path.join(trialDir, "verification.json");
   const verifyChatPath = path.join(trialDir, "verify-chat.sh");
+  const verifyChatText = readFileIfExists(verifyChatPath);
   const deliverableText = `${specText}\n${installText}\n${resourceText}`;
   const appService = specText.match(/^\s*app_service:\s*['"]?([^'"\s#]+)['"]?\s*$/m)?.[1] || "";
   if (installText.trim().length < 80) {
@@ -835,7 +836,7 @@ function artifactContractIssues(trialDir) {
   }
   if (/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/.test(deliverableText)) {
     issues.push(
-      "do not bake the evaluation marker CA_CONFIDENTIAL_AGENT_EVAL_OK into the AppSpec, install script, service code, or resource config; it must appear only as live chat evidence from the deployed target.",
+      "do not bake CA_CONFIDENTIAL_AGENT_EVAL_OK into the AppSpec, install script, service code, or resource config; it is allowed only in controller-side verification.json/verify-chat.sh and live chat evidence from the deployed target.",
     );
   }
   if (/(one-click|install-only|deploy-openclaw|CA_ONE_CLICK|\bCA_REF\b)/i.test(installText)) {
@@ -935,12 +936,14 @@ function artifactContractIssues(trialDir) {
   } else {
     for (const field of ["service_id", "chat_guest_port", "chat_method", "chat_path"]) {
       if (verification[field] === undefined || String(verification[field]).trim() === "") {
-        issues.push(`verification.json must declare ${field}.`);
+        issues.push(`verification.json must declare top-level key ${field}; do not nest it inside chat_probe, request, or another wrapper object.`);
       }
     }
   }
   if (!fs.existsSync(verifyChatPath)) {
     issues.push("verify-chat.sh must exist and run the final chat probe through connect-ready.json.");
+  } else if (!/\bconnect-ready\.json\b/.test(verifyChatText) || !/\bverification\.json\b/.test(verifyChatText)) {
+    issues.push("verify-chat.sh must read connect-ready.json and verification.json, select the declared local endpoint, and run the chat probe; do not hard-code a status-only probe.");
   }
   return issues;
 }
@@ -1325,6 +1328,14 @@ function targetMigrationArtifactPattern() {
   return /(?:^|[\s"'`=:/])(?:\.\/)?(?:confidential-agent\.ya?ml|result\.json|verification\.json|verify-chat\.sh|install-[A-Za-z0-9_.-]+\.sh|[A-Za-z0-9_.-]*-service\.sh|resource[_-]?config\.(?:json|ya?ml)|app-config\.(?:json|ya?ml)|[A-Za-z0-9_.-]+-config\.ya?ml)\b/i;
 }
 
+function deployableMigrationArtifactPattern() {
+  return /(?:^|[\s"'`=:/])(?:\.\/)?(?:confidential-agent\.ya?ml|result\.json|install-[A-Za-z0-9_.-]+\.sh|[A-Za-z0-9_.-]*-service\.sh|resource[_-]?config\.(?:json|ya?ml)|app-config\.(?:json|ya?ml)|[A-Za-z0-9_.-]+-config\.ya?ml)\b/i;
+}
+
+function verificationArtifactPattern() {
+  return /(?:^|[\s"'`=:/])(?:\.\/)?(?:verification\.json|verify-chat\.sh)\b/i;
+}
+
 function writesTargetMigrationArtifact(cmd) {
   const stripped = stripHeredocBodies(cmd);
   const targetArtifact = targetMigrationArtifactPattern();
@@ -1341,14 +1352,50 @@ function writesTargetMigrationArtifact(cmd) {
 }
 
 function commandBakesEvalMarkerIntoArtifact(cmd) {
-  const full = String(cmd || "");
+  const full = stripAllowedVerificationMarkerHeredocs(String(cmd || ""));
   if (!/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/.test(full)) return false;
-  if (!targetMigrationArtifactPattern().test(full)) return false;
+  if (!deployableMigrationArtifactPattern().test(full)) return false;
   return (
     containsFileWriteShellSyntax(full) ||
     containsStateMutationCommand(full) ||
     /\b(?:python3?|node|ruby)\b[\s\S]*(?:writeFile|open\s*\()/i.test(full)
   );
+}
+
+function stripAllowedVerificationMarkerHeredocs(cmd) {
+  let stripped = String(cmd || "").replace(
+    /(?:^|\n)\s*cat\s*>\s*([^\s;&|]+)\s*<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*\n([\s\S]*?)\n\t*\2(?=\s|$)/g,
+    (match, target) => {
+      const name = path.basename(String(target || "").replace(/^['"]|['"]$/g, ""));
+      if (/^(verification\.json|verify-chat\.sh)$/i.test(name)) {
+        return match.replace(/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/g, "CA_ALLOWED_VERIFICATION_MARKER");
+      }
+      return match;
+    },
+  );
+  stripped = stripped.replace(
+    /(?:^|\n)\s*cat\s*<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*>\s*([^\s;&|]+)\s*\n([\s\S]*?)\n\t*\1(?=\s|$)/g,
+    (match, _delimiter, target) => {
+      const name = path.basename(String(target || "").replace(/^['"]|['"]$/g, ""));
+      if (/^(verification\.json|verify-chat\.sh)$/i.test(name)) {
+        return match.replace(/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/g, "CA_ALLOWED_VERIFICATION_MARKER");
+      }
+      return match;
+    },
+  );
+  return stripped
+    .split(/\n/)
+    .map((line) => {
+      if (
+        /\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/.test(line) &&
+        verificationArtifactPattern().test(line) &&
+        !deployableMigrationArtifactPattern().test(line)
+      ) {
+        return line.replace(/\bCA_CONFIDENTIAL_AGENT_EVAL_OK\b/g, "CA_ALLOWED_VERIFICATION_MARKER");
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapReady = hostBootstrapReady()) {
@@ -1367,7 +1414,7 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
       stdout: "",
       stderr:
         "Blocked artifact write that bakes CA_CONFIDENTIAL_AGENT_EVAL_OK into the deployed service or migration artifacts. " +
-        "The marker must appear only in the final chat request/response evidence through confidential-agent connect, not in app code, scripts, resources, or result metadata.",
+        "The marker may appear in verification.json, verify-chat.sh, and final chat request/response evidence only, not in app code, install scripts, resources, or result metadata.",
     });
   }
   const uncorroboratedFields = uncorroboratedResultTrueFieldsForCommand(cmd, cwd);
@@ -1760,7 +1807,7 @@ When the task is complete, reply:
 
 Rules:
 - Do not use mock services or placeholder replacements for the target agent.
-- Do not write the eval marker, canned success responses, or standalone compatibility servers into the deployed app. If a wrapper is required, it must delegate to the real upstream runtime and surface upstream failures.
+- Do not write the eval marker, canned success responses, or standalone compatibility servers into the deployed app. The marker may appear in controller-side verification.json/verify-chat.sh and final live chat evidence only. If a wrapper is required, it must delegate to the real upstream runtime and surface upstream failures.
 - Do not print secrets.
 - Work in the current trial directory.
 - Keep final evidence in result.json as requested by the task result contract.
@@ -1769,6 +1816,7 @@ Rules:
 - If your result upstream_url differs from the task target_repo, the trial fails.
 - Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, verification.json, verify-chat.sh, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
 - result.json.resource_config must be the guest runtime config file declared under confidential-agent.yaml resources.*.source. It must not be verification.json, verify-chat.sh, result.json, the AppSpec, or the install script.
+- verification.json must be a flat top-level object with service_id, chat_guest_port, chat_method, and chat_path. Do not nest those keys under chat_probe, request, or another wrapper.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - Do not construct GitHub raw URLs, release/archive URLs, or API URLs by guessing path conventions. Use URLs explicitly provided in the skill context, or clone/fetch repositories with git and verify the selected commit.

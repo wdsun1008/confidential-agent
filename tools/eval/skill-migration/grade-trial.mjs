@@ -194,7 +194,7 @@ function readVerificationPlan(trialDir) {
 
 function verificationChatPath(plan) {
   if (!plan || typeof plan !== "object") return "";
-  return String(plan.chat_path || plan.path || plan?.chat?.path || plan?.request?.path || "").trim();
+  return String(plan.chat_path || "").trim();
 }
 
 function commandUsesRenderedPort(commandText, ports) {
@@ -371,6 +371,7 @@ const toolResults = toolResultText(events);
 const renderedLocalPorts = collectRenderedLocalPorts(trialDir, events);
 const verificationPlan = readVerificationPlan(trialDir);
 const chatPath = verificationChatPath(verificationPlan);
+const verifyChatText = readArtifact(trialDir, "verify-chat.sh");
 const weakCriticalCommands = events
   .filter((event) => commandLosesCriticalEvidence(event.cmd))
   .map((event) => event.cmd);
@@ -487,6 +488,12 @@ addFinding(
   fs.existsSync(path.join(trialDir, "verify-chat.sh")),
   "verify_chat_script_exists",
   "verify-chat.sh must exist and run the declared chat probe through connect-ready.json",
+);
+addFinding(
+  findings,
+  /\bconnect-ready\.json\b/.test(verifyChatText) && /\bverification\.json\b/.test(verifyChatText),
+  "verify_chat_reads_contract",
+  "verify-chat.sh must read connect-ready.json and verification.json instead of hard-coding a status probe",
 );
 addFinding(
   findings,
