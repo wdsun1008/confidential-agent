@@ -323,6 +323,7 @@ impl AgentSpec {
         {
             bail!("build.base_image must not be empty when set");
         }
+        validate_build_packages(&self.build)?;
         if self.deploy.instance_type.trim().is_empty() {
             bail!("deploy.instance_type must not be empty");
         }
@@ -436,6 +437,45 @@ fn validate_connect_ports(ports: &[u16], connect: &[u16]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_build_packages(build: &BuildSpec) -> Result<()> {
+    if build.base_image.is_some() {
+        return Ok(());
+    }
+    for (index, package) in build.packages.iter().enumerate() {
+        let package = package.trim();
+        if package.is_empty() {
+            bail!("build.packages[{index}] must not be empty");
+        }
+        if let Some(replacement) = alinux_package_substitution(package) {
+            bail!(
+                "build.packages[{index}]='{package}' uses a Debian/Ubuntu package name; default mkosi builds use Alinux/RHEL dnf packages, so use {replacement} instead"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn alinux_package_substitution(package: &str) -> Option<&'static str> {
+    match package {
+        "build-essential" => Some("'gcc', 'gcc-c++', and 'make'"),
+        "python3-dev" => Some("'python3-devel' or a versioned devel package such as 'python3.11-devel'"),
+        "python3-venv" => Some("the matching Alinux Python runtime package; remove this package unless a custom repository provides it"),
+        "python-dev" => Some("'python3-devel' or a versioned devel package such as 'python3.11-devel'"),
+        "python-dev-is-python3" => Some("'python3-devel' or a versioned devel package such as 'python3.11-devel'"),
+        "libc-dev" => Some("'glibc-devel'"),
+        "libc6-dev" => Some("'glibc-devel'"),
+        "libffi-dev" => Some("'libffi-devel'"),
+        "libssl-dev" => Some("'openssl-devel'"),
+        "openssh-client" => Some("'openssh-clients'"),
+        "procps" => Some("'procps-ng'"),
+        "xz-utils" => Some("'xz'"),
+        "docker-cli" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
+        "docker.io" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
+        "ffmpeg" => Some("a custom base image or repository that provides ffmpeg; otherwise remove it from build.packages"),
+        _ => None,
+    }
 }
 
 fn validate_variant(name: &str, variant: &BuildVariantSpec) -> Result<()> {
@@ -630,6 +670,66 @@ resources:
 
         assert!(spec.build.base_image.is_none());
         assert_eq!(spec.image_id(), "openclaw-agent");
+    }
+
+    #[test]
+    fn rejects_debian_package_names_for_default_mkosi_builds() {
+        let yaml = SPEC
+            .replace("  base_image: ./base.qcow2\n", "")
+            .replace("    - nodejs", "    - build-essential");
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("build.packages[0]='build-essential' uses a Debian/Ubuntu package name"));
+    }
+
+    #[test]
+    fn rejects_whitespace_padded_debian_package_names() {
+        let yaml = SPEC
+            .replace("  base_image: ./base.qcow2\n", "")
+            .replace("    - nodejs", "    - \" libffi-dev \"");
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err.to_string().contains("use 'libffi-devel' instead"));
+    }
+
+    #[test]
+    fn rejects_additional_debian_package_names() {
+        for package in ["python3-venv", "python-dev-is-python3", "libc-dev", "docker.io"] {
+            let yaml = SPEC
+                .replace("  base_image: ./base.qcow2\n", "")
+                .replace("    - nodejs", &format!("    - {package}"));
+            let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains(&format!("build.packages[0]='{package}'")));
+        }
+    }
+
+    #[test]
+    fn rejects_packages_unavailable_in_default_alinux_repos() {
+        let yaml = SPEC
+            .replace("  base_image: ./base.qcow2\n", "")
+            .replace("    - nodejs", "    - ffmpeg");
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("custom base image or repository that provides ffmpeg"));
+    }
+
+    #[test]
+    fn allows_custom_base_images_to_choose_package_ecosystem() {
+        let yaml = SPEC.replace("    - nodejs", "    - build-essential");
+        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+
+        assert_eq!(
+            spec.build.base_image.as_deref(),
+            Some("/project/base.qcow2")
+        );
+        assert_eq!(spec.build.packages, vec!["build-essential"]);
     }
 
     #[test]

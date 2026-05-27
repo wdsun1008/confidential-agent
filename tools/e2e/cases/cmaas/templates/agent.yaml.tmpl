@@ -1,0 +1,40 @@
+schema: confidential-agent/v1
+
+service:
+  id: cmaas-agent
+  ports: [18080]
+  connect: []
+  app_service: cai-cmaas-agent.service
+
+build:
+{{raw:BASE_IMAGE_LINE}}
+  image_name: cmaas-agent
+  resize: 30G
+  with_network: true
+  packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
+  files:
+    - source: ./files/agent-client.mjs
+      target: /usr/local/share/confidential-agent/cmaas/agent-client.mjs
+      executable: true
+  scripts: [./install-agent.sh]
+  variants:
+    release:
+      enabled: false
+    debug:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: {{yaml:INSTANCE_TYPE}}
+  region: {{yaml:REGION}}
+  zone_id: {{yaml:ZONE_ID}}
+  disk_gb: {{raw:DISK_GB}}
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: {{yaml:REFERENCE_VALUES}}
+{{raw:REKOR_BLOCK}}
+
+resources: {}

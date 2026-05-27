@@ -74,12 +74,35 @@ fn operator_peerings() -> PeeringsFile {
 }
 
 #[test]
-fn renders_release_shelter_build_without_ssh_key_name() {
+fn build_config_omits_deploy_by_default() {
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let rendered = render_build_config(
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            peerings: operator_peerings(),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(rendered.contains("from: /images/base.qcow2"));
+    assert!(rendered.contains("variants:"));
+    assert!(rendered.contains("name: release"));
+    assert!(!rendered.contains("deploy:"));
+    assert!(!rendered.contains("backend: terraform"));
+    assert!(!rendered.contains("security_group_ports:"));
+    assert!(!rendered.contains("control_8006_peer_203_0_113_0_24"));
+}
+
+#[test]
+fn renders_release_shelter_deploy_without_ssh_key_name() {
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            include_deploy: true,
             peerings: operator_peerings(),
             ..ShelterRenderOptions::default()
         },
@@ -135,6 +158,7 @@ fn renders_mkosi_build_without_from_or_legacy_variants() {
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            include_deploy: true,
             peerings: operator_peerings(),
             ..ShelterRenderOptions::default()
         },
@@ -160,6 +184,7 @@ fn renders_debug_deploy_with_ssh_security_group() {
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            include_deploy: true,
             peerings: operator_peerings(),
             ..ShelterRenderOptions::default()
         },
@@ -191,6 +216,7 @@ fn renders_mesh_peer_rules_for_all_service_ports() {
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            include_deploy: true,
             mesh_peer_cidrs: vec!["39.105.93.168/32".to_string()],
             ..ShelterRenderOptions::default()
         },
@@ -221,6 +247,7 @@ fn renders_peerings_for_agent_card_and_connect_ports() {
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            include_deploy: true,
             peerings,
             ..ShelterRenderOptions::default()
         },
@@ -249,6 +276,7 @@ fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            include_deploy: true,
             images_dir: Some(PathBuf::from("/state/services/openclaw/artifacts")),
             cache_dir: Some(PathBuf::from("/state/services/openclaw/cache")),
             deploy_resource_name: Some("openclaw-20260429201011".to_string()),
@@ -370,6 +398,7 @@ fn local_image_import_name_defaults_to_build_id() {
         &spec,
         &assets(),
         &ShelterRenderOptions {
+            include_deploy: true,
             local_image_source: Some(PathBuf::from(
                 "/var/lib/shelter/images/openclaw-agent/final-release-202604281803.qcow2",
             )),

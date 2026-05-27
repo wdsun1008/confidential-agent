@@ -5,7 +5,8 @@ use super::commands::{
     validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
-use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
+use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, StatusArgs};
+use clap::Parser;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -22,6 +23,70 @@ fn test_cli() -> Cli {
         shelter_bin: PathBuf::from("shelter"),
         state_dir: PathBuf::from("/work/.confidential-agent"),
         tools_image: "confidential-agent-tools:test".to_string(),
+    }
+}
+
+#[test]
+fn common_commands_default_to_confidential_agent_yaml() {
+    let build = Cli::parse_from(["confidential-agent", "build"]);
+    match build.command {
+        Commands::Build(args) => assert_eq!(args.spec, PathBuf::from("confidential-agent.yaml")),
+        other => panic!("expected build command, got {other:?}"),
+    }
+
+    let deploy = Cli::parse_from(["confidential-agent", "deploy"]);
+    match deploy.command {
+        Commands::Deploy(args) => assert_eq!(args.spec, PathBuf::from("confidential-agent.yaml")),
+        other => panic!("expected deploy command, got {other:?}"),
+    }
+
+    let validate = Cli::parse_from(["confidential-agent", "spec", "validate"]);
+    match validate.command {
+        Commands::Spec(SpecArgs {
+            command: SpecCommands::Validate { spec, .. },
+        }) => assert_eq!(spec, PathBuf::from("confidential-agent.yaml")),
+        other => panic!("expected spec validate command, got {other:?}"),
+    }
+}
+
+#[test]
+fn connect_cli_keeps_bare_mode_and_adds_start_stop() {
+    let bare = Cli::parse_from(["confidential-agent", "connect", "--service", "openclaw"]);
+    match bare.command {
+        Commands::Connect(args) => {
+            assert_eq!(args.service.as_deref(), Some("openclaw"));
+            assert!(args.command.is_none());
+        }
+        other => panic!("expected connect command, got {other:?}"),
+    }
+
+    let start = Cli::parse_from([
+        "confidential-agent",
+        "connect",
+        "start",
+        "--service",
+        "openclaw",
+        "--ready-json",
+        "ready.json",
+    ]);
+    match start.command {
+        Commands::Connect(args) => match args.command {
+            Some(ConnectCommands::Start(start)) => {
+                assert_eq!(start.service.as_deref(), Some("openclaw"));
+                assert_eq!(start.ready_json, PathBuf::from("ready.json"));
+            }
+            other => panic!("expected connect start, got {other:?}"),
+        },
+        other => panic!("expected connect command, got {other:?}"),
+    }
+
+    let stop = Cli::parse_from(["confidential-agent", "connect", "stop", "--ready-json", "ready.json"]);
+    match stop.command {
+        Commands::Connect(args) => match args.command {
+            Some(ConnectCommands::Stop(stop)) => assert_eq!(stop.ready_json, PathBuf::from("ready.json")),
+            other => panic!("expected connect stop, got {other:?}"),
+        },
+        other => panic!("expected connect command, got {other:?}"),
     }
 }
 
@@ -525,7 +590,7 @@ fn write_fake_shelter(path: &Path, log: &Path) {
     write_script(
         path,
         &format!(
-            r#"#!/usr/bin/env python3
+            r#"#!/usr/bin/env python3.11
 import json
 import os
 import sys
@@ -907,6 +972,7 @@ service:
   ports: [18789]
   connect: [18789]
 build:
+  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -961,7 +1027,7 @@ resources: {}
 }
 
 #[test]
-fn build_render_only_keeps_selected_variant_rendered_config() {
+fn build_render_only_ignores_peerings_and_keeps_selected_variant_rendered_config() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let fake_bin = write_fake_prepare_tools(temp.path());
@@ -980,6 +1046,7 @@ service:
   ports: [18789]
   connect: [18789]
 build:
+  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1029,9 +1096,190 @@ resources: {}
 
     let rendered =
         fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
-    assert!(rendered.contains("name: openclaw-agent-release-"));
+    assert!(rendered.contains("name: release"));
+    assert!(!rendered.contains("deploy:"));
+    assert!(!rendered.contains("security_group_ports:"));
+    assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
+    assert!(!rendered.contains("name: debug"));
+}
+
+#[test]
+fn deploy_render_only_includes_operator_peering_security_group_rules() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let shelter = temp.path().join("fake-shelter");
+    let log = temp.path().join("shelter.log");
+    write_fake_shelter(&shelter, &log);
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+    cli.shelter_bin = shelter;
+
+    cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false,
+        },
+    )
+    .unwrap();
+    let err = cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec: spec.clone(),
+            skip_inject: false,
+            render_only: false,
+            skip_peering_check: false,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("no operator peering"));
+
+    PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "203.0.113.10/32".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    }
+    .write_to_path(&cli.state_dir.join("peerings.yaml"))
+    .unwrap();
+
+    cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec,
+            skip_inject: true,
+            render_only: true,
+            skip_peering_check: false,
+        },
+    )
+    .unwrap();
+    std::env::set_var("PATH", old_path);
+
+    let rendered =
+        fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("deploy:"));
+    assert!(rendered.contains("backend: terraform"));
+    assert!(rendered.contains("security_group_ports: []"));
     assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
-    assert!(!rendered.contains("name: openclaw-agent-debug-"));
+    assert!(rendered.contains("status_8088_peer_203_0_113_10_32"));
+    assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
+}
+
+#[test]
+fn render_service_config_from_state_refreshes_peering_rules_without_rebuild() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let spec_path = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec_path,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.spec.path = spec_path;
+    state.deploy.terraform_dir = Some(
+        state_dir
+            .join("services")
+            .join("openclaw")
+            .join("terraform")
+            .join("active"),
+    );
+    state.deploy.image_import_name = Some("openclaw-agent-release-20260429201011".to_string());
+    write_state(&state_dir, &state);
+    write_manifest(&state_dir, "openclaw", &state.build.build_id);
+
+    PeeringsFile {
+        version: 1,
+        peerings: vec![PeeringEntry {
+            label: "ops".to_string(),
+            role: PeeringRole::Operator,
+            cidr: "203.0.113.10/32".to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }],
+    }
+    .write_to_path(&state_dir.join("peerings.yaml"))
+    .unwrap();
+    render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
+    let rendered =
+        fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("deploy:"));
+    assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
+    assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
+
+    PeeringsFile::empty()
+        .write_to_path(&state_dir.join("peerings.yaml"))
+        .unwrap();
+    render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
+    let rendered =
+        fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    assert!(rendered.contains("deploy:"));
+    assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
+    assert!(!rendered.contains("connect_18789_peer_203_0_113_10_32"));
 }
 
 #[test]
@@ -2397,7 +2645,7 @@ fn connect_requires_public_ip() {
     );
     write_mesh_bundle(temp.path(), vec![service], sample);
 
-    let err = render_connect_config(temp.path()).unwrap_err();
+    let err = render_connect_config(temp.path(), None).unwrap_err();
 
     assert!(err
         .to_string()
@@ -2410,7 +2658,7 @@ fn connect_ignores_services_without_connect_ports() {
     let service = local_state("mcp", vec![3001], Vec::new());
     write_state(temp.path(), &service);
 
-    let err = render_connect_config(temp.path()).unwrap_err();
+    let err = render_connect_config(temp.path(), None).unwrap_err();
 
     assert!(err
         .to_string()
@@ -2438,11 +2686,67 @@ fn connect_renders_all_connect_services() {
     );
     write_mesh_bundle(temp.path(), vec![openclaw, worker, mcp], sample);
 
-    let config = render_connect_config(temp.path()).unwrap();
+    let config = render_connect_config(temp.path(), None).unwrap();
 
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
-    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 49152);
-    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 49153);
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 49152);
+    assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 49153);
+    assert_eq!(config["client_endpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(config["client_endpoints"][0]["service"], "openclaw");
+    assert_eq!(config["client_endpoints"][0]["guest_port"], 49152);
+    assert_eq!(config["client_endpoints"][0]["local_host"], "127.0.0.1");
+    let local_port = config["client_endpoints"][0]["local_port"].as_u64().unwrap();
+    assert!(local_port >= 49152);
+    assert_eq!(
+        config["client_endpoints"][0]["http_base_url"],
+        format!("http://127.0.0.1:{local_port}")
+    );
+}
+
+#[test]
+fn connect_service_filter_renders_only_requested_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let openclaw = local_state("openclaw", vec![49152], vec![49152]);
+    let worker = local_state("worker", vec![49153], vec![49153]);
+    write_state(temp.path(), &openclaw);
+    write_state(temp.path(), &worker);
+
+    let mut sample = BTreeMap::new();
+    sample.insert(
+        "openclaw".to_string(),
+        serde_json::json!({"measurement.uki.SHA-384": ["openclaw-rv"]}),
+    );
+    sample.insert(
+        "worker".to_string(),
+        serde_json::json!({"measurement.uki.SHA-384": ["worker-rv"]}),
+    );
+    write_mesh_bundle(temp.path(), vec![openclaw, worker], sample);
+
+    let config = render_connect_config(temp.path(), Some("worker")).unwrap();
+
+    assert_eq!(config["add_ingress"].as_array().unwrap().len(), 1);
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 49153);
+    assert_eq!(config["client_endpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(config["client_endpoints"][0]["service"], "worker");
+}
+
+#[test]
+fn connect_service_filter_rejects_unknown_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let openclaw = local_state("openclaw", vec![49152], vec![49152]);
+    write_state(temp.path(), &openclaw);
+    write_mesh_bundle(
+        temp.path(),
+        vec![openclaw],
+        BTreeMap::from([(
+            "openclaw".to_string(),
+            serde_json::json!({"measurement.uki.SHA-384": ["openclaw-rv"]}),
+        )]),
+    );
+
+    let err = render_connect_config(temp.path(), Some("missing")).unwrap_err();
+
+    assert!(err.to_string().contains("no local state for service 'missing'"));
 }
 
 #[test]

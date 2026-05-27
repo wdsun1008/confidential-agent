@@ -1,7 +1,8 @@
 use crate::cli::{
-    A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, DeployArgs, DestroyArgs,
-    ImageArgs, ImageCommands, InjectArgs, MeshArgs, MeshCommands, MigrateArgs, PeeringArgs,
-    PeeringCommands, StatusArgs,
+    A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands,
+    ConnectStartArgs, ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs,
+    ImageCommands, InjectArgs, MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs,
+    PeeringCommands, SpecArgs, SpecCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -120,6 +121,7 @@ struct PreparedConfig {
 struct PrepareOptions {
     build_id: Option<String>,
     image_variant: Option<String>,
+    include_deploy: bool,
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
     peerings: PeeringsFile,
@@ -254,6 +256,25 @@ struct ToolContainerSpec {
     envs: Vec<(String, String)>,
     workdir: Option<PathBuf>,
     container_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConnectClientEndpoint {
+    service: String,
+    guest_port: u16,
+    local_host: String,
+    local_port: u16,
+    protocol: String,
+    http_base_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConnectReadyFile {
+    schema: String,
+    container_name: String,
+    container_id: String,
+    started_at: String,
+    client_endpoints: Vec<ConnectClientEndpoint>,
 }
 
 #[derive(Debug)]
@@ -409,6 +430,9 @@ mod commands;
 use commands::deploy_shelter_args;
 pub(crate) use commands::run;
 
+mod self_describe;
+use self_describe::*;
+
 fn prepare(
     cli: &Cli,
     state_dir: &Path,
@@ -461,6 +485,7 @@ fn prepare(
             images_dir: Some(paths.artifacts_dir.clone()),
             cache_dir: Some(paths.cache_dir.clone()),
             terraform_dir: terraform_dir.clone(),
+            include_deploy: options.include_deploy,
             local_image_source: None,
             deploy_resource_name: options
                 .deploy_names

@@ -1,0 +1,12 @@
+{
+  "assets": [
+    {"source": "examples/openclaw/install-openclaw.sh", "target": "openclaw/install-openclaw.sh"},
+    {"source": "examples/openclaw/files", "target": "openclaw/files"},
+    {"source": "examples/mcp/install-mcp.sh", "target": "mcp/install-mcp.sh"}
+  ],
+  "templates": [
+    {"source": "templates/openclaw.yaml.tmpl", "target": "openclaw/openclaw.yaml"},
+    {"source": "templates/openclaw.json.tmpl", "target": "openclaw/openclaw.json", "mode": "0600"},
+    {"source": "templates/mcp-demo.yaml.tmpl", "target": "mcp/mcp-demo.yaml"}
+  ]
+}

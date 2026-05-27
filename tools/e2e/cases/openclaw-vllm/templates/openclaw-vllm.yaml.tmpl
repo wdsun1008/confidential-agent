@@ -1,0 +1,80 @@
+schema: confidential-agent/v1
+
+service:
+  id: openclaw-vllm
+  ports: [18789]
+  connect: [18789]
+  app_service: cai-openclaw-gateway.service
+
+build:
+{{raw:BASE_IMAGE_LINE}}
+  image_name: openclaw-vllm-agent
+  kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
+  resize: 80G
+  with_network: true
+  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  files:
+    - source: ./nvidia-persistenced.service
+      target: /usr/local/share/cai/nvidia-persistenced.service
+    - source: ./cai-nvidia-cc-stack-install.sh
+      target: /usr/local/sbin/cai-nvidia-cc-stack-install.sh
+      executable: true
+    - source: {{yaml:CAI_PEP}}
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ./files/tdx-remote-attestation.SKILL.md
+      target: /home/openclaw/.openclaw/skills/tdx-remote-attestation/SKILL.md
+    - source: ./files/install-cai-pep.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/install-openclaw-runtime.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh
+      executable: true
+    - source: ./files/cai-pep-default-policy.json
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
+    - source: ./files/cai-pep-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/cai-a2a-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin
+    - source: ./files/patch-openclaw-cai-pep.js
+      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
+      executable: true
+  scripts: [./install-openclaw-vllm.sh]
+  variants:
+    release:
+      enabled: false
+    debug:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: {{yaml:INSTANCE_TYPE}}
+  region: {{yaml:REGION}}
+  zone_id: {{yaml:ZONE_ID}}
+  disk_gb: {{raw:DISK_GB}}
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: {{yaml:REFERENCE_VALUES}}
+{{raw:REKOR_BLOCK}}
+
+a2a:
+  id: openclaw-vllm
+  name: openclaw-vllm
+  version: "1.0.0"
+  description: "OpenClaw vLLM confidential agent"
+  skills:
+    - id: chat
+      name: Chat
+      description: "OpenClaw gateway chat"
+
+resources:
+  openclaw_config:
+    source: ./openclaw-vllm.json
+    target: /home/openclaw/.openclaw/openclaw.json
+    owner: openclaw
+    group: openclaw
+    mode: "0600"
+    required: true

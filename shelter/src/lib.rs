@@ -35,6 +35,7 @@ pub struct ShelterRenderOptions {
     pub images_dir: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub terraform_dir: Option<PathBuf>,
+    pub include_deploy: bool,
     pub local_image_source: Option<PathBuf>,
     pub deploy_resource_name: Option<String>,
     pub local_image_import_name: Option<String>,
@@ -83,7 +84,11 @@ pub fn render_build_config(
                 path: assets.initrd_secret_fetch_module.clone(),
             }],
         },
-        deploy: render_deploy_config(spec, options),
+        deploy: if options.include_deploy {
+            render_deploy_config(spec, options)
+        } else {
+            None
+        },
     };
 
     serde_yaml::to_string(&config).map_err(Into::into)

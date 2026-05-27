@@ -72,7 +72,6 @@ install_os_dependencies() {
     openssh-clients
     openssl
     pkgconf-pkg-config
-    python3
     python3.11
     tar
     util-linux
@@ -200,7 +199,9 @@ openclaw_global_package_version() {
 }
 
 ensure_host_openclaw_runtime() {
-  [[ "${CA_SKIP_HOST_OPENCLAW:-0}" != "1" ]] || return
+  if [[ "${CA_SKIP_HOST_OPENCLAW:-0}" == "1" ]]; then
+    return 0
+  fi
   is_root || die "installing host OpenClaw CLI requires root"
   ensure_host_node22
   command -v npm >/dev/null 2>&1 || die "npm is required to install OpenClaw"

@@ -101,11 +101,6 @@ detect_public_ip() {
     "https://ifconfig.me/ip" \
     "https://ipinfo.io/ip" \
     "https://checkip.amazonaws.com"; do
-    ip="$(curl --noproxy '*' -fsSL --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-      printf '%s\n' "$ip"
-      return 0
-    fi
     ip="$(curl -fsSL --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
       printf '%s\n' "$ip"

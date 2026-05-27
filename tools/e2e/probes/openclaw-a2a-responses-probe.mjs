@@ -28,7 +28,7 @@ function normalizeBaseUrl(raw) {
 async function postJson(baseUrl, pathname, token, body, timeoutMs) {
   const url = new URL(pathname, baseUrl);
   const retryableStatuses = new Set([401, 404, 502, 503]);
-  const retryDeadline = Date.now() + Math.min(timeoutMs, 60000);
+  const retryDeadline = Date.now() + timeoutMs;
   let lastError;
 
   while (true) {
@@ -182,7 +182,7 @@ async function main() {
           parameters: A2aChatSchema,
         },
       ],
-      tool_choice: { type: "function", function: { name: "a2a_chat" } },
+      tool_choice: "required",
       max_output_tokens: 2048,
       stream: false,
     },
@@ -238,7 +238,6 @@ async function main() {
       ],
       instructions:
         "Return only the peer response text from the function output. Do not add explanation and do not call any tools.",
-      tool_choice: "none",
       max_output_tokens: 256,
       stream: false,
     },

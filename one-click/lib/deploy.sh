@@ -139,7 +139,7 @@ build_openclaw_image() {
 openclaw_is_active() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3 - "$status_json" <<'PY' >/dev/null 2>&1
+  python3.11 - "$status_json" <<'PY' >/dev/null 2>&1
 import json
 import sys
 
@@ -158,7 +158,7 @@ PY
 openclaw_public_ip() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3 - "$status_json" <<'PY'
+  python3.11 - "$status_json" <<'PY'
 import json
 import sys
 
@@ -179,7 +179,7 @@ PY
 openclaw_debug_ssh_key() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3 - "$status_json" <<'PY'
+  python3.11 - "$status_json" <<'PY'
 import json
 import sys
 
@@ -265,7 +265,7 @@ wait_for_live_status() {
   log "waiting for live guest status"
   while ((SECONDS < deadline)); do
     if ca_cmd status --live --json >"$status_json" 2>"$CA_WORK_DIR/status-live.err"; then
-      if python3 - "$status_json" <<'PY' >/dev/null 2>&1
+      if python3.11 - "$status_json" <<'PY' >/dev/null 2>&1
 import json
 import sys
 
@@ -365,7 +365,7 @@ run_chat_probe() {
     return
   fi
   log "running OpenClaw chat probe through connect"
-  if node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
+  if node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
     --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
     --token "$CA_GATEWAY_TOKEN" \
     --message "$CA_CHAT_MESSAGE" \
@@ -410,7 +410,7 @@ run_tdx_attestation_probe() {
   local out="$CA_WORK_DIR/tdx-skill-probe.json"
   local err="$CA_WORK_DIR/tdx-skill-probe.err"
   log "triggering OpenClaw tdx-remote-attestation skill"
-  if ! node "$ROOT_DIR/tools/e2e/openclaw-chat-probe.mjs" \
+  if ! node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
     --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
     --token "$CA_GATEWAY_TOKEN" \
     --message "请使用 tdx-remote-attestation skill 验证当前 TDX 运行环境。必须执行 skill 文档中的 cai-pep attest collect-and-verify 命令；如果工具调用失败，请直接报告失败，不要改用 CPU flags、/dev/tdx_guest 或系统日志推断。" \
@@ -491,7 +491,6 @@ EOF
 
 run_install_only() {
   install_os_dependencies
-  ensure_host_openclaw_runtime
   ensure_sigstore_tools
   ensure_shelter
   build_confidential_agent
@@ -513,8 +512,8 @@ run_deploy_openclaw() {
   install_confidential_agent_cli
   build_tools_image
   prepare_openclaw_specs
-  ensure_operator_peering
   build_openclaw_image
+  ensure_operator_peering
   deploy_openclaw_service
   sync_active_openclaw_resources
   restart_active_openclaw_app

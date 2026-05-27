@@ -28,7 +28,7 @@ function normalizeBaseUrl(raw) {
 async function postJson(baseUrl, pathname, token, body, timeoutMs) {
   const url = new URL(pathname, baseUrl);
   const retryableStatuses = new Set([401, 404, 502, 503]);
-  const retryDeadline = Date.now() + Math.min(timeoutMs, 60000);
+  const retryDeadline = Date.now() + timeoutMs;
   let lastError;
 
   while (true) {
