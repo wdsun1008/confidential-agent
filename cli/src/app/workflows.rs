@@ -579,13 +579,17 @@ pub(super) fn update_mesh_generation(
     Ok(())
 }
 
-pub(super) fn render_connect_config(state_dir: &Path) -> Result<serde_json::Value> {
+pub(super) fn render_connect_config(
+    state_dir: &Path,
+    service_filter: Option<&str>,
+) -> Result<serde_json::Value> {
     let states = read_service_states(state_dir)?;
-    let services = connect_services(&states)?;
+    let services = connect_services(&states, service_filter)?;
 
     let bundle = read_mesh_bundle(state_dir)?;
     let mut used_local_ports = BTreeSet::new();
     let mut ingress = Vec::new();
+    let mut client_endpoints = Vec::new();
     for service in services {
         let remote_ports = service.service.connect.clone();
 
@@ -605,6 +609,14 @@ pub(super) fn render_connect_config(state_dir: &Path) -> Result<serde_json::Valu
                 "CONNECT_FORWARD host=127.0.0.1 port={} remote_host={} remote_port={} service={}",
                 local_port, host, remote_port, service.service_id
             );
+            client_endpoints.push(ConnectClientEndpoint {
+                service: service.service_id.clone(),
+                guest_port: remote_port,
+                local_host: "127.0.0.1".to_string(),
+                local_port,
+                protocol: "http".to_string(),
+                http_base_url: format!("http://127.0.0.1:{local_port}"),
+            });
             ingress.push(serde_json::json!({
                 "mapping": {
                     "in": {
@@ -626,7 +638,10 @@ pub(super) fn render_connect_config(state_dir: &Path) -> Result<serde_json::Valu
         }
     }
 
-    Ok(serde_json::json!({ "add_ingress": ingress }))
+    Ok(serde_json::json!({
+        "add_ingress": ingress,
+        "client_endpoints": client_endpoints,
+    }))
 }
 
 pub(super) fn render_agent_card_connect_config(card: &AgentCard) -> Result<serde_json::Value> {
@@ -639,9 +654,10 @@ pub(super) fn render_agent_card_connect_config_with_port_checker(
 ) -> Result<serde_json::Value> {
     let ext = confidential_extension(card)?;
     let mut used_local_ports = BTreeSet::new();
+    let mut client_endpoints = Vec::new();
     let control_port = allocate_local_port(50000, &is_occupied)?;
     used_local_ports.insert(control_port);
-    derive_tng_client_config_with_local_ports(
+    let mut config = derive_tng_client_config_with_local_ports(
         card,
         |remote_port| {
             let local_port = allocate_local_port(remote_port, |port| {
@@ -656,13 +672,52 @@ pub(super) fn render_agent_card_connect_config_with_port_checker(
                 "CONNECT_FORWARD host=127.0.0.1 port={} remote_host={} remote_port={} service={}",
                 local_port, ext.public_ip, remote_port, ext.id
             );
+            client_endpoints.push(ConnectClientEndpoint {
+                service: ext.id.clone(),
+                guest_port: remote_port,
+                local_host: "127.0.0.1".to_string(),
+                local_port,
+                protocol: "http".to_string(),
+                http_base_url: format!("http://127.0.0.1:{local_port}"),
+            });
             Ok(local_port)
         },
         control_port,
-    )
+    )?;
+    if let serde_json::Value::Object(map) = &mut config {
+        map.insert(
+            "client_endpoints".to_string(),
+            serde_json::to_value(client_endpoints)?,
+        );
+    }
+    Ok(config)
 }
 
-pub(super) fn connect_services(states: &[LocalServiceState]) -> Result<Vec<&LocalServiceState>> {
+pub(super) fn connect_services<'a>(
+    states: &'a [LocalServiceState],
+    service_filter: Option<&str>,
+) -> Result<Vec<&'a LocalServiceState>> {
+    if let Some(service_id) = service_filter {
+        let state = states
+            .iter()
+            .find(|state| state.service_id == service_id)
+            .with_context(|| format!("no local state for service '{service_id}'"))?;
+        if state.phase != "active" {
+            bail!(
+                "service '{}' is {}; connect requires an active deployed service",
+                state.service_id,
+                state.phase
+            );
+        }
+        if state.service.connect.is_empty() {
+            bail!(
+                "service '{}' does not expose any service.connect ports",
+                state.service_id
+            );
+        }
+        return Ok(vec![state]);
+    }
+
     let services = states
         .iter()
         .filter(|state| state.phase == "active" && !state.service.connect.is_empty())

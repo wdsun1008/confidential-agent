@@ -638,23 +638,34 @@ pub(super) fn cmd_migrate(cli: &Cli, args: &MigrateArgs) -> Result<()> {
 }
 
 pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
-    let config = if let Some(url) = args.from_card.as_deref() {
-        let card = fetch_agent_card(url)
-            .map_err(anyhow::Error::new)
-            .with_context(|| format!("failed to fetch AgentCard from '{url}'"))?;
-        render_agent_card_connect_config(&card)?
-    } else {
-        if args.service.is_some() {
-            bail!("--service is only supported with --from-card in this version");
+    match &args.command {
+        Some(ConnectCommands::Start(start)) => {
+            if args.render_only {
+                bail!("connect start does not support --render-only; use `connect --render-only` to inspect the forwarding plan");
+            }
+            let from_card =
+                merge_connect_option("from-card", args.from_card.as_ref(), start.from_card.as_ref())?;
+            let service =
+                merge_connect_option("service", args.service.as_ref(), start.service.as_ref())?;
+            return cmd_connect_start(cli, start, from_card, service);
         }
-        render_connect_config(&cli.state_dir)?
-    };
-    let config_content = serde_json::to_string(&config)?;
+        Some(ConnectCommands::Stop(stop)) => {
+            if args.render_only || args.from_card.is_some() || args.service.is_some() {
+                bail!("connect stop only accepts --ready-json");
+            }
+            return cmd_connect_stop(stop);
+        }
+        None => {}
+    }
+
+    let config = resolve_connect_config(cli, args.from_card.as_deref(), args.service.as_deref())?;
     if args.render_only {
         println!("{}", serde_json::to_string_pretty(&config)?);
         return Ok(());
     }
 
+    let tng_config = tng_launch_config(&config);
+    let config_content = serde_json::to_string(&tng_config)?;
     let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
     let mounts = vec![workdir.clone()];
 
@@ -673,6 +684,274 @@ pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
         },
         true,
     )
+}
+
+fn merge_connect_option<'a>(
+    name: &str,
+    top_level: Option<&'a String>,
+    subcommand: Option<&'a String>,
+) -> Result<Option<&'a str>> {
+    match (top_level, subcommand) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("conflicting --{name} values: '{left}' and '{right}'")
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value.as_str())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_connect_config(
+    cli: &Cli,
+    from_card: Option<&str>,
+    service: Option<&str>,
+) -> Result<serde_json::Value> {
+    if let Some(url) = from_card {
+        let card = fetch_agent_card(url)
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("failed to fetch AgentCard from '{url}'"))?;
+        render_agent_card_connect_config(&card)
+    } else {
+        render_connect_config(&cli.state_dir, service)
+    }
+}
+
+fn tng_launch_config(config: &serde_json::Value) -> serde_json::Value {
+    let mut value = config.clone();
+    if let serde_json::Value::Object(map) = &mut value {
+        map.remove("client_endpoints");
+    }
+    value
+}
+
+fn cmd_connect_start(
+    cli: &Cli,
+    args: &ConnectStartArgs,
+    from_card: Option<&str>,
+    service: Option<&str>,
+) -> Result<()> {
+    if from_card.is_some() && service.is_some() {
+        bail!("connect start accepts either --from-card or --service, not both");
+    }
+    let config = resolve_connect_config(cli, from_card, service)?;
+    let endpoints = connect_client_endpoints(&config)?;
+    let tng_config = tng_launch_config(&config);
+    let config_content = serde_json::to_string(&tng_config)?;
+    let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
+    let mounts = vec![workdir.clone()];
+    guard_existing_connect_ready(&args.ready_json)?;
+    let container_name = connect_container_name();
+    let container_id = start_tools_container_detached(
+        cli,
+        ToolContainerSpec {
+            tool: "tng",
+            tool_args: vec![
+                OsString::from("launch"),
+                OsString::from(format!("--config-content={config_content}")),
+            ],
+            mounts,
+            envs: inherited_proxy_envs(None),
+            workdir: Some(workdir),
+            container_name: Some(container_name.clone()),
+        },
+    )?;
+
+    if let Err(err) = wait_for_connect_endpoints(&endpoints, Duration::from_secs(args.wait_ready)) {
+        let logs = docker_logs(&container_name);
+        let _ = stop_connect_container(&container_name);
+        if let Some(log_file) = args.log_file.as_ref() {
+            let _ = fs::write(log_file, logs.as_deref().unwrap_or(""));
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "connect container '{}' did not become ready; logs: {}",
+                container_name,
+                logs.as_deref().unwrap_or("<unavailable>")
+            )
+        });
+    }
+
+    let ready = ConnectReadyFile {
+        schema: "confidential-agent/connect-ready/v1".to_string(),
+        container_name: container_name.clone(),
+        container_id,
+        started_at: current_utc_timestamp(),
+        client_endpoints: endpoints,
+    };
+    if let Some(parent) = args.ready_json.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    fs::write(&args.ready_json, serde_json::to_string_pretty(&ready)?)
+        .with_context(|| format!("failed to write '{}'", args.ready_json.display()))?;
+    if let Some(log_file) = args.log_file.as_ref() {
+        fs::write(
+            log_file,
+            format!(
+                "connect container '{}' is running. Use `docker logs {}` for live tunnel logs.\n",
+                container_name, container_name
+            ),
+        )
+        .with_context(|| format!("failed to write '{}'", log_file.display()))?;
+    }
+    println!(
+        "[ca] connect ready: {} endpoints; ready_json={}",
+        ready.client_endpoints.len(),
+        args.ready_json.display()
+    );
+    for endpoint in &ready.client_endpoints {
+        println!(
+            "CONNECT_READY service={} guest_port={} url={}",
+            endpoint.service, endpoint.guest_port, endpoint.http_base_url
+        );
+    }
+    Ok(())
+}
+
+fn cmd_connect_stop(args: &ConnectStopArgs) -> Result<()> {
+    let ready: ConnectReadyFile = serde_json::from_str(
+        &fs::read_to_string(&args.ready_json)
+            .with_context(|| format!("failed to read '{}'", args.ready_json.display()))?,
+    )
+    .with_context(|| format!("failed to parse '{}'", args.ready_json.display()))?;
+    stop_connect_container(&ready.container_name)?;
+    println!("[ca] connect stopped: {}", ready.container_name);
+    Ok(())
+}
+
+fn start_tools_container_detached(cli: &Cli, spec: ToolContainerSpec) -> Result<String> {
+    ensure_docker_available()?;
+    let mut args = tools_container_args(cli, spec);
+    args.insert(2, OsString::from("-d"));
+    let output = Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to execute 'docker'")?;
+    if !output.status.success() {
+        bail!(
+            "docker run for connect tunnel failed with {}; stderr: {}; stdout: {}",
+            output.status,
+            summarize_command_bytes(&output.stderr),
+            summarize_command_bytes(&output.stdout)
+        );
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        bail!("docker run for connect tunnel did not return a container id");
+    }
+    Ok(id)
+}
+
+fn guard_existing_connect_ready(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(ready) = serde_json::from_str::<ConnectReadyFile>(&fs::read_to_string(path)?) else {
+        return Ok(());
+    };
+    if connect_container_running(&ready.container_name) {
+        bail!(
+            "connect tunnel '{}' from '{}' is already running; stop it first or use a different --ready-json",
+            ready.container_name,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn connect_container_running(container_name: &str) -> bool {
+    Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", container_name])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+fn connect_client_endpoints(config: &serde_json::Value) -> Result<Vec<ConnectClientEndpoint>> {
+    let endpoints = config
+        .get("client_endpoints")
+        .cloned()
+        .context("connect config has no client_endpoints")?;
+    let endpoints: Vec<ConnectClientEndpoint> =
+        serde_json::from_value(endpoints).context("connect config client_endpoints are invalid")?;
+    if endpoints.is_empty() {
+        bail!("connect config has no client endpoints");
+    }
+    Ok(endpoints)
+}
+
+fn wait_for_connect_endpoints(
+    endpoints: &[ConnectClientEndpoint],
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut missing = Vec::new();
+        for endpoint in endpoints {
+            let address = format!("{}:{}", endpoint.local_host, endpoint.local_port);
+            let socket = address
+                .parse()
+                .with_context(|| format!("connect endpoint address '{address}' is invalid"))?;
+            if TcpStream::connect_timeout(&socket, Duration::from_secs(1)).is_err() {
+                missing.push(address);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for connect local endpoints: {}",
+                missing.join(", ")
+            );
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn stop_connect_container(container_name: &str) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["rm", "-f", container_name])
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to execute docker rm for '{container_name}'"))?;
+    if !output.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if text.contains("No such container") {
+            eprintln!("[ca] connect container '{}' is already gone", container_name);
+            return Ok(());
+        }
+        bail!(
+            "docker rm -f '{}' failed with {}; stderr: {}; stdout: {}",
+            container_name,
+            output.status,
+            summarize_command_bytes(&output.stderr),
+            summarize_command_bytes(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
+fn docker_logs(container_name: &str) -> Option<String> {
+    Command::new("docker")
+        .args(["logs", "--tail", "200", container_name])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .map(|output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
 }
 
 fn connect_container_name() -> String {

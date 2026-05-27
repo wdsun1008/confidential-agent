@@ -151,6 +151,34 @@ pub(crate) struct ConnectArgs {
     pub(crate) from_card: Option<String>,
     #[arg(long)]
     pub(crate) service: Option<String>,
+    #[command(subcommand)]
+    pub(crate) command: Option<ConnectCommands>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConnectCommands {
+    Start(ConnectStartArgs),
+    Stop(ConnectStopArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConnectStartArgs {
+    #[arg(long)]
+    pub(crate) from_card: Option<String>,
+    #[arg(long)]
+    pub(crate) service: Option<String>,
+    #[arg(long, default_value = "connect-ready.json")]
+    pub(crate) ready_json: PathBuf,
+    #[arg(long, default_value_t = 120)]
+    pub(crate) wait_ready: u64,
+    #[arg(long)]
+    pub(crate) log_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConnectStopArgs {
+    #[arg(long, default_value = "connect-ready.json")]
+    pub(crate) ready_json: PathBuf,
 }
 
 #[derive(Debug, Args)]

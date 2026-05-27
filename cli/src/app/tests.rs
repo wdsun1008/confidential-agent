@@ -5,7 +5,7 @@ use super::commands::{
     validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
-use crate::cli::{ImageArgs, ImageCommands, StatusArgs};
+use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, StatusArgs};
 use clap::Parser;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
 use std::ffi::OsStr;
@@ -46,6 +46,47 @@ fn common_commands_default_to_confidential_agent_yaml() {
             command: SpecCommands::Validate { spec, .. },
         }) => assert_eq!(spec, PathBuf::from("confidential-agent.yaml")),
         other => panic!("expected spec validate command, got {other:?}"),
+    }
+}
+
+#[test]
+fn connect_cli_keeps_bare_mode_and_adds_start_stop() {
+    let bare = Cli::parse_from(["confidential-agent", "connect", "--service", "openclaw"]);
+    match bare.command {
+        Commands::Connect(args) => {
+            assert_eq!(args.service.as_deref(), Some("openclaw"));
+            assert!(args.command.is_none());
+        }
+        other => panic!("expected connect command, got {other:?}"),
+    }
+
+    let start = Cli::parse_from([
+        "confidential-agent",
+        "connect",
+        "start",
+        "--service",
+        "openclaw",
+        "--ready-json",
+        "ready.json",
+    ]);
+    match start.command {
+        Commands::Connect(args) => match args.command {
+            Some(ConnectCommands::Start(start)) => {
+                assert_eq!(start.service.as_deref(), Some("openclaw"));
+                assert_eq!(start.ready_json, PathBuf::from("ready.json"));
+            }
+            other => panic!("expected connect start, got {other:?}"),
+        },
+        other => panic!("expected connect command, got {other:?}"),
+    }
+
+    let stop = Cli::parse_from(["confidential-agent", "connect", "stop", "--ready-json", "ready.json"]);
+    match stop.command {
+        Commands::Connect(args) => match args.command {
+            Some(ConnectCommands::Stop(stop)) => assert_eq!(stop.ready_json, PathBuf::from("ready.json")),
+            other => panic!("expected connect stop, got {other:?}"),
+        },
+        other => panic!("expected connect command, got {other:?}"),
     }
 }
 
@@ -2604,7 +2645,7 @@ fn connect_requires_public_ip() {
     );
     write_mesh_bundle(temp.path(), vec![service], sample);
 
-    let err = render_connect_config(temp.path()).unwrap_err();
+    let err = render_connect_config(temp.path(), None).unwrap_err();
 
     assert!(err
         .to_string()
@@ -2617,7 +2658,7 @@ fn connect_ignores_services_without_connect_ports() {
     let service = local_state("mcp", vec![3001], Vec::new());
     write_state(temp.path(), &service);
 
-    let err = render_connect_config(temp.path()).unwrap_err();
+    let err = render_connect_config(temp.path(), None).unwrap_err();
 
     assert!(err
         .to_string()
@@ -2645,11 +2686,67 @@ fn connect_renders_all_connect_services() {
     );
     write_mesh_bundle(temp.path(), vec![openclaw, worker, mcp], sample);
 
-    let config = render_connect_config(temp.path()).unwrap();
+    let config = render_connect_config(temp.path(), None).unwrap();
 
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
-    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 49152);
-    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 49153);
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 49152);
+    assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 49153);
+    assert_eq!(config["client_endpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(config["client_endpoints"][0]["service"], "openclaw");
+    assert_eq!(config["client_endpoints"][0]["guest_port"], 49152);
+    assert_eq!(config["client_endpoints"][0]["local_host"], "127.0.0.1");
+    let local_port = config["client_endpoints"][0]["local_port"].as_u64().unwrap();
+    assert!(local_port >= 49152);
+    assert_eq!(
+        config["client_endpoints"][0]["http_base_url"],
+        format!("http://127.0.0.1:{local_port}")
+    );
+}
+
+#[test]
+fn connect_service_filter_renders_only_requested_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let openclaw = local_state("openclaw", vec![49152], vec![49152]);
+    let worker = local_state("worker", vec![49153], vec![49153]);
+    write_state(temp.path(), &openclaw);
+    write_state(temp.path(), &worker);
+
+    let mut sample = BTreeMap::new();
+    sample.insert(
+        "openclaw".to_string(),
+        serde_json::json!({"measurement.uki.SHA-384": ["openclaw-rv"]}),
+    );
+    sample.insert(
+        "worker".to_string(),
+        serde_json::json!({"measurement.uki.SHA-384": ["worker-rv"]}),
+    );
+    write_mesh_bundle(temp.path(), vec![openclaw, worker], sample);
+
+    let config = render_connect_config(temp.path(), Some("worker")).unwrap();
+
+    assert_eq!(config["add_ingress"].as_array().unwrap().len(), 1);
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 49153);
+    assert_eq!(config["client_endpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(config["client_endpoints"][0]["service"], "worker");
+}
+
+#[test]
+fn connect_service_filter_rejects_unknown_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let openclaw = local_state("openclaw", vec![49152], vec![49152]);
+    write_state(temp.path(), &openclaw);
+    write_mesh_bundle(
+        temp.path(),
+        vec![openclaw],
+        BTreeMap::from([(
+            "openclaw".to_string(),
+            serde_json::json!({"measurement.uki.SHA-384": ["openclaw-rv"]}),
+        )]),
+    );
+
+    let err = render_connect_config(temp.path(), Some("missing")).unwrap_err();
+
+    assert!(err.to_string().contains("no local state for service 'missing'"));
 }
 
 #[test]

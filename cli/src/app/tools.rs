@@ -183,7 +183,7 @@ done
         .context("failed to spawn tools container cleanup watcher")
 }
 
-fn summarize_command_bytes(bytes: &[u8]) -> String {
+pub(super) fn summarize_command_bytes(bytes: &[u8]) -> String {
     const MAX: usize = 4096;
     let text = String::from_utf8_lossy(bytes);
     let text = text.trim();
