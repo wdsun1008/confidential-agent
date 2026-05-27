@@ -54,7 +54,7 @@
 - After `confidential-agent spec validate` passes and artifacts are internally consistent, run build instead of continuing speculative artifact rewrites; use real build/deploy/status output for the next fix.
 - After `confidential-agent build` exits 0, preserve the built image and advance to peering and deploy. Do not delete images, kill builder processes, or rerun build unless deploy or live status evidence shows the image itself is defective.
 - Do not write, patch, delete, or recreate `.confidential-agent`/state-dir internals such as `build-result.json`, `deploy-result.json`, or `manifest.json`; those files are produced by the CLI. If they are missing or wrong, fix the migration artifacts and rerun the corresponding CLI command.
-- Do not use `pkill`, `killall`, or broad `kill -9` patterns against `confidential-agent`, Shelter, mkosi, Terraform, or runner process names. Stop only a PID you started and recorded, such as a saved connect tunnel PID.
+- Do not use `pkill`, `killall`, `kill $(pgrep ...)`, or broad `kill -9` patterns against `confidential-agent`, Shelter, mkosi, Terraform, or runner process names. Stop only a PID you started and recorded, such as a saved connect tunnel PID.
 - Do not SSH, scp, or directly hotfix the deployed guest to make verification pass. Fixes that matter must be moved into the AppSpec, install script, or resource files, then rebuilt and redeployed.
 
 ## Package Name Translation

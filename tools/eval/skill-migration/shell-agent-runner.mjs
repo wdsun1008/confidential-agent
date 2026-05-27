@@ -40,9 +40,12 @@ const REPEATED_COMMAND_STALL_BLOCKS = positiveIntEnv("CA_EVAL_REPEATED_COMMAND_S
 const CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_BLOCK_THRESHOLD", 16);
 const CONSECUTIVE_READ_ONLY_STALL_BLOCKS = positiveIntEnv("CA_EVAL_CONSECUTIVE_READONLY_STALL_BLOCKS", 3);
 const CONSECUTIVE_NO_ACTION_STALL_LIMIT = positiveIntEnv("CA_EVAL_CONSECUTIVE_NO_ACTION_STALL_LIMIT", 5);
-// Runner guard exits currently use 64-70 and 72-83; 71 is intentionally unused.
+const READ_ONLY_RATIO_STALL_STEP = positiveIntEnv("CA_EVAL_READONLY_RATIO_STALL_STEP", 60);
+const READ_ONLY_RATIO_STALL_PERCENT = positiveIntEnv("CA_EVAL_READONLY_RATIO_STALL_PERCENT", 80);
+const READ_ONLY_RATIO_STALL_MIN_ACTIONS = positiveIntEnv("CA_EVAL_READONLY_RATIO_STALL_MIN_ACTIONS", 40);
+// Runner guard exits currently use 64-70 and 72-85; 71 is intentionally unused.
 const RUNNER_GUARD_CODES = new Set([
-  64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83,
+  64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
 ]);
 
 if (REQUESTED_MAX_STEPS > MAX_STEPS_CEILING) {
@@ -1097,6 +1100,25 @@ function containsForegroundConnectCommand(cmd) {
     });
 }
 
+function containsCompoundBackgroundConnectCommand(cmd) {
+  const connectRe = /\bconfidential-agent(?:\s+--[A-Za-z0-9_-]+(?:[=\s][^\s;&|]+)?)*\s+connect\b/gi;
+  return String(cmd || "")
+    .split(/\r?\n/)
+    .some((line) => {
+      connectRe.lastIndex = 0;
+      for (const match of line.matchAll(connectRe)) {
+        const before = line.slice(0, match.index);
+        const after = line.slice(match.index + match[0].length);
+        const commandTail = after.split(/\s*(?:&&|\|\||;)\s*/)[0] || after;
+        if (/\b--render-only\b|(?:^|\s)(?:--help|-h|help)(?:\s|$)/i.test(commandTail)) continue;
+        if (!/(^|[^0-9])&(?:\s|$)/.test(after)) continue;
+        const currentStatementPrefix = before.slice(Math.max(before.lastIndexOf(";"), 0));
+        if (/(?:&&|\|\|)/.test(currentStatementPrefix)) return true;
+      }
+      return false;
+    });
+}
+
 function containsUnsafeBackgroundConnectCommand(cmd) {
   return String(cmd || "")
     .split(/\r?\n/)
@@ -1123,7 +1145,10 @@ function commandKillsInfrastructureProcess(cmd) {
     .some((segment) => {
       const text = segment.trim();
       if (!text) return false;
-      const broadKill = /\b(?:pkill|killall)\b/.test(text) || /\bkill\s+-9\b[\s\S]*\b(?:pgrep|pidof)\b/.test(text);
+      const broadKill =
+        /\b(?:pkill|killall)\b/.test(text) ||
+        /\bkill\b[\s\S]*\$\(\s*(?:pgrep|pidof)\b/.test(text) ||
+        /\bkill\b[\s\S]*`\s*(?:pgrep|pidof)\b/.test(text);
       if (!broadKill) return false;
       return /\b(?:confidential-agent|shelter|mkosi|terraform|runner|run-hermes-heldout-eval|shell-agent-runner)\b/i.test(
         text,
@@ -1241,6 +1266,15 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
       stderr:
         "Blocked broad process-kill command targeting Confidential Agent, Shelter, mkosi, Terraform, or runner process names. " +
         "Only stop a PID that this trial explicitly started and recorded, such as a saved connect tunnel PID.",
+    });
+  }
+  if (containsCompoundBackgroundConnectCommand(guardCmd)) {
+    return Promise.resolve({
+      code: 84,
+      stdout: "",
+      stderr:
+        "Blocked compound-list background confidential-agent connect. Do not write `cd ... && nohup confidential-agent connect ... &` or prefix the background connect line with `&&` or `||`. " +
+        "Run `cd <trial-dir>` as its own statement first, or use `cd <trial-dir> || exit; nohup confidential-agent connect </dev/null >connect.log 2>&1 &` and save `$!`.",
     });
   }
   if (containsForegroundConnectCommand(guardCmd)) {
@@ -1614,7 +1648,7 @@ Rules:
 - Do not prepend long sleeps before confidential-agent build/deploy/status/connect/destroy. Run the command directly; if it is still running, wait for that command or inspect its real log from a separate read-only command.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
-- confidential-agent connect is a long-running tunnel. In this single-shell eval, first run "confidential-agent connect --render-only > connect-config.json" and parse ".add_ingress[0].mapping.in.port" as the host-side port. Start the tunnel only with "nohup confidential-agent connect </dev/null >connect.log 2>&1 &", save "$!", probe the parsed host-side port, and stop only that saved PID after chat verification.
+- confidential-agent connect is a long-running tunnel. In this single-shell eval, first run "confidential-agent connect --render-only > connect-config.json" and parse ".add_ingress[0].mapping.in.port" as the host-side port. Start the tunnel only with "nohup confidential-agent connect </dev/null >connect.log 2>&1 &", save "$!", probe the parsed host-side port, and stop only that saved PID after chat verification. The nohup connect line must be an independent shell statement: do not prefix it with "cd ... &&" or any other "&&"/"||" compound-list, and do not append cat/curl/sleep probes after the "&" on the same physical line.
 - Use plain confidential-agent connect unless the task provides an agent card for --from-card. Do not use connect --service for local service selection in this CLI version.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
 - Destroy is the last success-phase step. Do not run confidential-agent destroy until chat_ok has real evidence; if you abandon a failed run, leave unfinished success booleans false.
@@ -1657,6 +1691,8 @@ async function main() {
   let repeatedCommandCount = 0;
   let consecutiveReadOnlyCount = 0;
   let consecutiveNoActionCount = 0;
+  let bashActionCount = 0;
+  let readOnlyActionCount = 0;
   writeAgentMetrics(trialDir, metrics, { completed: false, finish_reason: "started", last_step: 0 });
 
   for (let step = 1; step <= MAX_STEPS; step += 1) {
@@ -1738,6 +1774,10 @@ async function main() {
       continue;
     }
     const readOnlyExploration = isReadOnlyExplorationCommand(action.cmd);
+    bashActionCount += 1;
+    if (readOnlyExploration) readOnlyActionCount += 1;
+    metrics.bash_actions = bashActionCount;
+    metrics.readonly_actions = readOnlyActionCount;
     consecutiveReadOnlyCount = readOnlyExploration ? consecutiveReadOnlyCount + 1 : 0;
     const commandKey = normalizeRepeatedCommand(action.cmd);
     if (commandKey && commandKey === lastCommandKey) {
@@ -1756,6 +1796,17 @@ async function main() {
       bootstrapReadyBeforeCommand &&
       missingCoreArtifacts(trialDir) &&
       consecutiveReadOnlyCount >= CONSECUTIVE_READ_ONLY_BLOCK_THRESHOLD;
+    const currentResult = readResultJson(trialDir) || {};
+    const readOnlyPercent = bashActionCount ? Math.floor((readOnlyActionCount * 100) / bashActionCount) : 0;
+    const blockReadOnlyRatioStall =
+      readOnlyExploration &&
+      bootstrapReadyBeforeCommand &&
+      step >= READ_ONLY_RATIO_STALL_STEP &&
+      bashActionCount >= READ_ONLY_RATIO_STALL_MIN_ACTIONS &&
+      readOnlyPercent >= READ_ONLY_RATIO_STALL_PERCENT &&
+      currentResult.build_ok !== true &&
+      currentResult.deploy_ok !== true &&
+      currentResult.chat_ok !== true;
     const repeatReminder = repeatedAny
       ? repeatedCommandReminder(repeatedCommandCount, blockRepeatedCommand, readOnlyExploration)
       : "";
@@ -1781,6 +1832,14 @@ async function main() {
         blockedReadOnlyWithoutArtifactsMessage(consecutiveReadOnlyCount),
       );
     }
+    if (blockReadOnlyRatioStall) {
+      appendRunnerReminder(
+        trialDir,
+        step,
+        "readonly-ratio-stall",
+        `Read-only stall: ${readOnlyActionCount}/${bashActionCount} bash actions (${readOnlyPercent}%) are read-only and no build/deploy/chat success has been recorded. Stop help/docs/list exploration and make a concrete artifact or CLI phase change.`,
+      );
+    }
     console.error(`[agent] step ${step}: ${redact(action.cmd)}`);
     const result = blockReadOnlyWithoutArtifacts
       ? {
@@ -1788,6 +1847,12 @@ async function main() {
           stdout: "",
           stderr: blockedReadOnlyWithoutArtifactsMessage(consecutiveReadOnlyCount),
         }
+      : blockReadOnlyRatioStall
+        ? {
+            code: 85,
+            stdout: "",
+            stderr: `Read-only stall: ${readOnlyActionCount}/${bashActionCount} bash actions (${readOnlyPercent}%) are read-only while build_ok, deploy_ok, and chat_ok are still false. Make a concrete artifact or CLI phase change instead of more help/docs/list commands.`,
+          }
       : blockRepeatedCommand
         ? {
             code: blockRepeatedReadOnly ? 72 : 75,
@@ -1852,6 +1917,19 @@ async function main() {
         error: message,
       });
       writeRunnerResultFailure(trialDir, "stalled_readonly_without_artifacts", message);
+      throw new Error(message);
+    }
+    if (Number(result.code) === 85) {
+      const message =
+        `stalled_readonly_ratio: ${readOnlyActionCount}/${bashActionCount} bash actions ` +
+        `(${readOnlyPercent}%) were read-only before any build/deploy/chat success`;
+      writeAgentMetrics(trialDir, metrics, {
+        completed: false,
+        finish_reason: "stalled_readonly_ratio",
+        last_step: step,
+        error: message,
+      });
+      writeRunnerResultFailure(trialDir, "stalled_readonly_ratio", message);
       throw new Error(message);
     }
     messages.push({ role: "assistant", content: JSON.stringify(action) });

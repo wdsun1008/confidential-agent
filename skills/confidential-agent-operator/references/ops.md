@@ -72,7 +72,9 @@ nc -vz 127.0.0.1 <port>
 ```
 
 Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`. Do not use `connect --service <name>` for local service selection.
-`connect` is long-running. In a noninteractive shell, first render the local mapping, then start the tunnel with stdin/stdout/stderr detached from the shell action:
+`connect` is long-running. In a noninteractive shell, first render the local mapping, then start the tunnel with stdin/stdout/stderr detached from the shell action.
+
+The `nohup confidential-agent connect ... &` line must be an independent shell statement. Do not write `cd <dir> && nohup confidential-agent connect ... &`, and do not append `cat`, `curl`, `sleep`, or another probe after the `&` on the same physical line. Run `cd <dir>` as a separate statement first, or use `cd <dir> || exit;` before the independent `nohup` statement; otherwise shell grammar can background the whole `cd && connect` list and leave a subshell holding the action output pipe open.
 
 ```bash
 confidential-agent connect --render-only > connect-config.json
@@ -85,6 +87,7 @@ if not ingress:
 print(ingress[0]["mapping"]["in"]["port"])
 PY
 )"
+# Keep this line independent; do not write `cd ... && nohup ... &`.
 nohup confidential-agent connect </dev/null >connect.log 2>&1 &
 CONNECT_PID=$!
 CONNECTED=0

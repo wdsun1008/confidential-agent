@@ -31,7 +31,7 @@ If you compress the bootstrap into one shell line, separate the variable assignm
 - Critical CLI commands (`confidential-agent build`, `deploy`, `peering`, `status`, `connect`, `destroy`) must preserve useful stdout, stderr, and command status. Do not append `||`, chain another command after them with `;` or `&&`, pipe to filters such as `grep`, `head`, `tail`, or `jq`, or redirect output to `/dev/null`.
 - Do not put a long `sleep` before `confidential-agent build`, `deploy`, `status`, `connect`, or `destroy`. Run the CLI command directly, let it finish or fail, and use its complete output as the next decision point.
 - Do not invoke Shelter directly for migration operations such as build, deploy, destroy, or clean. Use the public `confidential-agent` CLI; it orchestrates Shelter and keeps local state consistent. `shelter --help` is only a bootstrap availability check.
-- Do not run broad process-kill commands such as `pkill`, `killall`, or `kill -9` against infrastructure names like `confidential-agent`, `shelter`, `mkosi`, `terraform`, or `runner`. If you started a background process yourself, save its exact PID and stop only that PID.
+- Do not run broad process-kill commands such as `pkill`, `killall`, `kill $(pgrep ...)`, or `kill -9` against infrastructure names like `confidential-agent`, `shelter`, `mkosi`, `terraform`, or `runner`. If you started a background process yourself, save its exact PID and stop only that PID.
 - Only set a `result.json` boolean to `true` immediately after the corresponding real command exits 0 and you have evidence in the transcript. Leave the field `false` after a failed or unattempted step.
 - `result.json` fields that name deliverable artifacts (`generated_spec`, `install_script`, `resource_config`) must be relative file paths to files in the working directory, not inline YAML, JSON, or shell content.
 - `result.json.upstream_commit` must be the full 40-hex output of `git rev-parse HEAD`, not a short hash, branch name, or tag.
@@ -223,6 +223,7 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 5. **Verify**
    - Run `confidential-agent status --live --json`.
    - Render the connect mapping, start `confidential-agent connect`, and verify the service with `curl`, `nc`, or the workload's native client. `connect` is a long-running tunnel process; in single-shell or noninteractive automation, use this shape so the tunnel cannot hold the shell action's stdout/stderr open:
+   - The `nohup confidential-agent connect ... &` line must be its own shell statement. Do not prefix it with `cd ... &&`, `cmd &&`, or `cmd ||`, and do not append `cat`, `curl`, `sleep`, or another probe after the `&` on the same physical line. If you need to change directories, run `cd <trial-dir>` as a separate statement first or use `cd <trial-dir> || exit;` before the independent `nohup` statement. In shell grammar, `cd dir && nohup confidential-agent connect ... &` backgrounds the whole `cd && connect` list and can leave a subshell holding the action output pipe open.
 
 ```bash
 confidential-agent connect --render-only > connect-config.json
@@ -235,6 +236,7 @@ if not ingress:
 print(ingress[0]["mapping"]["in"]["port"])
 PY
 )"
+# Keep this line independent; do not write `cd ... && nohup ... &`.
 nohup confidential-agent connect </dev/null >connect.log 2>&1 &
 CONNECT_PID=$!
 CONNECTED=0

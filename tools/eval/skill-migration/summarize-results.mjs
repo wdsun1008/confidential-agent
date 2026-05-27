@@ -57,7 +57,7 @@ function processMetrics(dir) {
     ),
     install_only: commands.some((cmd) => /one-click\/install\.sh/.test(cmd) && /\binstall-only\b/.test(cmd)),
     blocked_commands: toolEvents.filter((event) =>
-      [64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83].includes(
+      [64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85].includes(
         event.result?.code,
       ),
     ).length,
