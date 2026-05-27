@@ -145,7 +145,7 @@ deploy:
 | `vpc_id` / `vswitch_id` / `security_group_id` | string | ❌ | 留空时由 Shelter 自动创建 |
 | `private_ip` | string | ❌ | 期望分配的固定内网 IP |
 
-`deploy` 不再包含 `security.allowed_cidr` / `security.a2a_peer_cidrs`。所有入向安全组规则都从 `<state-dir>/peerings.yaml` 派生，由 `confidential-agent peering ...` 管理；旧字段会被严格模式拒绝，可用 `confidential-agent migrate <spec>` 迁移。
+`deploy` 不再包含 `security.allowed_cidr` / `security.a2a_peer_cidrs`。所有入向安全组规则都从 `<state-dir>/peerings.yaml` 派生，由 `confidential-agent peering ...` 管理；旧字段会被严格模式拒绝，可用 `confidential-agent migrate <spec>` 迁移。`build` 阶段只产出镜像和 build artifact，不读取 `peerings.yaml`；operator peering 应在 build 完成后、首次 deploy 前添加。
 
 **安全组规则的自动构造**（详见 [`shelter/src/lib.rs::security_group_rules`](../shelter/src/lib.rs)）：
 
@@ -287,7 +287,9 @@ AgentCard 的标准 A2A 字段保留在顶层，confidential-agent 扩展放在 
 ### 9.1 `peering` — 入向网络授权
 
 ```bash
+confidential-agent build --spec confidential-agent.yaml
 confidential-agent peering add --role operator --cidr <ops-cidr>/32 --label ops
+confidential-agent deploy --spec confidential-agent.yaml
 confidential-agent peering add --role peer --cidr <peer-vm-ip>/32 --label beta
 confidential-agent peering apply
 ```

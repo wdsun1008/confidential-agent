@@ -1,0 +1,12 @@
+{
+  "assets": [
+    {"source": "examples/openclaw-vllm/install-openclaw-vllm.sh", "target": "openclaw-vllm/install-openclaw-vllm.sh"},
+    {"source": "examples/openclaw-vllm/cai-nvidia-cc-stack-install.sh", "target": "openclaw-vllm/cai-nvidia-cc-stack-install.sh"},
+    {"source": "examples/openclaw-vllm/nvidia-persistenced.service", "target": "openclaw-vllm/nvidia-persistenced.service"},
+    {"source": "examples/openclaw/files", "target": "openclaw-vllm/files"}
+  ],
+  "templates": [
+    {"source": "templates/openclaw-vllm.yaml.tmpl", "target": "openclaw-vllm/openclaw-vllm.yaml"},
+    {"source": "templates/openclaw-vllm.json.tmpl", "target": "openclaw-vllm/openclaw-vllm.json", "mode": "0600"}
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "assets": [
+    {"source": "examples/cmaas/install-cmaas.sh", "target": "cmaas/install-cmaas.sh"},
+    {"source": "examples/cmaas/install-agent.sh", "target": "agent/install-agent.sh"},
+    {"source": "examples/cmaas/files", "target": "cmaas/files"},
+    {"source": "examples/cmaas/files", "target": "agent/files"}
+  ],
+  "templates": [
+    {"source": "templates/cmaas.yaml.tmpl", "target": "cmaas/cmaas.yaml"},
+    {"source": "templates/agent.yaml.tmpl", "target": "agent/agent.yaml"}
+  ]
+}

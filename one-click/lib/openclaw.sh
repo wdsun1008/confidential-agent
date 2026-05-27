@@ -47,7 +47,7 @@ copy_openclaw_inputs() {
   local dst="$CA_WORK_DIR/openclaw"
   local out="$dst/install-openclaw.sh"
   install -d -m 0755 "$dst"
-  python3 - "$ROOT_DIR/examples/openclaw/install-openclaw.sh" "$out" \
+  python3.11 - "$ROOT_DIR/examples/openclaw/install-openclaw.sh" "$out" \
     "$CA_OPENCLAW_VERSION" "$CA_NODE_VERSION" "$CA_NPM_REGISTRY" <<'PY'
 import shlex
 import sys
@@ -77,7 +77,7 @@ write_openclaw_json() {
   local out="$CA_WORK_DIR/openclaw/openclaw.json"
   local enable_dingtalk="$CA_ENABLE_DINGTALK"
   local base_url="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-  python3 - "$out" "$DASHSCOPE_API_KEY" "$CA_GATEWAY_TOKEN" "$enable_dingtalk" \
+  python3.11 - "$out" "$DASHSCOPE_API_KEY" "$CA_GATEWAY_TOKEN" "$enable_dingtalk" \
     "${DINGTALK_BOT_CLIENT_ID:-}" "${DINGTALK_BOT_CLIENT_SECRET:-}" "$base_url" \
     "$CA_BAILIAN_MODEL" <<'PY'
 import json

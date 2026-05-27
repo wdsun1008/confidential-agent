@@ -33,7 +33,7 @@ Common options:
   --skip-rustup                  Do not install Rust with rustup (default)
   --allow-rustup                 Allow rustup fallback if OS cargo/rust is unavailable
   --skip-cargo-build             Reuse existing target/release binaries
-  --skip-host-openclaw           Do not install Node.js/OpenClaw CLI on the deploy host
+  --skip-host-openclaw           Do not install Node.js/OpenClaw CLI on the deploy host during deploy-openclaw
   --rebuild-tools-image          Rebuild the tools image even if it exists
   --help                         Show this help
 
@@ -68,7 +68,7 @@ Shelter options:
 
 Examples:
   one-click/install.sh
-  one-click/install.sh install-only
+  one-click/install.sh install-only     # installs Confidential Agent CLI/Shelter/tools only
   one-click/install.sh deploy-openclaw --enable-dingtalk
   one-click/install.sh cleanup --state-dir "\$HOME/.confidential-agent"
 EOF

@@ -1,0 +1,72 @@
+schema: confidential-agent/v1
+
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+  app_service: cai-openclaw-gateway.service
+
+build:
+{{raw:BASE_IMAGE_LINE}}
+  image_name: beta-agent
+  resize: 30G
+  with_network: true
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
+  files:
+    - source: {{yaml:CAI_PEP}}
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ./files/tdx-remote-attestation.SKILL.md
+      target: /root/.openclaw/skills/tdx-remote-attestation/SKILL.md
+    - source: ./files/install-cai-pep.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/install-openclaw-runtime.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh
+      executable: true
+    - source: ./files/cai-pep-default-policy.json
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-default-policy.json
+    - source: ./files/cai-pep-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-pep-plugin
+    - source: ./files/cai-a2a-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin
+    - source: ./files/patch-openclaw-cai-pep.js
+      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
+      executable: true
+  scripts: [./install-openclaw.sh]
+  variants:
+    release:
+      enabled: false
+    debug:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: {{yaml:INSTANCE_TYPE}}
+  region: {{yaml:REGION}}
+  zone_id: {{yaml:ZONE_ID}}
+  disk_gb: 200
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: {{yaml:REFERENCE_VALUES}}
+{{raw:REKOR_BLOCK}}
+
+a2a:
+  id: beta
+  name: beta-openclaw
+  version: "1.0.0"
+  description: "OpenClaw confidential A2A test agent"
+  skills:
+    - id: chat
+      name: Chat
+      description: "OpenClaw gateway chat"
+
+resources:
+  openclaw_config:
+    source: ./openclaw.json
+    target: /root/.openclaw/openclaw.json
+    mode: "0600"
+    required: true

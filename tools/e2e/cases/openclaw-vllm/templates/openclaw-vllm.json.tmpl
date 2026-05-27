@@ -1,0 +1,75 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "local-vllm": {
+        "baseUrl": "http://127.0.0.1:8090/v1",
+        "apiKey": "local-unused",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "Qwen3.6-35B-A3B",
+            "name": "Qwen3.6-35B-A3B",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 262144,
+            "maxTokens": 16384
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "local-vllm/Qwen3.6-35B-A3B"
+      }
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "plugins": {
+    "enabled": true,
+    "allow": ["cai-pep", "cai-a2a"],
+    "entries": {
+      "cai-pep": {
+        "enabled": true,
+        "config": {
+          "socketPath": "/run/cai/pep.sock",
+          "pepRequired": true,
+          "defaultWorkdir": "/workspace"
+        }
+      },
+      "cai-a2a": {
+        "enabled": true,
+        "config": {
+          "peers": {}
+        }
+      }
+    }
+  },
+  "channels": {},
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": {{json:OPENCLAW_GATEWAY_TOKEN}}
+    },
+    "http": {
+      "endpoints": {
+        "responses": {
+          "enabled": true
+        }
+      }
+    },
+    "controlUi": {
+      "enabled": true,
+      "basePath": "/openclaw",
+      "dangerouslyAllowHostHeaderOriginFallback": true,
+      "dangerouslyDisableDeviceAuth": true
+    }
+  }
+}

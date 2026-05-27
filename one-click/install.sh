@@ -13,6 +13,8 @@ Usage:
 Bootstrap options:
   --repo URL             Git repository to clone when running through curl | sh
   --branch NAME          Git branch to checkout when running through curl | sh
+  --ref REF              Git branch, tag, or commit to checkout when running through curl | sh
+  --commit SHA           Alias for --ref; SHA must be the full 40 hex chars
   --source-dir PATH      Local source checkout directory
   --help                 Show this help
 
@@ -22,6 +24,19 @@ EOF
 
 append_pass_arg() {
     printf '%s\0' "$1" >>"$pass_args_file"
+}
+
+validate_commit_ref() {
+    case "$1" in
+        ""|*[!0123456789abcdefABCDEF]*)
+            echo "--commit requires a full 40-character hex commit SHA" >&2
+            exit 2
+            ;;
+    esac
+    if [ "${#1}" -ne 40 ]; then
+        echo "--commit requires a full 40-character hex commit SHA, not a short SHA" >&2
+        exit 2
+    fi
 }
 
 run_main() {
@@ -57,7 +72,8 @@ ensure_git() {
 # try to read the remaining script from the terminal and silently hang.
 main() {
     repo="${CA_ONE_CLICK_REPO:-$DEFAULT_REPO}"
-    branch="${CA_ONE_CLICK_BRANCH:-$DEFAULT_BRANCH}"
+    ref="${CA_ONE_CLICK_REF:-${CA_ONE_CLICK_BRANCH:-$DEFAULT_BRANCH}}"
+    commit_ref=0
     source_dir="${CA_ONE_CLICK_SOURCE_DIR:-${HOME:-/root}/.cache/confidential-agent/source}"
     pass_args_file="$(mktemp "${TMPDIR:-/tmp}/ca-one-click-args.XXXXXX")"
     trap 'rm -f "$pass_args_file"' EXIT HUP INT TERM
@@ -75,7 +91,18 @@ main() {
                 ;;
             --branch)
                 [ "$#" -ge 2 ] || { echo "missing value for --branch" >&2; exit 2; }
-                branch="$2"
+                ref="$2"
+                shift 2
+                ;;
+            --ref)
+                [ "$#" -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }
+                ref="$2"
+                shift 2
+                ;;
+            --commit)
+                [ "$#" -ge 2 ] || { echo "missing value for --commit" >&2; exit 2; }
+                ref="$2"
+                commit_ref=1
                 shift 2
                 ;;
             --source-dir)
@@ -94,6 +121,10 @@ main() {
         esac
     done
 
+    if [ "$commit_ref" = "1" ]; then
+        validate_commit_ref "$ref"
+    fi
+
     script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P 2>/dev/null || pwd)
     local_root=$(CDPATH= cd -- "$script_dir/.." 2>/dev/null && pwd -P 2>/dev/null || true)
     if [ -n "$local_root" ] && [ -f "$local_root/Cargo.toml" ] && [ -f "$local_root/one-click/lib/main.sh" ]; then
@@ -104,11 +135,16 @@ main() {
     mkdir -p "$(dirname "$source_dir")"
 
     if [ -d "$source_dir/.git" ]; then
-        git -C "$source_dir" fetch --depth 1 origin "$branch"
-        git -C "$source_dir" checkout -B "$branch" "FETCH_HEAD"
+        git -C "$source_dir" remote set-url origin "$repo"
+        git -C "$source_dir" fetch --depth 1 origin "$ref"
+        git -C "$source_dir" checkout --detach "FETCH_HEAD"
     else
         rm -rf "$source_dir"
-        git clone --depth 1 --branch "$branch" "$repo" "$source_dir"
+        mkdir -p "$source_dir"
+        git -C "$source_dir" init
+        git -C "$source_dir" remote add origin "$repo"
+        git -C "$source_dir" fetch --depth 1 origin "$ref"
+        git -C "$source_dir" checkout --detach "FETCH_HEAD"
     fi
 
     if [ ! -f "$source_dir/one-click/lib/main.sh" ]; then

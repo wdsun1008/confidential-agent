@@ -72,7 +72,7 @@ write_secret_summary() {
 }
 
 yaml_quote() {
-  python3 - "$1" <<'PY'
+  python3.11 - "$1" <<'PY'
 import sys
 value = sys.argv[1]
 if "\n" in value or "\r" in value:
@@ -82,7 +82,7 @@ PY
 }
 
 json_string() {
-  python3 - "$1" <<'PY'
+  python3.11 - "$1" <<'PY'
 import json
 import sys
 print(json.dumps(sys.argv[1]))

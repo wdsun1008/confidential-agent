@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 fn default_state_dir() -> PathBuf {
@@ -11,6 +11,7 @@ fn default_state_dir() -> PathBuf {
 #[derive(Debug, Parser)]
 #[command(name = "confidential-agent")]
 #[command(about = "Confidential Agent host CLI")]
+#[command(version)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -40,6 +41,8 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     Build(BuildArgs),
     Deploy(DeployArgs),
+    Docs(DocsArgs),
+    Spec(SpecArgs),
     #[command(hide = true)]
     Inject(InjectArgs),
     #[command(hide = true)]
@@ -51,11 +54,12 @@ pub(crate) enum Commands {
     Image(ImageArgs),
     Status(StatusArgs),
     Destroy(DestroyArgs),
+    Version,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct BuildArgs {
-    #[arg(long)]
+    #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
     #[arg(long, hide = true)]
     pub(crate) render_only: bool,
@@ -63,7 +67,7 @@ pub(crate) struct BuildArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct DeployArgs {
-    #[arg(long)]
+    #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
     #[arg(long, hide = true)]
     pub(crate) skip_inject: bool,
@@ -71,6 +75,48 @@ pub(crate) struct DeployArgs {
     pub(crate) render_only: bool,
     #[arg(long, env = "CA_SKIP_PEERING_CHECK")]
     pub(crate) skip_peering_check: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum OutputFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum DocsTopic {
+    Overview,
+    Workflow,
+    Appspec,
+    Ops,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DocsArgs {
+    #[arg(value_enum)]
+    pub(crate) topic: DocsTopic,
+    #[arg(long, value_enum, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SpecArgs {
+    #[command(subcommand)]
+    pub(crate) command: SpecCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SpecCommands {
+    Schema {
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: OutputFormat,
+    },
+    Validate {
+        #[arg(long, default_value = "confidential-agent.yaml")]
+        spec: PathBuf,
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +151,34 @@ pub(crate) struct ConnectArgs {
     pub(crate) from_card: Option<String>,
     #[arg(long)]
     pub(crate) service: Option<String>,
+    #[command(subcommand)]
+    pub(crate) command: Option<ConnectCommands>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConnectCommands {
+    Start(ConnectStartArgs),
+    Stop(ConnectStopArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConnectStartArgs {
+    #[arg(long)]
+    pub(crate) from_card: Option<String>,
+    #[arg(long)]
+    pub(crate) service: Option<String>,
+    #[arg(long, default_value = "connect-ready.json")]
+    pub(crate) ready_json: PathBuf,
+    #[arg(long, default_value_t = 120)]
+    pub(crate) wait_ready: u64,
+    #[arg(long)]
+    pub(crate) log_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConnectStopArgs {
+    #[arg(long, default_value = "connect-ready.json")]
+    pub(crate) ready_json: PathBuf,
 }
 
 #[derive(Debug, Args)]
