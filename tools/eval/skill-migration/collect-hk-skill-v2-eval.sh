@@ -64,7 +64,7 @@ collect_node() {
     return 0
   fi
 
-  if ssh -n "${ssh_opts[@]}" "root@$ip" "bash -s -- '$remote_archive'" >>"$node_dir/collect.log" 2>&1 <<'REMOTE'
+  if ssh "${ssh_opts[@]}" "root@$ip" "bash -s -- '$remote_archive'" >>"$node_dir/collect.log" 2>&1 <<'REMOTE'
 set -Eeuo pipefail
 archive="$1"
 rm -f "$archive"
