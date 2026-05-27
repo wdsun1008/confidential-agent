@@ -132,7 +132,7 @@ while IFS= read -r row; do
 done <"$RUN_DIR/nodes.jsonl"
 
 find "$OUT_DIR" \
-  \( -name report.md -o -name summary.json -o -name result.json -o -name grade.json -o -name trial.json -o -name transcript.jsonl -o -name connect-ready.json -o -name verification.json \) \
+  \( -name report.md -o -name summary.json -o -name result.json -o -name grade.json -o -name trial.json -o -name agent-transcript.jsonl -o -name transcript.jsonl -o -name connect-ready.json -o -name verification.json \) \
   -print | sort >"$OUT_DIR/report-index.txt"
 
 ln -sfn "$OUT_DIR" "$ROOT_DIR/.tmp/latest-skill-v2-collected"
