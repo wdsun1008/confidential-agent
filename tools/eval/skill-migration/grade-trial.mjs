@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import {
   E2E_COMMAND_EVIDENCE,
   commandLosesCriticalEvidence,
+  evidenceCommandText,
   hasSuccessfulChatEvidence,
   hasSuccessfulCommand,
 } from "./lib/evidence-patterns.mjs";
@@ -140,6 +141,86 @@ function toolResultText(events) {
     .toLowerCase();
 }
 
+function topLevelJsonFiles(dir, pattern) {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && pattern.test(entry.name))
+      .map((entry) => path.join(dir, entry.name));
+  } catch {
+    return [];
+  }
+}
+
+function localPortsFromConnectJson(value) {
+  const ports = new Set();
+  if (!value || typeof value !== "object") return ports;
+  for (const endpoint of Array.isArray(value.client_endpoints) ? value.client_endpoints : []) {
+    const port = Number(endpoint?.local_port);
+    if (Number.isInteger(port) && port > 0) ports.add(port);
+  }
+  for (const ingress of Array.isArray(value.add_ingress) ? value.add_ingress : []) {
+    const port = Number(ingress?.mapping?.in?.port);
+    if (Number.isInteger(port) && port > 0) ports.add(port);
+  }
+  return ports;
+}
+
+function collectRenderedLocalPorts(trialDir, events) {
+  const ports = new Set();
+  for (const file of topLevelJsonFiles(trialDir, /(?:connect|ready).*\.json$/i)) {
+    for (const port of localPortsFromConnectJson(readJson(file, null))) ports.add(port);
+  }
+  for (const event of events) {
+    for (const text of [event.result?.stdout || "", event.result?.stderr || ""]) {
+      try {
+        for (const port of localPortsFromConnectJson(JSON.parse(text))) ports.add(port);
+      } catch {}
+      for (const match of text.matchAll(/CONNECT_FORWARD\s+[^\n]*\bhost=127\.0\.0\.1\s+\bport=(\d+)\b/gi)) {
+        ports.add(Number(match[1]));
+      }
+    }
+  }
+  return [...ports].sort((left, right) => left - right);
+}
+
+function readVerificationPlan(trialDir) {
+  for (const file of topLevelJsonFiles(trialDir, /^verification\.json$/i)) {
+    const parsed = readJson(file, null);
+    if (parsed && typeof parsed === "object") return parsed;
+  }
+  return null;
+}
+
+function verificationChatPath(plan) {
+  if (!plan || typeof plan !== "object") return "";
+  return String(plan.chat_path || plan.path || plan?.chat?.path || plan?.request?.path || "").trim();
+}
+
+function commandUsesRenderedPort(commandText, ports) {
+  if (!ports.length) return false;
+  return ports.some((port) => new RegExp(`\\b(?:127\\.0\\.0\\.1|localhost):${port}\\b`, "i").test(commandText));
+}
+
+function successfulConnectStart(events) {
+  return events.some(
+    (event) =>
+      /\bconfidential-agent(?:\s+--[A-Za-z0-9_-]+(?:[=\s][^\s;&|]+)?)*\s+connect\s+start\b/i.test(
+        evidenceCommandText(event.cmd),
+      ) && event.result?.code === 0,
+  );
+}
+
+function successfulLocalPortProbe(events, ports) {
+  if (successfulConnectStart(events)) return true;
+  return events.some((event) => {
+    if (event.result?.code !== 0) return false;
+    const commandText = evidenceCommandText(event.cmd);
+    if (!/\b(?:nc|ncat|curl|wget|python3?|node)\b/i.test(commandText)) return false;
+    return commandUsesRenderedPort(commandText, ports);
+  });
+}
+
 function regexForTracePattern(pattern) {
   return new RegExp(
     String(pattern)
@@ -219,6 +300,9 @@ const transcript = readTranscript(trialDir);
 const events = toolEvents(transcript);
 const commands = toolCommandText(events);
 const toolResults = toolResultText(events);
+const renderedLocalPorts = collectRenderedLocalPorts(trialDir, events);
+const verificationPlan = readVerificationPlan(trialDir);
+const chatPath = verificationChatPath(verificationPlan);
 const weakCriticalCommands = events
   .filter((event) => commandLosesCriticalEvidence(event.cmd))
   .map((event) => event.cmd);
@@ -299,6 +383,77 @@ addFinding(
         .map((cmd) => (cmd.length > 300 ? `${cmd.slice(0, 300)}...` : cmd))
         .join("\n") || undefined,
   },
+);
+addFinding(
+  findings,
+  renderedLocalPorts.length > 0,
+  "render_mapping_ok",
+  "connect render/start must expose at least one host-side local port",
+  { detail: renderedLocalPorts.join(", ") || undefined, soft: phase === "static" },
+);
+addFinding(
+  findings,
+  successfulConnectStart(events) || hasSuccessfulCommand(events, E2E_COMMAND_EVIDENCE.connect_ok),
+  "connect_started_ok",
+  "connect evidence must include a successful non-render connect command",
+  { soft: phase === "static" },
+);
+addFinding(
+  findings,
+  successfulLocalPortProbe(events, renderedLocalPorts),
+  "local_port_probe_ok",
+  "a rendered host-side local port must become reachable before chat verification",
+  { soft: phase === "static" },
+);
+addFinding(
+  findings,
+  Boolean(verificationPlan),
+  "verification_plan_exists",
+  "full chat verification must be declared in verification.json",
+);
+addFinding(
+  findings,
+  fs.existsSync(path.join(trialDir, "verify-chat.sh")),
+  "verify_chat_script_exists",
+  "verify-chat.sh must exist and run the declared chat probe through connect-ready.json",
+);
+addFinding(
+  findings,
+  Boolean(chatPath),
+  "verification_chat_path",
+  "verification.json must declare the chat request path",
+);
+const chatEvidenceOptions = { renderedLocalPorts, chatPath };
+const chatCandidateEvents = events.filter(
+  (event) =>
+    E2E_COMMAND_EVIDENCE.chat_ok.test(evidenceCommandText(event.cmd)) &&
+    event.result?.code === 0 &&
+    !commandLosesCriticalEvidence(event.cmd),
+);
+addFinding(
+  findings,
+  chatCandidateEvents.some((event) => commandUsesRenderedPort(evidenceCommandText(event.cmd), renderedLocalPorts)),
+  "chat_used_rendered_local_port",
+  "chat verification must call the exact host-side local port from connect render/start",
+  { detail: renderedLocalPorts.join(", ") || undefined, soft: phase === "static" },
+);
+addFinding(
+  findings,
+  Boolean(chatPath) &&
+    chatCandidateEvents.some((event) => {
+      const commandText = evidenceCommandText(event.cmd);
+      return commandUsesRenderedPort(commandText, renderedLocalPorts) && commandText.includes(chatPath);
+    }),
+  "chat_endpoint_matches_plan",
+  "chat verification command must use the path declared in verification.json",
+  { detail: chatPath || undefined, soft: phase === "static" },
+);
+addFinding(
+  findings,
+  hasSuccessfulChatEvidence(events, E2E_COMMAND_EVIDENCE.chat_ok, grader.chat_success_patterns || []),
+  "chat_response_natural_language",
+  "chat verification must return a real non-empty natural-language or target-success response",
+  { soft: phase === "static" },
 );
 addFinding(
   findings,
@@ -444,7 +599,7 @@ for (const field of grader.required_boolean_fields) {
   const evidence = E2E_COMMAND_EVIDENCE[field];
   const corroborated = evidence
     ? field === "chat_ok"
-      ? hasSuccessfulChatEvidence(events, evidence, grader.chat_success_patterns || [])
+      ? hasSuccessfulChatEvidence(events, evidence, grader.chat_success_patterns || [], chatEvidenceOptions)
       : hasSuccessfulCommand(events, evidence)
     : true;
   addFinding(
@@ -508,11 +663,25 @@ const stageFindings = {
     "build_render_ok",
     "install_script_exists",
     "resource_config_exists",
+    "verification_plan_exists",
+    "verification_chat_path",
+    "verify_chat_script_exists",
     "install_script_not_mock_http_service",
     "eval_marker_not_baked",
     ...(runtimePatterns.length ? ["target_runtime_referenced"] : []),
   ],
-  e2e: grader.required_boolean_fields || [],
+  e2e: [
+    ...(grader.required_boolean_fields || []),
+    "render_mapping_ok",
+    "connect_started_ok",
+    "local_port_probe_ok",
+    "verification_plan_exists",
+    "verify_chat_script_exists",
+    "verification_chat_path",
+    "chat_used_rendered_local_port",
+    "chat_endpoint_matches_plan",
+    "chat_response_natural_language",
+  ],
 };
 const stageScores = Object.fromEntries(
   Object.entries(stageFindings).map(([stage, codes]) => {

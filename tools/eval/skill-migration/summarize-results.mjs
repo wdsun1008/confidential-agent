@@ -49,6 +49,20 @@ function processMetrics(dir) {
     cli_docs: commands.some((cmd) => /\bconfidential-agent\s+docs\b/.test(cmd)),
     cli_schema: commands.some((cmd) => /\bconfidential-agent\s+spec\s+schema\b/.test(cmd)),
     cli_validate: commands.some((cmd) => /\bconfidential-agent\s+spec\s+validate\b/.test(cmd)),
+    connect_render: commands.some((cmd) => /\bconfidential-agent\s+connect\b[^\n]*--render-only\b/.test(cmd)),
+    connect_start: commands.some((cmd) => /\bconfidential-agent\s+connect\s+start\b/.test(cmd)),
+    connect_stop: commands.some((cmd) => /\bconfidential-agent\s+connect\s+stop\b/.test(cmd)),
+    direct_ip_attempts: commands.filter((cmd) =>
+      /\b(?:curl|wget|python3?|node|http)\b[\s\S]*https?:\/\/(?!(?:127\.0\.0\.1|localhost)\b)(?:\d{1,3}\.){3}\d{1,3}\b/.test(
+        cmd,
+      ),
+    ).length,
+    ssh_attempts: commands.filter((cmd) => /\bssh\s+(?:-[A-Za-z]\s+)*[^&|;\n]+@?[\w.-]+/i.test(cmd)).length,
+    health_as_chat_attempts: commands.filter(
+      (cmd) =>
+        /\b(?:health|healthz|status|version|models|v1\/models)\b/.test(cmd) &&
+        /\b(?:chat|message|prompt|CA_CONFIDENTIAL_AGENT_EVAL_OK)\b/i.test(cmd),
+    ).length,
     raw_skill_fetch: commands.some(
       (cmd) =>
         /raw\.githubusercontent\.com\/wdsun1008\/confidential-agent\/[^/\s]+\/skills\/confidential-agent-operator\/skill\.md/.test(
@@ -129,7 +143,20 @@ const rows = trials(workDir).map((dir) => {
   const agentMetrics = readJson(path.join(dir, "agent-metrics.json"), rawRunnerResult.agent_metrics || {});
   const runnerResult = inferRunnerResult(rawRunnerResult, agentMetrics, Boolean(grade));
   const metrics = processMetrics(dir);
-  const e2eCodes = new Set(["build_ok", "deploy_ok", "live_status_ok", "connect_ok", "chat_ok", "cleanup_ok"]);
+  const e2eCodes = new Set([
+    "build_ok",
+    "deploy_ok",
+    "live_status_ok",
+    "connect_ok",
+    "chat_ok",
+    "cleanup_ok",
+    "render_mapping_ok",
+    "connect_started_ok",
+    "local_port_probe_ok",
+    "chat_used_rendered_local_port",
+    "chat_endpoint_matches_plan",
+    "chat_response_natural_language",
+  ]);
   const failedFindings =
     grade?.findings?.filter(
       (finding) =>
@@ -320,11 +347,11 @@ for (const row of rows) {
 lines.push("");
 lines.push("## Process Metrics");
 lines.push("");
-lines.push("| Model | Condition | Finish | Steps | Last Step | Max Steps | Requested Max | Tool Calls | First Result Step | Docs | Schema | Validate | Blocked |");
-lines.push("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+lines.push("| Model | Condition | Finish | Steps | Last Step | Max Steps | Requested Max | Tool Calls | First Result Step | Docs | Schema | Validate | Connect Render | Connect Start | Connect Stop | Direct IP | SSH | Health-as-chat | Blocked |");
+lines.push("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 for (const row of rows) {
   lines.push(
-    `| ${row.model || "-"} | ${row.condition || "-"} | ${row.finish_reason || "-"} | ${row.steps ?? "-"} | ${row.last_step ?? "-"} | ${row.max_steps ?? "-"} | ${row.requested_max_steps ?? "-"} | ${row.tool_calls ?? "-"} | ${row.first_result_step ?? "-"} | ${row.cli_docs ? "yes" : "no"} | ${row.cli_schema ? "yes" : "no"} | ${row.cli_validate ? "yes" : "no"} | ${row.blocked_commands ?? 0} |`,
+    `| ${row.model || "-"} | ${row.condition || "-"} | ${row.finish_reason || "-"} | ${row.steps ?? "-"} | ${row.last_step ?? "-"} | ${row.max_steps ?? "-"} | ${row.requested_max_steps ?? "-"} | ${row.tool_calls ?? "-"} | ${row.first_result_step ?? "-"} | ${row.cli_docs ? "yes" : "no"} | ${row.cli_schema ? "yes" : "no"} | ${row.cli_validate ? "yes" : "no"} | ${row.connect_render ? "yes" : "no"} | ${row.connect_start ? "yes" : "no"} | ${row.connect_stop ? "yes" : "no"} | ${row.direct_ip_attempts ?? 0} | ${row.ssh_attempts ?? 0} | ${row.health_as_chat_attempts ?? 0} | ${row.blocked_commands ?? 0} |`,
   );
 }
 lines.push("");

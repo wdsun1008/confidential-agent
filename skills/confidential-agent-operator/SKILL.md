@@ -7,6 +7,18 @@ description: Use when migrating, deploying, operating, or troubleshooting an arb
 
 Use this skill to migrate an arbitrary agent into Confidential Agent. Treat the target agent as unknown until you inspect its repository, manifests, docs, and runtime behavior.
 
+## Connect Contract
+
+Use this mental model throughout the migration:
+
+- `service.connect` declares guest workload ports, not host ports.
+- The app must listen on `0.0.0.0:<guest_port>` or all interfaces; guest loopback-only services cannot be reached by the host-side tunnel.
+- `confidential-agent connect --render-only` prints a forwarding plan; it does not start a tunnel.
+- `confidential-agent connect start --service <service-id> --ready-json connect-ready.json --wait-ready 120` starts the tunnel and writes `client_endpoints[]`.
+- Only requests to `http://127.0.0.1:<local_port>` from `client_endpoints[]` count as connect/chat evidence.
+- Guest public/private IP curls and SSH are diagnostics only; they never satisfy `connect_ok` or `chat_ok`.
+- `chat_ok` requires a natural-language request to the real upstream agent through the local tunnel. Health, status, version, config, and model-list endpoints are not chat evidence.
+
 ## Host Bootstrap
 
 Before migration work, ensure the controller host has the Confidential Agent CLI, Shelter, and `confidential-agent-tools:latest`. Use `confidential-agent --help`, `shelter --help`, and the local container image list for this availability check. If any of those are missing, run the one-click installer in `install-only` mode from the same source ref as this skill.
@@ -117,10 +129,12 @@ Before stopping, write these files in the working directory:
 - `confidential-agent.yaml`: AppSpec for the real target agent.
 - Install/runtime script referenced by the AppSpec.
 - Resource config file referenced under `resources`.
+- `verification.json`: a target-agnostic chat probe contract with `service_id`, `chat_guest_port`, `chat_method`, `chat_path`, headers/body shape, and success predicate.
+- `verify-chat.sh`: an executable probe that reads `connect-ready.json` and `verification.json`, calls only the rendered `127.0.0.1:<local_port>` endpoint, and prints the full response.
 - `result.json`: write every field named in the task's `result_contract.required_fields`; keep values consistent with the artifacts you created.
 
 If you only inspect the repository but do not write these artifacts, the migration is incomplete.
-Keep the final deliverables in the original task working directory. If you generate a template in a subdirectory, copy or rewrite the final AppSpec, install script, resource file, and `result.json` back to the original working directory.
+Keep the final deliverables in the original task working directory. If you generate a template in a subdirectory, copy or rewrite the final AppSpec, install script, resource file, verification files, and `result.json` back to the original working directory.
 For a full/live evaluation, do not finalize after static artifacts only. Final completion requires successful build, operator peering, deploy, live status, connect, real chat/API probe, and cleanup.
 
 ## Evidence State Machine
@@ -129,12 +143,12 @@ Treat `result.json` booleans as evidence state, not progress notes. Initialize r
 
 ## Artifact-First Rule
 
-Follow this execution order unless the caller gives stricter instructions. In step-limited automation, all four deliverables should exist by your third target-migration bash action after Host Bootstrap is complete.
+Follow this execution order unless the caller gives stricter instructions. In step-limited automation, the core migration deliverables should exist by your third target-migration bash action after Host Bootstrap is complete.
 
 0. If the Confidential Agent CLI, Shelter, or tools image is unavailable, run Host Bootstrap once. The "third bash action" budget starts after this bootstrap succeeds and `confidential-agent --help` works.
 1. One command for CLI discovery: read schema docs first, then workflow docs.
 2. One command to clone/pin the upstream and inspect only README, primary manifest, Dockerfile or equivalent startup script, and one focused entrypoint/port file.
-3. The next command must write all four deliverables with heredocs: `confidential-agent.yaml`, install/runtime script, resource config, and `result.json`.
+3. The next command must write the deliverables with heredocs: `confidential-agent.yaml`, install/runtime script, resource config, `verification.json`, `verify-chat.sh`, and `result.json`.
 4. Only after those files exist, run more `cat`, `grep`, `find`, or repository exploration to refine them.
 
 Do not spend the whole run reading. A rough but concrete first draft is better than no artifacts.
@@ -222,43 +236,33 @@ Only set `build.base_image` when the task provides a real disk-image path or URL
 
 5. **Verify**
    - Run `confidential-agent status --live --json`.
-   - Render the connect mapping, start `confidential-agent connect`, and verify the service with `curl`, `nc`, or the workload's native client. `connect` is a long-running tunnel process; in single-shell or noninteractive automation, use this shape so the tunnel cannot hold the shell action's stdout/stderr open:
-   - The `nohup confidential-agent connect ... &` line must be its own shell statement. Do not prefix it with `cd ... &&`, `cmd &&`, or `cmd ||`, and do not append `cat`, `curl`, `sleep`, or another probe after the `&` on the same physical line. If you need to change directories, run `cd <trial-dir>` as a separate statement first or use `cd <trial-dir> || exit;` before the independent `nohup` statement. In shell grammar, `cd dir && nohup confidential-agent connect ... &` backgrounds the whole `cd && connect` list and can leave a subshell holding the action output pipe open.
+   - Start the host-side tunnel with the automation command, then use only the endpoint from `connect-ready.json` for probes:
 
 ```bash
-confidential-agent connect --render-only > connect-config.json
-HOST_PORT="$(python3 - <<'PY'
-import json
-data = json.load(open("connect-config.json", encoding="utf-8"))
-ingress = data.get("add_ingress") or []
-if not ingress:
-    raise SystemExit("connect config has no add_ingress entries")
-print(ingress[0]["mapping"]["in"]["port"])
-PY
-)"
-# Keep this line independent; do not write `cd ... && nohup ... &`.
-nohup confidential-agent connect </dev/null >connect.log 2>&1 &
-CONNECT_PID=$!
-CONNECTED=0
-for _ in $(seq 1 30); do
-  if nc -z 127.0.0.1 "$HOST_PORT"; then
-    CONNECTED=1
-    break
-  fi
-  sleep 2
-done
-if [ "$CONNECTED" != 1 ]; then
-  tail -n 200 connect.log || true
-  kill "$CONNECT_PID" 2>/dev/null || true
-  wait "$CONNECT_PID" 2>/dev/null || true
-  exit 1
-fi
-# Send the real chat/API request through http://127.0.0.1:${HOST_PORT}/...
-kill "$CONNECT_PID" 2>/dev/null || true
-wait "$CONNECT_PID" 2>/dev/null || true
+confidential-agent connect start --service <service-id> --ready-json connect-ready.json --wait-ready 120
+./verify-chat.sh
+confidential-agent connect stop --ready-json connect-ready.json
 ```
 
-   - Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`; `connect --service <name>` is not supported for local service selection.
+   - `verify-chat.sh` must read `connect-ready.json` and select the endpoint matching `verification.json.service_id` and `verification.json.chat_guest_port`. Use this pattern inside the script:
+
+```bash
+BASE_URL="$(python3 - <<'PY'
+import json
+ready = json.load(open("connect-ready.json", encoding="utf-8"))
+plan = json.load(open("verification.json", encoding="utf-8"))
+for endpoint in ready.get("client_endpoints", []):
+    if endpoint.get("service") == plan["service_id"] and int(endpoint.get("guest_port")) == int(plan["chat_guest_port"]):
+        print(endpoint["http_base_url"])
+        break
+else:
+    raise SystemExit("no matching client endpoint")
+PY
+)"
+# Send the real chat/API request to "${BASE_URL}${CHAT_PATH}".
+```
+
+   - `confidential-agent connect --service <service-id>` selects the active local service by exact id. Omit it only when intentionally connecting every active service.
    - All reachability and chat probes must go through `confidential-agent connect` or its exposed host-side port. Direct SSH guest probes are only diagnostics; they do not satisfy `connect_ok` or `chat_ok`, and guest-side hotfixes must be moved back into the build artifacts before rerunning the flow.
    - Health, status, version, config, and model-list endpoints prove reachability only; they do not prove the migrated agent works. For `chat_ok`, send a real natural-language request through the connected service and save the response. Prefer two turns when the workload supports it, and include a deterministic marker if the task provides one. The marker must be produced by the target service response, not by a local command.
    - Verify that the running service is the real target upstream, using commit hash, process command, installed files, and response behavior.

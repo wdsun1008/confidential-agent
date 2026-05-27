@@ -6,7 +6,10 @@ export const E2E_COMMAND_EVIDENCE = {
   build_ok: new RegExp(`${CA_COMMAND}build\\b`, "i"),
   deploy_ok: new RegExp(`${CA_COMMAND}deploy\\b`, "i"),
   live_status_ok: new RegExp(`${CA_COMMAND}status\\b[^\\n;&|]*--live\\b`, "i"),
-  connect_ok: new RegExp(`${CA_COMMAND}connect\\b(?![^\\n;&|]*(?:--render-only|--help|-h|\\bhelp\\b))`, "i"),
+  connect_ok: new RegExp(
+    `${CA_COMMAND}connect\\b(?!\\s+stop\\b)(?![^\\n;&|]*(?:--render-only|--help|-h|\\bhelp\\b))`,
+    "i",
+  ),
   chat_ok:
     /\b(curl|python3?|node|wget|nc|ncat|socat|grpcurl|http|hermes|openclaw)\b[\s\S]*(chat|message|messages|completion|completions|responses|invoke|query|prompt|ask|\/v1\/(?:chat|messages|completions|responses)|\/api\/(?:chat|messages?|generate|completion|completions|invoke|query|prompt|ask))\b/i,
   cleanup_ok: new RegExp(`${CA_COMMAND}destroy\\b`, "i"),
@@ -123,11 +126,37 @@ export function compileOutputPatterns(patterns = []) {
     .filter(Boolean);
 }
 
-export function hasSuccessfulChatEvidence(events, pattern, outputPatterns = []) {
+function commandUsesRenderedLocalPort(commandText, renderedLocalPorts = []) {
+  if (!renderedLocalPorts.length) return false;
+  return renderedLocalPorts.some((port) => {
+    const escaped = String(port).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b(?:127\\.0\\.0\\.1|localhost):${escaped}\\b`, "i").test(commandText);
+  });
+}
+
+function commandUsesChatPath(commandText, chatPath) {
+  if (!chatPath) return false;
+  const escaped = String(chatPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(escaped, "i").test(commandText);
+}
+
+export function hasSuccessfulChatEvidence(events, pattern, outputPatterns = [], options = {}) {
   const compiledOutputPatterns = Array.isArray(outputPatterns) ? compileOutputPatterns(outputPatterns) : [];
   return events.some((event) => {
     const commandText = evidenceCommandText(event.cmd);
     if (!pattern.test(commandText) || event.result?.code !== 0 || commandLosesCriticalEvidence(event.cmd)) {
+      return false;
+    }
+    if (
+      Array.isArray(options.renderedLocalPorts) &&
+      !commandUsesRenderedLocalPort(commandText, options.renderedLocalPorts)
+    ) {
+      return false;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(options, "chatPath") &&
+      !commandUsesChatPath(commandText, options.chatPath || "")
+    ) {
       return false;
     }
     if (looksLikeFabricatedChatCommand(commandText)) return false;

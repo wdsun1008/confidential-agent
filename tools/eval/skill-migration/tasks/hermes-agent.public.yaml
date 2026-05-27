@@ -15,6 +15,7 @@ constraints:
   - Store final trial metadata in result.json in the trial work directory.
   - In full phase, every true result.json boolean must be backed by a successful real command in the trial transcript.
   - In full phase, chat_ok requires a real natural-language request through confidential-agent connect to the migrated Hermes service. Health, status, config, version, or model-list endpoints are not sufficient.
+  - Declare the final chat probe in verification.json and use verify-chat.sh through the rendered 127.0.0.1 connect endpoint.
   - For the final chat verification, ask the running Hermes service to reply with CA_CONFIDENTIAL_AGENT_EVAL_OK and capture that response in the transcript.
   - In full phase, complete cleanup after verification.
 result_contract:

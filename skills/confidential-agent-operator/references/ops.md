@@ -66,51 +66,29 @@ confidential-agent peering apply
 ```bash
 confidential-agent status --json
 confidential-agent status --live --json
-confidential-agent connect
-curl -fsS http://127.0.0.1:<port>/healthz
-nc -vz 127.0.0.1 <port>
+confidential-agent connect start --service <service-id> --ready-json connect-ready.json --wait-ready 120
+./verify-chat.sh
+confidential-agent connect stop --ready-json connect-ready.json
 ```
 
-Use plain `confidential-agent connect` unless the task gives an agent card for `--from-card`. Do not use `connect --service <name>` for local service selection.
-`connect` is long-running. In a noninteractive shell, first render the local mapping, then start the tunnel with stdin/stdout/stderr detached from the shell action.
+`connect --service <service-id>` selects the active local service by exact id. Without it, connect covers every active service with `service.connect` ports.
 
-The `nohup confidential-agent connect ... &` line must be an independent shell statement. Do not write `cd <dir> && nohup confidential-agent connect ... &`, and do not append `cat`, `curl`, `sleep`, or another probe after the `&` on the same physical line. Run `cd <dir>` as a separate statement first, or use `cd <dir> || exit;` before the independent `nohup` statement; otherwise shell grammar can background the whole `cd && connect` list and leave a subshell holding the action output pipe open.
+`connect start` writes `connect-ready.json`; use `client_endpoints[]` from that file to build the local URL. `connect --render-only` prints the same mapping without starting the tunnel.
 
 ```bash
-confidential-agent connect --render-only > connect-config.json
-HOST_PORT="$(python3 - <<'PY'
+confidential-agent connect start --service <service-id> --ready-json connect-ready.json --wait-ready 120
+BASE_URL="$(python3 - <<'PY'
 import json
-data = json.load(open("connect-config.json", encoding="utf-8"))
-ingress = data.get("add_ingress") or []
-if not ingress:
-    raise SystemExit("connect config has no add_ingress entries")
-print(ingress[0]["mapping"]["in"]["port"])
+ready = json.load(open("connect-ready.json", encoding="utf-8"))
+plan = json.load(open("verification.json", encoding="utf-8"))
+for endpoint in ready.get("client_endpoints", []):
+    if endpoint.get("service") == plan["service_id"] and int(endpoint.get("guest_port")) == int(plan["chat_guest_port"]):
+        print(endpoint["http_base_url"])
+        break
+else:
+    raise SystemExit("no matching client endpoint")
 PY
 )"
-# Keep this line independent; do not write `cd ... && nohup ... &`.
-nohup confidential-agent connect </dev/null >connect.log 2>&1 &
-CONNECT_PID=$!
-CONNECTED=0
-for _ in $(seq 1 30); do
-  if nc -z 127.0.0.1 "$HOST_PORT"; then
-    CONNECTED=1
-    break
-  fi
-  sleep 2
-done
-if [ "$CONNECTED" != 1 ]; then
-  tail -n 200 connect.log || true
-  kill "$CONNECT_PID" 2>/dev/null || true
-  wait "$CONNECT_PID" 2>/dev/null || true
-  exit 1
-fi
-```
-
-Probe the host-side port from `HOST_PORT`, run the real chat/API request through that local address, then stop only the saved PID:
-
-```bash
-kill "$CONNECT_PID" 2>/dev/null || true
-wait "$CONNECT_PID" 2>/dev/null || true
 ```
 
 For chat or agent APIs, use the workload's documented client or a `curl` request against its real endpoint. If `app_ready` is false, inspect `service.app_service`, guest unit logs, config resource targets, and whether the app listens on the declared port.

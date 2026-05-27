@@ -480,6 +480,13 @@ function hasRequiredArtifacts(trialDir) {
     }
   });
   if (!filesOk) return false;
+  for (const file of ["verification.json", "verify-chat.sh"]) {
+    try {
+      if (!fs.statSync(path.join(trialDir, file)).isFile()) return false;
+    } catch {
+      return false;
+    }
+  }
   return specValidationForArtifacts(trialDir).ok;
 }
 
@@ -729,6 +736,8 @@ function artifactContractIssues(trialDir) {
   const specText = readArtifactFromResult(trialDir, result, "generated_spec");
   const installText = readArtifactFromResult(trialDir, result, "install_script");
   const resourceText = readArtifactFromResult(trialDir, result, "resource_config");
+  const verificationPath = path.join(trialDir, "verification.json");
+  const verifyChatPath = path.join(trialDir, "verify-chat.sh");
   const deliverableText = `${specText}\n${installText}\n${resourceText}`;
   const appService = specText.match(/^\s*app_service:\s*['"]?([^'"\s#]+)['"]?\s*$/m)?.[1] || "";
   if (installText.trim().length < 80) {
@@ -812,6 +821,19 @@ function artifactContractIssues(trialDir) {
   }
   if (resourceText.trim().length > 0 && /your[_ -]?[a-z0-9_ -]*key[_ -]?here|changeme|todo|placeholder/i.test(resourceText)) {
     issues.push("resource_config still contains placeholder values; use concrete non-secret runtime config or environment/file references for secrets.");
+  }
+  const verification = readJson(verificationPath, null);
+  if (!verification || typeof verification !== "object") {
+    issues.push("verification.json must exist and contain a JSON object for the chat probe contract.");
+  } else {
+    for (const field of ["service_id", "chat_guest_port", "chat_method", "chat_path"]) {
+      if (verification[field] === undefined || String(verification[field]).trim() === "") {
+        issues.push(`verification.json must declare ${field}.`);
+      }
+    }
+  }
+  if (!fs.existsSync(verifyChatPath)) {
+    issues.push("verify-chat.sh must exist and run the final chat probe through connect-ready.json.");
   }
   return issues;
 }
@@ -1048,7 +1070,7 @@ function repeatedCommandReminder(repeatCount, blocked, readOnly) {
     ? `Repeated command blocked after ${repeatCount} identical attempts.`
     : `Repeated command reminder: the last command has run ${repeatCount} times in a row.`;
   const action = readOnly
-    ? "Stop repeating read-only exploration. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json, then run spec validate/build as appropriate."
+    ? "Stop repeating read-only exploration. Write or fix confidential-agent.yaml, the install script, the resource config, verification.json, verify-chat.sh, and result.json, then run spec validate/build as appropriate."
     : "Stop repeating the same shell action. Read the latest error/output, change the artifact or CLI invocation, then rerun only when something meaningful has changed.";
   return (
     `${prefix} ${action}`
@@ -1058,7 +1080,7 @@ function repeatedCommandReminder(repeatCount, blocked, readOnly) {
 function blockedReadOnlyWithoutArtifactsMessage(count) {
   return (
     `[runner] Command blocked: ${count} consecutive read-only commands ran while confidential-agent.yaml or result.json is still missing. ` +
-    "Write confidential-agent.yaml, the target install script, resource config, and result.json in the trial directory before reading more files."
+    "Write confidential-agent.yaml, the target install script, resource config, verification.json, verify-chat.sh, and result.json in the trial directory before reading more files."
   );
 }
 
@@ -1082,7 +1104,7 @@ function consecutiveReadOnlyReminder(trialDir, count, sentReminders) {
   sentReminders.add(key);
   return (
     `Read-only exploration reminder: you have run ${count} read-only commands in a row without completing the core deliverables. ` +
-    "Stop reading and write confidential-agent.yaml, the target install script, resource config, and result.json in the trial directory."
+    "Stop reading and write confidential-agent.yaml, the target install script, resource config, verification.json, verify-chat.sh, and result.json in the trial directory."
   );
 }
 
@@ -1096,6 +1118,7 @@ function containsForegroundConnectCommand(cmd) {
       if (/\b--render-only\b/i.test(segment)) return false;
       const tail = segment.slice(match.index + match[0].length);
       if (/(^|\s)(?:--help|-h|help)(?:\s|$)/i.test(tail)) return false;
+      if (/(^|\s)(?:start|stop)(?:\s|$)/i.test(tail)) return false;
       return !/(^|[^0-9])&(?:\s|$)/.test(tail);
     });
 }
@@ -1111,6 +1134,7 @@ function containsCompoundBackgroundConnectCommand(cmd) {
         const after = line.slice(match.index + match[0].length);
         const commandTail = after.split(/\s*(?:&&|\|\||;)\s*/)[0] || after;
         if (/\b--render-only\b|(?:^|\s)(?:--help|-h|help)(?:\s|$)/i.test(commandTail)) continue;
+        if (/(^|\s)(?:start|stop)(?:\s|$)/i.test(commandTail)) continue;
         if (!/(^|[^0-9])&(?:\s|$)/.test(after)) continue;
         const currentStatementPrefix = before.slice(Math.max(before.lastIndexOf(";"), 0));
         if (/(?:&&|\|\|)/.test(currentStatementPrefix)) return true;
@@ -1128,6 +1152,7 @@ function containsUnsafeBackgroundConnectCommand(cmd) {
         return false;
       }
       if (/\b--render-only\b|(?:^|\s)(?:--help|-h|help)(?:\s|$)/i.test(segment)) return false;
+      if (/\bconnect\s+(?:start|stop)\b/i.test(segment)) return false;
       if (!/(^|[^0-9])&(?:\s|$)/.test(segment)) return false;
       const hasNohup = /\bnohup\s+confidential-agent\b/i.test(segment);
       const hasStdinDetach = /(?:^|\s)(?:0?<\s*\/dev\/null)(?:\s|$)/.test(segment);
@@ -1190,7 +1215,7 @@ function containsDelayedCriticalCliCommand(cmd) {
 }
 
 function targetMigrationArtifactPattern() {
-  return /(?:^|[\s"'`=:/])(?:\.\/)?(?:confidential-agent\.ya?ml|result\.json|install-[A-Za-z0-9_.-]+\.sh|[A-Za-z0-9_.-]*-service\.sh|resource[_-]?config\.(?:json|ya?ml)|app-config\.(?:json|ya?ml)|[A-Za-z0-9_.-]+-config\.ya?ml)\b/i;
+  return /(?:^|[\s"'`=:/])(?:\.\/)?(?:confidential-agent\.ya?ml|result\.json|verification\.json|verify-chat\.sh|install-[A-Za-z0-9_.-]+\.sh|[A-Za-z0-9_.-]*-service\.sh|resource[_-]?config\.(?:json|ya?ml)|app-config\.(?:json|ya?ml)|[A-Za-z0-9_.-]+-config\.ya?ml)\b/i;
 }
 
 function writesTargetMigrationArtifact(cmd) {
@@ -1273,8 +1298,8 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
       code: 84,
       stdout: "",
       stderr:
-        "Blocked compound-list background confidential-agent connect. Do not write `cd ... && nohup confidential-agent connect ... &` or prefix the background connect line with `&&` or `||`. " +
-        "Run `cd <trial-dir>` as its own statement first, or use `cd <trial-dir> || exit; nohup confidential-agent connect </dev/null >connect.log 2>&1 &` and save `$!`.",
+        "Blocked compound-list background confidential-agent connect. Prefer `confidential-agent connect start --service <id> --ready-json connect-ready.json --wait-ready 120`. " +
+        "If using the legacy background form, do not write `cd ... && nohup confidential-agent connect ... &` or prefix the background connect line with `&&` or `||`.",
     });
   }
   if (containsForegroundConnectCommand(guardCmd)) {
@@ -1290,8 +1315,8 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
       code: 83,
       stdout: "",
       stderr:
-        "Blocked unsafe background confidential-agent connect. Use `confidential-agent connect --render-only` to get the local port, then start the tunnel as `nohup confidential-agent connect </dev/null >connect.log 2>&1 &` and save `$!`. " +
-        "Background connect commands that inherit the shell action stdout/stderr can hang the controller instead of returning to the next probe.",
+        "Blocked unsafe background confidential-agent connect. Prefer `confidential-agent connect start --service <id> --ready-json connect-ready.json --wait-ready 120`. " +
+        "Legacy background connect commands that inherit the shell action stdout/stderr can hang the controller instead of returning to the next probe.",
     });
   }
   if (containsBlockedShelterInvocation(guardCmd)) {
@@ -1393,7 +1418,7 @@ function runCommand(cmd, cwd, expectedRepo, extraAllowedRepos = [], bootstrapRea
 }
 
 function artifactSnapshot(trialDir) {
-  const files = ["confidential-agent.yaml", "result.json"];
+  const files = ["confidential-agent.yaml", "verification.json", "verify-chat.sh", "result.json"];
   const exists = Object.fromEntries(
     files.map((file) => [file, fs.existsSync(path.join(trialDir, file))]),
   );
@@ -1438,7 +1463,7 @@ function artifactFirstReminder(trialDir, step, sentReminders) {
   sentReminders.add(key);
   return (
     `Artifact-first reminder (step ${step}): confidential-agent.yaml and result.json are still missing. ` +
-    "Stop broad read-only exploration and write the AppSpec, install script, resource config, and result.json in the trial directory before continuing."
+    "Stop broad read-only exploration and write the AppSpec, install script, resource config, verification.json, verify-chat.sh, and result.json in the trial directory before continuing."
   );
 }
 
@@ -1635,7 +1660,7 @@ Rules:
 - Eval phase: ${phase}.
 - The only valid upstream target repository is exactly: ${expectedRepo || "the target_repo field in the task file"}.
 - If your result upstream_url differs from the task target_repo, the trial fails.
-- Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
+- Artifact-first: after any required Host Bootstrap is complete and confidential-agent --help works, by your third target-migration bash action confidential-agent.yaml, the target install script, the resource config, verification.json, verify-chat.sh, and result.json must exist in the trial directory. Write a rough first draft with heredocs in one command, then refine it.
 - In static phase, your target is high-quality migration artifacts, not live cloud execution. Do not perform live cloud operations. Set build_ok/deploy_ok/live_status_ok/connect_ok/chat_ok false unless you actually verified them.
 - ${fullBootstrapInstruction}
 - Do not construct GitHub raw URLs, release/archive URLs, or API URLs by guessing path conventions. Use URLs explicitly provided in the skill context, or clone/fetch repositories with git and verify the selected commit.
@@ -1648,8 +1673,9 @@ Rules:
 - Do not prepend long sleeps before confidential-agent build/deploy/status/connect/destroy. Run the command directly; if it is still running, wait for that command or inspect its real log from a separate read-only command.
 - After build exits 0, progress to operator peering and deploy. Do not delete built images or rerun build unless deploy or live status fails and requires an image fix.
 - All verification and chat probes must go through confidential-agent connect or its exposed host-side port. Do not SSH into the guest to fix, install, or probe the service directly.
-- confidential-agent connect is a long-running tunnel. In this single-shell eval, first run "confidential-agent connect --render-only > connect-config.json" and parse ".add_ingress[0].mapping.in.port" as the host-side port. Start the tunnel only with "nohup confidential-agent connect </dev/null >connect.log 2>&1 &", save "$!", probe the parsed host-side port, and stop only that saved PID after chat verification. The nohup connect line must be an independent shell statement: do not prefix it with "cd ... &&" or any other "&&"/"||" compound-list, and do not append cat/curl/sleep probes after the "&" on the same physical line.
-- Use plain confidential-agent connect unless the task provides an agent card for --from-card. Do not use connect --service for local service selection in this CLI version.
+- For automation, prefer "confidential-agent connect start --service <service-id> --ready-json connect-ready.json --wait-ready 120" and later "confidential-agent connect stop --ready-json connect-ready.json". The ready JSON contains client_endpoints with the exact 127.0.0.1 local URL to use for chat probes.
+- If you use old foreground connect manually, it is a long-running tunnel. Do not run foreground connect in this single-shell eval; render first, background safely, save the exact PID, probe the parsed local port, and stop only that saved PID.
+- "connect --service <service-id>" selects the active local service by exact id. Do not use direct guest IPs for chat evidence.
 - Health/status/version/config/model-list calls do not satisfy chat_ok. Verify a real conversation through the connected service and capture the response.
 - Destroy is the last success-phase step. Do not run confidential-agent destroy until chat_ok has real evidence; if you abandon a failed run, leave unfinished success booleans false.
 
@@ -1764,7 +1790,7 @@ async function main() {
       messages.push({
         role: "user",
         content:
-          `Final is not accepted yet: result.json and the artifacts named by generated_spec, install_script, and resource_config must exist on disk in this trial directory, and the generated spec must pass confidential-agent spec validate.${fullReminder} ${validation}`,
+          `Final is not accepted yet: result.json, verification.json, verify-chat.sh, and the artifacts named by generated_spec, install_script, and resource_config must exist on disk in this trial directory, and the generated spec must pass confidential-agent spec validate.${fullReminder} ${validation}`,
       });
       continue;
     }
@@ -1859,7 +1885,7 @@ async function main() {
             stdout: "",
             stderr:
               readOnlyExploration
-                ? "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, and result.json before running more read-only commands."
+                ? "[runner] Command blocked: repeated read-only exploration is not progress. Write or fix confidential-agent.yaml, the install script, the resource config, verification.json, verify-chat.sh, and result.json before running more read-only commands."
                 : "[runner] Command blocked: the exact same shell action has repeated too many times. Inspect the latest output, change the artifact or CLI invocation, then rerun.",
           }
       : await runCommand(action.cmd, trialDir, expectedRepo, extraAllowedRepos, bootstrapReadyBeforeCommand);
@@ -1935,7 +1961,7 @@ async function main() {
     messages.push({ role: "assistant", content: JSON.stringify(action) });
     let reminder = "";
     if (remaining <= 3) {
-      reminder = `\n\nYou have ${remaining - 1} steps left. Stop exploration now. Write confidential-agent.yaml, install script, resource config, and result.json if missing. Current artifact snapshot: ${JSON.stringify(artifactSnapshot(trialDir))}`;
+      reminder = `\n\nYou have ${remaining - 1} steps left. Stop exploration now. Write confidential-agent.yaml, install script, resource config, verification.json, verify-chat.sh, and result.json if missing. Current artifact snapshot: ${JSON.stringify(artifactSnapshot(trialDir))}`;
     } else if (step === Math.ceil(MAX_STEPS / 2)) {
       reminder = `\n\nMid-run artifact check: ${JSON.stringify(artifactSnapshot(trialDir))}. If confidential-agent.yaml or result.json is missing, create them next.`;
     }
