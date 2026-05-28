@@ -1,14 +1,14 @@
 use crate::cli::{
-    A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands,
-    ConnectStartArgs, ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs,
-    ImageCommands, InjectArgs, MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs,
-    PeeringCommands, SpecArgs, SpecCommands, StatusArgs,
+    A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
+    ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
+    InjectArgs, MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands,
+    SpecArgs, SpecCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use confidential_agent_core::a2a::{
-    A2aBundle, A2aBundlePeer, A2aCardSummary, A2aCliPreview, A2aCliPreviewError, A2aStateFile,
-    A2aStatePeer, A2aSignerPin,
+    A2aBundle, A2aBundlePeer, A2aCardSummary, A2aCliPreview, A2aCliPreviewError, A2aSignerPin,
+    A2aStateFile, A2aStatePeer,
 };
 use confidential_agent_core::agent_card::{
     confidential_extension, derive_tng_client_config_with_local_ports,
@@ -16,18 +16,20 @@ use confidential_agent_core::agent_card::{
 use confidential_agent_core::agent_card_fetch::{
     fetch_agent_card, fetch_agent_card_with_signer, parse_agent_card_url, AgentCardFetchError,
 };
-use confidential_agent_core::agent_card_signing::sign_agent_card_keyless;
 use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{
-    AgentCard, AgentCardCapabilities, AgentCardConfidential, AgentCardPort, AgentCardRekor,
-    AgentCardSkill, AgentExtension, AgentInterface, BootstrapConfig, DaemonStatus, GuestResource,
-    LocalBuildState,
-    LocalDebugSshKey, LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState,
-    LocalSpecState, MeshBundle, MeshService, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION,
-    DAEMON_STATUS_PORT, LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
+    AgentCard, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState, LocalDebugSshKey,
+    LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState, LocalSpecState,
+    MeshBundle, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
+    LOCAL_SERVICE_STATE_SCHEMA_VERSION,
+};
+#[cfg(test)]
+use confidential_agent_core::schema::{
+    AgentCardCapabilities, AgentCardConfidential, AgentCardPort, AgentCardRekor, AgentExtension,
+    AgentInterface, MESH_SCHEMA_VERSION,
 };
 use confidential_agent_core::spec::{AgentSpec, AttestationTee, ReferenceValueMode};
-use confidential_agent_core::util::{hex_encode, rekor_payload, required_json_string, sha256_file};
+use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use confidential_agent_shelter::{
     render_build_config, shelter_build_id, GuestAssets, GuestFileAsset, ShelterRenderOptions,
 };

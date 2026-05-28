@@ -342,3 +342,74 @@ pub(super) fn find_agentd_binary() -> Result<PathBuf> {
         current.display()
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agentd_service_unit_is_valid_systemd() {
+        let unit = agentd_service_unit();
+        assert!(unit.contains("[Unit]"));
+        assert!(unit.contains("[Service]"));
+        assert!(unit.contains("[Install]"));
+        assert!(unit.contains("confidential-agentd"));
+    }
+
+    #[test]
+    fn guest_setup_script_is_executable_shell() {
+        let script = guest_setup_script();
+        assert!(script.starts_with("#!/"));
+    }
+
+    #[test]
+    fn cryptpilot_fde_config_is_toml() {
+        let config = cryptpilot_fde_config();
+        assert!(
+            config.contains("[cryptpilot]") || config.contains("name =") || config.contains('[')
+        );
+    }
+
+    #[test]
+    fn secret_fetch_module_setup_is_shell_script() {
+        let setup = secret_fetch_module_setup();
+        assert!(setup.starts_with("#!/"));
+        assert!(setup.contains("install"));
+    }
+
+    #[test]
+    fn secret_fetch_service_unit_is_systemd() {
+        let unit = secret_fetch_service_unit();
+        assert!(unit.contains("[Unit]") || unit.contains("[Service]"));
+    }
+
+    #[test]
+    fn write_secret_fetch_module_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let module_dir = dir.path().join("99test-module");
+        write_secret_fetch_module(&module_dir).unwrap();
+        assert!(module_dir.join("module-setup.sh").exists());
+        assert!(module_dir
+            .join("confidential-agent-secret-fetch.service")
+            .exists());
+    }
+
+    #[test]
+    fn stage_guest_setup_script_creates_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stage_guest_setup_script(dir.path()).unwrap();
+        assert!(path.exists());
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.permissions().mode() & 0o111 != 0);
+    }
+
+    #[test]
+    fn write_executable_sets_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-script.sh");
+        write_executable(&path, "#!/bin/sh\necho hello\n").unwrap();
+        assert!(path.exists());
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.permissions().mode() & 0o111 != 0);
+    }
+}

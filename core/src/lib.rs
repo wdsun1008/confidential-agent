@@ -2,6 +2,7 @@ pub mod a2a;
 pub mod agent_card;
 pub mod agent_card_fetch;
 pub mod agent_card_signing;
+pub mod mesh;
 pub mod peerings;
 pub mod schema;
 pub mod spec;
@@ -154,8 +155,8 @@ mod schema_tests {
     fn bootstrap_config_round_trips_peers_and_agent_card() {
         use crate::agent_card::{confidential_extension, CONFIDENTIAL_AGENT_EXTENSION};
         use crate::schema::{
-            AgentCard, AgentCardCapabilities, AgentCardConfidential, AgentCardPort,
-            AgentCardRekor, AgentCardSkill, AgentExtension, AgentInterface, BootstrapPeer,
+            AgentCard, AgentCardCapabilities, AgentCardConfidential, AgentCardPort, AgentCardRekor,
+            AgentCardSkill, AgentExtension, AgentInterface, BootstrapPeer,
             BootstrapPeerPortMapping,
         };
 

@@ -219,22 +219,259 @@ fn validate_label(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn peer_role_defaults_to_agent_card_and_connect() {
-        let entry = PeeringEntry {
-            label: "beta".to_string(),
-            role: PeeringRole::Peer,
-            cidr: "198.51.100.10/32".to_string(),
+    fn operator(label: &str, cidr: &str) -> PeeringEntry {
+        PeeringEntry {
+            label: label.to_string(),
+            role: PeeringRole::Operator,
+            cidr: cidr.to_string(),
             scope: Vec::new(),
             note: None,
             added_at: None,
             added_by: None,
-        };
+        }
+    }
 
+    fn peer(label: &str, cidr: &str) -> PeeringEntry {
+        PeeringEntry {
+            label: label.to_string(),
+            role: PeeringRole::Peer,
+            cidr: cidr.to_string(),
+            scope: Vec::new(),
+            note: None,
+            added_at: None,
+            added_by: None,
+        }
+    }
+
+    #[test]
+    fn peer_role_defaults_to_agent_card_and_connect() {
+        let entry = peer("beta", "198.51.100.10/32");
         let scope = entry.effective_scope();
-
         assert!(scope.contains(&PeeringScope::AgentCard));
         assert!(scope.contains(&PeeringScope::Connect));
         assert!(!scope.contains(&PeeringScope::Mesh));
+    }
+
+    #[test]
+    fn operator_role_defaults_include_control_status_ssh() {
+        let entry = operator("ops", "203.0.113.0/24");
+        let scope = entry.effective_scope();
+        assert!(scope.contains(&PeeringScope::Control));
+        assert!(scope.contains(&PeeringScope::Status));
+        assert!(scope.contains(&PeeringScope::Ssh));
+        assert!(scope.contains(&PeeringScope::AgentCard));
+        assert!(scope.contains(&PeeringScope::Connect));
+        assert!(!scope.contains(&PeeringScope::Mesh));
+    }
+
+    #[test]
+    fn explicit_scope_overrides_defaults() {
+        let mut entry = operator("ops", "10.0.0.0/8");
+        entry.scope = vec![PeeringScope::Status];
+        assert!(entry.has_scope(PeeringScope::Status));
+        assert!(!entry.has_scope(PeeringScope::Control));
+    }
+
+    #[test]
+    fn validate_accepts_valid_file() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![
+                operator("ops", "203.0.113.0/24"),
+                peer("beta", "198.51.100.10/32"),
+            ],
+        };
+        assert!(file.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_version() {
+        let file = PeeringsFile {
+            version: 2,
+            peerings: vec![],
+        };
+        let err = file.validate().unwrap_err();
+        assert!(err.to_string().contains("version must be 1"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_labels() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![operator("same", "10.0.0.0/8"), peer("same", "10.1.0.0/16")],
+        };
+        let err = file.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate label"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_label() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![operator("", "10.0.0.0/8")],
+        };
+        assert!(file.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_cidr() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![operator("ops", "not-a-cidr")],
+        };
+        assert!(file.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_scope() {
+        let mut entry = operator("ops", "10.0.0.0/8");
+        entry.scope = vec![PeeringScope::Control, PeeringScope::Control];
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![entry],
+        };
+        let err = file.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate scope"));
+    }
+
+    #[test]
+    fn cidrs_for_scope_filters_by_role_and_scope() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![
+                operator("ops", "203.0.113.0/24"),
+                peer("beta", "198.51.100.10/32"),
+            ],
+        };
+        let control = file.cidrs_for_scope(PeeringScope::Control);
+        assert_eq!(control, vec!["203.0.113.0/24"]);
+
+        let agent_card = file.cidrs_for_scope(PeeringScope::AgentCard);
+        assert_eq!(agent_card.len(), 2);
+    }
+
+    #[test]
+    fn cidrs_for_scope_deduplicates() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![
+                operator("ops1", "10.0.0.0/8"),
+                operator("ops2", "10.0.0.0/8"),
+            ],
+        };
+        let cidrs = file.cidrs_for_scope(PeeringScope::Control);
+        assert_eq!(cidrs.len(), 1);
+    }
+
+    #[test]
+    fn has_operator_control_status_true_for_default_operator() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![operator("ops", "10.0.0.0/8")],
+        };
+        assert!(file.has_operator_control_status());
+    }
+
+    #[test]
+    fn has_operator_control_status_false_for_peer_only() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![peer("beta", "10.0.0.0/8")],
+        };
+        assert!(!file.has_operator_control_status());
+    }
+
+    #[test]
+    fn has_operator_control_status_false_when_scoped_to_status_only() {
+        let mut entry = operator("ops", "10.0.0.0/8");
+        entry.scope = vec![PeeringScope::Status];
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![entry],
+        };
+        assert!(!file.has_operator_control_status());
+    }
+
+    #[test]
+    fn control_cidrs_contain_matches_ip_in_range() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![operator("ops", "10.0.0.0/8")],
+        };
+        assert!(file
+            .control_cidrs_contain("10.1.2.3".parse().unwrap())
+            .unwrap());
+        assert!(!file
+            .control_cidrs_contain("192.168.1.1".parse().unwrap())
+            .unwrap());
+    }
+
+    #[test]
+    fn control_cidrs_contain_ignores_peers() {
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![peer("beta", "10.0.0.0/8")],
+        };
+        assert!(!file
+            .control_cidrs_contain("10.1.2.3".parse().unwrap())
+            .unwrap());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_accepts_valid() {
+        assert!(validate_ipv4_cidr("test", "10.0.0.0/8").is_ok());
+        assert!(validate_ipv4_cidr("test", "192.168.1.0/24").is_ok());
+        assert!(validate_ipv4_cidr("test", "1.2.3.4/32").is_ok());
+        assert!(validate_ipv4_cidr("test", "0.0.0.0/0").is_ok());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_no_slash() {
+        assert!(validate_ipv4_cidr("test", "10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_bad_address() {
+        assert!(validate_ipv4_cidr("test", "999.0.0.0/8").is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_prefix_over_32() {
+        assert!(validate_ipv4_cidr("test", "10.0.0.0/33").is_err());
+    }
+
+    #[test]
+    fn ipv4_cidr_contains_various() {
+        assert!(ipv4_cidr_contains("10.0.0.0/8", "10.255.255.255".parse().unwrap()).unwrap());
+        assert!(!ipv4_cidr_contains("10.0.0.0/8", "11.0.0.0".parse().unwrap()).unwrap());
+        assert!(ipv4_cidr_contains("192.168.1.5/32", "192.168.1.5".parse().unwrap()).unwrap());
+        assert!(!ipv4_cidr_contains("192.168.1.5/32", "192.168.1.6".parse().unwrap()).unwrap());
+        assert!(ipv4_cidr_contains("0.0.0.0/0", "1.2.3.4".parse().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn from_path_and_write_to_path_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peerings.yaml");
+        let file = PeeringsFile {
+            version: 1,
+            peerings: vec![
+                operator("ops", "203.0.113.0/24"),
+                peer("beta", "198.51.100.10/32"),
+            ],
+        };
+        file.write_to_path(&path).unwrap();
+        let loaded = PeeringsFile::from_path(&path).unwrap();
+        assert_eq!(loaded.peerings.len(), 2);
+        assert_eq!(loaded.peerings[0].label, "ops");
+        assert_eq!(loaded.peerings[1].label, "beta");
+    }
+
+    #[test]
+    fn empty_creates_valid_empty_file() {
+        let file = PeeringsFile::empty();
+        assert_eq!(file.version, 1);
+        assert!(file.peerings.is_empty());
+        assert!(file.validate().is_ok());
     }
 }
