@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use confidential_agent_core::a2a::{A2aBundle, A2aBundlePeer};
 use confidential_agent_core::agent_card::{agent_card_reference_values, confidential_extension};
-use confidential_agent_core::agent_card_fetch::fetch_agent_card_with_signer;
+use confidential_agent_core::agent_card_fetch::{
+    fetch_agent_card_with_signer, AgentCardFetchError,
+};
 use confidential_agent_core::schema::{
     confidential_ports, AppliedResourceState, BootstrapConfig, DaemonA2aPeerStatus, DaemonStatus,
     GuestResource, MeshBundle, ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService,
@@ -1266,15 +1268,20 @@ fn resolve_a2a_peer(
         }
         ensure_cached_ports_available(cached, used_local_ports)?;
         let resolved = resolved_from_cache(cached)?;
+        let state_name = if cached.error.is_some() {
+            "stale"
+        } else {
+            "ok"
+        };
         state.a2a_status.insert(
             key,
             DaemonA2aPeerStatus {
                 url: peer.url.clone(),
                 id: Some(resolved.id.clone()),
-                state: "ok".to_string(),
+                state: state_name.to_string(),
                 last_fetch_unix: Some(cached.fetched_at_unix),
                 last_success_unix: Some(cached.fetched_at_unix),
-                error: None,
+                error: cached.error.clone(),
                 ports: resolved.ports.iter().map(|port| port.local).collect(),
             },
         );
@@ -1285,7 +1292,7 @@ fn resolve_a2a_peer(
         .signer
         .as_ref()
         .map(confidential_agent_core::agent_card_signing::AgentCardSignerPin::from);
-    match fetch_agent_card_with_signer(&peer.url, signer.as_ref()).map_err(anyhow::Error::new) {
+    match fetch_agent_card_with_signer(&peer.url, signer.as_ref()) {
         Ok(card) => {
             let ext = confidential_extension(&card)?;
             let reference_values = agent_card_reference_values(&card)?;
@@ -1330,16 +1337,23 @@ fn resolve_a2a_peer(
                 reference_values,
             })
         }
-        Err(err) => {
+        Err(fetch_err) => {
+            let stale_allowed = a2a_fetch_error_allows_stale(&fetch_err);
+            let err = anyhow::Error::new(fetch_err);
             let error = err.to_string();
             if let Some(cached) = state.a2a_cache.get_mut(&key) {
+                let last_success_unix = if cached_peer_is_resolvable(cached) {
+                    Some(cached.fetched_at_unix)
+                } else {
+                    None
+                };
                 cached.next_refresh_unix = now + A2A_FETCH_FAILURE_BACKOFF_SEC;
                 cached.error = Some(error.clone());
                 cached.url = peer.url.clone();
                 cached.alias = peer.alias.clone();
                 cached.fingerprint = peer.fingerprint.clone();
 
-                if cached_peer_is_resolvable(cached) {
+                if stale_allowed && cached_peer_is_resolvable(cached) {
                     ensure_cached_ports_available(cached, used_local_ports)?;
                     let resolved = resolved_from_cache(cached)?;
                     state.a2a_status.insert(
@@ -1357,7 +1371,11 @@ fn resolve_a2a_peer(
                     return Ok(resolved);
                 }
 
-                cached.fetched_at_unix = now;
+                if !stale_allowed {
+                    *cached = negative_a2a_cache(peer, now, error.clone());
+                } else {
+                    cached.fetched_at_unix = now;
+                }
                 state.a2a_status.insert(
                     key.clone(),
                     DaemonA2aPeerStatus {
@@ -1365,7 +1383,7 @@ fn resolve_a2a_peer(
                         id: peer.alias.clone(),
                         state: "error".to_string(),
                         last_fetch_unix: Some(now),
-                        last_success_unix: None,
+                        last_success_unix,
                         error: Some(error.clone()),
                         ports: Vec::new(),
                     },
@@ -1393,6 +1411,14 @@ fn resolve_a2a_peer(
                 error
             )
         }
+    }
+}
+
+fn a2a_fetch_error_allows_stale(err: &AgentCardFetchError) -> bool {
+    match err {
+        AgentCardFetchError::Transport(_) => true,
+        AgentCardFetchError::HttpStatus { status, .. } => *status >= 500,
+        _ => false,
     }
 }
 

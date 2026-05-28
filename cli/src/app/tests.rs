@@ -2904,6 +2904,13 @@ fn a2a_preview_error_kind_keeps_trust_failures_distinct() {
         "host_mismatch"
     );
     assert_eq!(
+        a2a_cli_preview_error_kind(&AgentCardFetchError::HostResolution {
+            host: "peer.example".to_string(),
+            message: "temporary DNS failure".to_string(),
+        }),
+        "host_mismatch"
+    );
+    assert_eq!(
         a2a_cli_preview_error_kind(&AgentCardFetchError::RekorUrlNotTrusted {
             url: "https://rekor.example".to_string(),
             allowed: vec!["https://rekor.sigstore.dev".to_string()],

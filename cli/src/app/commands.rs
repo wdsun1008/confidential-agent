@@ -1894,8 +1894,11 @@ fn a2a_cli_preview_error(err: &AgentCardFetchError) -> A2aCliPreviewError {
 
 pub(super) fn a2a_cli_preview_error_kind(err: &AgentCardFetchError) -> &'static str {
     match err {
-        AgentCardFetchError::Transport(_) | AgentCardFetchError::HttpStatus { .. } => "unreachable",
-        AgentCardFetchError::PublicIpHostMismatch { .. } => "host_mismatch",
+        AgentCardFetchError::Transport(_) | AgentCardFetchError::HttpStatus { .. } => {
+            "unreachable"
+        }
+        AgentCardFetchError::PublicIpHostMismatch { .. }
+        | AgentCardFetchError::HostResolution { .. } => "host_mismatch",
         AgentCardFetchError::RekorUrlNotTrusted { .. } => "rekor_untrusted",
         AgentCardFetchError::SignatureMissing => "unsigned",
         AgentCardFetchError::SignatureVerification(_) => "signature_failed",
