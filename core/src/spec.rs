@@ -442,9 +442,7 @@ impl AgentSpec {
                     bail!("a2a.interfaces[{idx}].port must be greater than 0");
                 }
                 if !self.service.connect.contains(&interface.port) {
-                    bail!(
-                        "a2a.interfaces[{idx}].port must be listed in service.connect"
-                    );
+                    bail!("a2a.interfaces[{idx}].port must be listed in service.connect");
                 }
                 if !interface.path.starts_with('/') {
                     bail!("a2a.interfaces[{idx}].path must start with '/'");
@@ -819,7 +817,12 @@ resources:
 
     #[test]
     fn rejects_additional_debian_package_names() {
-        for package in ["python3-venv", "python-dev-is-python3", "libc-dev", "docker.io"] {
+        for package in [
+            "python3-venv",
+            "python-dev-is-python3",
+            "libc-dev",
+            "docker.io",
+        ] {
             let yaml = SPEC
                 .replace("  base_image: ./base.qcow2\n", "")
                 .replace("    - nodejs", &format!("    - {package}"));

@@ -90,7 +90,10 @@ impl fmt::Display for AgentCardFetchError {
                 resolved
             ),
             Self::HostResolution { host, message } => {
-                write!(f, "failed to resolve agent card URL host '{host}': {message}")
+                write!(
+                    f,
+                    "failed to resolve agent card URL host '{host}': {message}"
+                )
             }
             Self::RekorUrlNotTrusted { url, allowed } => {
                 write!(
@@ -261,9 +264,11 @@ fn fetch_agent_card_once(
         }
     })?;
     if let Some(signer) = signer {
-        verify_agent_card_signature(&card, signer).map_err(|err| match err.to_string().as_str() {
-            "agent card has no signatures" => AgentCardFetchError::SignatureMissing,
-            _ => AgentCardFetchError::SignatureVerification(err.to_string()),
+        verify_agent_card_signature(&card, signer).map_err(|err| {
+            match err.to_string().as_str() {
+                "agent card has no signatures" => AgentCardFetchError::SignatureMissing,
+                _ => AgentCardFetchError::SignatureVerification(err.to_string()),
+            }
         })?;
     }
     verify_agent_card_trust(&card, parsed)?;
@@ -325,12 +330,13 @@ pub fn resolve_host_ipv4(
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(vec![IpAddr::V4(ip)]);
     }
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|err| AgentCardFetchError::HostResolution {
-            host: host.to_string(),
-            message: err.to_string(),
-        })?;
+    let addrs =
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|err| AgentCardFetchError::HostResolution {
+                host: host.to_string(),
+                message: err.to_string(),
+            })?;
     let mut resolved = addrs
         .filter_map(|addr| match addr.ip() {
             IpAddr::V4(ip) => Some(IpAddr::V4(ip)),

@@ -21,7 +21,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Version => {
             println!("confidential-agent {}", env!("CARGO_PKG_VERSION"));
             Ok(())
-        },
+        }
     }
 }
 
@@ -667,8 +667,11 @@ pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
             if args.render_only {
                 bail!("connect start does not support --render-only; use `connect --render-only` to inspect the forwarding plan");
             }
-            let from_card =
-                merge_connect_option("from-card", args.from_card.as_ref(), start.from_card.as_ref())?;
+            let from_card = merge_connect_option(
+                "from-card",
+                args.from_card.as_ref(),
+                start.from_card.as_ref(),
+            )?;
             let service =
                 merge_connect_option("service", args.service.as_ref(), start.service.as_ref())?;
             return cmd_connect_start(cli, start, from_card, service);
@@ -801,7 +804,11 @@ fn cmd_connect_start(
         started_at: current_utc_timestamp(),
         client_endpoints: endpoints,
     };
-    if let Some(parent) = args.ready_json.parent().filter(|path| !path.as_os_str().is_empty()) {
+    if let Some(parent) = args
+        .ready_json
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
@@ -949,7 +956,10 @@ fn stop_connect_container(container_name: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
         if text.contains("No such container") {
-            eprintln!("[ca] connect container '{}' is already gone", container_name);
+            eprintln!(
+                "[ca] connect container '{}' is already gone",
+                container_name
+            );
             return Ok(());
         }
         bail!(
@@ -1894,9 +1904,7 @@ fn a2a_cli_preview_error(err: &AgentCardFetchError) -> A2aCliPreviewError {
 
 pub(super) fn a2a_cli_preview_error_kind(err: &AgentCardFetchError) -> &'static str {
     match err {
-        AgentCardFetchError::Transport(_) | AgentCardFetchError::HttpStatus { .. } => {
-            "unreachable"
-        }
+        AgentCardFetchError::Transport(_) | AgentCardFetchError::HttpStatus { .. } => "unreachable",
         AgentCardFetchError::PublicIpHostMismatch { .. }
         | AgentCardFetchError::HostResolution { .. } => "host_mismatch",
         AgentCardFetchError::RekorUrlNotTrusted { .. } => "rekor_untrusted",
