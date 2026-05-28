@@ -188,3 +188,197 @@ pub(super) fn put_ssh_string(buf: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 pub(super) fn put_u32(buf: &mut Vec<u8>, value: u32) {
     buf.extend_from_slice(&value.to_be_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use confidential_agent_core::spec::AgentSpec;
+
+    const DEBUG_SPEC: &str = r#"
+schema: confidential-agent/v1
+service:
+  id: test-svc
+  ports: [8080]
+build:
+  base_image: /images/base.qcow2
+  image_name: test-agent
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#;
+
+    const RELEASE_SPEC: &str = r#"
+schema: confidential-agent/v1
+service:
+  id: test-svc
+  ports: [8080]
+build:
+  base_image: /images/base.qcow2
+  image_name: test-agent
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#;
+
+    #[test]
+    fn ensure_debug_ssh_key_skips_for_release_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = context_paths(dir.path(), "test-svc");
+        let mut spec = AgentSpec::from_yaml(RELEASE_SPEC, Path::new("/project")).unwrap();
+        let result = ensure_debug_ssh_key_with_generator(&paths, &mut spec, |_, _| {
+            panic!("should not be called");
+        })
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ensure_debug_ssh_key_generates_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = context_paths(dir.path(), "test-svc");
+        let mut spec = AgentSpec::from_yaml(DEBUG_SPEC, Path::new("/project")).unwrap();
+        let result = ensure_debug_ssh_key_with_generator(&paths, &mut spec, |priv_key, pub_key| {
+            fs::write(priv_key, "PRIVATE")?;
+            fs::write(pub_key, "PUBLIC")?;
+            Ok(())
+        })
+        .unwrap();
+        let ssh = result.unwrap();
+        assert!(ssh.private_key.exists());
+        assert!(ssh.public_key.exists());
+        assert!(spec
+            .build
+            .variants
+            .debug
+            .as_ref()
+            .unwrap()
+            .ssh_public_key
+            .is_some());
+    }
+
+    #[test]
+    fn ensure_debug_ssh_key_skips_when_already_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = context_paths(dir.path(), "test-svc");
+        let mut spec = AgentSpec::from_yaml(DEBUG_SPEC, Path::new("/project")).unwrap();
+        spec.build.variants.debug.as_mut().unwrap().ssh_public_key =
+            Some(PathBuf::from("/existing/key.pub"));
+        let result = ensure_debug_ssh_key_with_generator(&paths, &mut spec, |_, _| {
+            panic!("should not be called");
+        })
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ensure_debug_ssh_key_reuses_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = context_paths(dir.path(), "test-svc");
+        fs::create_dir_all(&paths.secrets_dir).unwrap();
+        fs::write(paths.secrets_dir.join("debug_ssh"), "PRIV").unwrap();
+        fs::write(paths.secrets_dir.join("debug_ssh.pub"), "PUB").unwrap();
+        let mut spec = AgentSpec::from_yaml(DEBUG_SPEC, Path::new("/project")).unwrap();
+        let result = ensure_debug_ssh_key_with_generator(&paths, &mut spec, |_, _| {
+            panic!("should not be called");
+        })
+        .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn ensure_debug_ssh_key_errors_on_half_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = context_paths(dir.path(), "test-svc");
+        fs::create_dir_all(&paths.secrets_dir).unwrap();
+        fs::write(paths.secrets_dir.join("debug_ssh"), "PRIV").unwrap();
+        let mut spec = AgentSpec::from_yaml(DEBUG_SPEC, Path::new("/project")).unwrap();
+        let err =
+            ensure_debug_ssh_key_with_generator(&paths, &mut spec, |_, _| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn ed25519_keypair_deterministic() {
+        let seed = [42u8; 32];
+        let (pk1, sk1) = ed25519_keypair_from_seed(&seed);
+        let (pk2, sk2) = ed25519_keypair_from_seed(&seed);
+        assert_eq!(pk1, pk2);
+        assert_eq!(sk1, sk2);
+    }
+
+    #[test]
+    fn ed25519_keypair_different_seeds() {
+        let (pk1, _) = ed25519_keypair_from_seed(&[1u8; 32]);
+        let (pk2, _) = ed25519_keypair_from_seed(&[2u8; 32]);
+        assert_ne!(pk1, pk2);
+    }
+
+    #[test]
+    fn openssh_public_blob_starts_with_key_type() {
+        let (pk, _) = ed25519_keypair_from_seed(&[42u8; 32]);
+        let blob = openssh_ed25519_public_blob(&pk).unwrap();
+        assert!(blob.len() > 32);
+        assert!(String::from_utf8_lossy(&blob).contains("ssh-ed25519"));
+    }
+
+    #[test]
+    fn openssh_private_key_pem_format() {
+        let (pk, sk) = ed25519_keypair_from_seed(&[42u8; 32]);
+        let blob = openssh_ed25519_public_blob(&pk).unwrap();
+        let pem = openssh_ed25519_private_key(&blob, &pk, &sk, "test-comment", 12345).unwrap();
+        assert!(pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
+        assert!(pem.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+    }
+
+    #[test]
+    fn generate_debug_ssh_key_creates_valid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let priv_path = dir.path().join("debug_ssh");
+        let pub_path = dir.path().join("debug_ssh.pub");
+        generate_debug_ssh_key("test-svc", &priv_path, &pub_path).unwrap();
+        let pub_content = fs::read_to_string(&pub_path).unwrap();
+        assert!(pub_content.starts_with("ssh-ed25519 "));
+        assert!(pub_content.contains("confidential-agent:test-svc:debug"));
+        let priv_content = fs::read_to_string(&priv_path).unwrap();
+        assert!(priv_content.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn put_ssh_string_encodes_length_prefix() {
+        let mut buf = Vec::new();
+        put_ssh_string(&mut buf, b"hello").unwrap();
+        assert_eq!(&buf[..4], &[0, 0, 0, 5]);
+        assert_eq!(&buf[4..], b"hello");
+    }
+
+    #[test]
+    fn put_u32_big_endian() {
+        let mut buf = Vec::new();
+        put_u32(&mut buf, 0x01020304);
+        assert_eq!(buf, vec![1, 2, 3, 4]);
+    }
+}

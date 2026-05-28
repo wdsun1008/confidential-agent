@@ -524,3 +524,296 @@ pub(super) fn allocate_local_port(
 pub(super) fn port_is_available(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Commands, StatusArgs};
+
+    fn test_cli() -> Cli {
+        Cli {
+            command: Commands::Status(StatusArgs {
+                service: None,
+                json: false,
+                live: false,
+            }),
+            shelter_bin: PathBuf::from("shelter"),
+            state_dir: PathBuf::from("/work/.confidential-agent"),
+            tools_image: "confidential-agent-tools:test".to_string(),
+        }
+    }
+
+    #[test]
+    fn tools_container_args_basic() {
+        let cli = test_cli();
+        let spec = ToolContainerSpec {
+            tool: "my-tool",
+            tool_args: vec![OsString::from("--flag"), OsString::from("val")],
+            mounts: vec![],
+            envs: vec![],
+            workdir: None,
+            container_name: None,
+        };
+        let args = tools_container_args(&cli, spec);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs[0], "run");
+        assert_eq!(strs[1], "--rm");
+        assert_eq!(strs[2], "--network");
+        assert_eq!(strs[3], "host");
+        assert!(strs.contains(&"confidential-agent-tools:test".to_string()));
+        assert!(strs.contains(&"my-tool".to_string()));
+        assert!(strs.contains(&"--flag".to_string()));
+        assert!(strs.contains(&"val".to_string()));
+    }
+
+    #[test]
+    fn tools_container_args_with_name() {
+        let cli = test_cli();
+        let spec = ToolContainerSpec {
+            tool: "t",
+            tool_args: vec![],
+            mounts: vec![],
+            envs: vec![],
+            workdir: None,
+            container_name: Some("my-container".to_string()),
+        };
+        let args = tools_container_args(&cli, spec);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let name_idx = strs.iter().position(|s| s == "--name").unwrap();
+        assert_eq!(strs[name_idx + 1], "my-container");
+    }
+
+    #[test]
+    fn tools_container_args_dedup_mounts() {
+        let cli = test_cli();
+        let spec = ToolContainerSpec {
+            tool: "t",
+            tool_args: vec![],
+            mounts: vec![
+                PathBuf::from("/data"),
+                PathBuf::from("/data"),
+                PathBuf::from("/other"),
+            ],
+            envs: vec![],
+            workdir: None,
+            container_name: None,
+        };
+        let args = tools_container_args(&cli, spec);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let volume_count = strs.iter().filter(|s| s.as_str() == "--volume").count();
+        assert_eq!(volume_count, 2);
+    }
+
+    #[test]
+    fn tools_container_args_skips_empty_mount() {
+        let cli = test_cli();
+        let spec = ToolContainerSpec {
+            tool: "t",
+            tool_args: vec![],
+            mounts: vec![PathBuf::from(""), PathBuf::from("/real")],
+            envs: vec![],
+            workdir: None,
+            container_name: None,
+        };
+        let args = tools_container_args(&cli, spec);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let volume_count = strs.iter().filter(|s| s.as_str() == "--volume").count();
+        assert_eq!(volume_count, 1);
+    }
+
+    #[test]
+    fn tools_container_args_envs() {
+        let cli = test_cli();
+        let spec = ToolContainerSpec {
+            tool: "t",
+            tool_args: vec![],
+            mounts: vec![],
+            envs: vec![("KEY".to_string(), "VALUE".to_string())],
+            workdir: None,
+            container_name: None,
+        };
+        let args = tools_container_args(&cli, spec);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let env_idx = strs.iter().position(|s| s == "--env").unwrap();
+        assert_eq!(strs[env_idx + 1], "KEY=VALUE");
+    }
+
+    #[test]
+    fn tools_container_args_workdir() {
+        let cli = test_cli();
+        let spec = ToolContainerSpec {
+            tool: "t",
+            tool_args: vec![],
+            mounts: vec![],
+            envs: vec![],
+            workdir: Some(PathBuf::from("/work/project")),
+            container_name: None,
+        };
+        let args = tools_container_args(&cli, spec);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let wd_idx = strs.iter().position(|s| s == "--workdir").unwrap();
+        assert_eq!(strs[wd_idx + 1], "/work/project");
+    }
+
+    #[test]
+    fn summarize_command_bytes_empty() {
+        assert_eq!(summarize_command_bytes(b""), "<empty>");
+        assert_eq!(summarize_command_bytes(b"  \n  "), "<empty>");
+    }
+
+    #[test]
+    fn summarize_command_bytes_short() {
+        assert_eq!(summarize_command_bytes(b"hello"), "hello");
+    }
+
+    #[test]
+    fn summarize_command_bytes_truncates_long() {
+        let long = "x".repeat(5000);
+        let result = summarize_command_bytes(long.as_bytes());
+        assert!(result.ends_with("...<truncated>"));
+        assert!(result.len() < 5000);
+    }
+
+    #[test]
+    fn no_proxy_with_target_appends() {
+        assert_eq!(no_proxy_with_target("", "10.0.0.1"), "10.0.0.1");
+        assert_eq!(
+            no_proxy_with_target("localhost,127.0.0.1", "10.0.0.1"),
+            "localhost,127.0.0.1,10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_with_target_does_not_duplicate() {
+        assert_eq!(
+            no_proxy_with_target("localhost,10.0.0.1", "10.0.0.1"),
+            "localhost,10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_with_target_empty_target() {
+        assert_eq!(no_proxy_with_target("localhost", ""), "localhost");
+    }
+
+    #[test]
+    fn inherited_proxy_envs_from_forwards_proxy_vars() {
+        let source = vec![
+            ("http_proxy", "http://proxy:3128"),
+            ("HTTPS_PROXY", "http://proxy:3129"),
+            ("UNRELATED", "ignored"),
+        ];
+        let envs = inherited_proxy_envs_from(source, None);
+        assert_eq!(envs.len(), 2);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "http_proxy" && v == "http://proxy:3128"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://proxy:3129"));
+    }
+
+    #[test]
+    fn inherited_proxy_envs_from_adds_no_proxy_target() {
+        let source = vec![
+            ("http_proxy", "http://proxy:3128"),
+            ("no_proxy", "localhost"),
+        ];
+        let envs = inherited_proxy_envs_from(source, Some("10.0.0.1"));
+        let no_proxy = envs.iter().find(|(k, _)| k == "no_proxy").unwrap();
+        assert!(no_proxy.1.contains("10.0.0.1"));
+        assert!(no_proxy.1.contains("localhost"));
+    }
+
+    #[test]
+    fn challenge_inject_envs_direct_mode() {
+        let source = vec![
+            ("http_proxy", "http://proxy:3128"),
+            ("no_proxy", "localhost"),
+        ];
+        let envs = challenge_inject_envs(true, "10.0.0.1", source);
+        assert!(envs.iter().all(|(k, _)| k != "http_proxy"));
+        let no_proxy = envs.iter().find(|(k, _)| k == "NO_PROXY");
+        assert!(no_proxy.is_some());
+        assert!(no_proxy.unwrap().1.contains("10.0.0.1"));
+    }
+
+    #[test]
+    fn challenge_inject_tool_args_wraps_with_timeout() {
+        let inner = vec![OsString::from("--flag")];
+        let wrapped = challenge_inject_tool_args(inner, 120);
+        let strs: Vec<String> = wrapped
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs[0], "120s");
+        assert_eq!(strs[1], "attestation-challenge-client");
+        assert_eq!(strs[2], "--flag");
+    }
+
+    #[test]
+    fn allocate_local_port_returns_preferred_when_available() {
+        assert_eq!(allocate_local_port(8080, |_| false).unwrap(), 8080);
+    }
+
+    #[test]
+    fn allocate_local_port_skips_occupied() {
+        let port = allocate_local_port(8080, |p| p < 8083).unwrap();
+        assert_eq!(port, 8083);
+    }
+
+    #[test]
+    fn allocate_local_port_fails_when_all_occupied() {
+        assert!(allocate_local_port(u16::MAX, |_| true).is_err());
+    }
+
+    #[test]
+    fn mounts_for_file_absolute_parent() {
+        let mounts = mounts_for_file(Path::new("/data/secret.json"), Path::new("/work"));
+        assert_eq!(mounts, vec![PathBuf::from("/data")]);
+    }
+
+    #[test]
+    fn mounts_for_file_relative_parent() {
+        let mounts = mounts_for_file(Path::new("secrets/key.pem"), Path::new("/work"));
+        assert_eq!(mounts, vec![PathBuf::from("/work/secrets")]);
+    }
+
+    #[test]
+    fn mounts_for_file_no_parent() {
+        let mounts = mounts_for_file(Path::new("file.txt"), Path::new("/work"));
+        assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn absolute_path_keeps_absolute() {
+        assert_eq!(
+            absolute_path(Path::new("/absolute/path")).unwrap(),
+            PathBuf::from("/absolute/path")
+        );
+    }
+
+    #[test]
+    fn absolute_path_resolves_relative() {
+        let result = absolute_path(Path::new("relative")).unwrap();
+        assert!(result.is_absolute());
+    }
+}

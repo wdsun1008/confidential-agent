@@ -127,113 +127,12 @@ pub(super) fn render_agent_card(
     meta: &serde_json::Value,
     sample_reference_values: Option<&serde_json::Value>,
 ) -> Result<AgentCard> {
-    let a2a = spec
-        .a2a
-        .as_ref()
-        .context("a2a must be configured to render an AgentCard")?;
-    if !a2a.enabled {
-        bail!("a2a is disabled");
-    }
-    if spec.service.connect.is_empty() {
-        bail!("a2a requires service.connect to expose at least one connect port");
-    }
-    let interfaces = if a2a.interfaces.is_empty() {
-        spec.service
-            .connect
-            .iter()
-            .map(|port| AgentInterface {
-                url: format!("http://{target_ip}:{port}/a2a"),
-                protocol_binding: "JSONRPC".to_string(),
-                protocol_version: "1.0".to_string(),
-                tenant: None,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        a2a.interfaces
-            .iter()
-            .map(|interface| AgentInterface {
-                url: format!("http://{target_ip}:{}{}", interface.port, interface.path),
-                protocol_binding: interface.protocol_binding.clone(),
-                protocol_version: "1.0".to_string(),
-                tenant: None,
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let confidential = AgentCardConfidential {
-        id: a2a.id.clone(),
-        cache_ttl_sec: a2a.cache_ttl_sec,
-        public_ip: target_ip.to_string(),
-        ports: spec
-            .service
-            .connect
-            .iter()
-            .map(|port| AgentCardPort {
-                name: format!("port-{port}"),
-                port: *port,
-            })
-            .collect(),
-        reference_values: sample_reference_values.cloned(),
-        rekor: AgentCardRekor {
-            rekor_url: required_json_string(meta, "rekor_url")?.to_string(),
-            artifact_id: required_json_string(meta, "artifact_id")?.to_string(),
-            artifact_type: required_json_string(meta, "artifact_type")?.to_string(),
-            artifact_version: required_json_string(meta, "artifact_version")?.to_string(),
-            rv_name: required_json_string(meta, "rv_name")?.to_string(),
-        },
-        tee: tee_name(spec.attestation.tee).to_string(),
-    };
-
-    let mut card = AgentCard {
-        protocol_version: "1.0".to_string(),
-        name: a2a.name.clone(),
-        description: a2a
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("Confidential Agent {}", a2a.name)),
-        version: a2a.version.clone(),
-        supported_interfaces: interfaces,
-        preferred_transport: Some("JSONRPC".to_string()),
-        skills: a2a
-            .skills
-            .iter()
-            .map(|s| AgentCardSkill {
-                id: s.id.clone(),
-                name: s.name.clone(),
-                description: s.description.clone(),
-                tags: s.tags.clone(),
-                examples: s.examples.clone(),
-                input_modes: s.input_modes.clone(),
-                output_modes: s.output_modes.clone(),
-            })
-            .collect(),
-        default_input_modes: vec!["text".to_string()],
-        default_output_modes: vec!["text".to_string()],
-        capabilities: AgentCardCapabilities {
-            streaming: Some(false),
-            push_notifications: Some(false),
-            state_transition_history: Some(false),
-            extended_agent_card: Some(false),
-            extensions: vec![AgentExtension {
-                uri: confidential_agent_core::agent_card::CONFIDENTIAL_AGENT_EXTENSION.to_string(),
-                description: Some(
-                    "Confidential Agent TEE/Rekor metadata for RATS-TLS routing".to_string(),
-                ),
-                required: true,
-                params: serde_json::to_value(confidential)?,
-            }],
-        },
-        provider: a2a.provider.clone(),
-        security_schemes: None,
-        security: Vec::new(),
-        supports_authenticated_extended_card: Some(false),
-        signatures: Vec::new(),
-    };
-
-    if a2a.signing.required {
-        sign_agent_card_keyless(&mut card, a2a.signing.oidc_issuer.as_deref())?;
-    }
-    Ok(card)
+    confidential_agent_core::agent_card::render_agent_card(
+        spec,
+        target_ip,
+        meta,
+        sample_reference_values,
+    )
 }
 
 pub(super) fn write_service_state(
@@ -1150,39 +1049,471 @@ pub(super) fn render_mesh_bundle(
     reference_values: &ReferenceValueArtifacts,
     generation: u64,
 ) -> MeshBundle {
-    let mut service_map = BTreeMap::new();
-    for service in services {
-        if service.phase != "active" {
-            continue;
-        }
-        service_map.insert(
-            service.service_id.clone(),
-            MeshService {
-                phase: service.phase.clone(),
-                private_ip: service.deploy.private_ip.clone(),
-                public_ip: service.deploy.public_ip.clone(),
-                ports: service.service.ports.clone(),
-                connect: service.service.connect.clone(),
+    confidential_agent_core::mesh::render_mesh_bundle(
+        services,
+        &reference_values.sample,
+        &reference_values.rekor,
+        generation,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_service_state(
+        id: &str,
+        phase: &str,
+        ports: Vec<u16>,
+        connect: Vec<u16>,
+    ) -> LocalServiceState {
+        LocalServiceState {
+            schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
+            service_id: id.to_string(),
+            generation: 1,
+            phase: phase.to_string(),
+            spec: LocalSpecState {
+                path: PathBuf::from("/project/agent.yaml"),
+                sha256: "spec-hash".to_string(),
             },
-        );
+            build: LocalBuildState {
+                build_id: "build-1".to_string(),
+                image_name: format!("{id}-agent"),
+                variant: "release".to_string(),
+                debug_ssh: None,
+                sample_rv: Some(PathBuf::from("/state/rv.json")),
+                rekor_meta: None,
+                image_path: PathBuf::from("/state/image.qcow2"),
+                images_dir: PathBuf::from("/state/images"),
+                cache_dir: PathBuf::from("/state/cache"),
+            },
+            deploy: LocalDeployState {
+                provider: "aliyun".to_string(),
+                run_id: "run-1".to_string(),
+                resource_name: format!("{id}-resource"),
+                instance_id: Some("i-test".to_string()),
+                security_group_id: None,
+                public_ip: Some("1.2.3.4".to_string()),
+                private_ip: Some("10.0.0.1".to_string()),
+                terraform_dir: Some(PathBuf::from("/state/terraform")),
+                image_source: None,
+                image_import_name: None,
+                bucket: None,
+                tee: "tdx".to_string(),
+            },
+            service: LocalServiceNetwork {
+                ports: ports.clone(),
+                connect: connect.clone(),
+            },
+            resources: BTreeMap::new(),
+            mesh_generation: 1,
+            reference_values: "sample".to_string(),
+        }
     }
 
-    MeshBundle {
-        schema: MESH_SCHEMA_VERSION.to_string(),
-        generation,
-        updated_at: unix_timestamp(),
-        reference_values: reference_values
-            .sample
-            .iter()
-            .filter(|(service_id, _)| service_map.contains_key(*service_id))
-            .map(|(service_id, value)| (service_id.clone(), value.clone()))
-            .collect(),
-        rekor_reference_values: reference_values
-            .rekor
-            .iter()
-            .filter(|(service_id, _)| service_map.contains_key(*service_id))
-            .map(|(service_id, value)| (service_id.clone(), value.clone()))
-            .collect(),
-        services: service_map,
+    #[test]
+    fn validate_mesh_port_conflicts_no_conflict() {
+        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
+        assert!(validate_mesh_port_conflicts(&states, "beta", &[9090]).is_ok());
+    }
+
+    #[test]
+    fn validate_mesh_port_conflicts_detects_conflict() {
+        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
+        let err = validate_mesh_port_conflicts(&states, "beta", &[8080]).unwrap_err();
+        assert!(err.to_string().contains("8080"));
+        assert!(err.to_string().contains("alpha"));
+    }
+
+    #[test]
+    fn validate_mesh_port_conflicts_skips_inactive() {
+        let states = vec![test_service_state("alpha", "deleted", vec![8080], vec![])];
+        assert!(validate_mesh_port_conflicts(&states, "beta", &[8080]).is_ok());
+    }
+
+    #[test]
+    fn validate_mesh_port_conflicts_skips_same_service() {
+        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
+        assert!(validate_mesh_port_conflicts(&states, "alpha", &[8080]).is_ok());
+    }
+
+    #[test]
+    fn connect_services_filters_by_id() {
+        let states = vec![
+            test_service_state("alpha", "active", vec![8080], vec![8080]),
+            test_service_state("beta", "active", vec![9090], vec![9090]),
+        ];
+        let result = connect_services(&states, Some("alpha")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].service_id, "alpha");
+    }
+
+    #[test]
+    fn connect_services_rejects_inactive() {
+        let states = vec![test_service_state(
+            "alpha",
+            "deployed",
+            vec![8080],
+            vec![8080],
+        )];
+        assert!(connect_services(&states, Some("alpha")).is_err());
+    }
+
+    #[test]
+    fn connect_services_rejects_no_connect_ports() {
+        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
+        assert!(connect_services(&states, Some("alpha")).is_err());
+    }
+
+    #[test]
+    fn connect_services_all_active_when_no_filter() {
+        let states = vec![
+            test_service_state("alpha", "active", vec![8080], vec![8080]),
+            test_service_state("beta", "deployed", vec![9090], vec![9090]),
+            test_service_state("gamma", "active", vec![7070], vec![7070]),
+        ];
+        let result = connect_services(&states, None).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn connect_services_errors_when_none_available() {
+        let states = vec![test_service_state("alpha", "deployed", vec![8080], vec![])];
+        assert!(connect_services(&states, None).is_err());
+    }
+
+    #[test]
+    fn connect_host_extracts_ip() {
+        let state = test_service_state("alpha", "active", vec![], vec![]);
+        assert_eq!(connect_host(&state).unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn connect_host_errors_when_missing() {
+        let mut state = test_service_state("alpha", "active", vec![], vec![]);
+        state.deploy.public_ip = None;
+        assert!(connect_host(&state).is_err());
+    }
+
+    #[test]
+    fn connect_host_errors_when_empty() {
+        let mut state = test_service_state("alpha", "active", vec![], vec![]);
+        state.deploy.public_ip = Some("  ".to_string());
+        assert!(connect_host(&state).is_err());
+    }
+
+    #[test]
+    fn connect_policy_config_structure() {
+        let config = connect_policy_config();
+        assert_eq!(config["type"], "path");
+        assert!(config["path"].as_str().unwrap().contains("rego"));
+    }
+
+    #[test]
+    fn connect_reference_values_from_sample() {
+        let bundle: MeshBundle = serde_json::from_value(json!({
+            "schema": "confidential-agent/mesh-bundle/v1",
+            "generation": 1,
+            "updated_at": 0,
+            "services": {},
+            "reference_values": {
+                "openclaw": {"tdx": {"mr_td": "abc123"}}
+            },
+            "rekor_reference_values": {}
+        }))
+        .unwrap();
+        let rv = connect_reference_values(&bundle, "openclaw").unwrap();
+        let arr = rv.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "sample");
+    }
+
+    #[test]
+    fn connect_reference_values_from_rekor() {
+        let bundle: MeshBundle = serde_json::from_value(json!({
+            "schema": "confidential-agent/mesh-bundle/v1",
+            "generation": 1,
+            "updated_at": 0,
+            "services": {},
+            "reference_values": {},
+            "rekor_reference_values": {
+                "openclaw": {
+                    "artifact_id": "openclaw-agent",
+                    "artifact_version": "v0.1.0",
+                    "artifact_type": "uki",
+                    "rekor_url": "https://rekor.example.com"
+                }
+            }
+        }))
+        .unwrap();
+        let rv = connect_reference_values(&bundle, "openclaw").unwrap();
+        let arr = rv.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "slsa");
+    }
+
+    #[test]
+    fn connect_reference_values_missing_errors() {
+        let bundle: MeshBundle = serde_json::from_value(json!({
+            "schema": "confidential-agent/mesh-bundle/v1",
+            "generation": 1,
+            "updated_at": 0,
+            "services": {},
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }))
+        .unwrap();
+        assert!(connect_reference_values(&bundle, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn active_peer_public_cidrs_excludes_self() {
+        let alpha = test_service_state("alpha", "active", vec![], vec![]);
+        let mut beta = test_service_state("beta", "active", vec![], vec![]);
+        beta.deploy.public_ip = Some("5.6.7.8".to_string());
+        let states = vec![alpha, beta];
+        let cidrs = active_peer_public_cidrs("alpha", &states).unwrap();
+        assert_eq!(cidrs, vec!["5.6.7.8/32"]);
+    }
+
+    #[test]
+    fn active_peer_public_cidrs_skips_inactive() {
+        let states = vec![
+            test_service_state("alpha", "active", vec![], vec![]),
+            test_service_state("beta", "deleted", vec![], vec![]),
+        ];
+        let cidrs = active_peer_public_cidrs("alpha", &states).unwrap();
+        assert!(cidrs.is_empty());
+    }
+
+    #[test]
+    fn read_service_states_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc_dir = dir.path().join("services").join("test-svc");
+        fs::create_dir_all(&svc_dir).unwrap();
+        let state = test_service_state("test-svc", "active", vec![8080], vec![]);
+        fs::write(
+            svc_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        let states = read_service_states(dir.path()).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].service_id, "test-svc");
+    }
+
+    #[test]
+    fn read_service_states_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let states = read_service_states(dir.path()).unwrap();
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn read_service_state_file_returns_none_for_missing() {
+        let result = read_service_state_file(Path::new("/nonexistent/state.json")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn render_agent_card_produces_valid_card() {
+        let spec_yaml = r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: rekor
+  rekor:
+    artifact_id: openclaw-agent
+    artifact_type: uki
+    slsa_generator: ./slsa-gen
+a2a:
+  enabled: true
+  id: openclaw-agent
+  name: OpenClaw Alpha
+resources: {}
+"#;
+        let spec = AgentSpec::from_yaml(spec_yaml, Path::new("/project")).unwrap();
+        let meta = json!({
+            "rekor_url": "https://rekor.example.com",
+            "artifact_id": "openclaw-agent",
+            "artifact_type": "uki",
+            "artifact_version": "v0.1.0",
+            "rv_name": "openclaw"
+        });
+        let card = render_agent_card(&spec, "1.2.3.4", &meta, None).unwrap();
+        assert_eq!(card.name, "OpenClaw Alpha");
+        let ext = confidential_agent_core::agent_card::confidential_extension(&card).unwrap();
+        assert_eq!(ext.id, "openclaw-agent");
+        assert_eq!(ext.public_ip, "1.2.3.4");
+        assert_eq!(ext.ports.len(), 1);
+        assert_eq!(ext.ports[0].port, 18789);
+        assert_eq!(ext.tee, "tdx");
+    }
+
+    #[test]
+    fn render_agent_card_requires_a2a_enabled() {
+        let spec_yaml = r#"
+schema: confidential-agent/v1
+service:
+  id: test
+  ports: [8080]
+  connect: [8080]
+build:
+  base_image: /images/base.qcow2
+  image_name: test
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#;
+        let spec = AgentSpec::from_yaml(spec_yaml, Path::new("/project")).unwrap();
+        assert!(render_agent_card(&spec, "1.2.3.4", &json!({}), None).is_err());
+    }
+
+    #[test]
+    fn render_agent_card_requires_connect_ports() {
+        let spec_yaml = r#"
+schema: confidential-agent/v1
+service:
+  id: test
+  ports: [8080]
+build:
+  base_image: /images/base.qcow2
+  image_name: test
+  variants:
+    release:
+      enabled: true
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+a2a:
+  enabled: true
+  id: test-agent
+  name: Test
+resources: {}
+"#;
+        let spec = AgentSpec::from_yaml(spec_yaml, Path::new("/project")).unwrap();
+        let meta = json!({
+            "rekor_url": "https://r.example.com",
+            "artifact_id": "t",
+            "artifact_type": "uki",
+            "artifact_version": "v1",
+            "rv_name": "t"
+        });
+        assert!(render_agent_card(&spec, "1.2.3.4", &meta, None).is_err());
+    }
+
+    #[test]
+    fn render_mesh_bundle_includes_only_active_services() {
+        let states = vec![
+            test_service_state("alpha", "active", vec![8080], vec![8080]),
+            test_service_state("beta", "deleted", vec![9090], vec![]),
+        ];
+        let rv = ReferenceValueArtifacts {
+            sample: BTreeMap::from([
+                ("alpha".to_string(), json!({"tdx": "test"})),
+                ("beta".to_string(), json!({"tdx": "stale"})),
+            ]),
+            rekor: BTreeMap::new(),
+        };
+        let bundle = render_mesh_bundle(&states, &rv, 1);
+        assert_eq!(bundle.services.len(), 1);
+        assert!(bundle.services.contains_key("alpha"));
+        assert!(!bundle.services.contains_key("beta"));
+        assert!(bundle.reference_values.contains_key("alpha"));
+        assert!(!bundle.reference_values.contains_key("beta"));
+    }
+
+    #[test]
+    fn render_agent_card_connect_config_produces_tng_config() {
+        let conf = AgentCardConfidential {
+            id: "test-agent".to_string(),
+            cache_ttl_sec: 300,
+            public_ip: "1.2.3.4".to_string(),
+            ports: vec![AgentCardPort {
+                name: "api".to_string(),
+                port: 18789,
+            }],
+            reference_values: None,
+            rekor: AgentCardRekor {
+                rekor_url: "https://rekor.example.com".to_string(),
+                artifact_id: "test".to_string(),
+                artifact_type: "uki".to_string(),
+                artifact_version: "v1".to_string(),
+                rv_name: "test".to_string(),
+            },
+            tee: "tdx".to_string(),
+        };
+        let card = AgentCard {
+            protocol_version: "1.0".to_string(),
+            name: "test".to_string(),
+            description: "Test agent".to_string(),
+            version: None,
+            supported_interfaces: vec![AgentInterface {
+                url: "http://1.2.3.4:18789".to_string(),
+                protocol_binding: "jsonrpc/http".to_string(),
+                protocol_version: "1.0".to_string(),
+                tenant: None,
+            }],
+            preferred_transport: None,
+            skills: vec![],
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            capabilities: AgentCardCapabilities {
+                extensions: vec![AgentExtension {
+                    uri: confidential_agent_core::agent_card::CONFIDENTIAL_AGENT_EXTENSION
+                        .to_string(),
+                    description: None,
+                    required: true,
+                    params: serde_json::to_value(conf).unwrap(),
+                }],
+                ..Default::default()
+            },
+            provider: None,
+            security_schemes: None,
+            security: vec![],
+            supports_authenticated_extended_card: None,
+            signatures: vec![],
+        };
+        let config = render_agent_card_connect_config_with_port_checker(&card, |_| false).unwrap();
+        assert!(config["add_ingress"].is_array());
+        assert!(config["client_endpoints"].is_array());
+        assert!(config["control_interface"].is_object());
+        let endpoints = config["client_endpoints"].as_array().unwrap();
+        assert_eq!(endpoints[0]["service"], "test-agent");
+        assert_eq!(endpoints[0]["guest_port"], 18789);
     }
 }
