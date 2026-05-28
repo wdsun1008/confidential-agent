@@ -1,6 +1,6 @@
 use super::commands::{
-    a2a_cli_preview_error_kind, cmd_a2a, cmd_build, cmd_deploy, cmd_destroy, cmd_image,
-    cmd_inject, collect_image_entries, collect_live_status, debug_ssh_hint, deploy_shelter_args,
+    a2a_cli_preview_error_kind, cmd_a2a, cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject,
+    collect_image_entries, collect_live_status, debug_ssh_hint, deploy_shelter_args,
     fetch_daemon_status_from, live_status_table_columns, status_table_columns, status_views,
     validate_build_start, validate_deploy_start, wait_for_daemon_status_from,
 };
@@ -9,9 +9,9 @@ use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, StatusArgs};
 use clap::Parser;
 use confidential_agent_core::agent_card_fetch::AgentCardFetchError;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
-use std::net::{IpAddr, Ipv4Addr};
 use std::ffi::OsStr;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -82,10 +82,18 @@ fn connect_cli_keeps_bare_mode_and_adds_start_stop() {
         other => panic!("expected connect command, got {other:?}"),
     }
 
-    let stop = Cli::parse_from(["confidential-agent", "connect", "stop", "--ready-json", "ready.json"]);
+    let stop = Cli::parse_from([
+        "confidential-agent",
+        "connect",
+        "stop",
+        "--ready-json",
+        "ready.json",
+    ]);
     match stop.command {
         Commands::Connect(args) => match args.command {
-            Some(ConnectCommands::Stop(stop)) => assert_eq!(stop.ready_json, PathBuf::from("ready.json")),
+            Some(ConnectCommands::Stop(stop)) => {
+                assert_eq!(stop.ready_json, PathBuf::from("ready.json"))
+            }
             other => panic!("expected connect stop, got {other:?}"),
         },
         other => panic!("expected connect command, got {other:?}"),
@@ -1267,8 +1275,7 @@ resources: {}
     .write_to_path(&state_dir.join("peerings.yaml"))
     .unwrap();
     render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
-    let rendered =
-        fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    let rendered = fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
     assert!(rendered.contains("deploy:"));
     assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
@@ -1277,8 +1284,7 @@ resources: {}
         .write_to_path(&state_dir.join("peerings.yaml"))
         .unwrap();
     render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
-    let rendered =
-        fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    let rendered = fs::read_to_string(state_dir.join("services/openclaw/shelter.yaml")).unwrap();
     assert!(rendered.contains("deploy:"));
     assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(!rendered.contains("connect_18789_peer_203_0_113_10_32"));
@@ -2698,7 +2704,9 @@ fn connect_renders_all_connect_services() {
     assert_eq!(config["client_endpoints"][0]["service"], "openclaw");
     assert_eq!(config["client_endpoints"][0]["guest_port"], 49152);
     assert_eq!(config["client_endpoints"][0]["local_host"], "127.0.0.1");
-    let local_port = config["client_endpoints"][0]["local_port"].as_u64().unwrap();
+    let local_port = config["client_endpoints"][0]["local_port"]
+        .as_u64()
+        .unwrap();
     assert!(local_port >= 49152);
     assert_eq!(
         config["client_endpoints"][0]["http_base_url"],
@@ -2749,7 +2757,9 @@ fn connect_service_filter_rejects_unknown_service() {
 
     let err = render_connect_config(temp.path(), Some("missing")).unwrap_err();
 
-    assert!(err.to_string().contains("no local state for service 'missing'"));
+    assert!(err
+        .to_string()
+        .contains("no local state for service 'missing'"));
 }
 
 #[test]

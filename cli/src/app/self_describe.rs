@@ -37,7 +37,9 @@ pub(super) fn cmd_spec(args: &SpecArgs) -> Result<()> {
     match &args.command {
         SpecCommands::Schema { format } => match format {
             OutputFormat::Markdown => println!("{}", SPEC_SCHEMA_MARKDOWN.trim()),
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&spec_schema_json())?),
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&spec_schema_json())?)
+            }
         },
         SpecCommands::Validate { spec, format } => cmd_spec_validate(spec, *format)?,
     }

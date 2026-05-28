@@ -300,7 +300,11 @@ pub struct AgentCard {
     pub version: Option<String>,
     #[serde(default, rename = "supportedInterfaces")]
     pub supported_interfaces: Vec<AgentInterface>,
-    #[serde(default, rename = "preferredTransport", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "preferredTransport",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub preferred_transport: Option<String>,
     #[serde(default)]
     pub skills: Vec<AgentCardSkill>,
@@ -312,7 +316,11 @@ pub struct AgentCard {
     pub capabilities: AgentCardCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<serde_json::Value>,
-    #[serde(default, rename = "securitySchemes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "securitySchemes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub security_schemes: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<serde_json::Value>,
@@ -357,11 +365,23 @@ pub struct AgentCardSkill {
 pub struct AgentCardCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streaming: Option<bool>,
-    #[serde(default, rename = "pushNotifications", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "pushNotifications",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub push_notifications: Option<bool>,
-    #[serde(default, rename = "stateTransitionHistory", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "stateTransitionHistory",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub state_transition_history: Option<bool>,
-    #[serde(default, rename = "extendedAgentCard", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "extendedAgentCard",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub extended_agent_card: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<AgentExtension>,

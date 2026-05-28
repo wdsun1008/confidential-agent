@@ -982,11 +982,7 @@ fn a2a_tng_ingress_uses_stale_cache_for_transient_fetch_failure() {
     let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
     assert_eq!(ingress.len(), 1);
-    state
-        .a2a_cache
-        .get_mut("remote")
-        .unwrap()
-        .next_refresh_unix = 0;
+    state.a2a_cache.get_mut("remote").unwrap().next_refresh_unix = 0;
 
     let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
@@ -1017,11 +1013,7 @@ fn a2a_tng_ingress_uses_stale_cache_for_http_5xx() {
     let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
     assert_eq!(ingress.len(), 1);
-    state
-        .a2a_cache
-        .get_mut("remote")
-        .unwrap()
-        .next_refresh_unix = 0;
+    state.a2a_cache.get_mut("remote").unwrap().next_refresh_unix = 0;
 
     let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
@@ -1110,11 +1102,7 @@ fn a2a_tng_ingress_rejects_public_ip_update_without_stale_fallback() {
     let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
     assert_eq!(ingress.len(), 1);
-    state
-        .a2a_cache
-        .get_mut("remote")
-        .unwrap()
-        .next_refresh_unix = 0;
+    state.a2a_cache.get_mut("remote").unwrap().next_refresh_unix = 0;
 
     let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
@@ -1127,7 +1115,9 @@ fn a2a_tng_ingress_rejects_public_ip_update_without_stale_fallback() {
         .as_deref()
         .unwrap()
         .contains("publicIp"));
-    assert!(!cached_peer_is_resolvable(state.a2a_cache.get("remote").unwrap()));
+    assert!(!cached_peer_is_resolvable(
+        state.a2a_cache.get("remote").unwrap()
+    ));
 }
 
 #[test]
@@ -1145,11 +1135,7 @@ fn a2a_tng_ingress_rejects_untrusted_rekor_update_without_stale_fallback() {
     let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
     assert_eq!(ingress.len(), 1);
-    state
-        .a2a_cache
-        .get_mut("remote")
-        .unwrap()
-        .next_refresh_unix = 0;
+    state.a2a_cache.get_mut("remote").unwrap().next_refresh_unix = 0;
 
     let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
@@ -1162,7 +1148,9 @@ fn a2a_tng_ingress_rejects_untrusted_rekor_update_without_stale_fallback() {
         .as_deref()
         .unwrap()
         .contains("rekorUrl"));
-    assert!(!cached_peer_is_resolvable(state.a2a_cache.get("remote").unwrap()));
+    assert!(!cached_peer_is_resolvable(
+        state.a2a_cache.get("remote").unwrap()
+    ));
 }
 
 #[test]
@@ -1176,11 +1164,7 @@ fn a2a_tng_ingress_rejects_http_404_without_stale_fallback() {
     let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
     assert_eq!(ingress.len(), 1);
-    state
-        .a2a_cache
-        .get_mut("remote")
-        .unwrap()
-        .next_refresh_unix = 0;
+    state.a2a_cache.get_mut("remote").unwrap().next_refresh_unix = 0;
 
     let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
 
@@ -1193,7 +1177,9 @@ fn a2a_tng_ingress_rejects_http_404_without_stale_fallback() {
         .as_deref()
         .unwrap()
         .contains("HTTP status 404"));
-    assert!(!cached_peer_is_resolvable(state.a2a_cache.get("remote").unwrap()));
+    assert!(!cached_peer_is_resolvable(
+        state.a2a_cache.get("remote").unwrap()
+    ));
 }
 
 #[test]

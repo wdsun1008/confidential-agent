@@ -14,10 +14,7 @@ pub struct AgentCardSignerPin {
     pub subject: String,
 }
 
-pub fn sign_agent_card_keyless(
-    card: &mut AgentCard,
-    issuer: Option<&str>,
-) -> Result<()> {
+pub fn sign_agent_card_keyless(card: &mut AgentCard, issuer: Option<&str>) -> Result<()> {
     let signature = create_sigstore_signature(card, issuer)?;
     card.signatures.push(signature);
     Ok(())
@@ -41,13 +38,11 @@ pub fn verify_agent_card_signature(card: &AgentCard, pin: &AgentCardSignerPin) -
 }
 
 fn create_sigstore_signature(card: &AgentCard, issuer: Option<&str>) -> Result<AgentCardSignature> {
-    let protected = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&serde_json::json!({
-            "alg": "ES256",
-            "typ": "JOSE",
-            "kid": "sigstore-keyless-v1"
-        }))?,
-    );
+    let protected = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+        "alg": "ES256",
+        "typ": "JOSE",
+        "kid": "sigstore-keyless-v1"
+    }))?);
     let signing_input = jws_signing_input(card, &protected)?;
     let dir = tempfile::Builder::new()
         .prefix("cagent-card-sign-")
