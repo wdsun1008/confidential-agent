@@ -1,6 +1,7 @@
 pub mod a2a;
 pub mod agent_card;
 pub mod agent_card_fetch;
+pub mod agent_card_signing;
 pub mod peerings;
 pub mod schema;
 pub mod spec;
@@ -151,9 +152,11 @@ mod schema_tests {
 
     #[test]
     fn bootstrap_config_round_trips_peers_and_agent_card() {
+        use crate::agent_card::{confidential_extension, CONFIDENTIAL_AGENT_EXTENSION};
         use crate::schema::{
-            AgentCard, AgentCardConfidential, AgentCardExtensions, AgentCardPort, AgentCardRekor,
-            AgentCardSkill, BootstrapPeer, BootstrapPeerPortMapping,
+            AgentCard, AgentCardCapabilities, AgentCardConfidential, AgentCardPort,
+            AgentCardRekor, AgentCardSkill, AgentExtension, AgentInterface, BootstrapPeer,
+            BootstrapPeerPortMapping,
         };
 
         let bootstrap = BootstrapConfig {
@@ -177,39 +180,60 @@ mod schema_tests {
                 }],
             }],
             agent_card: Some(AgentCard {
+                protocol_version: "1.0".to_string(),
                 name: "test-agent".to_string(),
-                description: Some("A test agent".to_string()),
+                description: "A test agent".to_string(),
                 version: Some("1.0.0".to_string()),
-                url: Some("http://1.2.3.4:8089/.well-known/agent-card.json".to_string()),
+                supported_interfaces: vec![AgentInterface {
+                    url: "http://1.2.3.4:18789/a2a".to_string(),
+                    protocol_binding: "JSONRPC".to_string(),
+                    protocol_version: "1.0".to_string(),
+                    tenant: None,
+                }],
+                preferred_transport: Some("JSONRPC".to_string()),
                 skills: vec![AgentCardSkill {
                     id: "chat".to_string(),
                     name: "Chat".to_string(),
                     description: None,
+                    tags: Vec::new(),
+                    examples: Vec::new(),
+                    input_modes: Vec::new(),
+                    output_modes: Vec::new(),
                 }],
                 default_input_modes: vec!["text".to_string()],
                 default_output_modes: vec!["text".to_string()],
-                capabilities: None,
-                provider: None,
-                extensions: AgentCardExtensions {
-                    confidential_agent: Some(AgentCardConfidential {
-                        id: "test-agent".to_string(),
-                        cache_ttl_sec: 300,
-                        public_ip: "1.2.3.4".to_string(),
-                        ports: vec![AgentCardPort {
-                            name: "chat".to_string(),
-                            port: 18789,
-                        }],
-                        reference_values: None,
-                        rekor: AgentCardRekor {
-                            rekor_url: "https://rekor.sigstore.dev".to_string(),
-                            artifact_id: "test-agent-release".to_string(),
-                            artifact_type: "uki".to_string(),
-                            artifact_version: "20260512".to_string(),
-                            rv_name: "measurement.uki.SHA-384".to_string(),
-                        },
-                        tee: "tdx".to_string(),
-                    }),
+                capabilities: AgentCardCapabilities {
+                    extensions: vec![AgentExtension {
+                        uri: CONFIDENTIAL_AGENT_EXTENSION.to_string(),
+                        description: None,
+                        required: true,
+                        params: serde_json::to_value(AgentCardConfidential {
+                            id: "test-agent".to_string(),
+                            cache_ttl_sec: 300,
+                            public_ip: "1.2.3.4".to_string(),
+                            ports: vec![AgentCardPort {
+                                name: "chat".to_string(),
+                                port: 18789,
+                            }],
+                            reference_values: None,
+                            rekor: AgentCardRekor {
+                                rekor_url: "https://rekor.sigstore.dev".to_string(),
+                                artifact_id: "test-agent-release".to_string(),
+                                artifact_type: "uki".to_string(),
+                                artifact_version: "20260512".to_string(),
+                                rv_name: "measurement.uki.SHA-384".to_string(),
+                            },
+                            tee: "tdx".to_string(),
+                        })
+                        .unwrap(),
+                    }],
+                    ..Default::default()
                 },
+                provider: None,
+                security_schemes: None,
+                security: Vec::new(),
+                supports_authenticated_extended_card: Some(false),
+                signatures: Vec::new(),
             }),
         };
 
@@ -225,7 +249,7 @@ mod schema_tests {
 
         let card = decoded.agent_card.unwrap();
         assert_eq!(card.name, "test-agent");
-        let confidential = card.extensions.confidential_agent.unwrap();
+        let confidential = confidential_extension(&card).unwrap();
         assert_eq!(confidential.tee, "tdx");
         assert_eq!(confidential.id, "test-agent");
         assert_eq!(confidential.public_ip, "1.2.3.4");

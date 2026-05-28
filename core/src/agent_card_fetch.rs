@@ -1,6 +1,10 @@
-use crate::agent_card::validate_confidential_agent_card;
+use crate::agent_card::{
+    confidential_extension, validate_confidential_agent_card, CONFIDENTIAL_AGENT_EXTENSION,
+};
+use crate::agent_card_signing::{verify_agent_card_signature, AgentCardSignerPin};
 use crate::schema::AgentCard;
 use anyhow::Result;
+use serde_json::Value;
 use std::fmt;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -32,6 +36,9 @@ pub enum AgentCardFetchError {
     InvalidContentType(String),
     InvalidJson(String),
     NotConfidentialAgent,
+    LegacyConfidentialAgentCard,
+    SignatureMissing,
+    SignatureVerification(String),
     SchemaValidation(String),
     PublicIpHostMismatch {
         declared: IpAddr,
@@ -58,7 +65,19 @@ impl fmt::Display for AgentCardFetchError {
             }
             Self::InvalidJson(msg) => write!(f, "invalid agent card JSON: {msg}"),
             Self::NotConfidentialAgent => {
-                write!(f, "agent card has no x-confidential-agent/v1 extension")
+                write!(f, "agent card has no confidential-agent extension")
+            }
+            Self::LegacyConfidentialAgentCard => {
+                write!(
+                    f,
+                    "agent card uses legacy top-level confidential-agent extension; upgrade the peer to the A2A v1 capabilities.extensions AgentCard format"
+                )
+            }
+            Self::SignatureMissing => {
+                write!(f, "agent card has no signatures")
+            }
+            Self::SignatureVerification(msg) => {
+                write!(f, "agent card signature verification failed: {msg}")
             }
             Self::SchemaValidation(msg) => write!(f, "invalid agent card schema: {msg}"),
             Self::PublicIpHostMismatch { declared, resolved } => write!(
@@ -157,10 +176,17 @@ pub fn parse_agent_card_url(
 }
 
 pub fn fetch_agent_card(url: &str) -> std::result::Result<AgentCard, AgentCardFetchError> {
+    fetch_agent_card_with_signer(url, None)
+}
+
+pub fn fetch_agent_card_with_signer(
+    url: &str,
+    signer: Option<&AgentCardSignerPin>,
+) -> std::result::Result<AgentCard, AgentCardFetchError> {
     let parsed = parse_agent_card_url(url)?;
     let mut attempt = 1;
     loop {
-        match fetch_agent_card_once(url, &parsed) {
+        match fetch_agent_card_once(url, &parsed, signer) {
             Ok(card) => return Ok(card),
             Err(AgentCardFetchError::Transport(_)) if attempt < AGENT_CARD_FETCH_ATTEMPTS => {
                 attempt += 1;
@@ -175,6 +201,7 @@ pub fn fetch_agent_card(url: &str) -> std::result::Result<AgentCard, AgentCardFe
 fn fetch_agent_card_once(
     url: &str,
     parsed: &ParsedAgentCardUrl,
+    signer: Option<&AgentCardSignerPin>,
 ) -> std::result::Result<AgentCard, AgentCardFetchError> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
@@ -204,15 +231,34 @@ fn fetch_agent_card_once(
     if body.len() as u64 > MAX_AGENT_CARD_BODY_BYTES {
         return Err(AgentCardFetchError::BodyTooLarge);
     }
-    let card: AgentCard = serde_json::from_slice(&body)
+    let raw_card: Value = serde_json::from_slice(&body)
         .map_err(|err| AgentCardFetchError::InvalidJson(err.to_string()))?;
-    validate_confidential_agent_card(&card).map_err(|err| {
-        if err.to_string().contains("x-confidential-agent/v1") {
-            AgentCardFetchError::NotConfidentialAgent
+    let legacy_confidential_agent = has_legacy_confidential_agent_extension(&raw_card);
+    let card: AgentCard = serde_json::from_value(raw_card.clone()).map_err(|err| {
+        if legacy_confidential_agent {
+            AgentCardFetchError::LegacyConfidentialAgentCard
         } else {
             AgentCardFetchError::SchemaValidation(err.to_string())
         }
     })?;
+    validate_confidential_agent_card(&card).map_err(|err| {
+        let message = err.to_string();
+        if legacy_confidential_agent {
+            AgentCardFetchError::LegacyConfidentialAgentCard
+        } else if message.contains(CONFIDENTIAL_AGENT_EXTENSION)
+            || message.contains("capabilities.extensions")
+        {
+            AgentCardFetchError::NotConfidentialAgent
+        } else {
+            AgentCardFetchError::SchemaValidation(message)
+        }
+    })?;
+    if let Some(signer) = signer {
+        verify_agent_card_signature(&card, signer).map_err(|err| match err.to_string().as_str() {
+            "agent card has no signatures" => AgentCardFetchError::SignatureMissing,
+            _ => AgentCardFetchError::SignatureVerification(err.to_string()),
+        })?;
+    }
     verify_agent_card_trust(&card, parsed)?;
     Ok(card)
 }
@@ -221,11 +267,8 @@ pub fn verify_agent_card_trust(
     card: &AgentCard,
     parsed_url: &ParsedAgentCardUrl,
 ) -> std::result::Result<(), AgentCardFetchError> {
-    let ext = card
-        .extensions
-        .confidential_agent
-        .as_ref()
-        .ok_or(AgentCardFetchError::NotConfidentialAgent)?;
+    let ext = confidential_extension(card)
+        .map_err(|err| AgentCardFetchError::SchemaValidation(err.to_string()))?;
     let declared = ext.public_ip.parse::<IpAddr>().map_err(|_| {
         AgentCardFetchError::SchemaValidation("publicIp must be an IP address".to_string())
     })?;
@@ -314,6 +357,23 @@ fn is_json_content_type(value: &str) -> bool {
         || (media_type.starts_with("application/") && media_type.ends_with("+json"))
 }
 
+fn has_legacy_confidential_agent_extension(value: &Value) -> bool {
+    let Some(extensions) = value.get("extensions") else {
+        return false;
+    };
+    if extensions.get("x-confidential-agent/v1").is_some() {
+        return true;
+    }
+    extensions.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("uri")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                == Some("x-confidential-agent/v1")
+        })
+    })
+}
+
 fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
@@ -335,6 +395,39 @@ mod tests {
             AgentCardFetchError::InvalidUrl(msg) => msg,
             other => panic!("expected InvalidUrl, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detects_legacy_confidential_agent_extension_object() {
+        let card = serde_json::json!({
+            "protocolVersion": "1.0",
+            "name": "legacy",
+            "description": "legacy",
+            "supportedInterfaces": [{
+                "url": "http://127.0.0.1:18789/a2a",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": "1.0"
+            }],
+            "extensions": {
+                "x-confidential-agent/v1": {
+                    "publicIp": "127.0.0.1"
+                }
+            }
+        });
+
+        assert!(has_legacy_confidential_agent_extension(&card));
+    }
+
+    #[test]
+    fn detects_legacy_confidential_agent_extension_array() {
+        let card = serde_json::json!({
+            "extensions": [{
+                "uri": "x-confidential-agent/v1",
+                "params": {}
+            }]
+        });
+
+        assert!(has_legacy_confidential_agent_extension(&card));
     }
 
     #[test]

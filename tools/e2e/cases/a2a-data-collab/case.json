@@ -1,0 +1,14 @@
+{
+  "assets": [
+    {"source": "examples/a2a-data-collab/install-agent.sh", "target": "analyst-org/analyst/install-agent.sh"},
+    {"source": "examples/a2a-data-collab/install-agent.sh", "target": "data-owner-org/data-owner/install-agent.sh"},
+    {"source": "examples/a2a-data-collab/files", "target": "analyst-org/analyst/files"},
+    {"source": "examples/a2a-data-collab/files", "target": "data-owner-org/data-owner/files"}
+  ],
+  "templates": [
+    {"source": "templates/analyst.yaml.tmpl", "target": "analyst-org/analyst/analyst.yaml"},
+    {"source": "templates/data-owner.yaml.tmpl", "target": "data-owner-org/data-owner/data-owner.yaml"},
+    {"source": "templates/analyst-agent.json.tmpl", "target": "analyst-org/analyst/agent.json", "mode": "0600"},
+    {"source": "templates/data-owner-agent.json.tmpl", "target": "data-owner-org/data-owner/agent.json", "mode": "0600"}
+  ]
+}

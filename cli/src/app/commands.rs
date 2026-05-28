@@ -461,8 +461,22 @@ pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
             agent_card_url,
             alias,
             service,
+            signer_issuer,
+            signer_subject,
         } => {
             parse_agent_card_url(agent_card_url).map_err(anyhow::Error::new)?;
+            let signer = match (signer_issuer.as_deref(), signer_subject.as_deref()) {
+                (Some(issuer), Some(subject))
+                    if !issuer.trim().is_empty() && !subject.trim().is_empty() =>
+                {
+                    Some(A2aSignerPin {
+                        issuer: issuer.to_string(),
+                        subject: subject.to_string(),
+                    })
+                }
+                (None, None) => None,
+                _ => bail!("--signer-issuer and --signer-subject must be provided together"),
+            };
             let mut state = read_a2a_state_or_empty(&cli.state_dir)?;
             if state.peers.iter().any(|peer| peer.url == *agent_card_url) {
                 bail!("a2a peer URL '{}' already exists", agent_card_url);
@@ -472,7 +486,7 @@ pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
                 ensure_a2a_alias_available(&cli.state_dir, alias, None)?;
             }
             validate_a2a_scoped_services(&cli.state_dir, service)?;
-            let preview = fetch_agent_card_preview(agent_card_url);
+            let preview = fetch_agent_card_preview(agent_card_url, signer.as_ref());
             let (cli_preview, cli_preview_error) = match preview {
                 Ok(preview) => (Some(preview), None),
                 Err(err) => {
@@ -489,10 +503,20 @@ pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
             if let Some(err) = &cli_preview_error {
                 eprintln!("[ca] a2a preview status: {} ({})", err.kind, err.message);
             }
+            if signer.is_none()
+                && cli_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.card_summary.signed)
+            {
+                eprintln!(
+                    "[ca] warning: peer AgentCard is signed but no signer pin was configured; use --signer-issuer and --signer-subject to verify it"
+                );
+            }
             let peer = A2aStatePeer {
                 alias: alias.clone(),
                 url: agent_card_url.clone(),
                 scoped_services: service.clone(),
+                signer,
                 added_at: current_utc_timestamp(),
                 cli_preview,
                 cli_preview_error,
@@ -568,7 +592,7 @@ pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
                 if !selected {
                     continue;
                 }
-                match fetch_agent_card_preview(&peer.url) {
+                match fetch_agent_card_preview(&peer.url, peer.signer.as_ref()) {
                     Ok(preview) => {
                         peer.cli_preview = Some(preview);
                         peer.cli_preview_error = None;
@@ -1839,8 +1863,12 @@ fn validate_a2a_scoped_services(state_dir: &Path, scoped_services: &[String]) ->
     Ok(())
 }
 
-fn fetch_agent_card_preview(url: &str) -> std::result::Result<A2aCliPreview, AgentCardFetchError> {
-    let card = fetch_agent_card(url)?;
+fn fetch_agent_card_preview(
+    url: &str,
+    signer: Option<&A2aSignerPin>,
+) -> std::result::Result<A2aCliPreview, AgentCardFetchError> {
+    let pin = signer.map(confidential_agent_core::agent_card_signing::AgentCardSignerPin::from);
+    let card = fetch_agent_card_with_signer(url, pin.as_ref())?;
     let ext = confidential_extension(&card)
         .map_err(|err| AgentCardFetchError::SchemaValidation(err.to_string()))?;
     Ok(A2aCliPreview {
@@ -1849,6 +1877,7 @@ fn fetch_agent_card_preview(url: &str) -> std::result::Result<A2aCliPreview, Age
             id: ext.id.clone(),
             public_ip: ext.public_ip.clone(),
             ports: ext.ports.iter().map(|port| port.port).collect(),
+            signed: !card.signatures.is_empty(),
         },
         verified: true,
         lint: None,
@@ -1863,16 +1892,19 @@ fn a2a_cli_preview_error(err: &AgentCardFetchError) -> A2aCliPreviewError {
     }
 }
 
-fn a2a_cli_preview_error_kind(err: &AgentCardFetchError) -> &'static str {
+pub(super) fn a2a_cli_preview_error_kind(err: &AgentCardFetchError) -> &'static str {
     match err {
         AgentCardFetchError::Transport(_) | AgentCardFetchError::HttpStatus { .. } => "unreachable",
-        AgentCardFetchError::PublicIpHostMismatch { .. }
-        | AgentCardFetchError::RekorUrlNotTrusted { .. } => "untrusted",
+        AgentCardFetchError::PublicIpHostMismatch { .. } => "host_mismatch",
+        AgentCardFetchError::RekorUrlNotTrusted { .. } => "rekor_untrusted",
+        AgentCardFetchError::SignatureMissing => "unsigned",
+        AgentCardFetchError::SignatureVerification(_) => "signature_failed",
         AgentCardFetchError::InvalidUrl(_)
         | AgentCardFetchError::BodyTooLarge
         | AgentCardFetchError::InvalidContentType(_)
         | AgentCardFetchError::InvalidJson(_)
         | AgentCardFetchError::NotConfidentialAgent
+        | AgentCardFetchError::LegacyConfidentialAgentCard
         | AgentCardFetchError::SchemaValidation(_) => "invalid",
     }
 }
@@ -1923,16 +1955,18 @@ fn render_a2a_bundle(state: &A2aStateFile) -> Result<A2aBundle> {
                 "alias": peer.alias,
                 "url": peer.url,
                 "scoped_services": peer.scoped_services,
+                "signer": peer.signer,
             });
             Ok(A2aBundlePeer {
                 alias: peer.alias.clone(),
                 url: peer.url.clone(),
                 scoped_services: peer.scoped_services.clone(),
+                signer: peer.signer.clone(),
                 fingerprint: sha256_bytes(&serde_json::to_vec(&fingerprint_source)?),
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let bundle = A2aBundle { version: 1, peers };
+    let bundle = A2aBundle { version: 2, peers };
     bundle.validate()?;
     Ok(bundle)
 }

@@ -3,53 +3,86 @@ use crate::util::rekor_payload;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-pub const CONFIDENTIAL_AGENT_EXTENSION: &str = "x-confidential-agent/v1";
+pub const CONFIDENTIAL_AGENT_EXTENSION: &str =
+    "https://confidential-agent.dev/extensions/tee-rekor/v1";
 
-pub fn confidential_extension(card: &AgentCard) -> Result<&AgentCardConfidential> {
-    card.extensions
-        .confidential_agent
-        .as_ref()
-        .context("agent card is missing extensions[\"x-confidential-agent/v1\"]")
+pub fn confidential_extension(card: &AgentCard) -> Result<AgentCardConfidential> {
+    let extension = card
+        .capabilities
+        .extensions
+        .iter()
+        .find(|extension| extension.uri == CONFIDENTIAL_AGENT_EXTENSION)
+        .with_context(|| {
+            format!("agent card is missing capabilities.extensions[{CONFIDENTIAL_AGENT_EXTENSION}]")
+        })?;
+    serde_json::from_value(extension.params.clone()).with_context(|| {
+        format!("invalid capabilities.extensions[{CONFIDENTIAL_AGENT_EXTENSION}].params")
+    })
 }
 
 pub fn validate_confidential_agent_card(card: &AgentCard) -> Result<()> {
+    if card.protocol_version.trim().is_empty() {
+        bail!("agent card metadata field protocolVersion must not be empty");
+    }
+    if card.protocol_version.trim() != "1.0" && card.protocol_version.trim() != "1.0.0" {
+        bail!("agent card metadata field protocolVersion must be 1.0");
+    }
     if card.name.trim().is_empty() {
-        bail!("agent card name must not be empty");
+        bail!("agent card metadata field name must not be empty");
+    }
+    if card.description.trim().is_empty() {
+        bail!("agent card metadata field description must not be empty");
+    }
+    if card.supported_interfaces.is_empty() {
+        bail!("agent card metadata field supportedInterfaces must not be empty");
+    }
+    for interface in &card.supported_interfaces {
+        if interface.url.trim().is_empty() {
+            bail!("agent card metadata field supportedInterfaces[].url must not be empty");
+        }
+        if interface.protocol_binding.trim().is_empty() {
+            bail!("agent card metadata field supportedInterfaces[].protocolBinding must not be empty");
+        }
+        if interface.protocol_version.trim().is_empty() {
+            bail!(
+                "agent card metadata field supportedInterfaces[].protocolVersion must not be empty"
+            );
+        }
     }
     let ext = confidential_extension(card)?;
     validate_id("agent card confidential id", &ext.id)?;
     if ext.public_ip.trim().is_empty() {
-        bail!("agent card confidential publicIp must not be empty");
+        bail!("agent card security field confidential publicIp must not be empty");
     }
     if ext.ports.is_empty() {
-        bail!("agent card confidential ports must not be empty");
+        bail!("agent card security field confidential ports must not be empty");
     }
     if ext.reference_values.as_ref().is_some_and(Value::is_null) {
-        bail!("agent card referenceValues must not be null");
+        bail!("agent card security field referenceValues must not be null");
     }
     for port in &ext.ports {
         if port.name.trim().is_empty() {
-            bail!("agent card confidential port name must not be empty");
+            bail!("agent card security field confidential port name must not be empty");
         }
         if port.port == 0 {
-            bail!("agent card confidential ports must be greater than 0");
+            bail!("agent card security field confidential ports must be greater than 0");
         }
     }
     let rekor = &ext.rekor;
     if rekor.rekor_url.trim().is_empty() {
-        bail!("agent card rekorUrl must not be empty");
+        bail!("agent card security field rekorUrl must not be empty");
     }
     if rekor.artifact_id.trim().is_empty() {
-        bail!("agent card artifactId must not be empty");
+        bail!("agent card security field artifactId must not be empty");
     }
     if rekor.artifact_type.trim().is_empty() {
-        bail!("agent card artifactType must not be empty");
+        bail!("agent card security field artifactType must not be empty");
     }
     if rekor.artifact_version.trim().is_empty() {
-        bail!("agent card artifactVersion must not be empty");
+        bail!("agent card security field artifactVersion must not be empty");
     }
     if rekor.rv_name.trim().is_empty() {
-        bail!("agent card rvName must not be empty");
+        bail!("agent card security field rvName must not be empty");
     }
     Ok(())
 }

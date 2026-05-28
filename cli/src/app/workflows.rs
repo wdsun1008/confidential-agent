@@ -137,13 +137,63 @@ pub(super) fn render_agent_card(
     if spec.service.connect.is_empty() {
         bail!("a2a requires service.connect to expose at least one connect port");
     }
-    Ok(AgentCard {
+    let interfaces = if a2a.interfaces.is_empty() {
+        spec.service
+            .connect
+            .iter()
+            .map(|port| AgentInterface {
+                url: format!("http://{target_ip}:{port}/a2a"),
+                protocol_binding: "JSONRPC".to_string(),
+                protocol_version: "1.0".to_string(),
+                tenant: None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        a2a.interfaces
+            .iter()
+            .map(|interface| AgentInterface {
+                url: format!("http://{target_ip}:{}{}", interface.port, interface.path),
+                protocol_binding: interface.protocol_binding.clone(),
+                protocol_version: "1.0".to_string(),
+                tenant: None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let confidential = AgentCardConfidential {
+        id: a2a.id.clone(),
+        cache_ttl_sec: a2a.cache_ttl_sec,
+        public_ip: target_ip.to_string(),
+        ports: spec
+            .service
+            .connect
+            .iter()
+            .map(|port| AgentCardPort {
+                name: format!("port-{port}"),
+                port: *port,
+            })
+            .collect(),
+        reference_values: sample_reference_values.cloned(),
+        rekor: AgentCardRekor {
+            rekor_url: required_json_string(meta, "rekor_url")?.to_string(),
+            artifact_id: required_json_string(meta, "artifact_id")?.to_string(),
+            artifact_type: required_json_string(meta, "artifact_type")?.to_string(),
+            artifact_version: required_json_string(meta, "artifact_version")?.to_string(),
+            rv_name: required_json_string(meta, "rv_name")?.to_string(),
+        },
+        tee: tee_name(spec.attestation.tee).to_string(),
+    };
+
+    let mut card = AgentCard {
+        protocol_version: "1.0".to_string(),
         name: a2a.name.clone(),
-        description: a2a.description.clone(),
+        description: a2a
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Confidential Agent {}", a2a.name)),
         version: a2a.version.clone(),
-        url: Some(format!(
-            "http://{target_ip}:{AGENT_CARD_PORT}/.well-known/agent-card.json"
-        )),
+        supported_interfaces: interfaces,
+        preferred_transport: Some("JSONRPC".to_string()),
         skills: a2a
             .skills
             .iter()
@@ -151,38 +201,39 @@ pub(super) fn render_agent_card(
                 id: s.id.clone(),
                 name: s.name.clone(),
                 description: s.description.clone(),
+                tags: s.tags.clone(),
+                examples: s.examples.clone(),
+                input_modes: s.input_modes.clone(),
+                output_modes: s.output_modes.clone(),
             })
             .collect(),
         default_input_modes: vec!["text".to_string()],
         default_output_modes: vec!["text".to_string()],
-        capabilities: None,
-        provider: None,
-        extensions: AgentCardExtensions {
-            confidential_agent: Some(AgentCardConfidential {
-                id: a2a.id.clone(),
-                cache_ttl_sec: a2a.cache_ttl_sec,
-                public_ip: target_ip.to_string(),
-                ports: spec
-                    .service
-                    .connect
-                    .iter()
-                    .map(|port| AgentCardPort {
-                        name: format!("port-{port}"),
-                        port: *port,
-                    })
-                    .collect(),
-                reference_values: sample_reference_values.cloned(),
-                rekor: AgentCardRekor {
-                    rekor_url: required_json_string(meta, "rekor_url")?.to_string(),
-                    artifact_id: required_json_string(meta, "artifact_id")?.to_string(),
-                    artifact_type: required_json_string(meta, "artifact_type")?.to_string(),
-                    artifact_version: required_json_string(meta, "artifact_version")?.to_string(),
-                    rv_name: required_json_string(meta, "rv_name")?.to_string(),
-                },
-                tee: tee_name(spec.attestation.tee).to_string(),
-            }),
+        capabilities: AgentCardCapabilities {
+            streaming: Some(false),
+            push_notifications: Some(false),
+            state_transition_history: Some(false),
+            extended_agent_card: Some(false),
+            extensions: vec![AgentExtension {
+                uri: confidential_agent_core::agent_card::CONFIDENTIAL_AGENT_EXTENSION.to_string(),
+                description: Some(
+                    "Confidential Agent TEE/Rekor metadata for RATS-TLS routing".to_string(),
+                ),
+                required: true,
+                params: serde_json::to_value(confidential)?,
+            }],
         },
-    })
+        provider: a2a.provider.clone(),
+        security_schemes: None,
+        security: Vec::new(),
+        supports_authenticated_extended_card: Some(false),
+        signatures: Vec::new(),
+    };
+
+    if a2a.signing.required {
+        sign_agent_card_keyless(&mut card, a2a.signing.oidc_issuer.as_deref())?;
+    }
+    Ok(card)
 }
 
 pub(super) fn write_service_state(

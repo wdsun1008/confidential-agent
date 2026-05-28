@@ -10,6 +10,7 @@ usage: tools/e2e/run.sh <case>
 cases:
   openclaw-bailian
   openclaw-a2a
+  a2a-data-collab
   openclaw-vllm
   cmaas
 EOF
@@ -23,7 +24,7 @@ fi
 shift
 
 case "$CASE_NAME" in
-  openclaw-bailian | openclaw-a2a | openclaw-vllm | cmaas) ;;
+  openclaw-bailian | openclaw-a2a | a2a-data-collab | openclaw-vllm | cmaas) ;;
   *) usage; exit 2 ;;
 esac
 

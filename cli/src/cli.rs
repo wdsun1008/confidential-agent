@@ -228,6 +228,16 @@ pub(crate) enum A2aCommands {
         alias: Option<String>,
         #[arg(long, value_delimiter = ',')]
         service: Vec<String>,
+        #[arg(
+            long,
+            help = "Expected OIDC issuer for the peer AgentCard Sigstore keyless signature"
+        )]
+        signer_issuer: Option<String>,
+        #[arg(
+            long,
+            help = "Expected certificate identity/subject for the peer AgentCard Sigstore keyless signature"
+        )]
+        signer_subject: Option<String>,
     },
     Remove {
         alias_or_url: String,

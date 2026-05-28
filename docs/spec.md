@@ -253,15 +253,25 @@ resources:
 
 ```yaml
 a2a:
-  id: openclaw-agent              # 必填，写入 AgentCard extension，作为对端 service-directory key
+  id: openclaw-agent              # 必填，写入 CA extension，作为对端 service-directory key
   name: openclaw-agent            # 必填，标准 A2A Agent 名称
   version: "1.0.0"                # 可选
   description: "OpenClaw AI Agent" # 可选
   cacheTtlSec: 300                # 可选，默认 300
+  interfaces:                     # 可选；默认从 service.connect 推导 JSONRPC /a2a
+    - protocol_binding: JSONRPC
+      port: 18789
+      path: /a2a
+  signing:                        # 可选；required=true 时 deploy/inject 会用 cosign keyless 签卡
+    mode: sigstore-keyless
+    required: true
+    expected_issuer: https://token.actions.githubusercontent.com
+    expected_subject: repo:org/repo:ref:refs/heads/main
   skills:
     - id: chat
       name: Chat
       description: "General conversation"
+      tags: [chat]
 ```
 
 | 字段 | 类型 | 必填 | 校验 |
@@ -272,17 +282,23 @@ a2a:
 | `version` | string | ❌ | — |
 | `description` | string | ❌ | — |
 | `cacheTtlSec` | u64 | ❌ | 默认 `300`，必须 > 0 |
-| `skills` | array | ❌ | 默认 `[]`；每项 `id` 必须合法、`name` 非空 |
+| `interfaces` | array | ❌ | 默认由 `service.connect[]` 推导；每项 `port` 必须在 `service.connect` 中，`path` 必须以 `/` 开头 |
+| `signing` | object | ❌ | `required=true` 时 `mode=sigstore-keyless` 且 `expected_issuer` / `expected_subject` 非空 |
+| `skills` | array | ❌ | 默认 `[]`；每项 `id` 必须合法、`name` 非空；可带 `tags` / `examples` / `input_modes` / `output_modes` |
 
 设置 `a2a` 后，CLI 在 `deploy` / `inject` 阶段生成 AgentCard 并注入 guest。daemon 在 `:8089/.well-known/agent-card.json` 发布 AgentCard；`:8088` 只用于 `/status` / `/health`，两者端口和安全组 scope 分离。
 
-AgentCard 的标准 A2A 字段保留在顶层，confidential-agent 扩展放在 `extensions["x-confidential-agent/v1"]`，包括本机 `publicIp`、`service.connect` 端口、TEE 类型和 Rekor 指针。`a2a` 需要 `attestation.reference_values=rekor` 且 `service.connect` 非空，否则没有可公开审计的 reference value metadata 或可公开接入端口，注入会失败。
+AgentCard 按 A2A v1 发布：顶层包含 `protocolVersion`、`supportedInterfaces`、`capabilities`、`skills` 和可选 `signatures`。confidential-agent 扩展放在 `capabilities.extensions[]`，URI 为 `https://confidential-agent.dev/extensions/tee-rekor/v1`，其中包含本机 `publicIp`、`service.connect` 端口、TEE 类型和 Rekor 指针。`a2a` 需要 `attestation.reference_values=rekor` 且 `service.connect` 非空，否则没有可公开审计的 reference value metadata 或可公开接入端口，注入会失败。该 AgentCard 形态与旧版 top-level CA extension 不兼容；混合版本部署时应先升级发布 AgentCard 的服务端，再让调用方执行 `a2a add` / `a2a sync`。
 
-**不把 cosign 公钥放进 AgentCard**：v1 的信任根是本地 trusted Rekor allowlist 加 Rekor transparency log，AgentCard 只携带 `rekorUrl`、`artifactId`、`artifactType`、`artifactVersion`、`rvName` 这些指针。把公钥或签名放进可被中间人替换的 AgentCard 反而会让攻击者同时替换信任材料；特定组织身份 pinning 属于后续版本。
+**AgentCard 签名**：`a2a.signing.required=true` 时，CLI 用 `cosign sign-blob` 的 keyless flow 对去除 `signatures` 后的 canonical AgentCard JWS signing input 签名，并把 Sigstore bundle 写入 `signatures[].header`。对端 `a2a add` 可通过 `--signer-issuer` / `--signer-subject` 配置 signer pin；daemon 在配置了 pin 时先用 `cosign verify-blob` 验签，再继续 Rekor allowlist 与 RATS-TLS reference value 处理。
+
+`CA_A2A_SIGSTORE_IDENTITY_TOKEN` 可选传给签名流程。设置后，CLI 会把它作为 `cosign sign-blob --identity-token` 使用，适合 CI 中复用 OIDC/JWT，避免 keyless signing 进入交互式登录。`a2a.signing.expected_issuer` / `expected_subject` 描述本服务发布 AgentCard 时预期使用的签名身份；对端消费这个 AgentCard 时，应把同一组值填入 `a2a add --signer-issuer` / `--signer-subject`。
 
 ## 9. 外部 Peering 与 A2A 连接
 
 跨组织接入不再写进 spec。网络入向授权由 `<state-dir>/peerings.yaml` 管理，协议层 desired state 由 `<state-dir>/a2a.json` 管理。
+
+`a2a.json` 当前版本为 `2`。新 CLI 不再自动迁移旧版 `version: 1` state；读取到旧 state 会直接失败。没有存量服务时应删除旧 `a2a.json` 后重新执行 `a2a add`，不要让新旧 CLI 混用同一个 `<state-dir>`。
 
 ### 9.1 `peering` — 入向网络授权
 
@@ -321,23 +337,27 @@ peerings:
 ### 9.2 `a2a` — 外部 AgentCard desired state
 
 ```bash
-confidential-agent a2a add --alias beta http://198.51.100.20:8089/.well-known/agent-card.json
+confidential-agent a2a add --alias beta \
+  --signer-issuer https://token.actions.githubusercontent.com \
+  --signer-subject repo:org/repo:ref:refs/heads/main \
+  http://198.51.100.20:8089/.well-known/agent-card.json
 confidential-agent a2a list
 confidential-agent a2a sync --all
 confidential-agent a2a remove beta
 ```
 
-`a2a add` 只需要一个 AgentCard URL。peer 的 public IP、业务端口、Rekor metadata 都由 daemon 从 AgentCard 获取；本地不再重复填写 peer 端口/CIDR/reference values。
+`a2a add` 至少需要一个 AgentCard URL。peer 的 public IP、业务端口、Rekor metadata 都由 daemon 从 AgentCard 获取；本地不再重复填写 peer 端口/CIDR/reference values。生产跨组织接入应同时提供 signer pin；未提供 pin 时只执行 v1 schema、publicIp 和 Rekor trust 校验。
 
-CLI 会 best-effort 拉取 AgentCard 做预览；失败不会阻塞，因为真实场景里对端可能只允许本服务 VM 访问 `:8089`，不允许 operator 笔记本访问。CLI 会把失败分类记录为 `unreachable` / `untrusted` / `invalid`，供 `a2a list` 和 `a2a show` 查看。daemon 侧拉取是权威结果，会按 AgentCard `cacheTtlSec` 刷新，并写入 `status --live` 的 `a2a_peers`。
+CLI 会 best-effort 拉取 AgentCard 做预览；失败不会阻塞，因为真实场景里对端可能只允许本服务 VM 访问 `:8089`，不允许 operator 笔记本访问。CLI 会把失败分类记录为 `unreachable` / `unsigned` / `signature_failed` / `host_mismatch` / `rekor_untrusted` / `invalid`，供 `a2a list` 和 `a2a show` 查看。daemon 侧拉取是权威结果，会按 AgentCard `cacheTtlSec` 刷新，并写入 `status --live` 的 `a2a_peers`。
 
 daemon 接收 `cagent_a2a_bundle` 后会：
 
 1. 拉取并校验 AgentCard：URL path 固定、content-type 为 JSON、body 有大小上限。
-2. 校验 `extensions["x-confidential-agent/v1"]` 存在，且 `publicIp` 与 URL host 的 IPv4 解析结果一致。
-3. 校验 `rekorUrl` 落在 trusted Rekor allowlist，默认只信任 `https://rekor.sigstore.dev`，可用 `CA_TRUSTED_REKOR_URLS` 扩展。
-4. 用 AgentCard 中的 Rekor metadata 生成 TNG reference values。
-5. 为 AgentCard 声明的 connect 端口生成本地 TNG ingress，并写入 `/etc/cai/service-directory.json`。
+2. 如 peer 配置了 signer pin，校验 `signatures[]` 中至少一个 Sigstore keyless 签名满足 issuer/subject pin。
+3. 校验 `capabilities.extensions[]` 中的 CA extension 存在，且 `publicIp` 与 URL host 的 IPv4 解析结果一致。
+4. 校验 `rekorUrl` 落在 trusted Rekor allowlist，默认只信任 `https://rekor.sigstore.dev`，可用 `CA_TRUSTED_REKOR_URLS` 扩展。
+5. 用 AgentCard 中的 Rekor metadata 生成 TNG reference values。
+6. 为 AgentCard 声明的 connect 端口生成本地 TNG ingress，并写入 `/etc/cai/service-directory.json`。
 
 A2A 按 `connect` 模型处理：本地调用方验证对端服务端 TEE，不要求对端显式 `a2a add` 本服务；如果业务需要双向应用调用，双方各自添加一条出向 A2A desired state。
 

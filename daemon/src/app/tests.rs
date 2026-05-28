@@ -890,11 +890,9 @@ fn a2a_tng_ingress_fetches_agent_card_and_generates_config() {
 #[test]
 fn a2a_tng_ingress_prefers_agent_card_sample_reference_values() {
     let mut card = test_agent_card("remote-agent", &[3001]);
-    card.extensions
-        .confidential_agent
-        .as_mut()
-        .unwrap()
-        .reference_values = Some(json!({"measurement.uki.SHA-384": ["sample-rv"]}));
+    mutate_confidential(&mut card, |confidential| {
+        confidential.reference_values = Some(json!({"measurement.uki.SHA-384": ["sample-rv"]}));
+    });
     let url = serve_agent_card_once(card);
     let bundle = test_a2a_bundle(None, &url, &[]);
     let directory = empty_service_directory();
@@ -976,11 +974,9 @@ fn a2a_tng_ingress_uses_negative_cache_after_initial_fetch_failure() {
 #[test]
 fn a2a_tng_ingress_rejects_agent_card_public_ip_mismatch() {
     let mut card = test_agent_card("remote-agent", &[3001]);
-    card.extensions
-        .confidential_agent
-        .as_mut()
-        .unwrap()
-        .public_ip = "198.51.100.10".to_string();
+    mutate_confidential(&mut card, |confidential| {
+        confidential.public_ip = "198.51.100.10".to_string();
+    });
     let url = serve_agent_card_once(card);
     let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
     let directory = empty_service_directory();
@@ -1001,12 +997,9 @@ fn a2a_tng_ingress_rejects_agent_card_public_ip_mismatch() {
 #[test]
 fn a2a_tng_ingress_rejects_untrusted_rekor_url() {
     let mut card = test_agent_card("remote-agent", &[3001]);
-    card.extensions
-        .confidential_agent
-        .as_mut()
-        .unwrap()
-        .rekor
-        .rekor_url = "https://attacker.example/rekor".to_string();
+    mutate_confidential(&mut card, |confidential| {
+        confidential.rekor.rekor_url = "https://attacker.example/rekor".to_string();
+    });
     let url = serve_agent_card_once(card);
     let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
     let directory = empty_service_directory();
@@ -1051,11 +1044,9 @@ fn a2a_tng_ingress_rejects_peer_id_collision_with_service_directory() {
 #[test]
 fn a2a_tng_ingress_clamps_agent_card_cache_ttl() {
     let mut card = test_agent_card("remote-agent", &[3001]);
-    card.extensions
-        .confidential_agent
-        .as_mut()
-        .unwrap()
-        .cache_ttl_sec = 1;
+    mutate_confidential(&mut card, |confidential| {
+        confidential.cache_ttl_sec = 1;
+    });
     let url = serve_agent_card_once(card);
     let bundle = test_a2a_bundle(None, &url, &[]);
     let directory = empty_service_directory();
@@ -1072,44 +1063,77 @@ fn a2a_tng_ingress_clamps_agent_card_cache_ttl() {
 }
 
 fn test_agent_card(id: &str, ports: &[u16]) -> confidential_agent_core::schema::AgentCard {
+    use confidential_agent_core::agent_card::CONFIDENTIAL_AGENT_EXTENSION;
     use confidential_agent_core::schema::{
-        AgentCard, AgentCardConfidential, AgentCardExtensions, AgentCardPort, AgentCardRekor,
+        AgentCard, AgentCardCapabilities, AgentCardConfidential, AgentCardPort, AgentCardRekor,
+        AgentExtension, AgentInterface,
     };
 
     AgentCard {
+        protocol_version: "1.0".to_string(),
         name: id.to_string(),
-        description: None,
+        description: format!("{id} test card"),
         version: Some("1.0.0".to_string()),
-        url: None,
+        supported_interfaces: ports
+            .iter()
+            .map(|port| AgentInterface {
+                url: format!("http://127.0.0.1:{port}/a2a"),
+                protocol_binding: "JSONRPC".to_string(),
+                protocol_version: "1.0".to_string(),
+                tenant: None,
+            })
+            .collect(),
+        preferred_transport: Some("JSONRPC".to_string()),
         skills: Vec::new(),
         default_input_modes: vec!["text".to_string()],
         default_output_modes: vec!["text".to_string()],
-        capabilities: None,
-        provider: None,
-        extensions: AgentCardExtensions {
-            confidential_agent: Some(AgentCardConfidential {
-                id: id.to_string(),
-                cache_ttl_sec: 300,
-                public_ip: "127.0.0.1".to_string(),
-                ports: ports
-                    .iter()
-                    .map(|port| AgentCardPort {
-                        name: format!("port-{port}"),
-                        port: *port,
-                    })
-                    .collect(),
-                reference_values: None,
-                rekor: AgentCardRekor {
-                    rekor_url: "https://rekor.sigstore.dev".to_string(),
-                    artifact_id: format!("{id}-release"),
-                    artifact_type: "uki".to_string(),
-                    artifact_version: "20260512".to_string(),
-                    rv_name: "measurement.uki.SHA-384".to_string(),
-                },
-                tee: "tdx".to_string(),
-            }),
+        capabilities: AgentCardCapabilities {
+            extensions: vec![AgentExtension {
+                uri: CONFIDENTIAL_AGENT_EXTENSION.to_string(),
+                description: None,
+                required: true,
+                params: serde_json::to_value(AgentCardConfidential {
+                    id: id.to_string(),
+                    cache_ttl_sec: 300,
+                    public_ip: "127.0.0.1".to_string(),
+                    ports: ports
+                        .iter()
+                        .map(|port| AgentCardPort {
+                            name: format!("port-{port}"),
+                            port: *port,
+                        })
+                        .collect(),
+                    reference_values: None,
+                    rekor: AgentCardRekor {
+                        rekor_url: "https://rekor.sigstore.dev".to_string(),
+                        artifact_id: format!("{id}-release"),
+                        artifact_type: "uki".to_string(),
+                        artifact_version: "20260512".to_string(),
+                        rv_name: "measurement.uki.SHA-384".to_string(),
+                    },
+                    tee: "tdx".to_string(),
+                })
+                .unwrap(),
+            }],
+            ..Default::default()
         },
+        provider: None,
+        security_schemes: None,
+        security: Vec::new(),
+        supports_authenticated_extended_card: Some(false),
+        signatures: Vec::new(),
     }
+}
+
+fn mutate_confidential(
+    card: &mut confidential_agent_core::schema::AgentCard,
+    f: impl FnOnce(&mut confidential_agent_core::schema::AgentCardConfidential),
+) {
+    let extension = card.capabilities.extensions.first_mut().unwrap();
+    let mut confidential: confidential_agent_core::schema::AgentCardConfidential =
+        serde_json::from_value(extension.params.clone()).unwrap();
+    f(&mut confidential);
+    extension.params = serde_json::to_value(confidential).unwrap();
 }
 
 fn serve_agent_card_once(card: confidential_agent_core::schema::AgentCard) -> String {
@@ -1168,7 +1192,7 @@ fn serve_agent_card_error_counter() -> (String, Arc<AtomicUsize>) {
 
 fn test_a2a_bundle(alias: Option<&str>, url: &str, scoped_services: &[&str]) -> A2aBundle {
     A2aBundle {
-        version: 1,
+        version: 2,
         peers: vec![A2aBundlePeer {
             alias: alias.map(str::to_string),
             url: url.to_string(),
@@ -1176,6 +1200,7 @@ fn test_a2a_bundle(alias: Option<&str>, url: &str, scoped_services: &[&str]) -> 
                 .iter()
                 .map(|value| value.to_string())
                 .collect(),
+            signer: None,
             fingerprint: sha256_bytes(url.as_bytes()),
         }],
     }

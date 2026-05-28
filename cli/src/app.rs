@@ -8,18 +8,20 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use confidential_agent_core::a2a::{
     A2aBundle, A2aBundlePeer, A2aCardSummary, A2aCliPreview, A2aCliPreviewError, A2aStateFile,
-    A2aStatePeer,
+    A2aStatePeer, A2aSignerPin,
 };
 use confidential_agent_core::agent_card::{
     confidential_extension, derive_tng_client_config_with_local_ports,
 };
 use confidential_agent_core::agent_card_fetch::{
-    fetch_agent_card, parse_agent_card_url, AgentCardFetchError,
+    fetch_agent_card, fetch_agent_card_with_signer, parse_agent_card_url, AgentCardFetchError,
 };
+use confidential_agent_core::agent_card_signing::sign_agent_card_keyless;
 use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{
-    AgentCard, AgentCardConfidential, AgentCardExtensions, AgentCardPort, AgentCardRekor,
-    AgentCardSkill, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState,
+    AgentCard, AgentCardCapabilities, AgentCardConfidential, AgentCardPort, AgentCardRekor,
+    AgentCardSkill, AgentExtension, AgentInterface, BootstrapConfig, DaemonStatus, GuestResource,
+    LocalBuildState,
     LocalDebugSshKey, LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState,
     LocalSpecState, MeshBundle, MeshService, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION,
     DAEMON_STATUS_PORT, LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
