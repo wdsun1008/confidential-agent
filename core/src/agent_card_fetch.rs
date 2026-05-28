@@ -44,6 +44,10 @@ pub enum AgentCardFetchError {
         declared: IpAddr,
         resolved: Vec<IpAddr>,
     },
+    HostResolution {
+        host: String,
+        message: String,
+    },
     RekorUrlNotTrusted {
         url: String,
         allowed: Vec<String>,
@@ -85,6 +89,9 @@ impl fmt::Display for AgentCardFetchError {
                 "agent card publicIp {declared} is not one of URL host addresses {:?}",
                 resolved
             ),
+            Self::HostResolution { host, message } => {
+                write!(f, "failed to resolve agent card URL host '{host}': {message}")
+            }
             Self::RekorUrlNotTrusted { url, allowed } => {
                 write!(
                     f,
@@ -318,9 +325,12 @@ pub fn resolve_host_ipv4(
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(vec![IpAddr::V4(ip)]);
     }
-    let addrs = (host, port).to_socket_addrs().map_err(|err| {
-        AgentCardFetchError::Transport(format!("failed to resolve {host}: {err}"))
-    })?;
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| AgentCardFetchError::HostResolution {
+            host: host.to_string(),
+            message: err.to_string(),
+        })?;
     let mut resolved = addrs
         .filter_map(|addr| match addr.ip() {
             IpAddr::V4(ip) => Some(IpAddr::V4(ip)),

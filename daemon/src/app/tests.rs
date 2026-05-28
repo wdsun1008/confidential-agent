@@ -972,6 +972,107 @@ fn a2a_tng_ingress_uses_negative_cache_after_initial_fetch_failure() {
 }
 
 #[test]
+fn a2a_tng_ingress_uses_stale_cache_for_transient_fetch_failure() {
+    let card = test_agent_card("remote-agent", &[3001]);
+    let url = serve_agent_card_once(card);
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    state
+        .a2a_cache
+        .get_mut("remote")
+        .unwrap()
+        .next_refresh_unix = 0;
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    assert!(directory.contains_key("remote"));
+    assert_eq!(state.a2a_status["remote"].state, "stale");
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("agent card transport error"));
+
+    let directory = empty_service_directory();
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    assert_eq!(state.a2a_status["remote"].state, "stale");
+}
+
+#[test]
+fn a2a_tng_ingress_uses_stale_cache_for_http_5xx() {
+    let valid = test_agent_card("remote-agent", &[3001]);
+    let url = serve_agent_card_then_status(valid, 503, "unavailable");
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    state
+        .a2a_cache
+        .get_mut("remote")
+        .unwrap()
+        .next_refresh_unix = 0;
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    assert!(directory.contains_key("remote"));
+    assert_eq!(state.a2a_status["remote"].state, "stale");
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("HTTP status 503"));
+}
+
+#[test]
+fn a2a_fetch_error_stale_policy_keeps_trust_failures_strict() {
+    assert!(a2a_fetch_error_allows_stale(
+        &AgentCardFetchError::Transport("connection reset".to_string())
+    ));
+    assert!(a2a_fetch_error_allows_stale(
+        &AgentCardFetchError::HttpStatus {
+            status: 503,
+            body_preview: "unavailable".to_string(),
+        }
+    ));
+    assert!(!a2a_fetch_error_allows_stale(
+        &AgentCardFetchError::HttpStatus {
+            status: 499,
+            body_preview: "client closed".to_string(),
+        }
+    ));
+    assert!(!a2a_fetch_error_allows_stale(
+        &AgentCardFetchError::HostResolution {
+            host: "peer.example".to_string(),
+            message: "dns failed".to_string(),
+        }
+    ));
+    assert!(!a2a_fetch_error_allows_stale(
+        &AgentCardFetchError::PublicIpHostMismatch {
+            declared: "203.0.113.10".parse().unwrap(),
+            resolved: vec!["203.0.113.11".parse().unwrap()],
+        }
+    ));
+    assert!(!a2a_fetch_error_allows_stale(
+        &AgentCardFetchError::RekorUrlNotTrusted {
+            url: "https://rekor.example".to_string(),
+            allowed: vec!["https://rekor.sigstore.dev".to_string()],
+        }
+    ));
+}
+
+#[test]
 fn a2a_tng_ingress_rejects_agent_card_public_ip_mismatch() {
     let mut card = test_agent_card("remote-agent", &[3001]);
     mutate_confidential(&mut card, |confidential| {
@@ -992,6 +1093,107 @@ fn a2a_tng_ingress_rejects_agent_card_public_ip_mismatch() {
         .as_deref()
         .unwrap()
         .contains("publicIp"));
+}
+
+#[test]
+fn a2a_tng_ingress_rejects_public_ip_update_without_stale_fallback() {
+    let valid = test_agent_card("remote-agent", &[3001]);
+    let mut mismatch = test_agent_card("remote-agent", &[3001]);
+    mutate_confidential(&mut mismatch, |confidential| {
+        confidential.public_ip = "198.51.100.10".to_string();
+    });
+    let url = serve_agent_cards(vec![valid, mismatch]);
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    state
+        .a2a_cache
+        .get_mut("remote")
+        .unwrap()
+        .next_refresh_unix = 0;
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(directory.is_empty());
+    assert_eq!(state.a2a_status["remote"].state, "error");
+    assert!(state.a2a_status["remote"].last_success_unix.is_some());
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("publicIp"));
+    assert!(!cached_peer_is_resolvable(state.a2a_cache.get("remote").unwrap()));
+}
+
+#[test]
+fn a2a_tng_ingress_rejects_untrusted_rekor_update_without_stale_fallback() {
+    let valid = test_agent_card("remote-agent", &[3001]);
+    let mut untrusted = test_agent_card("remote-agent", &[3001]);
+    mutate_confidential(&mut untrusted, |confidential| {
+        confidential.rekor.rekor_url = "https://attacker.example/rekor".to_string();
+    });
+    let url = serve_agent_cards(vec![valid, untrusted]);
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    state
+        .a2a_cache
+        .get_mut("remote")
+        .unwrap()
+        .next_refresh_unix = 0;
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(directory.is_empty());
+    assert_eq!(state.a2a_status["remote"].state, "error");
+    assert!(state.a2a_status["remote"].last_success_unix.is_some());
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("rekorUrl"));
+    assert!(!cached_peer_is_resolvable(state.a2a_cache.get("remote").unwrap()));
+}
+
+#[test]
+fn a2a_tng_ingress_rejects_http_404_without_stale_fallback() {
+    let valid = test_agent_card("remote-agent", &[3001]);
+    let url = serve_agent_card_then_status(valid, 404, "removed");
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    let directory = empty_service_directory();
+    let mut state = DaemonState::default();
+
+    let (ingress, _) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert_eq!(ingress.len(), 1);
+    state
+        .a2a_cache
+        .get_mut("remote")
+        .unwrap()
+        .next_refresh_unix = 0;
+
+    let (ingress, directory) = a2a_tng_ingress(&bundle, "self", &[], &directory, &mut state);
+
+    assert!(ingress.is_empty());
+    assert!(directory.is_empty());
+    assert_eq!(state.a2a_status["remote"].state, "error");
+    assert!(state.a2a_status["remote"].last_success_unix.is_some());
+    assert!(state.a2a_status["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("HTTP status 404"));
+    assert!(!cached_peer_is_resolvable(state.a2a_cache.get("remote").unwrap()));
 }
 
 #[test]
@@ -1137,9 +1339,40 @@ fn mutate_confidential(
 }
 
 fn serve_agent_card_once(card: confidential_agent_core::schema::AgentCard) -> String {
+    serve_agent_cards(vec![card])
+}
+
+fn serve_agent_cards(cards: Vec<confidential_agent_core::schema::AgentCard>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for card in cards {
+            let card_json = serde_json::to_string(&card).unwrap();
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                card_json.len(),
+                card_json
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://127.0.0.1:{port}/.well-known/agent-card.json")
+}
+
+fn serve_agent_card_then_status(
+    card: confidential_agent_core::schema::AgentCard,
+    status: u16,
+    body: &str,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let card_json = serde_json::to_string(&card).unwrap();
+    let body = body.to_string();
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 1024];
@@ -1148,6 +1381,16 @@ fn serve_agent_card_once(card: confidential_agent_core::schema::AgentCard) -> St
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 card_json.len(),
                 card_json
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
             );
             let _ = stream.write_all(response.as_bytes());
         }

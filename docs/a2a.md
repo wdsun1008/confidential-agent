@@ -154,6 +154,10 @@ CLI preview 是 best-effort：管理机可能访问不了对端 `:8089`，失败
 | A2A 描述字段 | `protocolVersion`、`name`、`description`、`supportedInterfaces[].url`、`supportedInterfaces[].protocolBinding`、`supportedInterfaces[].protocolVersion` |
 | CA 安全字段 | CA extension `params.id`、`publicIp`、`ports[]`、`rekor.*`、`tee` |
 
+示例里的 `artifactVersion` 是发布方构建流水线写入 Rekor metadata 的版本字符串。当前 daemon 只要求它非空，不把它解释为时间戳，也不会拒绝比本地 cache 更老的版本。也就是说，当前实现没有 `min_artifact_version` 或“同一 peer 版本必须单调递增”的 rollback protection。
+
+`cacheTtlSec` 由发布方声明，但消费方 guest daemon 会做本地 clamp：小于 60 秒按 60 秒处理，大于 3600 秒按 3600 秒处理。
+
 ### 3.2 在 AppSpec 中发布 AgentCard
 
 ```yaml
@@ -225,20 +229,40 @@ daemon fetch peer AgentCard 后按顺序处理：
 3. 如果 peer 配置 signer pin，校验 `signatures[]` 中至少一个 Sigstore keyless 签名满足 issuer/subject pin。
 4. 校验 AgentCard `publicIp` 是 URL host 的 IPv4 解析结果之一。
 5. 校验 `rekorUrl` 在本地 trusted Rekor allowlist 中，默认只信任 `https://rekor.sigstore.dev`。
-6. 用 AgentCard 的 Rekor 指针生成 TNG reference values。
+6. 用 AgentCard 的 Rekor metadata 生成 TNG/RVPS 可消费的 reference value 查询 payload。
 7. TNG/RATS-TLS 握手时验证对端 TEE quote 与 reference values 匹配。
 
 握手成功意味着：
 
 - 调用目标运行在符合 reference values 的 confidential VM 中。
-- AgentCard 指向的 Rekor metadata 来自本地信任的 Rekor 实例。
+- AgentCard 指向的是本地 allowlist 中的 Rekor 实例。
 - 如果配置了 signer pin，AgentCard 由指定 OIDC issuer/subject 对应的 keyless 身份签署。
 
 握手成功不意味着：
 
 - 对端组织身份在未配置 signer pin 时已被证明。
+- Rekor entry 的签发者已经和 AgentCard signer pin 绑定。
+- Rekor entry 的 SET、signed checkpoint、inclusion proof 或 consistency proof 已在 CA daemon 层完成端到端校验。
+- AgentCard `artifactVersion` 一定是该 peer 历史上最新版本。
 - 对端业务逻辑一定不会泄露数据；业务层仍要做最小化返回和探针验证。
 - Rekor 或上游 build pipeline 自身没有被攻陷。
+
+### 4.1 Rekor 信任边界
+
+`rekor.sigstore.dev` 是公共透明日志，任何人都可以写入自己的条目。因此，单独信任 `rekorUrl=https://rekor.sigstore.dev` 只能说明“reference values 来自允许的日志位置”，不能说明“这条 Rekor entry 是目标组织或目标流水线发布的”。
+
+当前已经实现的发布方身份 pin 是 AgentCard 级别的：
+
+```bash
+confidential-agent a2a add --alias data-owner \
+  --signer-issuer https://token.actions.githubusercontent.com \
+  --signer-subject repo:org/repo:ref:refs/heads/main \
+  http://203.0.113.20:8089/.well-known/agent-card.json
+```
+
+这会把“谁有权发布这个 AgentCard”绑定到 OIDC issuer/subject，但不会额外验证 AgentCard 内部 `rekor.artifactId` / `artifactVersion` 指向的 Rekor entry 也是同一个 OIDC 身份写入。GitHub Actions 场景下两者通常来自同一条 workflow OIDC token，但当前实现没有强制绑定。
+
+如果接入方需要证明“AgentCard 和 Rekor provenance 都来自同一条受信流水线”，还需要新增 Rekor provenance signer pin，例如复用 AgentCard pin 或引入独立的 `--rekor-signer-issuer` / `--rekor-signer-subject`，并在解析 Rekor entry 时校验 SLSA/DSSE 签名身份和透明日志证明。该能力目前未实现。
 
 扩展 Rekor allowlist：
 
@@ -458,6 +482,8 @@ confidential-agent a2a remove <alias-or-url>
 
 `--service` 限定 peer 只分发给指定本地 service；为空时 fan-out 到本 state-dir 下所有 active services。fan-out 场景下，对端 peering 必须覆盖所有会 fetch AgentCard 的本地 service VM 公网 IP。
 
+`a2a sync --alias` 会刷新 host 侧 CLI preview，并把当前 `a2a-bundle.json` 重新下发给 active guest daemon；它不是强制绕过 guest daemon AgentCard cache 的 refresh 命令。只要 peer 的 alias、URL、scope、signer pin 没变，bundle fingerprint 不变，guest daemon 在 cache TTL 未到期前仍会继续使用本地 cache。今天要立即丢弃某个 peer 的 guest cache，需要先 `a2a remove` 并同步到 guest，让 daemon 从 active keys 中删掉该 cache，再重新 `a2a add`。
+
 ### 7.3 status
 
 ```bash
@@ -470,8 +496,14 @@ confidential-agent status --live --json
 | state | 含义 |
 |---|---|
 | `ok` | 最近一次 fetch、校验和 TNG ingress 生成成功 |
-| `stale` | 当前 fetch 失败，但 daemon 仍有上一份成功 cache 并继续服务 |
+| `stale` | 当前 AgentCard fetch 遇到 transport error 或 HTTP 5xx 这类临时可达性失败，但 daemon 仍有上一份成功 cache 并继续服务 |
 | `error` | 没有可用 cache，或 trust/schema/签名校验失败，或 peer id 冲突 |
+
+`stale` 只用于 fetch transport error 或 HTTP 5xx 这类临时可达性问题。HTTP 4xx、host 解析失败、body 超过 64 KiB、content-type 非 JSON、AgentCard 已返回但 schema 校验、signer pin、`publicIp` 或 `rekorUrl` trust 校验失败时，即使本地有旧 cache，也会进入 `error`，不会静默继续使用旧 reference values。这样可以避免对端主动撤回或发布不可信 AgentCard 时被旧 cache 掩盖。
+
+重复的可达性失败会按 60 秒 backoff 重试；host 解析失败属于 trust 校验未完成，不走 transport retry 和 stale fallback。当前没有 `max_stale_age`，所以攻击者如果只能让 AgentCard discovery 长期不可达，确实可以把上一份成功 cache 的使用窗口拉长。这个风险和“没有强制 refresh/吊销通道”有关，接入方需要通过网络监控、业务超时和后续强制刷新机制补齐。
+
+daemon A2A 状态只覆盖 AgentCard fetch、AgentCard trust 校验和 TNG ingress 配置生成。Rekor entry 拉取或 RATS-TLS 握手阶段如果由 TNG/RVPS 报错，可能表现为应用调用失败或 TNG 日志错误，而不是 `A2A Peers` 中单独的 `rekor_unreachable` 状态。
 
 CLI preview 状态：
 
@@ -482,7 +514,7 @@ CLI preview 状态：
 | `unreachable` | 管理机无法访问 peer AgentCard 或 HTTP 非 200 |
 | `unsigned` | 配置了 signer pin，但 AgentCard 没有 `signatures[]` |
 | `signature_failed` | Sigstore 签名存在，但不满足 issuer/subject pin 或 cosign 验证失败 |
-| `host_mismatch` | AgentCard `publicIp` 与 URL host 解析结果不一致 |
+| `host_mismatch` | AgentCard `publicIp` 与 URL host 解析结果不一致，或 URL host 无法完成 trust 校验解析 |
 | `rekor_untrusted` | `rekorUrl` 不在 trusted Rekor allowlist |
 | `invalid` | URL、JSON、schema 或 CA extension 格式无效；包括 legacy top-level CA extension |
 
@@ -497,6 +529,12 @@ CLI preview 状态：
 | `signature_failed` | signer issuer/subject 不匹配，或 cosign 验签失败 | 核对发布方 OIDC identity；消费方重做 `a2a add --signer-*` |
 | `publicIp ... is not one of URL host addresses` | AgentCard 与访问 URL 不一致 | 对端重新 deploy 或确认使用正确公网 IP/DNS |
 | `rekorUrl ... is not trusted` | 对端 Rekor 不在 allowlist | 确认可信后设置 `CA_TRUSTED_REKOR_URLS` |
+| `stale` 持续出现 | AgentCard discovery transport/HTTP 5xx 临时不可达，但还有旧 cache | 恢复对端 `:8089` 可达性；注意当前没有 `max_stale_age`，建议对 `now - last_success_unix` 超过本域阈值（如 30 分钟）告警 |
+| HTTP 4xx 后进入 `error` | 对端撤回 AgentCard、ACL 拒绝或 URL 不存在 | 修复对端 AgentCard discovery 或重新执行 `a2a add` 使用正确 URL |
+| AgentCard trust/schema/签名错误后进入 `error` | 对端返回了不可信或格式不兼容的新卡片 | 不会 fallback 到旧 cache；修复对端 AgentCard 后等下一次 backoff 或重启 daemon |
+| RATS-TLS/TNG 握手失败但 A2A state 仍是 `ok` | Rekor entry 拉取、reference value 解析或 quote 校验在 TNG/RVPS 阶段失败 | 查 TNG、attestation-service/RVPS 和应用调用日志；daemon A2A 状态不细分这类错误 |
+| 需要立即刷新已缓存 AgentCard | `a2a sync --alias` 未绕过 guest cache TTL | 先 `a2a remove` 并同步到 guest，再重新 `a2a add`；或等待 TTL 到期 |
+| 担心旧 `artifactVersion` rollback | 当前 daemon 不做 artifact version 单调校验 | 通过 signer pin 控制 AgentCard 发布权；需要更强保证时等待 `min_artifact_version` / Rekor signer pin 能力 |
 | `legacy top-level confidential-agent extension` | 对端仍发布旧 AgentCard | 先升级 AgentCard 发布方，再让消费方执行 `a2a add` |
 | 应用报 `peer 'X' is missing` | daemon 尚未生成 service-directory 条目 | 查 `status --live` 的 A2A peer state 和 error |
 
@@ -506,6 +544,11 @@ CLI preview 状态：
 
 - 未配置 signer pin 时，AgentCard 签名不会被验证。
 - AgentCard transport 允许 HTTP；信任决策来自 signer pin、Rekor allowlist 和 RATS-TLS，不来自 TLS WebPKI。
+- AgentCard signer pin 不校验 Rekor entry 的 issuer/subject；当前也没有 `--rekor-signer-*`。
+- CA daemon 不做完整 transparency log 客户端校验；SET、signed checkpoint、inclusion proof 和 consistency proof 不是当前文档承诺的安全保证。
+- daemon 不做 `artifactVersion` rollback 防护，也没有 `min_artifact_version`。
+- `stale` 只对 AgentCard discovery transport/HTTP 5xx 失败 fallback；HTTP 4xx、host 解析失败、body/content-type 异常、trust/schema/签名失败不再 fallback。可达性失败没有 `max_stale_age`。
+- `a2a sync --alias` 不强制 guest 绕过 cache TTL。
 - 只支持 IPv4 host 解析。
 - `a2a.json` 只支持 version `2`，不自动迁移 version `1`。
 - 旧顶层 CA extension 不兼容；新版只消费 `capabilities.extensions[]`。
@@ -518,7 +561,7 @@ CLI preview 状态：
 - 域级 catalog 发布与导入。
 - HTTPS-only AgentCard discovery。
 - IPv6 支持。
-- 更完整的 Rekor inclusion proof 边界校验。
+- Rekor provenance signer pin、完整 inclusion/consistency proof 校验和 artifact version rollback policy。
 
 ## 参考
 
