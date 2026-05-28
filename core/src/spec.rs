@@ -210,10 +210,41 @@ pub struct A2aSpec {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub provider: Option<serde_json::Value>,
     #[serde(default = "default_a2a_cache_ttl_sec", rename = "cacheTtlSec")]
     pub cache_ttl_sec: u64,
     #[serde(default)]
+    pub interfaces: Vec<A2aInterfaceSpec>,
+    #[serde(default)]
+    pub signing: A2aSigningSpec,
+    #[serde(default)]
     pub skills: Vec<A2aSkillSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct A2aInterfaceSpec {
+    #[serde(default = "default_a2a_protocol_binding")]
+    pub protocol_binding: String,
+    pub port: u16,
+    #[serde(default = "default_a2a_interface_path")]
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct A2aSigningSpec {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub expected_issuer: Option<String>,
+    #[serde(default)]
+    pub expected_subject: Option<String>,
+    #[serde(default)]
+    pub oidc_issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -223,6 +254,14 @@ pub struct A2aSkillSpec {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub examples: Vec<String>,
+    #[serde(default)]
+    pub input_modes: Vec<String>,
+    #[serde(default)]
+    pub output_modes: Vec<String>,
 }
 
 impl AgentSpec {
@@ -395,10 +434,62 @@ impl AgentSpec {
             if a2a.cache_ttl_sec == 0 {
                 bail!("a2a.cacheTtlSec must be greater than 0");
             }
+            for (idx, interface) in a2a.interfaces.iter().enumerate() {
+                if interface.protocol_binding.trim().is_empty() {
+                    bail!("a2a.interfaces[{idx}].protocol_binding must not be empty");
+                }
+                if interface.port == 0 {
+                    bail!("a2a.interfaces[{idx}].port must be greater than 0");
+                }
+                if !self.service.connect.contains(&interface.port) {
+                    bail!(
+                        "a2a.interfaces[{idx}].port must be listed in service.connect"
+                    );
+                }
+                if !interface.path.starts_with('/') {
+                    bail!("a2a.interfaces[{idx}].path must start with '/'");
+                }
+            }
+            if let Some(issuer) = a2a.signing.expected_issuer.as_deref() {
+                validate_https_url("a2a.signing.expected_issuer", issuer)?;
+            }
+            if let Some(issuer) = a2a.signing.oidc_issuer.as_deref() {
+                validate_https_url("a2a.signing.oidc_issuer", issuer)?;
+            }
+            if a2a.signing.required {
+                if a2a.signing.mode.as_deref() != Some("sigstore-keyless") {
+                    bail!("a2a.signing.mode must be sigstore-keyless when required=true");
+                }
+                if a2a
+                    .signing
+                    .expected_issuer
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    bail!("a2a.signing.expected_issuer is required when signing.required=true");
+                }
+                if a2a
+                    .signing
+                    .expected_subject
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    bail!("a2a.signing.expected_subject is required when signing.required=true");
+                }
+            }
             for (idx, skill) in a2a.skills.iter().enumerate() {
                 validate_id(&format!("a2a.skills[{idx}].id"), &skill.id)?;
                 if skill.name.trim().is_empty() {
                     bail!("a2a.skills[{idx}].name must not be empty");
+                }
+                for (tag_idx, tag) in skill.tags.iter().enumerate() {
+                    if tag.trim().is_empty() {
+                        bail!("a2a.skills[{idx}].tags[{tag_idx}] must not be empty");
+                    }
                 }
             }
         }
@@ -496,6 +587,30 @@ fn looks_like_url(value: &str) -> bool {
     value.contains("://")
 }
 
+fn validate_https_url(field: &str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{field} must not be empty when set");
+    }
+    if value.chars().any(char::is_whitespace) {
+        bail!("{field} must not contain whitespace");
+    }
+    let Some(rest) = value.strip_prefix("https://") else {
+        bail!("{field} must be an https URL");
+    };
+    let authority = rest
+        .split_once('/')
+        .map(|(authority, _)| authority)
+        .unwrap_or(rest);
+    if authority.is_empty() || authority.contains('@') {
+        bail!("{field} must include a plain host");
+    }
+    if value.contains('?') || value.contains('#') {
+        bail!("{field} must not include query or fragment");
+    }
+    Ok(())
+}
+
 fn absolute_base_dir(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -544,6 +659,14 @@ fn default_rekor_url() -> String {
 
 fn default_a2a_cache_ttl_sec() -> u64 {
     300
+}
+
+fn default_a2a_protocol_binding() -> String {
+    "JSONRPC".to_string()
+}
+
+fn default_a2a_interface_path() -> String {
+    "/a2a".to_string()
 }
 
 fn default_slsa_generator() -> PathBuf {
@@ -929,6 +1052,45 @@ a2a:
         assert_eq!(a2a.version.as_deref(), Some("1.0.0"));
         assert_eq!(a2a.skills.len(), 1);
         assert_eq!(a2a.skills[0].id, "chat");
+    }
+
+    #[test]
+    fn validates_a2a_signing_issuer_urls() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  signing:
+    mode: sigstore-keyless
+    required: true
+    expected_issuer: https://token.actions.githubusercontent.com
+    expected_subject: repo:example/project:ref:refs/heads/main
+    oidc_issuer: https://token.actions.githubusercontent.com
+"#
+        );
+
+        AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_a2a_signing_oidc_issuer() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  signing:
+    oidc_issuer: token.actions.githubusercontent.com
+"#
+        );
+
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+        assert!(format!("{err:?}").contains("a2a.signing.oidc_issuer must be an https URL"));
     }
 
     #[test]

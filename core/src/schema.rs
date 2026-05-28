@@ -292,25 +292,49 @@ pub struct DaemonA2aPeerStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentCard {
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: String,
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
+    #[serde(default, rename = "supportedInterfaces")]
+    pub supported_interfaces: Vec<AgentInterface>,
+    #[serde(default, rename = "preferredTransport", skip_serializing_if = "Option::is_none")]
+    pub preferred_transport: Option<String>,
     #[serde(default)]
     pub skills: Vec<AgentCardSkill>,
     #[serde(default, rename = "defaultInputModes")]
     pub default_input_modes: Vec<String>,
     #[serde(default, rename = "defaultOutputModes")]
     pub default_output_modes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<serde_json::Value>,
+    #[serde(default)]
+    pub capabilities: AgentCardCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<serde_json::Value>,
-    #[serde(default)]
-    pub extensions: AgentCardExtensions,
+    #[serde(default, rename = "securitySchemes", skip_serializing_if = "Option::is_none")]
+    pub security_schemes: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security: Vec<serde_json::Value>,
+    #[serde(
+        default,
+        rename = "supportsAuthenticatedExtendedCard",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supports_authenticated_extended_card: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<AgentCardSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInterface {
+    pub url: String,
+    #[serde(rename = "protocolBinding")]
+    pub protocol_binding: String,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,15 +343,47 @@ pub struct AgentCardSkill {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
+    #[serde(default, rename = "inputModes", skip_serializing_if = "Vec::is_empty")]
+    pub input_modes: Vec<String>,
+    #[serde(default, rename = "outputModes", skip_serializing_if = "Vec::is_empty")]
+    pub output_modes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentCardExtensions {
-    #[serde(
-        rename = "x-confidential-agent/v1",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub confidential_agent: Option<AgentCardConfidential>,
+pub struct AgentCardCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(default, rename = "pushNotifications", skip_serializing_if = "Option::is_none")]
+    pub push_notifications: Option<bool>,
+    #[serde(default, rename = "stateTransitionHistory", skip_serializing_if = "Option::is_none")]
+    pub state_transition_history: Option<bool>,
+    #[serde(default, rename = "extendedAgentCard", skip_serializing_if = "Option::is_none")]
+    pub extended_agent_card: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<AgentExtension>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentExtension {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCardSignature {
+    pub protected: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,6 +426,10 @@ pub struct AgentCardRekor {
 
 fn default_agent_card_cache_ttl() -> u64 {
     300
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn default_bootstrap_mode() -> String {

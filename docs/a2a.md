@@ -1,421 +1,437 @@
 # Confidential A2A 接入指南
 
-Confidential Agent 提供 **A2A（Agent-to-Agent）** 能力，允许位于不同管理域、不同云账号或不同组织的 confidential agent 之间通过远程证明建立可信调用通道。本文档介绍 A2A 的架构、信任模型、操作流程与运维方法。
+Confidential Agent 的 A2A 能力用于把不同管理域里的 agent 连接起来：每一方仍独立管理云账号、state-dir、镜像构建、密钥和安全组，但应用可以通过 A2A AgentCard 发现对端，并通过 RATS-TLS/TNG 建立经过远程证明的本地转发通道。
 
-> AppSpec 字段定义见 [`spec.md` §8 / §9](spec.md)；本文档面向跨组织接入的运维与开发人员。
-
----
+本文档描述当前实现，不描述计划中的兼容层。AppSpec 字段定义见 [`spec.md`](spec.md)。
 
 ## 目录
 
-1. [适用场景](#1-适用场景)
-2. [设计概要](#2-设计概要)
-3. [架构总览](#3-架构总览)
-4. [信任模型](#4-信任模型)
+1. [当前能解决什么问题](#1-当前能解决什么问题)
+2. [实现模型](#2-实现模型)
+3. [AgentCard 格式与签名](#3-agentcard-格式与签名)
+4. [信任链](#4-信任链)
 5. [跨组织接入流程](#5-跨组织接入流程)
-6. [其他接入形态](#6-其他接入形态)
-7. [CLI 命令参考](#7-cli-命令参考)
-8. [运维操作](#8-运维操作)
-9. [排错指南](#9-排错指南)
-10. [当前能力边界](#10-当前能力边界)
-11. [常见问题](#11-常见问题)
+6. [真实 E2E：a2a-data-collab](#6-真实-e2ea2a-data-collab)
+7. [CLI 与运行状态](#7-cli-与运行状态)
+8. [排错](#8-排错)
+9. [能力边界](#9-能力边界)
 
----
+## 1. 当前能解决什么问题
 
-## 1. 适用场景
+A2A 适合这几类场景：
 
-A2A 在以下场景中提供基于远程证明的跨域接入能力：
+- **跨组织 agent 协作**：组织 A 的 agent 需要调用组织 B 的 agent，但双方不能共享 state-dir、云 AK/SK 或部署流水线。
+- **只开放证明后的服务端口**：对端只能访问 `:8089` AgentCard 发现端口和 `service.connect` 端口，不能直接进入内部 mesh 端口。
+- **自然语言 agent 编排**：应用层只需要知道 peer alias，例如 `data-owner`，实际 IP、端口、reference values 和 TNG ingress 由 daemon 动态生成。
+- **可审计接入**：网络放行由 `peerings.yaml` 管理，协议 desired state 由 `a2a.json` 管理，两个变更面分离。
 
-- **跨组织调用**：不同组织各自部署的 confidential agent 之间需要互相调用，每个组织独立管理云账号、密钥与运维。
-- **跨用户接入**：终端用户或客户在没有部署方 state-dir 与 cosign 私钥的情况下，凭 AgentCard URL 即可建立带远程证明的连接。
-- **合规网络环境**：云策略禁止 `0.0.0.0/0` ingress、要求安全组变更走审计流程的环境。
+核心对象有三个：
 
-A2A 提供的核心能力：
-
-- **标准协议发现**：基于 [A2A v0.3.0](https://a2a-protocol.org/v0.3.0/specification/) AgentCard，第三方 A2A SDK 可直接消费 AgentCard 的标准字段。
-- **基于 Rekor 的远程证明**：peer 的 TEE measurement 由 daemon 从 trusted Rekor transparency log 拉取，不依赖 AgentCard 自描述内容。
-- **网络授权与协议接入解耦**：网络层 CIDR 放通与协议层 peer 接入由独立的命令族管理，可以分别归属不同的运维角色与变更节奏。
-
----
-
-## 2. 设计概要
-
-### 2.1 三层分离
-
-| 层 | 关注点 | 配置文件 / 命令族 |
+| 对象 | 所在位置 | 作用 |
 |---|---|---|
-| 网络层 | 哪些来源 CIDR 可以访问哪些端口 | `peerings.yaml` + `peering` 命令族 |
-| 协议层 | 本组织希望调用哪些外部 agent | `a2a.json` + `a2a` 命令族 |
-| 应用层 | 业务通过本地 alias 端口调用 peer | `service-directory.json` |
+| `peerings.yaml` | host state-dir | 入向安全组授权，声明哪些 CIDR 能访问哪些 scope |
+| `a2a.json` | host state-dir | 出向 A2A desired state，声明本域要调用哪些 AgentCard URL |
+| `service-directory.json` | guest `/etc/cai/` | 应用运行时读取的本地 peer alias 到 TNG ingress 端口映射 |
 
-每一层独立增删，互不依赖。
+## 2. 实现模型
 
-### 2.2 单向语义
+### 2.1 网络层和协议层分离
 
-A2A 是 caller→callee 的单向 RPC 协议。`a2a add <peer-card-url>` 是出向意图声明，仅声明本组织希望调用对端，不影响对端配置。需要应用层双向通信时，由两端各自执行一次 `a2a add`。
-
-### 2.3 远程证明信任根
-
-AgentCard 仅承载指针（`rekorUrl` / `artifactId` / `artifactVersion` / `rvName`），不携带 reference value 内容、不携带 cosign 公钥。daemon 从本地配置的 trusted Rekor allowlist 拉取 SLSA payload，再交由 TNG/Trustee 完成 RATS-TLS 校验。详细模型见 §4。
-
-### 2.4 安全组由动态状态派生
-
-AppSpec 不再包含 `allowed_cidr` 与 `peers[]` 字段。所有 SG ingress 规则由 `peerings.yaml` 驱动，通过 `peering apply` 触发 Terraform 重渲染。
-
-### 2.5 发现端口与控制端口分离
-
-| 端口 | 用途 | SG scope |
-|---|---|---|
-| `:8088` | daemon `/status` `/health` | `status` |
-| `:8089` | `/.well-known/agent-card.json` | `agent_card` |
-
-两个端口由 daemon 内独立的 listener thread 处理，对应独立的 SG scope。`:8089` 不响应 `/status`、`:8088` 不响应 AgentCard 请求。
-
----
-
-## 3. 架构总览
-
-### 3.1 端口与 scope 矩阵
+`peering` 只处理入向网络授权，`a2a` 只处理出向 peer 声明。
 
 ```
-┌─────────────────────── confidential-agent guest VM ────────────────────────┐
-│                                                                            │
-│  :8088 daemon /status /health           — status      scope                │
-│  :8089 daemon /.well-known/agent-card   — agent_card  scope                │
-│  :8006 inject control                   — control     scope                │
-│  :22   debug ssh (debug image only)     — ssh         scope                │
-│                                                                            │
-│  service.connect 端口 (RATS-TLS server)           — connect + mesh scope   │
-│  service.ports - service.connect (confidential)   — mesh scope            │
-│                                                                            │
-│  TNG ingress (RATS-TLS client) → 127.0.0.1:<auto-alias> → peer:<port>      │
-│  /etc/cai/service-directory.json:                                          │
-│     services["beta"] = { ports: [{address: "127.0.0.1", port: 18000, mode:"connect"}] } │
-└────────────────────────────────────────────────────────────────────────────┘
+alpha wants to call beta:
+
+beta side:
+  peering add --role peer --cidr <alpha-vm-ip>/32
+  peering apply
+
+alpha side:
+  a2a add --alias beta http://<beta-ip>:8089/.well-known/agent-card.json
 ```
 
-### 3.2 `a2a add` 触发后的数据流
+如果业务需要双向调用，双方各自执行一次 `a2a add`。A2A 本身不是双向 invite/accept 协议。
+
+### 2.2 端口与 scope
+
+| 端口 | 作用 | peering scope |
+|---|---|---|
+| `:8088` | daemon `/status` / `/health` | `status` |
+| `:8089` | daemon `/.well-known/agent-card.json` | `agent_card` |
+| `:8006` | challenge inject control | `control` |
+| `:22` | debug SSH，仅 debug image | `ssh` |
+| `service.connect[]` | RATS-TLS server 入口 | `connect` |
+| `service.ports - service.connect` | 内部 mesh 端口 | `mesh` |
+
+`role=operator` 默认包含 `control,status,ssh,agent_card,connect`；`role=peer` 默认包含 `agent_card,connect`。peer 默认不打开 `mesh`。
+
+### 2.3 `a2a add` 后发生什么
 
 ```mermaid
 flowchart TB
-    subgraph host["host (CLI)"]
-        ADD["confidential-agent a2a add &lt;url&gt;"]
-        CLIFETCH["best-effort fetch<br/>+ lint preview"]
-        A2AJSON["state-dir/a2a.json"]
+    subgraph host["host / CLI"]
+        ADD["a2a add <AgentCard URL>"]
+        PREVIEW["best-effort AgentCard preview"]
+        STATE["state-dir/a2a.json"]
         BUNDLE["state-dir/a2a-bundle.json"]
-        INJECT["challenge_inject<br/>:8006"]
+        INJECT["challenge_inject to active services"]
     end
 
-    subgraph guest["guest (daemon)"]
-        APPLY["a2a-bundle.json<br/>(via CDH challenge resource)"]
-        FETCH["fetch peer&apos;s :8089/.well-known/agent-card.json<br/>+ verify (publicIp / rekorUrl / Rekor pull)"]
-        CACHE["A2A peer cache<br/>(TTL clamp + negative backoff)"]
-        TNG["TNG ingress<br/>+ service-directory.json"]
-        APP["application:<br/>service-directory&nbsp;&rarr;&nbsp;127.0.0.1:&lt;alias&gt;"]
+    subgraph guest["guest / daemon"]
+        READ["read cagent_a2a_bundle"]
+        FETCH["fetch peer AgentCard"]
+        VERIFY["schema + optional signature + publicIp + Rekor allowlist"]
+        CACHE["A2A cache with TTL/backoff"]
+        TNG["render TNG ingress"]
+        DIR["write /etc/cai/service-directory.json"]
     end
 
-    REKOR["Trusted Rekor<br/>(default sigstore)"]
-
-    ADD --> CLIFETCH
-    CLIFETCH -->|preview / preview_error| A2AJSON
-    A2AJSON --> BUNDLE
-    BUNDLE --> INJECT
-    INJECT --> APPLY
-    APPLY --> FETCH
-    FETCH -->|rekorUrl 指针| REKOR
-    REKOR -->|SLSA payload| FETCH
-    FETCH --> CACHE
-    CACHE --> TNG
-    TNG --> APP
+    ADD --> PREVIEW --> STATE --> BUNDLE --> INJECT --> READ
+    READ --> FETCH --> VERIFY --> CACHE --> TNG --> DIR
 ```
 
-CLI 与 daemon 的职责划分：
+CLI preview 是 best-effort：管理机可能访问不了对端 `:8089`，失败不阻塞写入。guest daemon 的 fetch 和校验才是权威结果，会反映在 `status --live` 的 `A2A Peers` 段里。
 
-| 角色 | 出口 IP | 触发时机 | 失败语义 |
-|---|---|---|---|
-| CLI fetch | 管理机出口 IP | `a2a add` / `a2a sync` | best-effort，失败仅记录，不阻塞 |
-| daemon fetch | 服务 VM 公网 IP | 每次 daemon poll，受 cache TTL 控制 | 权威结果，决定服务可用性 |
+## 3. AgentCard 格式与签名
 
-a2a-bundle 仅携带 `url + alias + scoped_services + fingerprint`，不携带 cached card 与 verification 状态，由 daemon 独立完成 fetch 与校验。
+### 3.1 当前 AgentCard 形态
 
-### 3.3 SG 渲染规则
+当前实现发布 A2A v1 风格 AgentCard。CA 专用扩展只接受 `capabilities.extensions[]` 中 URI 为 `https://confidential-agent.dev/extensions/tee-rekor/v1` 的条目。旧版顶层 `extensions["x-confidential-agent/v1"]` 不再被消费；遇到这种卡片会提示对端仍在使用 legacy AgentCard extension。
 
-`peerings.yaml` 中每条 entry 的 `scope` 决定它会被渲染为哪些端口的 ingress 规则：
+最小有效 AgentCard 示例：
 
-| scope | 端口 | 默认包含的 role |
-|---|---|---|
-| `control` | `:8006` | operator |
-| `status` | `:8088` | operator |
-| `ssh` | `:22`（仅 debug 镜像） | operator |
-| `agent_card` | `:8089` | operator + peer |
-| `connect` | `service.connect` 端口 | operator + peer |
-| `mesh` | `service.ports - service.connect` | 显式 scope / 同 state-dir mesh |
-
-`role=operator` 默认不包含 `mesh`：运维通过 `connect` 端口走 RATS-TLS 接入，不直接打开 mesh 全端口。
-
----
-
-## 4. 信任模型
-
-### 4.1 校验流程
-
+```json
+{
+  "protocolVersion": "1.0",
+  "name": "data-owner-agent",
+  "description": "Data owner A2A agent",
+  "supportedInterfaces": [
+    {
+      "url": "http://203.0.113.20:18789/a2a",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "preferredTransport": "JSONRPC",
+  "skills": [
+    {
+      "id": "aggregate-risk",
+      "name": "Aggregate Risk Analysis",
+      "description": "Return aggregate risk evidence"
+    }
+  ],
+  "capabilities": {
+    "extensions": [
+      {
+        "uri": "https://confidential-agent.dev/extensions/tee-rekor/v1",
+        "required": true,
+        "params": {
+          "id": "data-owner",
+          "cacheTtlSec": 300,
+          "publicIp": "203.0.113.20",
+          "ports": [
+            { "name": "port-18789", "port": 18789 }
+          ],
+          "rekor": {
+            "rekorUrl": "https://rekor.sigstore.dev",
+            "artifactId": "data-owner-release",
+            "artifactType": "uki",
+            "artifactVersion": "20260528000000",
+            "rvName": "measurement.uki.SHA-384"
+          },
+          "tee": "tdx"
+        }
+      }
+    ]
+  }
+}
 ```
-拉到 AgentCard
-  ↓
-publicIp ∈ URL host 解析结果
-rekorUrl ∈ trusted Rekor allowlist
-  ↓
-按 AgentCard.rekor 指针从 trusted Rekor 拉 SLSA payload
-  ↓
-SLSA measurement → TNG/Trustee reference values
-  ↓
-RATS-TLS 握手：peer TEE quote 必须匹配 measurement
-  ↓
-握手成功
+
+强必填字段分两类：
+
+| 类别 | 字段 |
+|---|---|
+| A2A 描述字段 | `protocolVersion`、`name`、`description`、`supportedInterfaces[].url`、`supportedInterfaces[].protocolBinding`、`supportedInterfaces[].protocolVersion` |
+| CA 安全字段 | CA extension `params.id`、`publicIp`、`ports[]`、`rekor.*`、`tee` |
+
+### 3.2 在 AppSpec 中发布 AgentCard
+
+```yaml
+a2a:
+  id: analyst-agent
+  name: Analyst Agent
+  version: "1.0.0"
+  description: "LLM analyst agent"
+  interfaces:
+    - protocol_binding: JSONRPC
+      port: 18789
+      path: /a2a
+  skills:
+    - id: supply-chain-risk-analysis
+      name: Supply Chain Risk Analysis
+      tags: [analysis, a2a, confidential]
 ```
 
-### 4.2 当前模型保证的属性
+要求：
+
+- `service.connect` 至少包含一个端口。
+- `a2a.interfaces[].port` 必须在 `service.connect` 中。
+- `attestation.reference_values` 必须为 `rekor`，否则 AgentCard 中没有可公开审计的 Rekor metadata。
+
+未显式配置 `interfaces` 时，CLI 会从 `service.connect[]` 推导 `JSONRPC` + `/a2a`。
+
+### 3.3 Sigstore Keyless AgentCard 签名
+
+本服务要发布签名 AgentCard 时，在 spec 中开启：
+
+```yaml
+a2a:
+  signing:
+    mode: sigstore-keyless
+    required: true
+    expected_issuer: https://token.actions.githubusercontent.com
+    expected_subject: repo:org/repo:ref:refs/heads/main
+```
+
+`deploy` / `inject` 阶段会调用 `cosign sign-blob`，对去掉 `signatures` 字段后的 canonical AgentCard JWS signing input 签名，并把 Sigstore bundle 写入 `signatures[].header["x-confidential-agent-sigstore-bundle"]`。
+
+非交互式 CI 建议设置：
+
+```bash
+export CA_A2A_SIGSTORE_IDENTITY_TOKEN="$OIDC_JWT"
+```
+
+该变量会传给 `cosign sign-blob --identity-token`。没有 identity token 或 CI OIDC 环境时，keyless signing 可能进入交互式登录，不适合自动化 E2E。
+
+对端消费签名 AgentCard 时，必须在 `a2a add` 中配置 signer pin 才会验签：
+
+```bash
+confidential-agent a2a add --alias data-owner \
+  --signer-issuer https://token.actions.githubusercontent.com \
+  --signer-subject repo:org/repo:ref:refs/heads/main \
+  http://203.0.113.20:8089/.well-known/agent-card.json
+```
+
+`a2a.signing.expected_issuer` / `expected_subject` 描述“我发布的 AgentCard 应该由谁签”；`a2a add --signer-*` 描述“我消费的 peer AgentCard 必须由谁签”。当前 CLI 不会从本地 spec 自动推断对端 signer pin，因为本地 spec 描述的是本服务身份，不等价于 peer 身份。
+
+未配置 signer pin 时，daemon 不验证 `signatures[]`，仍会执行 A2A schema、`publicIp` 和 Rekor allowlist 校验。
+
+## 4. 信任链
+
+daemon fetch peer AgentCard 后按顺序处理：
+
+1. 校验 URL path 固定为 `/.well-known/agent-card.json`，content-type 为 JSON，body 不超过大小上限。
+2. 校验 AgentCard A2A 描述字段和 CA extension 安全字段。
+3. 如果 peer 配置 signer pin，校验 `signatures[]` 中至少一个 Sigstore keyless 签名满足 issuer/subject pin。
+4. 校验 AgentCard `publicIp` 是 URL host 的 IPv4 解析结果之一。
+5. 校验 `rekorUrl` 在本地 trusted Rekor allowlist 中，默认只信任 `https://rekor.sigstore.dev`。
+6. 用 AgentCard 的 Rekor 指针生成 TNG reference values。
+7. TNG/RATS-TLS 握手时验证对端 TEE quote 与 reference values 匹配。
 
 握手成功意味着：
 
-- 连接对象运行在 trusted Rekor 上具有合法 SLSA provenance 的 confidential-agent 镜像中。
-- 该 confidential-agent 的 TEE measurement 与 SLSA payload 中声明的 measurement 一致。
-- AgentCard 中声明的 `publicIp` 与本次访问的 URL host 解析结果一致，避免 HTTP body 将后续连接重定向至任意 IP。
+- 调用目标运行在符合 reference values 的 confidential VM 中。
+- AgentCard 指向的 Rekor metadata 来自本地信任的 Rekor 实例。
+- 如果配置了 signer pin，AgentCard 由指定 OIDC issuer/subject 对应的 keyless 身份签署。
 
-### 4.3 当前模型不保证的属性
+握手成功不意味着：
 
-握手成功**不**意味着：
+- 对端组织身份在未配置 signer pin 时已被证明。
+- 对端业务逻辑一定不会泄露数据；业务层仍要做最小化返回和探针验证。
+- Rekor 或上游 build pipeline 自身没有被攻陷。
 
-- 连接对象属于某个特定组织。任何能够同时控制以下三项的攻击者，都能让握手通过：
-  1. 部署一个合法的 confidential-agent 实例；
-  2. 将其 SLSA provenance 上传至同一个 trusted Rekor；
-  3. 通过 DNS 或路由层影响目标 URL host 的解析结果。
-- 对端 build pipeline 自身未被攻陷。
-- Rekor inclusion proof 在所有边界条件下均有效。
-
-后续增强方向见 §10。
-
-### 4.4 trusted Rekor allowlist 配置
-
-默认仅信任：
-
-```
-https://rekor.sigstore.dev
-```
-
-CLI 与 daemon 通过环境变量扩展（不可清空）：
+扩展 Rekor allowlist：
 
 ```bash
 export CA_TRUSTED_REKOR_URLS="https://rekor.sigstore.dev,https://rekor.example.com"
 ```
 
----
-
 ## 5. 跨组织接入流程
 
-以下示例展示两个组织 alpha 与 beta 各自部署 OpenClaw confidential agent 并互相 A2A 调用的完整流程。
+下面以 alpha 调用 beta 为例。
 
-> 完整的端到端脚本：`tools/e2e/run.sh openclaw-a2a`。
-
-### 5.1 前置条件
-
-- 两个云账号，或同账号下两段隔离的 VPC/subnet
-- 两个管理机分别可访问公网与各自的云控制面
-- `confidential-agent` CLI 与 `shelter` CLI 已安装
-- 云账号凭证已配置（access key 或 aliyun CLI profile）
-- `cosign` 已安装，用于生成 build 期签名密钥
-
-### 5.2 步骤总览
-
-```
-alpha-mgmt                                          beta-mgmt
-─────────────                                       ─────────────
-1. peering add --role operator <alpha-mgmt-ip>      1. peering add --role operator <beta-mgmt-ip>
-2. build && deploy alpha-spec.yaml                  2. build && deploy beta-spec.yaml
-                       │                                                  │
-                       └──── 通过带外通道交换公网 IP ────┘
-3. peering add --role peer <beta-public-ip>         3. peering add --role peer <alpha-public-ip>
-4. peering apply                                    4. peering apply
-5. a2a add http://<beta-public-ip>:8089/...         5. a2a add http://<alpha-public-ip>:8089/...
-                       │                                                  │
-                       └──── 应用层调用产生双向 marker ────┘
-```
-
-### 5.3 Step 1：配置 operator peering
-
-`deploy` 与 `inject` 启动时执行 fail-fast 检查：要求至少一条 `role=operator` peering 同时包含 `control` 与 `status` scope，且当前管理机的出口 IP 落在某条 `control` scope 的 CIDR 内。
+### 5.1 部署前准备 operator peering
 
 ```bash
-# alpha-mgmt
 confidential-agent --state-dir ./alpha-state \
-  peering add --role operator --cidr <alpha-mgmt-ip>/32 --label alpha-ops
+  peering add --role operator --cidr <alpha-ops-cidr> --label alpha-ops
 
-# beta-mgmt
 confidential-agent --state-dir ./beta-state \
-  peering add --role operator --cidr <beta-mgmt-ip>/32 --label beta-ops
+  peering add --role operator --cidr <beta-ops-cidr> --label beta-ops
 ```
 
-如需覆盖整段 jumphost 网段，可直接使用 `--cidr 203.0.113.0/24`。
+`deploy` / `inject` 会检查 operator peering 是否包含 `control+status`，并尽量确认当前管理机出口 IP 被 `control` scope 覆盖。
 
-### 5.4 Step 2：build 与 deploy
+### 5.2 build / deploy
 
 ```bash
-confidential-agent --state-dir ./alpha-state build  --spec alpha-spec.yaml
-confidential-agent --state-dir ./alpha-state deploy --spec alpha-spec.yaml
+confidential-agent --state-dir ./alpha-state build  --spec alpha.yaml
+confidential-agent --state-dir ./alpha-state deploy --spec alpha.yaml
+
+confidential-agent --state-dir ./beta-state build  --spec beta.yaml
+confidential-agent --state-dir ./beta-state deploy --spec beta.yaml
 ```
 
-AppSpec 中必须包含 `a2a` 块（参考 [`examples/openclaw/openclaw.yaml`](../examples/openclaw/openclaw.yaml)）：
-
-```yaml
-a2a:
-  id: alpha-openclaw
-  name: alpha-openclaw
-  version: "1.0.0"
-  description: "Alpha confidential agent"
-  skills:
-    - id: chat
-      name: Chat
-      description: "OpenClaw gateway chat"
-```
-
-deploy 完成后，`<state-dir>/services/<service>/state.json` 中的 `deploy.public_ip` 即为对外服务地址；daemon 在 guest 内通过 `:8089` 暴露 AgentCard。
-
-A2A 要求 `attestation.reference_values=rekor`，否则 spec 渲染阶段会拒绝。
-
-OpenClaw 应用层如需通过 `/v1/responses` 调用，需要开启 `gateway.http.endpoints.responses.enabled=true`。`examples/openclaw/openclaw.json` 已默认配置该项。
-
-### 5.5 Step 3：交换公网 IP
-
-部署完成后通过带外通道交换两端的服务公网 IP：
+部署完成后，服务公网 IP 在：
 
 ```bash
-ALPHA_IP=$(jq -r '.deploy.public_ip' ./alpha-state/services/openclaw/state.json)
-BETA_IP=$(jq  -r '.deploy.public_ip' ./beta-state/services/openclaw/state.json)
+jq -r '.deploy.public_ip' ./alpha-state/services/<service>/state.json
+jq -r '.deploy.public_ip' ./beta-state/services/<service>/state.json
 ```
 
-### 5.6 Step 4：配置 peer peering
+### 5.3 入向 peer peering
 
-`peering` 表示入向授权。alpha 将 `BETA_IP` 加入自身 peerings，意味着允许 beta 入向访问 alpha 的 `:8089` 与 `service.connect` 端口。A2A 是 connect 模型，不默认开放 confidential mesh 端口。
+beta 必须允许 alpha 服务 VM 访问 beta 的 `agent_card` 和 `connect` scope：
 
 ```bash
-# alpha-mgmt
-confidential-agent --state-dir ./alpha-state \
-  peering add --role peer --cidr ${BETA_IP}/32 --label beta-org
-
-# beta-mgmt
 confidential-agent --state-dir ./beta-state \
-  peering add --role peer --cidr ${ALPHA_IP}/32 --label alpha-org
-
-# 触发 Terraform 渲染
-confidential-agent --state-dir ./alpha-state peering apply
-confidential-agent --state-dir ./beta-state  peering apply
+  peering add --role peer --cidr <alpha-service-ip>/32 --label alpha
+confidential-agent --state-dir ./beta-state peering apply
 ```
 
-`role=peer` 默认 scope 为 `[agent_card, connect]`。如果确实要开放 confidential mesh 端口，需要显式设置 `scope: [agent_card, mesh]` 或额外声明 mesh scope。
+如果 beta 也要调用 alpha，alpha 侧同样添加 beta 服务 VM IP。
 
-### 5.7 Step 5：声明 a2a peer
+### 5.4 出向 a2a desired state
 
-`a2a add` 表示出向调用意图。
+alpha 声明要调用 beta：
 
 ```bash
-# alpha 调 beta
-confidential-agent --state-dir ./alpha-state \
-  a2a add --alias beta http://${BETA_IP}:8089/.well-known/agent-card.json
-
-# beta 调 alpha；只有需要反向应用调用时才需要
-confidential-agent --state-dir ./beta-state \
-  a2a add --alias alpha http://${ALPHA_IP}:8089/.well-known/agent-card.json
+confidential-agent --state-dir ./alpha-state a2a add \
+  --alias beta \
+  --signer-issuer <beta-agent-card-signer-issuer> \
+  --signer-subject <beta-agent-card-signer-subject> \
+  http://<beta-service-ip>:8089/.well-known/agent-card.json
 ```
 
-执行结果：
+`--signer-issuer` / `--signer-subject` 只在 beta 发布签名 AgentCard 时使用。没有 OIDC token、未启用 `a2a.signing.required=true` 的 legacy/unsigned 流程中，去掉这两个参数即可；daemon 仍会执行 schema、`publicIp`、Rekor allowlist 和 RATS-TLS 校验。
 
-- `<state-dir>/a2a.json` 写入 desired peer 记录
-- `<state-dir>/a2a-bundle.json` 重新渲染并 inject 至所有 active service 的 daemon
-- daemon 在 guest 内 fetch 对端 AgentCard，校验 `publicIp` 与 `rekorUrl`，按 AgentCard 中的 connect `ports` 配置 TNG ingress，写入 `/etc/cai/service-directory.json`
+执行后：
 
-CLI fetch 失败不阻塞写入；daemon 端 fetch 是权威结果。
+- host 写入 `<state-dir>/a2a.json`，当前版本为 `2`。
+- host 渲染 `<state-dir>/a2a-bundle.json`，并 inject 给 active service。
+- guest daemon fetch beta AgentCard，完成校验后生成 TNG ingress。
+- 应用在 `/etc/cai/service-directory.json` 里看到 alias `beta`。
 
-默认 fan-out 时，每个 active service VM 都会独立拉取并校验对端 AgentCard；因此对端 peerings 必须覆盖本组织所有 active service 的公网 IP。CLI 会在 `a2a add` 后提示 `remote side must allow these caller service public IPs ...`，需要将提示中的每个 `/32` 都加入对端 peerings 并执行 `peering apply`。若只希望特定 service 调用 peer，使用 `--service` 限定 fan-out 范围。
+`a2a.json version: 1` 不再自动迁移。没有存量服务时，删除旧文件并重新执行 `a2a add`。
 
-### 5.8 Step 6：应用层调用
+### 5.5 应用调用
 
-应用通过 `/etc/cai/service-directory.json` 获取 peer 的本地 alias，访问 `127.0.0.1:<alias>` 即可。`connect` 命令将 `service.connect` 端口暴露至本地：
+应用不直接写 beta IP。它读取 `/etc/cai/service-directory.json`，找到 peer alias 对应的本地端口，然后对 `127.0.0.1:<port>` 发起 HTTP/A2A 请求。该本地端口由 TNG ingress 转发到 beta 的 `service.connect` 端口，并在连接时完成 RATS-TLS 验证。
+
+管理机调试本服务时使用：
 
 ```bash
-confidential-agent --state-dir ./alpha-state connect &
-# stdout 示例：connect 127.0.0.1:18789 -> <alpha-public-ip>:18789 (openclaw)
-
-node tools/e2e/probes/openclaw-a2a-responses-probe.mjs \
-  --url http://127.0.0.1:18789 \
-  --token "$ALPHA_TOKEN" \
-  --peer beta \
-  --message "请只回复 CA_A2A_BETA_OK，不要输出其他内容。" \
-  --expect CA_A2A_BETA_OK
+confidential-agent --state-dir ./alpha-state connect start \
+  --service <alpha-service> \
+  --ready-json alpha-ready.json \
+  --wait-ready 180
 ```
 
-成功返回 `{"ok": true, "finalText": "CA_A2A_BETA_OK"}`。
-
-### 5.9 Step 7：查看运行状态
+停止：
 
 ```bash
-confidential-agent --state-dir ./alpha-state status --live
+confidential-agent --state-dir ./alpha-state connect stop \
+  --ready-json alpha-ready.json
 ```
 
-输出包含本地 service 概览、Daemon Live Status 与 A2A Peers 三段：
+## 6. 真实 E2E：a2a-data-collab
 
+`tools/e2e/run.sh a2a-data-collab` 是当前推荐的 A2A 端到端样例。它不依赖 OpenClaw 场景，而是构造一个更典型的跨组织 agent 协作流程。
+
+### 6.1 背景
+
+业务问题：分析方希望评估 `AlphaCorp` 的供应链风险，但原始数据属于数据方，包含客户姓名、订单号、区域、风险分和事件类别。数据方不希望把原始行暴露给分析方，只允许返回聚合统计和解释。
+
+两个组织：
+
+| 组织 | Agent | 私有能力 |
+|---|---|---|
+| Analyst Org | Analyst Agent | 接收用户自然语言任务，规划要向数据方请求什么聚合信息，再综合最终答案 |
+| Data Owner Org | Data Owner Agent | 持有 `private-risk-data.jsonl`，只能把本地数据聚合后交给 LLM 总结 |
+
+两个 agent 都是 `examples/a2a-data-collab/files/agent-server.mjs` 启动的真实 HTTP JSON-RPC A2A server，背后通过 DashScope compatible `/chat/completions` 调用真实 LLM。没有 mock LLM、没有固定字符串回复。
+
+### 6.2 运行链路
+
+```mermaid
+sequenceDiagram
+    participant Probe as E2E Probe
+    participant Analyst as Analyst Agent
+    participant Dir as service-directory
+    participant TNG as TNG ingress
+    participant Owner as Data Owner Agent
+    participant LLM as DashScope LLM
+
+    Probe->>Analyst: message/send("Assess AlphaCorp supply-chain risk...")
+    Analyst->>LLM: 规划给数据方的自然语言子任务
+    Analyst->>Dir: 查找 peer alias data-owner
+    Analyst->>TNG: POST 127.0.0.1:<alias>/a2a
+    TNG->>Owner: RATS-TLS 到 Data Owner service.connect
+    Owner->>Owner: 读取私有 JSONL 并计算聚合
+    Owner->>LLM: 只基于聚合 artifact 总结风险
+    Owner-->>Analyst: A2A completed task + aggregate artifact
+    Analyst->>LLM: 只基于 aggregate artifact 生成最终答案
+    Analyst-->>Probe: completed task
 ```
-A2A Peers
-SERVICE    PEER    STATE    FETCH    SUCCESS    PORTS    ERROR
-openclaw   beta    ok       12s      12s        18000    -
-```
 
-`STATE` 字段含义见 §9.4。
+E2E 覆盖的基础设施路径：
 
----
+1. 两个 state-dir 分别 build/deploy 两台 confidential VM。
+2. 两边添加 operator peering。
+3. 两边交换服务公网 IP 并添加 peer peering。
+4. 默认运行 unsigned AgentCard 流程，不需要 OIDC token；设置 `E2E_A2A_SIGNING=1` 后才开启 Sigstore Keyless signing。
+5. signed 模式下，`a2a add` 使用 signer pin 校验 peer AgentCard；脚本还会先用错误 signer subject 添加临时 peer，确认 daemon 严格拒绝。
+6. daemon 通过 AgentCard、Rekor metadata 和可选 signer pin 生成 TNG ingress。
+7. Analyst 应用通过 `/etc/cai/service-directory.json` 找到 `data-owner`，发起真实 A2A 调用。
+8. Probe 通过 `connect start` 暴露 Analyst 的 `/a2a`，发送自然语言任务并验证结果。
 
-## 6. 其他接入形态
+### 6.3 通过标准
 
-### 6.1 单向调用
+Probe 代码在 `tools/e2e/probes/a2a-data-collab-probe.mjs`。通过条件：
 
-仅 alpha 调用 beta、beta 不反向调用时，仅在 alpha 侧执行 §5 中的 step 1–6；beta 侧仅需在 step 4 加入对应的 peer peering，不需要执行任何 `a2a` 命令。
+- A2A response 是 `completed` task。
+- 最终文本看起来是针对 `AlphaCorp` 的聚合风险分析。
+- data artifact 中包含 Data Owner 返回的聚合结果。
+- 聚合结果符合测试数据：`record_count=6`，`high_risk_count=3`。
+- 响应全文和 artifact 不包含原始客户姓名 `Ada Lin`、`Ben Zhao`、`Cara Wu`、`Dev Patel`、`Eli Chen`、`Faye Kim`。
+- 响应全文和 artifact 不包含订单号模式 `ORD-ALPHA-\d+`。
 
-### 6.2 凭 AgentCard URL 接入
+这个样例的价值在于它同时验证了三层能力：基础设施信任链、A2A 协议发现与路由、真实自然语言 agent 协作。最终结果不是单纯 health check，而是一个经过 LLM 推理和跨 agent 委托的业务输出。
 
-第三方调用方未持有部署方的 state-dir 与 cosign 密钥时，可使用 `connect --from-card`：
+### 6.4 运行方式
+
+默认 unsigned 模式需要 Aliyun、DashScope 和 Rekor/cosign：
 
 ```bash
-confidential-agent connect --from-card http://${ALPHA_IP}:8089/.well-known/agent-card.json
+export ALICLOUD_ACCESS_KEY='...'
+export ALICLOUD_SECRET_KEY='...'
+export DASHSCOPE_API_KEY='...'
+export DASHSCOPE_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export DASHSCOPE_MODEL='qwen3.7-max'
+
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+  tools/e2e/run.sh a2a-data-collab
 ```
 
-CLI 拉取 AgentCard、完成 trust 校验、渲染 TNG client 配置并在本地端口建立 RATS-TLS 接入。alpha 侧需将调用方 IP 加入 peerings：
+开启 signed 模式时再提供 Sigstore keyless 身份：
 
 ```bash
-confidential-agent --state-dir ./alpha-state \
-  peering add --role peer --cidr <client-ip>/32 --label charlie
-confidential-agent --state-dir ./alpha-state peering apply
+export E2E_A2A_SIGNING=1
+export CA_A2A_SIGSTORE_IDENTITY_TOKEN="$OIDC_JWT"
 ```
 
-### 6.3 限定 fan-out 范围
-
-默认情况下 `a2a add` 将外部 peer 关系 fan-out 至本管理域所有 active services。如需限定 peer 仅对特定 service 可见：
+如果不设置 `A2A_SIGNER_ISSUER` / `A2A_SIGNER_SUBJECT`，runner 会从 `CA_A2A_SIGSTORE_IDENTITY_TOKEN` 的 JWT payload 中读取 `iss` / `sub`。也可以显式覆盖：
 
 ```bash
-confidential-agent a2a add --alias beta-prod \
-  --service prod,staging \
-  http://${BETA_PROD_IP}:8089/.well-known/agent-card.json
+export A2A_SIGNER_ISSUER='https://token.actions.githubusercontent.com'
+export A2A_SIGNER_SUBJECT='repo:org/repo:ref:refs/heads/main'
 ```
 
-`--service` 留空表示全 fan-out。
+## 7. CLI 与运行状态
 
-运维上需要注意：全 fan-out 不是只让 OpenClaw 一个 VM 拉取对端 AgentCard，而是本管理域内所有 active service 都会收到 desired peer，并各自从自己的公网 IP 发起 daemon fetch。如果对端只放行了某一个 caller service 的 IP，其他 service 会在 `status --live` 的 A2A Peers 中显示 `agent card transport error`。此时要么补齐对端 peerings，要么重新用 `--service` 只把 peer 分发给需要它的 service。
+### 7.1 peering
 
----
-
-## 7. CLI 命令参考
-
-### peering（网络层）
-
-```
+```bash
 confidential-agent peering add    --role operator|peer --cidr <CIDR> --label <name> [--scope ...]
 confidential-agent peering list
 confidential-agent peering show   <label>
@@ -423,243 +439,92 @@ confidential-agent peering remove <label>
 confidential-agent peering apply  [--dry-run]
 ```
 
-`--scope` 可选值：`control` / `status` / `ssh` / `agent_card` / `connect` / `mesh`，未指定时按 §3.3 表中的 role 默认值。
+`peering add/remove` 只改本地 desired state；`peering apply` 才会更新云上安全组。
 
-### a2a（协议层）
+### 7.2 a2a
 
-```
-confidential-agent a2a add    [--alias <id>] [--service <s1>,<s2>] <agent-card-url>
+```bash
+confidential-agent a2a add \
+  [--alias <id>] \
+  [--service <s1>,<s2>] \
+  [--signer-issuer <issuer> --signer-subject <subject>] \
+  <agent-card-url>
+
 confidential-agent a2a list
-confidential-agent a2a show   <alias-or-url>
+confidential-agent a2a show <alias-or-url>
+confidential-agent a2a sync [--alias <id>] [--all]
 confidential-agent a2a remove <alias-or-url>
-confidential-agent a2a sync   [--alias <id>] [--all]
 ```
 
-### connect
+`--service` 限定 peer 只分发给指定本地 service；为空时 fan-out 到本 state-dir 下所有 active services。fan-out 场景下，对端 peering 必须覆盖所有会 fetch AgentCard 的本地 service VM 公网 IP。
 
-```
-confidential-agent connect                                       # 默认从本地 state-dir 渲染配置
-confidential-agent connect --from-card <agent-card-url>          # 仅依赖 AgentCard URL
-```
-
-### status
-
-```
-confidential-agent status                # 本地 service 概览
-confidential-agent status --live         # 含 daemon /status 与 A2A peers
-confidential-agent status --live --json  # 结构化输出，供监控脚本消费
-```
-
-### deploy / inject
-
-```
-confidential-agent deploy --spec ... [--skip-peering-check]
-confidential-agent inject --spec ... [--skip-peering-check]
-```
-
-`--skip-peering-check` 仅在出口 IP 探测不准确的特殊网络环境下使用。
-
----
-
-## 8. 运维操作
-
-### 8.1 增加 peer
+### 7.3 status
 
 ```bash
-confidential-agent peering add --role peer --cidr <peer-ip>/32 --label <name>
-confidential-agent peering apply
-confidential-agent a2a add --alias <name> http://<peer-ip>:8089/.well-known/agent-card.json
+confidential-agent status --live
+confidential-agent status --live --json
 ```
 
-`peering add/remove` 不会自动触发 `peering apply`，以便 SG 变更可纳入审计流程。
-
-### 8.2 移除 peer
-
-```bash
-confidential-agent a2a remove <alias-or-url>
-confidential-agent peering remove <label>
-confidential-agent peering apply
-```
-
-### 8.3 peer 重建或 IP 变更
-
-对端重新部署后服务 IP 变更，需要：
-
-```bash
-confidential-agent a2a remove <old-alias>
-confidential-agent peering remove <old-label>
-confidential-agent peering add --role peer --cidr <new-ip>/32 --label <new-label>
-confidential-agent peering apply
-confidential-agent a2a add --alias <name> http://<new-ip>:8089/.well-known/agent-card.json
-```
-
-### 8.4 重新同步 AgentCard desired state
-
-daemon 按 AgentCard 中的 `cacheTtlSec` 自动刷新（默认 300 秒，clamp 至 [60s, 3600s]）。需要重新执行 CLI 侧预览校验并把当前 desired state 重新注入 guest 时：
-
-```bash
-confidential-agent a2a sync --alias <name>      # 单个
-confidential-agent a2a sync --all               # 全部
-```
-
-`a2a sync` 重新渲染 a2a-bundle 并 inject。若 URL / alias / service scope 发生变化，daemon 会因 bundle fingerprint 变化失效缓存并重新拉取；若 desired state 没变，daemon 会继续遵守现有 AgentCard cache TTL。
-
-### 8.5 status 输出解读
-
-```
-$ confidential-agent status --live
-SERVICE   PHASE   ...
-openclaw  active  ...
-
-Daemon Live Status
-SERVICE   DAEMON_PHASE   APP    MESH   SSH   ERROR
-openclaw  running        ready  ready  -     -
-
-A2A Peers
-SERVICE   PEER    STATE   FETCH   SUCCESS   PORTS   ERROR
-openclaw  beta    ok      12s     12s       18000   -
-openclaw  charlie unreachable -   -         -       transport error: ...
-```
-
-`A2A Peers` 段在没有 a2a peer 时不渲染。
-
-### 8.6 监控集成
-
-`status --live --json` 输出 JSON 结构供监控脚本消费。建议对 `a2a_peers[*].state` 持续处于 `error` 或 `stale` 的情况配置告警；双向 RA mesh 的 e2e 断言应等待 `mesh_generation` 达到期望值且 `mesh_ready=true`。
-
----
-
-## 9. 排错指南
-
-### 9.1 deploy fail-fast 错误
-
-| 错误信息片段 | 原因 | 处理方式 |
-|---|---|---|
-| `no operator peering with control+status scope` | 缺少 operator peering | 执行 `peering add --role operator --cidr ... --label ...` |
-| `outbound IP X is not covered` | 当前管理机出口 IP 未被任何 operator control CIDR 覆盖 | 加入对应 CIDR；或在特殊网络下使用 `--skip-peering-check` |
-| `unknown field 'security'` 或 `unknown field 'peers'` | spec 中残留旧版字段 | 执行 `confidential-agent migrate <spec>` |
-
-### 9.2 `a2a list` 状态分类
-
-CLI fetch 失败不阻塞 desired state 写入。`a2a list` 输出的状态列含义：
-
-| 显示值 | 含义 | 处理建议 |
-|---|---|---|
-| `verified` | CLI fetch 成功且所有 trust 校验通过 | 正常 |
-| `unverified` | 未尝试 CLI fetch 或无结果 | 执行 `a2a sync` |
-| `unreachable` | transport 失败（DNS / connect / read / 非 200） | 通常为对端 peering 未放行管理机 IP；以 `status --live` 中 daemon 端 STATE 为准 |
-| `untrusted` | `publicIp` 与 URL host 解析不一致，或 `rekorUrl` 不在 allowlist | 对端 AgentCard 不可信，确认对端配置 |
-| `invalid` | schema 缺字段、缺 `extensions["x-confidential-agent/v1"]`、JSON 解析失败 | 对端 daemon 配置异常 |
-
-### 9.3 daemon 侧 A2A peer 错误
-
-`status --live` 中 `STATE=error` 时，根据 `ERROR` 列定位：
-
-| ERROR 子串 | 根因 | 处理方式 |
-|---|---|---|
-| `agent card transport error` | 对端 `:8089` 不可达 | 确认对端 peering 是否覆盖本服务 VM 公网 IP；默认 fan-out 时要覆盖本组织所有 active service 的公网 IP；确认对端是否执行了 `peering apply`；核对云端 SG 实际状态 |
-| `publicIp ... is not one of URL host addresses` | AgentCard 中的 `publicIp` 与 URL host 解析结果不一致 | 通常为对端 IP 变更但 AgentCard 未刷新；对端重新 deploy 后即可 |
-| `rekorUrl ... is not trusted` | rekorUrl 不在本地 allowlist | 核对对端 rekorUrl；如确属可信 Rekor 实例，扩展 `CA_TRUSTED_REKOR_URLS` |
-| `directory id conflicts with an existing service` | peer id 与本域 service id 重名 | 使用 `--alias` 指定不同别名 |
-| `failed to fetch ... and no cached AgentCard is available` | 首次拉取失败且无缓存 | 60 秒内 daemon 不重试，按 `status --live` 观察下一次 fetch 结果，同时排查网络 |
-
-### 9.4 STATE 字段含义
+`A2A Peers` 中的 state：
 
 | state | 含义 |
 |---|---|
-| `ok` | 最近一次 fetch 与校验成功，TNG ingress 使用最新 AgentCard |
-| `stale` | 当前 fetch 失败，daemon 仍持有上一份成功 cache 并继续提供服务 |
-| `error` | 无可用 cache，或 trust 校验失败，或 peer id 与本域 service 冲突，TNG ingress 不可用 |
+| `ok` | 最近一次 fetch、校验和 TNG ingress 生成成功 |
+| `stale` | 当前 fetch 失败，但 daemon 仍有上一份成功 cache 并继续服务 |
+| `error` | 没有可用 cache，或 trust/schema/签名校验失败，或 peer id 冲突 |
 
-`stale` 是 daemon 在网络抖动期间的优雅降级状态，不属于异常；持续处于 `stale` 或 `error` 时需要介入。
+CLI preview 状态：
 
-### 9.5 应用层无法定位 peer
+| kind | 含义 |
+|---|---|
+| `verified` | CLI preview 成功 |
+| `unverified` | 没有 preview 结果 |
+| `unreachable` | 管理机无法访问 peer AgentCard 或 HTTP 非 200 |
+| `unsigned` | 配置了 signer pin，但 AgentCard 没有 `signatures[]` |
+| `signature_failed` | Sigstore 签名存在，但不满足 issuer/subject pin 或 cosign 验证失败 |
+| `host_mismatch` | AgentCard `publicIp` 与 URL host 解析结果不一致 |
+| `rekor_untrusted` | `rekorUrl` 不在 trusted Rekor allowlist |
+| `invalid` | URL、JSON、schema 或 CA extension 格式无效；包括 legacy top-level CA extension |
 
-应用通过 `/etc/cai/service-directory.json` 获取 peer alias 与本地端口的映射。当应用报告 `peer 'X' not found`：
+## 8. 排错
 
-1. SSH 进入 guest，确认 `cat /etc/cai/service-directory.json` 中是否包含该 peer。
-2. 如不存在，访问 `curl http://127.0.0.1:8088/status`，检查对应 peer 的 `state` 字段，按 §9.3 处理。
-3. 如 service-directory 有但应用读取不到，确认应用配置中的 peer id 与 `a2a add --alias` 一致。
+| 现象 | 常见原因 | 处理 |
+|---|---|---|
+| `deploy` 报缺少 operator peering | 没有 `control+status` scope | 先 `peering add --role operator ...` |
+| `a2a list` 是 `unreachable` | 管理机访问不了对端 `:8089` | 通常不阻塞；以 daemon `status --live` 为准 |
+| daemon error 包含 `agent card transport error` | 对端 peering 未放行本服务 VM IP | 对端添加 caller service 公网 IP `/32` 并 `peering apply` |
+| `unsigned` | 消费方配置了 signer pin，但发布方 AgentCard 未签名 | 发布方启用 `a2a.signing.required=true` 并重新 deploy/inject |
+| `signature_failed` | signer issuer/subject 不匹配，或 cosign 验签失败 | 核对发布方 OIDC identity；消费方重做 `a2a add --signer-*` |
+| `publicIp ... is not one of URL host addresses` | AgentCard 与访问 URL 不一致 | 对端重新 deploy 或确认使用正确公网 IP/DNS |
+| `rekorUrl ... is not trusted` | 对端 Rekor 不在 allowlist | 确认可信后设置 `CA_TRUSTED_REKOR_URLS` |
+| `legacy top-level confidential-agent extension` | 对端仍发布旧 AgentCard | 先升级 AgentCard 发布方，再让消费方执行 `a2a add` |
+| 应用报 `peer 'X' is missing` | daemon 尚未生成 service-directory 条目 | 查 `status --live` 的 A2A peer state 和 error |
 
-### 9.6 `peering apply` 后 SG 未生效
+## 9. 能力边界
 
-```bash
-confidential-agent peering apply --dry-run
-```
+当前实现有这些边界：
 
-输出 Terraform diff。如 dry-run 显示有变更但实际 apply 后云端 SG 未变化，从 Shelter 与 Terraform 日志中定位云 API 错误。
+- 未配置 signer pin 时，AgentCard 签名不会被验证。
+- AgentCard transport 允许 HTTP；信任决策来自 signer pin、Rekor allowlist 和 RATS-TLS，不来自 TLS WebPKI。
+- 只支持 IPv4 host 解析。
+- `a2a.json` 只支持 version `2`，不自动迁移 version `1`。
+- 旧顶层 CA extension 不兼容；新版只消费 `capabilities.extensions[]`。
+- E2E 的数据不泄露断言覆盖样例数据中的客户姓名和订单号模式，不是通用 DLP 引擎。
 
----
+后续可以继续增强：
 
-## 10. 当前能力边界
-
-### 10.1 当前未覆盖的属性
-
-- AgentCard 接入不依赖组织身份 pin，无法证明对端属于特定组织（详见 §4.3）。
-- AgentCard transport 同时允许 HTTP 与 HTTPS；信任根在 Rekor，传输层不参与信任决策。
-- 仅支持 IPv4。
-- AgentCard 不签名。
-- `deploy` 阶段的出口 IP 探测使用 ipinfo.io 与 ipify；多 ISP 或多 NAT 出口的环境下可能误判，可通过 `CA_OPERATOR_EGRESS_IP` 显式指定。
-- `peering apply` 仅作用于本组织 Terraform 资源范围，跨账号资源需另行打通。
-
-### 10.2 后续增强方向
-
-- AgentCard 签名与 signer pin（Fulcio identity / 长期 cosign key），用于组织身份绑定。
-- A2A invite/accept 双向接入工作流。
-- 域级 catalog 发布与导入，简化多 service 场景下的双方接入步骤。
-- 组级 trust policy（基于 SLSA-valid 的通配信任策略）。
+- signer pin 策略模板和轮换流程。
+- invite/accept 式双向接入工作流。
+- 域级 catalog 发布与导入。
+- HTTPS-only AgentCard discovery。
 - IPv6 支持。
-- AgentCard discovery 强制 HTTPS。
-- Rekor inclusion proof 边界条件验证。
-
----
-
-## 11. 常见问题
-
-**Q1：`a2a add` 后多久能调通？**
-取决于 daemon poll 周期（5 秒）与 inject 完成时间，通常在 10–15 秒内 `status --live` 显示 `ok`。
-
-**Q2：一台管理机能管理多个组织或环境吗？**
-能。每个组织或环境使用独立的 `--state-dir`，`peerings.yaml` 与 `a2a.json` 在 state-dir 范围内隔离。
-
-**Q3：peer 的 `service.connect` 修改后如何同步？**
-对端重新 deploy 后会发布新的 AgentCard。本地执行 `a2a sync --alias <name>` 可重新注入当前 desired state；如果本地 URL / alias / service scope 没变，daemon 仍会遵守现有 cache TTL。需要立即绕过成功缓存时，变更 desired state（例如 remove 后重新 add）或等待 `cacheTtlSec` 到期。
-
-**Q4：未持有部署方 state-dir 时如何接入？**
-使用 `connect --from-card`，前提是接入方 IP 已被部署方加入 peerings（`scope=agent_card,connect`）。详见 §6.2。
-
-**Q5：AgentCard 中可见的字段有哪些？**
-公开字段：`name`、`version`、`skills`、`url`、`cacheTtlSec`、`publicIp`、`ports`、`rekor.{rekorUrl,artifactId,artifactType,artifactVersion,rvName}`、`tee`。不包含 secret、镜像哈希、cosign 公钥。
-
-**Q6：peer 使用非默认 Rekor 实例如何处理？**
-默认仅信任 sigstore 公共 Rekor。确认 peer 所用 Rekor 实例的可信性后，通过 `CA_TRUSTED_REKOR_URLS` 扩展 allowlist。
-
-**Q7：如何撤回 `a2a add`？**
-执行 `a2a remove <alias-or-url>`。a2a-bundle 重新渲染后，daemon 在下一次 poll 时撤销对应 TNG ingress 与 service-directory 条目。
-
-**Q8：`peering apply` 是否会中断已建立的连接？**
-不会。Terraform 增量变更不影响已建立的 TCP / RATS-TLS 连接；但已被删除的 ingress 规则会阻止后续新建握手。
-
-**Q9：同一 URL 可以注册多个 alias 吗？**
-不可以。CLI 校验 URL 唯一性，建议一个 URL 对应一个 alias。
-
-**Q10：`a2a` 与 `peering` 命令是否幂等？**
-`peering add` 与 `a2a add` 在重复执行同一 label 或 URL 时会报错。在 IaC 场景下可使用：
-
-```bash
-peering add ... || true
-peering apply
-a2a add ...     || true
-```
-
-并通过 `peering list --json` 与 `a2a list --json` 进行 reconcile。
-
----
+- 更完整的 Rekor inclusion proof 边界校验。
 
 ## 参考
 
-- [`spec.md`](spec.md) — `a2a` / `peerings` schema 定义
-- [`architecture.md`](architecture.md) — 单组织 mesh 与远程证明通道
-- [A2A Protocol Spec v0.3.0](https://a2a-protocol.org/v0.3.0/specification/) — AgentCard 标准字段
-- [Sigstore Rekor](https://docs.sigstore.dev/logging/overview/) — transparency log 信任根
-- `tools/e2e/run.sh openclaw-a2a` — 跨组织接入端到端脚本
+- [`spec.md`](spec.md)
+- [`architecture.md`](architecture.md)
+- `examples/a2a-data-collab/`
+- `tools/e2e/run.sh a2a-data-collab`
+- [A2A Protocol Spec v1](https://a2a-protocol.org/latest/specification/)
+- [Sigstore Rekor](https://docs.sigstore.dev/logging/overview/)

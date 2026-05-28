@@ -60,6 +60,19 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
     )?;
     let guest_setup_script = Some(stage_guest_setup_script(guest_staging_dir)?);
 
+    let mut extra_files = vec![GuestFileAsset {
+        source: staged_attestation_client,
+        destination: "/opt/confidential-agent/hack/attestation-challenge-client".to_string(),
+        executable: true,
+    }];
+    if let Some(cosign) = stage_optional_host_binary(guest_staging_dir, "cosign")? {
+        extra_files.push(GuestFileAsset {
+            source: cosign,
+            destination: "/usr/local/bin/cosign".to_string(),
+            executable: true,
+        });
+    }
+
     Ok(GuestAssets {
         agentd_bin: staged_bin,
         agentd_service: staged_service,
@@ -70,12 +83,33 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         guest_tng_bin: staged_guest_tng_bin,
         libtdx_verify_rpm,
         guest_setup_script,
-        extra_files: vec![GuestFileAsset {
-            source: staged_attestation_client,
-            destination: "/opt/confidential-agent/hack/attestation-challenge-client".to_string(),
-            executable: true,
-        }],
+        extra_files,
     })
+}
+
+fn stage_optional_host_binary(guest_staging_dir: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name}"))
+        .output()
+        .with_context(|| format!("failed to locate optional host binary '{name}'"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let source = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if source.as_os_str().is_empty() || !source.exists() {
+        return Ok(None);
+    }
+    let staged = guest_staging_dir.join(name);
+    fs::copy(&source, &staged).with_context(|| {
+        format!(
+            "failed to copy optional host binary '{}' to '{}'",
+            source.display(),
+            staged.display()
+        )
+    })?;
+    set_mode(&staged, 0o755)?;
+    Ok(Some(staged))
 }
 
 #[cfg(test)]

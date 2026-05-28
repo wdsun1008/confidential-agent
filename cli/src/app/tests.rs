@@ -1,13 +1,15 @@
 use super::commands::{
-    cmd_a2a, cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries,
-    collect_live_status, debug_ssh_hint, deploy_shelter_args, fetch_daemon_status_from,
-    live_status_table_columns, status_table_columns, status_views, validate_build_start,
-    validate_deploy_start, wait_for_daemon_status_from,
+    a2a_cli_preview_error_kind, cmd_a2a, cmd_build, cmd_deploy, cmd_destroy, cmd_image,
+    cmd_inject, collect_image_entries, collect_live_status, debug_ssh_hint, deploy_shelter_args,
+    fetch_daemon_status_from, live_status_table_columns, status_table_columns, status_views,
+    validate_build_start, validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
 use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, StatusArgs};
 use clap::Parser;
+use confidential_agent_core::agent_card_fetch::AgentCardFetchError;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
+use std::net::{IpAddr, Ipv4Addr};
 use std::ffi::OsStr;
 use std::io::Write;
 
@@ -1569,9 +1571,10 @@ a2a:
     let card = render_agent_card(&spec, "198.51.100.20", &meta, Some(&sample)).unwrap();
 
     assert_eq!(card.name, "OpenClaw");
+    assert_eq!(card.protocol_version, "1.0");
     assert_eq!(
-        card.url.as_deref(),
-        Some("http://198.51.100.20:8089/.well-known/agent-card.json")
+        card.supported_interfaces[0].url,
+        "http://198.51.100.20:18789/a2a"
     );
     let ext = confidential_extension(&card).unwrap();
     assert_eq!(ext.id, "openclaw-agent");
@@ -2782,39 +2785,60 @@ fn connect_reference_values_prefers_sample_when_rekor_is_also_present() {
 }
 
 fn test_agent_card(ports: Vec<u16>) -> AgentCard {
+    let confidential = AgentCardConfidential {
+        id: "peer".to_string(),
+        cache_ttl_sec: 300,
+        public_ip: "203.0.113.8".to_string(),
+        ports: ports
+            .iter()
+            .copied()
+            .map(|port| AgentCardPort {
+                name: format!("port-{port}"),
+                port,
+            })
+            .collect(),
+        reference_values: None,
+        rekor: AgentCardRekor {
+            rekor_url: "https://rekor.sigstore.dev".to_string(),
+            artifact_id: "peer-disk".to_string(),
+            artifact_type: "uki".to_string(),
+            artifact_version: "20260514000000".to_string(),
+            rv_name: "measurement.uki.SHA-384".to_string(),
+        },
+        tee: "tdx".to_string(),
+    };
     AgentCard {
+        protocol_version: "1.0".to_string(),
         name: "peer-openclaw".to_string(),
-        description: None,
+        description: "peer openclaw".to_string(),
         version: Some("1.0.0".to_string()),
-        url: Some("http://203.0.113.8:8089/.well-known/agent-card.json".to_string()),
+        supported_interfaces: ports
+            .iter()
+            .map(|port| AgentInterface {
+                url: format!("http://203.0.113.8:{port}/a2a"),
+                protocol_binding: "JSONRPC".to_string(),
+                protocol_version: "1.0".to_string(),
+                tenant: None,
+            })
+            .collect(),
+        preferred_transport: Some("JSONRPC".to_string()),
         skills: Vec::new(),
         default_input_modes: vec!["text".to_string()],
         default_output_modes: vec!["text".to_string()],
-        capabilities: None,
-        provider: None,
-        extensions: AgentCardExtensions {
-            confidential_agent: Some(AgentCardConfidential {
-                id: "peer".to_string(),
-                cache_ttl_sec: 300,
-                public_ip: "203.0.113.8".to_string(),
-                ports: ports
-                    .into_iter()
-                    .map(|port| AgentCardPort {
-                        name: format!("port-{port}"),
-                        port,
-                    })
-                    .collect(),
-                reference_values: None,
-                rekor: AgentCardRekor {
-                    rekor_url: "https://rekor.sigstore.dev".to_string(),
-                    artifact_id: "peer-disk".to_string(),
-                    artifact_type: "uki".to_string(),
-                    artifact_version: "20260514000000".to_string(),
-                    rv_name: "measurement.uki.SHA-384".to_string(),
-                },
-                tee: "tdx".to_string(),
-            }),
+        capabilities: AgentCardCapabilities {
+            extensions: vec![AgentExtension {
+                uri: confidential_agent_core::agent_card::CONFIDENTIAL_AGENT_EXTENSION.to_string(),
+                description: None,
+                required: true,
+                params: serde_json::to_value(confidential).unwrap(),
+            }],
+            ..Default::default()
         },
+        provider: None,
+        security_schemes: None,
+        security: Vec::new(),
+        supports_authenticated_extended_card: Some(false),
+        signatures: Vec::new(),
     }
 }
 
@@ -2848,6 +2872,8 @@ fn a2a_add_rejects_unknown_scoped_service() {
                 agent_card_url: "http://127.0.0.1:8089/.well-known/agent-card.json".to_string(),
                 alias: Some("beta".to_string()),
                 service: vec!["missing".to_string()],
+                signer_issuer: None,
+                signer_subject: None,
             },
         },
     )
@@ -2856,6 +2882,38 @@ fn a2a_add_rejects_unknown_scoped_service() {
     assert!(err
         .to_string()
         .contains("a2a scoped service 'missing' does not exist locally"));
+}
+
+#[test]
+fn a2a_preview_error_kind_keeps_trust_failures_distinct() {
+    assert_eq!(
+        a2a_cli_preview_error_kind(&AgentCardFetchError::SignatureMissing),
+        "unsigned"
+    );
+    assert_eq!(
+        a2a_cli_preview_error_kind(&AgentCardFetchError::SignatureVerification(
+            "identity mismatch".to_string()
+        )),
+        "signature_failed"
+    );
+    assert_eq!(
+        a2a_cli_preview_error_kind(&AgentCardFetchError::PublicIpHostMismatch {
+            declared: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            resolved: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11))],
+        }),
+        "host_mismatch"
+    );
+    assert_eq!(
+        a2a_cli_preview_error_kind(&AgentCardFetchError::RekorUrlNotTrusted {
+            url: "https://rekor.example".to_string(),
+            allowed: vec!["https://rekor.sigstore.dev".to_string()],
+        }),
+        "rekor_untrusted"
+    );
+    assert_eq!(
+        a2a_cli_preview_error_kind(&AgentCardFetchError::LegacyConfidentialAgentCard),
+        "invalid"
+    );
 }
 
 #[test]

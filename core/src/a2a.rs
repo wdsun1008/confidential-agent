@@ -20,6 +20,8 @@ pub struct A2aStatePeer {
     pub url: String,
     #[serde(default)]
     pub scoped_services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<A2aSignerPin>,
     pub added_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_preview: Option<A2aCliPreview>,
@@ -52,6 +54,8 @@ pub struct A2aCardSummary {
     pub id: String,
     pub public_ip: String,
     pub ports: Vec<u16>,
+    #[serde(default)]
+    pub signed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,13 +83,31 @@ pub struct A2aBundlePeer {
     pub url: String,
     #[serde(default)]
     pub scoped_services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<A2aSignerPin>,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct A2aSignerPin {
+    pub issuer: String,
+    pub subject: String,
+}
+
+impl From<&A2aSignerPin> for crate::agent_card_signing::AgentCardSignerPin {
+    fn from(value: &A2aSignerPin) -> Self {
+        Self {
+            issuer: value.issuer.clone(),
+            subject: value.subject.clone(),
+        }
+    }
 }
 
 impl A2aStateFile {
     pub fn empty() -> Self {
         Self {
-            version: 1,
+            version: 2,
             peers: Vec::new(),
         }
     }
@@ -106,8 +128,11 @@ impl A2aStateFile {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 {
-            bail!("a2a.json version must be 1");
+        if self.version != 2 {
+            bail!(
+                "a2a.json version must be 2; version {} is unsupported and is not auto-migrated",
+                self.version
+            );
         }
         let mut aliases = BTreeSet::new();
         let mut urls = BTreeSet::new();
@@ -122,6 +147,9 @@ impl A2aStateFile {
                 bail!("a2a.json contains duplicate url '{}'", peer.url);
             }
             let mut scoped = BTreeSet::new();
+            if let Some(signer) = &peer.signer {
+                validate_signer_pin(signer)?;
+            }
             for service in &peer.scoped_services {
                 validate_id("a2a peer scoped service", service)?;
                 if !scoped.insert(service.as_str()) {
@@ -140,14 +168,14 @@ impl A2aStateFile {
 impl A2aBundle {
     pub fn empty() -> Self {
         Self {
-            version: 1,
+            version: 2,
             peers: Vec::new(),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 {
-            bail!("a2a bundle version must be 1");
+        if self.version != 2 {
+            bail!("a2a bundle version must be 2");
         }
         let mut aliases = BTreeSet::new();
         let mut urls = BTreeSet::new();
@@ -167,6 +195,9 @@ impl A2aBundle {
             if peer.fingerprint.trim().is_empty() {
                 bail!("a2a bundle peer fingerprint must not be empty");
             }
+            if let Some(signer) = &peer.signer {
+                validate_signer_pin(signer)?;
+            }
             let mut scoped = BTreeSet::new();
             for service in &peer.scoped_services {
                 validate_id("a2a bundle peer scoped service", service)?;
@@ -181,6 +212,16 @@ impl A2aBundle {
         }
         Ok(())
     }
+}
+
+fn validate_signer_pin(pin: &A2aSignerPin) -> Result<()> {
+    if pin.issuer.trim().is_empty() {
+        bail!("a2a peer signer issuer must not be empty");
+    }
+    if pin.subject.trim().is_empty() {
+        bail!("a2a peer signer subject must not be empty");
+    }
+    Ok(())
 }
 
 pub fn validate_id(field: &str, value: &str) -> Result<()> {
@@ -210,6 +251,7 @@ mod tests {
             alias: alias.map(str::to_string),
             url: url.to_string(),
             scoped_services: Vec::new(),
+            signer: None,
             added_at: "2026-05-14T00:00:00Z".to_string(),
             cli_preview: None,
             cli_preview_error: None,
@@ -221,6 +263,7 @@ mod tests {
             alias: alias.map(str::to_string),
             url: url.to_string(),
             scoped_services: Vec::new(),
+            signer: None,
             fingerprint: "fp".to_string(),
         }
     }
@@ -247,8 +290,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cli_lint_preview_still_parses() {
-        let state: A2aStateFile = serde_json::from_str(
+    fn from_path_rejects_v1_state_without_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a2a.json");
+        std::fs::write(
+            &path,
             r#"{
               "version": 1,
               "peers": [{
@@ -274,25 +320,29 @@ mod tests {
         )
         .unwrap();
 
-        assert!(state.peers[0].cli_preview.as_ref().unwrap().verified);
-        assert!(state.peers[0].cli_preview.as_ref().unwrap().lint.is_some());
+        let err = A2aStateFile::from_path(&path).unwrap_err();
+
+        assert!(err.to_string().contains("a2a.json version must be 2"));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted["version"], 1);
     }
 
     #[test]
     fn state_validate_rejects_unknown_version() {
         let state = A2aStateFile {
-            version: 2,
+            version: 1,
             peers: Vec::new(),
         };
 
         let err = state.validate().unwrap_err();
-        assert!(err.to_string().contains("a2a.json version must be 1"));
+        assert!(err.to_string().contains("a2a.json version must be 2"));
     }
 
     #[test]
     fn state_validate_rejects_duplicate_alias() {
         let state = A2aStateFile {
-            version: 1,
+            version: 2,
             peers: vec![
                 peer(Some("beta"), "http://1.example/.well-known/agent-card.json"),
                 peer(Some("beta"), "http://2.example/.well-known/agent-card.json"),
@@ -306,7 +356,7 @@ mod tests {
     #[test]
     fn state_validate_rejects_duplicate_url() {
         let state = A2aStateFile {
-            version: 1,
+            version: 2,
             peers: vec![
                 peer(
                     Some("alpha"),
@@ -323,7 +373,7 @@ mod tests {
     #[test]
     fn state_validate_rejects_alias_with_disallowed_characters() {
         let state = A2aStateFile {
-            version: 1,
+            version: 2,
             peers: vec![peer(Some("bad alias"), "http://1.example/")],
         };
 
@@ -336,7 +386,7 @@ mod tests {
     #[test]
     fn state_validate_rejects_duplicate_scoped_service_inside_one_peer() {
         let mut state = A2aStateFile {
-            version: 1,
+            version: 2,
             peers: vec![peer(Some("beta"), "http://1.example/")],
         };
         state.peers[0].scoped_services = vec!["openclaw".to_string(), "openclaw".to_string()];
@@ -350,7 +400,7 @@ mod tests {
     #[test]
     fn state_validate_allows_distinct_aliases_and_urls() {
         let state = A2aStateFile {
-            version: 1,
+            version: 2,
             peers: vec![
                 peer(Some("alpha"), "http://1.example/"),
                 peer(Some("beta"), "http://2.example/"),
@@ -370,13 +420,13 @@ mod tests {
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("a2a bundle version must be 1"));
+            .contains("a2a bundle version must be 2"));
     }
 
     #[test]
     fn bundle_validate_rejects_empty_url() {
         let mut bundle = A2aBundle {
-            version: 1,
+            version: 2,
             peers: vec![bundle_peer(None, "   ")],
         };
         // Make sure the blank fingerprint doesn't accidentally hide the
@@ -389,11 +439,12 @@ mod tests {
     #[test]
     fn bundle_validate_rejects_empty_fingerprint() {
         let bundle = A2aBundle {
-            version: 1,
+            version: 2,
             peers: vec![A2aBundlePeer {
                 alias: None,
                 url: "http://1.example/".to_string(),
                 scoped_services: Vec::new(),
+                signer: None,
                 fingerprint: "".to_string(),
             }],
         };
@@ -406,7 +457,7 @@ mod tests {
     #[test]
     fn bundle_validate_rejects_alias_with_disallowed_characters() {
         let bundle = A2aBundle {
-            version: 1,
+            version: 2,
             peers: vec![bundle_peer(Some("a/b"), "http://1.example/")],
         };
         let err = bundle.validate().unwrap_err();
@@ -418,7 +469,7 @@ mod tests {
     #[test]
     fn bundle_validate_rejects_duplicate_alias() {
         let bundle = A2aBundle {
-            version: 1,
+            version: 2,
             peers: vec![
                 bundle_peer(Some("beta"), "http://1.example/"),
                 bundle_peer(Some("beta"), "http://2.example/"),
@@ -432,7 +483,7 @@ mod tests {
     #[test]
     fn bundle_validate_rejects_duplicate_url() {
         let bundle = A2aBundle {
-            version: 1,
+            version: 2,
             peers: vec![
                 bundle_peer(Some("alpha"), "http://1.example/"),
                 bundle_peer(Some("beta"), "http://1.example/"),
@@ -446,7 +497,7 @@ mod tests {
     #[test]
     fn bundle_validate_rejects_duplicate_scoped_service_inside_one_peer() {
         let mut bundle = A2aBundle {
-            version: 1,
+            version: 2,
             peers: vec![bundle_peer(Some("beta"), "http://1.example/")],
         };
         bundle.peers[0].scoped_services = vec!["openclaw".to_string(), "openclaw".to_string()];
@@ -487,7 +538,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-              "version": 1,
+              "version": 2,
               "peers": [
                 {"alias": "beta", "url": "http://1.example/", "added_at": "2026-05-14T00:00:00Z"},
                 {"alias": "beta", "url": "http://2.example/", "added_at": "2026-05-14T00:00:00Z"}

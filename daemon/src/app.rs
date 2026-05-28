@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use confidential_agent_core::a2a::{A2aBundle, A2aBundlePeer};
 use confidential_agent_core::agent_card::{agent_card_reference_values, confidential_extension};
-use confidential_agent_core::agent_card_fetch::fetch_agent_card_result;
+use confidential_agent_core::agent_card_fetch::fetch_agent_card_with_signer;
 use confidential_agent_core::schema::{
     confidential_ports, AppliedResourceState, BootstrapConfig, DaemonA2aPeerStatus, DaemonStatus,
     GuestResource, MeshBundle, ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService,
@@ -1281,7 +1281,11 @@ fn resolve_a2a_peer(
         return Ok(resolved);
     }
 
-    match fetch_agent_card_result(&peer.url) {
+    let signer = peer
+        .signer
+        .as_ref()
+        .map(confidential_agent_core::agent_card_signing::AgentCardSignerPin::from);
+    match fetch_agent_card_with_signer(&peer.url, signer.as_ref()).map_err(anyhow::Error::new) {
         Ok(card) => {
             let ext = confidential_extension(&card)?;
             let reference_values = agent_card_reference_values(&card)?;

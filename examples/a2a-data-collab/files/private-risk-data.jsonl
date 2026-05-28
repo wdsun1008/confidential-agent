@@ -1,0 +1,6 @@
+{"customer_name":"Ada Lin","order_id":"ORD-ALPHA-0001","region":"east","incident_category":"late-shipment","risk_score":92}
+{"customer_name":"Ben Zhao","order_id":"ORD-ALPHA-0002","region":"east","incident_category":"supplier-concentration","risk_score":85}
+{"customer_name":"Cara Wu","order_id":"ORD-ALPHA-0003","region":"north","incident_category":"quality-escape","risk_score":71}
+{"customer_name":"Dev Patel","order_id":"ORD-ALPHA-0004","region":"south","incident_category":"late-shipment","risk_score":63}
+{"customer_name":"Eli Chen","order_id":"ORD-ALPHA-0005","region":"west","incident_category":"supplier-concentration","risk_score":88}
+{"customer_name":"Faye Kim","order_id":"ORD-ALPHA-0006","region":"north","incident_category":"documentation-gap","risk_score":54}
