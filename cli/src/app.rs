@@ -983,6 +983,11 @@ install() {
 
     inst_binary /usr/local/bin/confidential-agentd /usr/bin/confidential-agentd
     inst_multiple mkdir sleep systemctl
+    hostonly='' instmods tdx_guest || true
+    mkdir -p "$initdir/usr/lib/modprobe.d"
+    printf 'options tdx_guest tsm_api=1\n' > "$initdir/usr/lib/modprobe.d/confidential-agent-tdx.conf"
+    mkdir -p "$initdir/usr/lib/modules-load.d"
+    printf 'tdx_guest\n' > "$initdir/usr/lib/modules-load.d/confidential-agent-tdx.conf"
     inst_simple "$moddir/confidential-agent-secret-fetch.service" /usr/lib/systemd/system/confidential-agent-secret-fetch.service
     systemctl --root "$initdir" enable confidential-agent-secret-fetch.service
 }
