@@ -456,8 +456,10 @@ struct ShelterTools {
     cryptpilot_enhance: String,
     #[serde(rename = "cryptpilot-convert")]
     cryptpilot_convert: String,
-    #[serde(rename = "cryptpilot-fde")]
-    cryptpilot_fde: String,
+    #[serde(rename = "cryptpilot-fde-host")]
+    cryptpilot_fde_host: String,
+    #[serde(rename = "cryptpilot-fde-guest")]
+    cryptpilot_fde_guest: String,
 }
 
 impl ShelterTools {
@@ -465,19 +467,29 @@ impl ShelterTools {
         Self {
             cryptpilot_enhance: "cryptpilot-enhance".to_string(),
             cryptpilot_convert: "cryptpilot-convert".to_string(),
-            cryptpilot_fde: preferred_cryptpilot_fde_tool(),
+            cryptpilot_fde_host: preferred_cryptpilot_fde_host_tool(),
+            cryptpilot_fde_guest: preferred_cryptpilot_fde_guest_tool(),
         }
     }
 }
 
-fn preferred_cryptpilot_fde_tool() -> String {
+fn preferred_cryptpilot_fde_host_tool() -> String {
     preferred_existing_tool_path(
         [
-            "/usr/libexec/shelter/cryptpilot-fde",
-            "/usr/local/libexec/shelter/cryptpilot-fde",
-            "/root/shelter-rs/deps/libexec/redhat/cryptpilot-fde",
+            "/usr/bin/cryptpilot-fde-host",
+            "/usr/local/bin/cryptpilot-fde-host",
         ],
-        "cryptpilot-fde",
+        "cryptpilot-fde-host",
+    )
+}
+
+fn preferred_cryptpilot_fde_guest_tool() -> String {
+    preferred_existing_tool_path(
+        [
+            "/usr/bin/cryptpilot-fde-guest",
+            "/usr/local/bin/cryptpilot-fde-guest",
+        ],
+        "cryptpilot-fde-guest",
     )
 }
 
