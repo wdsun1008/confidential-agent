@@ -210,6 +210,7 @@ dependencies = [
  "anyhow",
  "clap",
  "confidential-agent-core",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -156,6 +156,95 @@ fn http_server_rate_limit_is_shared_across_kinds() {
 }
 
 #[test]
+fn resource_watcher_rejects_missing_cdh_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing-cdh");
+
+    let err = ResourceWatcher::new(
+        &missing,
+        [Path::new("default/local-resources/cagent_bootstrap_config")],
+    )
+    .unwrap_err();
+
+    assert!(format!("{err:#}").contains("cdh root"));
+}
+
+#[test]
+fn resource_watcher_wakes_on_directory_chain_creation_and_atomic_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    fs::create_dir(&cdh_root).unwrap();
+    let resource = Path::new("default/local-resources/cagent_bootstrap_config");
+    let resource_path = cdh_root.join(resource);
+    let mut watcher = ResourceWatcher::new(&cdh_root, [resource]).unwrap();
+
+    fs::create_dir(cdh_root.join("default")).unwrap();
+    assert_eq!(
+        watcher.wait(Some(Duration::from_secs(1))).unwrap(),
+        ResourceWatcherWait::Event
+    );
+
+    fs::create_dir(cdh_root.join("default/local-resources")).unwrap();
+    assert_eq!(
+        watcher.wait(Some(Duration::from_secs(1))).unwrap(),
+        ResourceWatcherWait::Event
+    );
+
+    let staged = temp.path().join("bootstrap.next");
+    fs::write(&staged, "{}").unwrap();
+    fs::rename(&staged, &resource_path).unwrap();
+    assert_eq!(
+        watcher.wait(Some(Duration::from_secs(1))).unwrap(),
+        ResourceWatcherWait::Event
+    );
+    assert_eq!(fs::read_to_string(resource_path).unwrap(), "{}");
+}
+
+#[test]
+fn resource_watcher_times_out_without_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    fs::create_dir(&cdh_root).unwrap();
+    let mut watcher = ResourceWatcher::new(
+        &cdh_root,
+        [Path::new("default/local-resources/cagent_bootstrap_config")],
+    )
+    .unwrap();
+
+    assert_eq!(
+        watcher.wait(Some(Duration::from_millis(50))).unwrap(),
+        ResourceWatcherWait::Timeout
+    );
+}
+
+#[test]
+fn overdue_a2a_refresh_timeout_is_throttled() {
+    let mut state = DaemonState::default();
+    let now = now_unix();
+    state.a2a_cache.insert(
+        "peer".to_string(),
+        A2aCachedPeer {
+            url: "http://127.0.0.1/.well-known/agent-card.json".to_string(),
+            alias: None,
+            id: None,
+            ports: Vec::new(),
+            public_ip: None,
+            reference_values: json!({}),
+            fetched_at_unix: now.saturating_sub(120),
+            next_refresh_unix: now.saturating_sub(1),
+            fingerprint: "fingerprint".to_string(),
+            error: None,
+        },
+    );
+
+    assert_eq!(
+        next_a2a_refresh_timeout(&state, true),
+        Some(Duration::from_secs(A2A_OVERDUE_REFRESH_RETRY_SEC))
+    );
+    assert_eq!(next_a2a_refresh_timeout(&state, false), None);
+}
+
+#[test]
 fn parses_octal_modes() {
     assert_eq!(parse_mode("0600").unwrap(), 0o600);
     assert_eq!(parse_mode("0o644").unwrap(), 0o644);
