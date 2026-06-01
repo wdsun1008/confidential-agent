@@ -14,10 +14,13 @@ use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,6 +49,7 @@ const DEFAULT_AGENT_CARD_PATH: &str = "/opt/confidential-agent/agent-card.json";
 const A2A_CACHE_TTL_MIN_SEC: u64 = 60;
 const A2A_CACHE_TTL_MAX_SEC: u64 = 3600;
 const A2A_FETCH_FAILURE_BACKOFF_SEC: u64 = 60;
+const A2A_OVERDUE_REFRESH_RETRY_SEC: u64 = 1;
 const HTTP_MAX_HEADER_BYTES: usize = 8 * 1024;
 const HTTP_READ_CHUNK_BYTES: usize = 512;
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -257,11 +261,25 @@ fn run_daemon(args: RunArgs) -> Result<()> {
         HttpServerKind::AgentCard,
         http_limits,
     )?;
+    let mut resource_watcher = ResourceWatcher::new(
+        &args.cdh_root,
+        [
+            Path::new(&args.bootstrap_resource),
+            Path::new(&args.mesh_resource),
+            Path::new(&args.a2a_bundle_resource),
+        ],
+    )?;
     let mut state = read_daemon_state().unwrap_or_default();
     let mut active_bootstrap: Option<BootstrapConfig> = None;
     loop {
         match read_bootstrap(&args)? {
             Some(bootstrap) => {
+                resource_watcher.add_resource_paths(
+                    bootstrap
+                        .resources
+                        .iter()
+                        .map(|resource| Path::new(&resource.resource_path)),
+                )?;
                 let resources_ready = match bootstrap_resources_ready(&bootstrap, &state) {
                     Ok(ready) => ready,
                     Err(err) => {
@@ -311,7 +329,322 @@ fn run_daemon(args: RunArgs) -> Result<()> {
             eprintln!("daemon state write failed: {err:#}");
         }
 
-        thread::sleep(Duration::from_secs(args.poll_interval_sec));
+        let refresh_timeout = next_a2a_refresh_timeout(&state, active_bootstrap.is_some());
+        match resource_watcher.wait(refresh_timeout)? {
+            ResourceWatcherWait::Event | ResourceWatcherWait::Timeout => {}
+        }
+    }
+}
+
+fn next_a2a_refresh_timeout(state: &DaemonState, bootstrap_active: bool) -> Option<Duration> {
+    if !bootstrap_active {
+        return None;
+    }
+    let next_refresh = state
+        .a2a_cache
+        .values()
+        .map(|peer| peer.next_refresh_unix)
+        .min()?;
+    let now = now_unix();
+    if next_refresh <= now {
+        Some(Duration::from_secs(A2A_OVERDUE_REFRESH_RETRY_SEC))
+    } else {
+        Some(Duration::from_secs(next_refresh - now))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceWatcherWait {
+    Event,
+    Timeout,
+}
+
+#[derive(Debug)]
+struct ResourceWatcher {
+    fd: RawFd,
+    cdh_root: PathBuf,
+    resource_paths: BTreeSet<PathBuf>,
+    watches: BTreeMap<RawFd, PathBuf>,
+    watched_dirs: BTreeMap<PathBuf, RawFd>,
+    read_buf: Vec<u8>,
+}
+
+impl ResourceWatcher {
+    fn new<I, P>(cdh_root: &Path, resource_paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let metadata = fs::metadata(cdh_root)
+            .with_context(|| format!("cdh root '{}' is not available", cdh_root.display()))?;
+        if !metadata.is_dir() {
+            bail!("cdh root '{}' is not a directory", cdh_root.display());
+        }
+
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to initialize inotify");
+        }
+
+        let mut watcher = Self {
+            fd,
+            cdh_root: cdh_root.to_path_buf(),
+            resource_paths: BTreeSet::new(),
+            watches: BTreeMap::new(),
+            watched_dirs: BTreeMap::new(),
+            read_buf: vec![0; 16 * 1024],
+        };
+        for path in resource_paths {
+            watcher.resource_paths.insert(path.as_ref().to_path_buf());
+        }
+        if let Err(err) = watcher.reconcile_watches() {
+            drop(watcher);
+            return Err(err);
+        }
+        Ok(watcher)
+    }
+
+    fn add_resource_paths<I, P>(&mut self, paths: I) -> Result<()>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for path in paths {
+            self.resource_paths.insert(path.as_ref().to_path_buf());
+        }
+        Ok(())
+    }
+
+    fn wait(&mut self, timeout: Option<Duration>) -> Result<ResourceWatcherWait> {
+        if self.reconcile_watches()? {
+            return Ok(ResourceWatcherWait::Event);
+        }
+        let timeout_ms = poll_timeout_ms(timeout);
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if ready == 0 {
+                return Ok(ResourceWatcherWait::Timeout);
+            }
+            if ready < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err).context("inotify poll failed");
+            }
+            if pollfd.revents & libc::POLLNVAL != 0 {
+                bail!("inotify poll failed: watcher file descriptor is invalid");
+            }
+            if pollfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                bail!("inotify poll failed with revents={}", pollfd.revents);
+            }
+            if pollfd.revents & libc::POLLIN == 0 {
+                continue;
+            }
+
+            if self.drain_events()? {
+                self.reconcile_watches()?;
+                return Ok(ResourceWatcherWait::Event);
+            }
+        }
+    }
+
+    fn drain_events(&mut self) -> Result<bool> {
+        let mut saw_event = false;
+        loop {
+            let read = unsafe {
+                libc::read(
+                    self.fd,
+                    self.read_buf.as_mut_ptr().cast(),
+                    self.read_buf.len(),
+                )
+            };
+            if read < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(saw_event);
+                }
+                return Err(err).context("failed to read inotify events");
+            }
+            if read == 0 {
+                return Ok(saw_event);
+            }
+
+            saw_event = true;
+            self.process_events(read as usize);
+        }
+    }
+
+    fn process_events(&mut self, bytes_read: usize) {
+        let event_size = std::mem::size_of::<libc::inotify_event>();
+        let mut offset = 0;
+        while offset + event_size <= bytes_read {
+            let event = unsafe {
+                std::ptr::read_unaligned(
+                    self.read_buf
+                        .as_ptr()
+                        .add(offset)
+                        .cast::<libc::inotify_event>(),
+                )
+            };
+            if event.mask & libc::IN_Q_OVERFLOW != 0 {
+                eprintln!(
+                    "inotify event queue overflow; treating as resource wake and reconciling watches"
+                );
+            }
+            if event.mask & (libc::IN_IGNORED | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+                self.remove_watch_id(event.wd);
+            }
+            offset += event_size + event.len as usize;
+        }
+    }
+
+    fn reconcile_watches(&mut self) -> Result<bool> {
+        let desired = self.existing_watch_dirs()?;
+        let mut changed = false;
+        let stale = self
+            .watched_dirs
+            .keys()
+            .filter(|path| !desired.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in stale {
+            self.remove_watch_path(&path)?;
+            changed = true;
+        }
+        for path in desired {
+            if !self.watched_dirs.contains_key(&path) {
+                self.add_watch(&path)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn existing_watch_dirs(&self) -> Result<BTreeSet<PathBuf>> {
+        let metadata = fs::metadata(&self.cdh_root)
+            .with_context(|| format!("cdh root '{}' is not available", self.cdh_root.display()))?;
+        if !metadata.is_dir() {
+            bail!("cdh root '{}' is not a directory", self.cdh_root.display());
+        }
+
+        let mut dirs = BTreeSet::new();
+        dirs.insert(self.cdh_root.clone());
+        for resource_path in &self.resource_paths {
+            let target = self.cdh_root.join(resource_path);
+            let Some(parent) = target.parent() else {
+                continue;
+            };
+            let Ok(relative_parent) = parent.strip_prefix(&self.cdh_root) else {
+                continue;
+            };
+            let mut current = self.cdh_root.clone();
+            for component in relative_parent.components() {
+                current.push(component.as_os_str());
+                match fs::metadata(&current) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        dirs.insert(current.clone());
+                    }
+                    Ok(_) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("failed to stat '{}'", current.display()));
+                    }
+                }
+            }
+        }
+        Ok(dirs)
+    }
+
+    fn add_watch(&mut self, path: &Path) -> Result<()> {
+        let c_path = path_to_cstring(path)?;
+        let mask = resource_watch_mask() | libc::IN_ONLYDIR;
+        loop {
+            let wd = unsafe { libc::inotify_add_watch(self.fd, c_path.as_ptr(), mask) };
+            if wd >= 0 {
+                self.watches.insert(wd, path.to_path_buf());
+                self.watched_dirs.insert(path.to_path_buf(), wd);
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err)
+                .with_context(|| format!("failed to add inotify watch for '{}'", path.display()));
+        }
+    }
+
+    fn remove_watch_id(&mut self, wd: RawFd) {
+        if let Some(path) = self.watches.remove(&wd) {
+            if self.watched_dirs.get(&path).copied() == Some(wd) {
+                self.watched_dirs.remove(&path);
+            }
+        }
+    }
+
+    fn remove_watch_path(&mut self, path: &Path) -> Result<()> {
+        let Some(wd) = self.watched_dirs.remove(path) else {
+            return Ok(());
+        };
+        self.watches.remove(&wd);
+        loop {
+            let removed = unsafe { libc::inotify_rm_watch(self.fd, wd) };
+            if removed == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(());
+            }
+            return Err(err).with_context(|| {
+                format!("failed to remove inotify watch for '{}'", path.display())
+            });
+        }
+    }
+}
+
+impl Drop for ResourceWatcher {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::close(self.fd) };
+    }
+}
+
+fn resource_watch_mask() -> u32 {
+    libc::IN_CREATE
+        | libc::IN_MODIFY
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_MOVED_TO
+        | libc::IN_MOVED_FROM
+        | libc::IN_DELETE
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF
+}
+
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path '{}' contains an interior NUL byte", path.display()))
+}
+
+fn poll_timeout_ms(timeout: Option<Duration>) -> libc::c_int {
+    match timeout {
+        Some(timeout) => {
+            let millis = timeout.as_millis();
+            millis.min(libc::c_int::MAX as u128) as libc::c_int
+        }
+        None => -1,
     }
 }
 

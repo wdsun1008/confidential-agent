@@ -28,3 +28,4 @@ sha2 = "=0.10.8"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 tempfile = "=3.10.1"
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+libc = "=0.2.186"
