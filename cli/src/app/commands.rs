@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const DAEMON_STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 const DAEMON_STATUS_WAIT_INTERVAL: Duration = Duration::from_secs(5);
@@ -17,6 +19,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::A2a(args) => cmd_a2a(cli, args),
         Commands::Migrate(args) => cmd_migrate(cli, args),
         Commands::Image(args) => cmd_image(cli, args),
+        Commands::Ssh(args) => cmd_ssh(cli, args),
         Commands::Status(args) => cmd_status(cli, args),
         Commands::Report(args) => cmd_report(cli, args),
         Commands::Destroy(args) => cmd_destroy(cli, args),
@@ -1642,6 +1645,107 @@ pub(super) fn debug_ssh_hint(state: &LocalServiceState) -> Option<String> {
             key.private_key.display()
         ),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DebugSshCommand {
+    pub(super) private_key: PathBuf,
+    pub(super) target: String,
+    pub(super) argv: Vec<OsString>,
+}
+
+pub(super) fn cmd_ssh(cli: &Cli, args: &SshArgs) -> Result<()> {
+    let command = resolve_debug_ssh_command(&cli.state_dir, &args.service, &args.ssh_args)?;
+    exec_debug_ssh_command(&command)
+}
+
+pub(super) fn resolve_debug_ssh_command(
+    state_dir: &Path,
+    service: &str,
+    ssh_args: &[OsString],
+) -> Result<DebugSshCommand> {
+    let paths = context_paths(state_dir, service);
+    let state = read_service_state_file(&paths.service_state)?.with_context(|| {
+        format!(
+            "service '{}' has no local state at '{}'; run deploy first",
+            service,
+            paths.service_state.display()
+        )
+    })?;
+    build_debug_ssh_command(&state, ssh_args)
+}
+
+pub(super) fn build_debug_ssh_command(
+    state: &LocalServiceState,
+    ssh_args: &[OsString],
+) -> Result<DebugSshCommand> {
+    let key = state.build.debug_ssh.as_ref().with_context(|| {
+        format!(
+            "service '{}' has no debug SSH key in local state; deploy a debug image first",
+            state.service_id
+        )
+    })?;
+    let target = debug_ssh_target(state).with_context(|| {
+        format!(
+            "service '{}' has no public_ip or private_ip in local state",
+            state.service_id
+        )
+    })?;
+    Ok(DebugSshCommand {
+        private_key: key.private_key.clone(),
+        target: target.to_string(),
+        argv: build_debug_ssh_argv(&key.private_key, target, ssh_args),
+    })
+}
+
+pub(super) fn build_debug_ssh_argv(
+    private_key: &Path,
+    target: &str,
+    ssh_args: &[OsString],
+) -> Vec<OsString> {
+    let mut argv = vec![
+        OsString::from("ssh"),
+        OsString::from("-i"),
+        private_key.as_os_str().to_os_string(),
+        OsString::from(format!("root@{target}")),
+    ];
+    argv.extend(ssh_args.iter().cloned());
+    argv
+}
+
+fn debug_ssh_target(state: &LocalServiceState) -> Option<&str> {
+    non_empty_ip(state.deploy.public_ip.as_deref())
+        .or_else(|| non_empty_ip(state.deploy.private_ip.as_deref()))
+}
+
+fn non_empty_ip(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(unix)]
+fn exec_debug_ssh_command(command: &DebugSshCommand) -> Result<()> {
+    set_mode(&command.private_key, 0o600).with_context(|| {
+        format!(
+            "failed to chmod debug SSH private key '{}'",
+            command.private_key.display()
+        )
+    })?;
+    let (program, args) = command
+        .argv
+        .split_first()
+        .context("debug SSH command argv is empty")?;
+    let err = Command::new(program).args(args).exec();
+    Err(err).with_context(|| format!("failed to exec '{}'", program.to_string_lossy()))
+}
+
+#[cfg(not(unix))]
+fn exec_debug_ssh_command(_command: &DebugSshCommand) -> Result<()> {
+    bail!("confidential-agent ssh is only supported on Unix hosts")
 }
 
 fn fetch_daemon_status(host: &str) -> Result<DaemonStatus> {
