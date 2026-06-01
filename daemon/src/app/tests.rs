@@ -8,6 +8,154 @@ use std::time::Instant;
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn http_parser_accepts_headers_larger_than_1024_bytes() {
+    let filler = "a".repeat(1500);
+    let request = format!("GET /health HTTP/1.1\r\nHost: localhost\r\nX-Fill: {filler}\r\n\r\n");
+
+    let parsed = parse_http_request_head(request.as_bytes()).unwrap();
+
+    assert_eq!(parsed.method, "GET");
+    assert_eq!(parsed.path, "/health");
+}
+
+#[test]
+fn http_parser_rejects_invalid_utf8_and_body_headers() {
+    assert!(matches!(
+        parse_http_request_head(b"GET /health HTTP/1.1\r\nX-Bad: \xff\r\n\r\n"),
+        Err(HttpRequestError::BadRequest)
+    ));
+    assert!(matches!(
+        parse_http_request_head(b"GET /health HTTP/1.1\r\nContent-Length: 1\r\n\r\n"),
+        Err(HttpRequestError::PayloadTooLarge)
+    ));
+    assert!(matches!(
+        parse_http_request_head(b"GET /health HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        Err(HttpRequestError::BadRequest)
+    ));
+    assert!(matches!(
+        parse_http_request_head(b"GET /health\r\n\r\n"),
+        Err(HttpRequestError::BadRequest)
+    ));
+}
+
+#[test]
+fn fixed_window_rate_limiter_limits_and_resets_per_peer() {
+    let mut limiter = FixedWindowRateLimiter::new(2, Duration::from_millis(100));
+    let peer = std::net::IpAddr::from([127, 0, 0, 1]);
+    let other_peer = std::net::IpAddr::from([127, 0, 0, 2]);
+    let now = Instant::now();
+
+    assert!(limiter.allow(peer, now));
+    assert!(limiter.allow(peer, now + Duration::from_millis(1)));
+    assert!(!limiter.allow(peer, now + Duration::from_millis(2)));
+    assert!(limiter.allow(other_peer, now + Duration::from_millis(2)));
+    assert!(limiter.allow(peer, now + Duration::from_millis(100)));
+}
+
+#[test]
+fn http_active_request_guard_releases_counter() {
+    let limits = HttpServerLimits::new(1, HTTP_RATE_LIMIT_REQUESTS, HTTP_RATE_LIMIT_WINDOW);
+    let guard = limits.try_acquire_request().unwrap();
+
+    assert!(limits.try_acquire_request().is_none());
+    drop(guard);
+    assert!(limits.try_acquire_request().is_some());
+}
+
+#[test]
+fn http_accept_path_rejects_concurrency_exhaustion_without_spawning_handler() {
+    let limits = Arc::new(HttpServerLimits::new(
+        1,
+        HTTP_RATE_LIMIT_REQUESTS,
+        HTTP_RATE_LIMIT_WINDOW,
+    ));
+    let held_slot = limits.try_acquire_request().unwrap();
+
+    let (response, spawned_handler) = http_roundtrip_with_accept_outcome(
+        HttpServerKind::Status,
+        limits.clone(),
+        b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    assert!(!spawned_handler);
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+    assert!(limits.try_acquire_request().is_none());
+    drop(held_slot);
+    assert!(limits.try_acquire_request().is_some());
+}
+
+#[test]
+fn http_server_accepts_valid_request_larger_than_1024_bytes() {
+    let filler = "a".repeat(1500);
+    let request = format!("GET /health HTTP/1.1\r\nHost: localhost\r\nX-Fill: {filler}\r\n\r\n");
+
+    let response = http_roundtrip(HttpServerKind::Status, request.as_bytes());
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains(r#"{"status":"ok"}"#));
+}
+
+#[test]
+fn http_server_rejects_over_limit_headers_with_431() {
+    let mut request = b"GET /health HTTP/1.1\r\nX-Fill: ".to_vec();
+    request.resize(HTTP_MAX_HEADER_BYTES, b'a');
+
+    let response = http_roundtrip(HttpServerKind::Status, &request);
+
+    assert!(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large"));
+}
+
+#[test]
+fn http_server_rejects_non_get_with_allow_header() {
+    let response = http_roundtrip(
+        HttpServerKind::Status,
+        b"POST /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+    assert!(response.contains("\r\nAllow: GET\r\n"));
+}
+
+#[test]
+fn http_server_rejects_body_headers() {
+    let content_length_response = http_roundtrip(
+        HttpServerKind::Status,
+        b"GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+    );
+    let transfer_encoding_response = http_roundtrip(
+        HttpServerKind::Status,
+        b"GET /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+
+    assert!(content_length_response.starts_with("HTTP/1.1 413 Payload Too Large"));
+    assert!(transfer_encoding_response.starts_with("HTTP/1.1 400 Bad Request"));
+}
+
+#[test]
+fn http_server_rejects_unknown_path_with_404() {
+    let response = http_roundtrip(
+        HttpServerKind::AgentCard,
+        b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+}
+
+#[test]
+fn http_server_rate_limit_is_shared_across_kinds() {
+    let limits = Arc::new(HttpServerLimits::new(64, 2, Duration::from_secs(60)));
+    let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    let first = http_roundtrip_with_limits(HttpServerKind::Status, limits.clone(), request);
+    let second = http_roundtrip_with_limits(HttpServerKind::AgentCard, limits.clone(), request);
+    let third = http_roundtrip_with_limits(HttpServerKind::Status, limits, request);
+
+    assert!(first.starts_with("HTTP/1.1 200 OK"));
+    assert!(second.starts_with("HTTP/1.1 200 OK"));
+    assert!(third.starts_with("HTTP/1.1 429 Too Many Requests"));
+}
+
+#[test]
 fn parses_octal_modes() {
     assert_eq!(parse_mode("0600").unwrap(), 0o600);
     assert_eq!(parse_mode("0o644").unwrap(), 0o644);
@@ -1417,6 +1565,69 @@ fn serve_agent_card_error_counter() -> (String, Arc<AtomicUsize>) {
         format!("http://127.0.0.1:{port}/.well-known/agent-card.json"),
         hits,
     )
+}
+
+fn http_roundtrip(kind: HttpServerKind, request: &[u8]) -> String {
+    http_roundtrip_with_limits(kind, Arc::new(HttpServerLimits::default()), request)
+}
+
+fn http_roundtrip_with_limits(
+    kind: HttpServerKind,
+    limits: Arc<HttpServerLimits>,
+    request: &[u8],
+) -> String {
+    http_roundtrip_with_accept_outcome(kind, limits, request).0
+}
+
+fn http_roundtrip_with_accept_outcome(
+    kind: HttpServerKind,
+    limits: Arc<HttpServerLimits>,
+    request: &[u8],
+) -> (String, bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let request = request.to_vec();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        match handle_accepted_http_stream(stream, kind, limits).unwrap() {
+            HttpAcceptOutcome::Spawned(handle) => {
+                handle.join().unwrap();
+                true
+            }
+            HttpAcceptOutcome::Rejected => false,
+        }
+    });
+
+    let mut client = TcpStream::connect(addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    match client.write_all(&request) {
+        Ok(()) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        Err(err) => panic!("failed to write HTTP request: {err}"),
+    }
+    let _ = client.shutdown(std::net::Shutdown::Write);
+
+    let mut response = String::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        match client.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.push_str(&String::from_utf8_lossy(&buffer[..read])),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(err) => panic!("failed to read HTTP response: {err}"),
+        }
+    }
+    let spawned_handler = server.join().unwrap();
+    (response, spawned_handler)
 }
 
 fn test_a2a_bundle(alias: Option<&str>, url: &str, scoped_services: &[&str]) -> A2aBundle {

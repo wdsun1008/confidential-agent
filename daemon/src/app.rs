@@ -13,15 +13,17 @@ use confidential_agent_core::schema::{
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{Cli, Commands, InitrdFetchArgs, RunArgs};
 
@@ -44,6 +46,12 @@ const DEFAULT_AGENT_CARD_PATH: &str = "/opt/confidential-agent/agent-card.json";
 const A2A_CACHE_TTL_MIN_SEC: u64 = 60;
 const A2A_CACHE_TTL_MAX_SEC: u64 = 3600;
 const A2A_FETCH_FAILURE_BACKOFF_SEC: u64 = 60;
+const HTTP_MAX_HEADER_BYTES: usize = 8 * 1024;
+const HTTP_READ_CHUNK_BYTES: usize = 512;
+const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_MAX_CONCURRENT_REQUESTS: usize = 64;
+const HTTP_RATE_LIMIT_REQUESTS: usize = 120;
+const HTTP_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
@@ -238,8 +246,17 @@ fn initrd_fail_closed(reason: String) -> Result<()> {
 
 fn run_daemon(args: RunArgs) -> Result<()> {
     println!("confidential-agentd starting");
-    start_http_server(&args.status_listen, HttpServerKind::Status)?;
-    start_http_server(&args.agent_card_listen, HttpServerKind::AgentCard)?;
+    let http_limits = Arc::new(HttpServerLimits::default());
+    start_http_server(
+        &args.status_listen,
+        HttpServerKind::Status,
+        http_limits.clone(),
+    )?;
+    start_http_server(
+        &args.agent_card_listen,
+        HttpServerKind::AgentCard,
+        http_limits,
+    )?;
     let mut state = read_daemon_state().unwrap_or_default();
     let mut active_bootstrap: Option<BootstrapConfig> = None;
     loop {
@@ -304,7 +321,127 @@ enum HttpServerKind {
     AgentCard,
 }
 
-fn start_http_server(listen: &str, kind: HttpServerKind) -> Result<()> {
+#[derive(Debug)]
+struct HttpServerLimits {
+    active_requests: Arc<AtomicUsize>,
+    max_concurrent_requests: usize,
+    rate_limiter: Mutex<FixedWindowRateLimiter>,
+}
+
+impl HttpServerLimits {
+    fn new(
+        max_concurrent_requests: usize,
+        max_peer_requests: usize,
+        peer_window: Duration,
+    ) -> Self {
+        Self {
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_requests,
+            rate_limiter: Mutex::new(FixedWindowRateLimiter::new(max_peer_requests, peer_window)),
+        }
+    }
+
+    fn try_acquire_request(&self) -> Option<ActiveRequestGuard> {
+        let mut current = self.active_requests.load(Ordering::Relaxed);
+        loop {
+            if current >= self.max_concurrent_requests {
+                return None;
+            }
+            match self.active_requests.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ActiveRequestGuard {
+                        active_requests: self.active_requests.clone(),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn allow_peer(&self, peer: IpAddr) -> bool {
+        let mut rate_limiter = self
+            .rate_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rate_limiter.allow(peer, Instant::now())
+    }
+}
+
+impl Default for HttpServerLimits {
+    fn default() -> Self {
+        Self::new(
+            HTTP_MAX_CONCURRENT_REQUESTS,
+            HTTP_RATE_LIMIT_REQUESTS,
+            HTTP_RATE_LIMIT_WINDOW,
+        )
+    }
+}
+
+struct ActiveRequestGuard {
+    active_requests: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.active_requests.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct FixedWindowRateLimiter {
+    max_requests: usize,
+    window: Duration,
+    peers: HashMap<IpAddr, PeerRateWindow>,
+}
+
+impl FixedWindowRateLimiter {
+    fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            peers: HashMap::new(),
+        }
+    }
+
+    fn allow(&mut self, peer: IpAddr, now: Instant) -> bool {
+        let window = self.window;
+        self.peers.retain(|_, rate| {
+            now.checked_duration_since(rate.window_started)
+                .is_some_and(|elapsed| elapsed < window)
+        });
+
+        if self.max_requests == 0 {
+            return false;
+        }
+
+        let rate = self.peers.entry(peer).or_insert(PeerRateWindow {
+            window_started: now,
+            count: 0,
+        });
+        if rate.count >= self.max_requests {
+            return false;
+        }
+        rate.count += 1;
+        true
+    }
+}
+
+#[derive(Debug)]
+struct PeerRateWindow {
+    window_started: Instant,
+    count: usize,
+}
+
+fn start_http_server(
+    listen: &str,
+    kind: HttpServerKind,
+    limits: Arc<HttpServerLimits>,
+) -> Result<()> {
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind daemon {:?} API on {listen}", kind))?;
     println!("confidential-agentd {:?} API listening on {listen}", kind);
@@ -312,11 +449,10 @@ fn start_http_server(listen: &str, kind: HttpServerKind) -> Result<()> {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    thread::spawn(move || {
-                        if let Err(err) = handle_http_request(stream, kind) {
-                            eprintln!("daemon {:?} API request failed: {err:#}", kind);
-                        }
-                    });
+                    let limits = limits.clone();
+                    if let Err(err) = handle_accepted_http_stream(stream, kind, limits) {
+                        eprintln!("daemon {:?} API accepted connection failed: {err:#}", kind);
+                    }
                 }
                 Err(err) => eprintln!("daemon {:?} API accept failed: {err}", kind),
             }
@@ -325,43 +461,234 @@ fn start_http_server(listen: &str, kind: HttpServerKind) -> Result<()> {
     Ok(())
 }
 
-fn handle_http_request(mut stream: TcpStream, kind: HttpServerKind) -> Result<()> {
-    let mut request = [0u8; 1024];
-    let read = stream
-        .read(&mut request)
-        .context("failed to read daemon API request")?;
-    let request = std::str::from_utf8(&request[..read]).unwrap_or_default();
-    let first_line = request.lines().next().unwrap_or_default();
-    match kind {
-        HttpServerKind::Status => {
-            match first_line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                ["GET", "/status", _] => serve_status_file(stream),
-                ["GET", "/health", _] => {
-                    write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
-                }
-                _ => write_http_response(
-                    stream,
-                    "404 Not Found",
-                    "application/json",
-                    r#"{"error":"not found"}"#,
-                ),
+enum HttpAcceptOutcome {
+    Spawned(thread::JoinHandle<()>),
+    Rejected,
+}
+
+fn handle_accepted_http_stream(
+    stream: TcpStream,
+    kind: HttpServerKind,
+    limits: Arc<HttpServerLimits>,
+) -> Result<HttpAcceptOutcome> {
+    configure_http_stream(&stream)?;
+    let peer = stream
+        .peer_addr()
+        .context("failed to resolve daemon API peer address")?
+        .ip();
+
+    if !limits.allow_peer(peer) {
+        write_http_response(
+            stream,
+            "429 Too Many Requests",
+            "application/json",
+            r#"{"error":"too many requests"}"#,
+        )?;
+        return Ok(HttpAcceptOutcome::Rejected);
+    }
+
+    let Some(active_request) = limits.try_acquire_request() else {
+        write_http_response(
+            stream,
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":"too many active requests"}"#,
+        )?;
+        return Ok(HttpAcceptOutcome::Rejected);
+    };
+
+    let handle = thread::Builder::new()
+        .name(format!("confidential-agentd-{kind:?}-request"))
+        .spawn(move || {
+            if let Err(err) = handle_http_request(stream, kind, active_request) {
+                eprintln!("daemon {:?} API request failed: {err:#}", kind);
             }
+        })
+        .context("failed to spawn daemon API request thread")?;
+    Ok(HttpAcceptOutcome::Spawned(handle))
+}
+
+fn configure_http_stream(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(HTTP_IO_TIMEOUT))
+        .context("failed to set daemon API read timeout")?;
+    stream
+        .set_write_timeout(Some(HTTP_IO_TIMEOUT))
+        .context("failed to set daemon API write timeout")?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HttpRequestHead {
+    method: String,
+    path: String,
+}
+
+#[derive(Debug)]
+enum HttpRequestError {
+    TooLarge,
+    BadRequest,
+    PayloadTooLarge,
+    Io(std::io::Error),
+}
+
+fn handle_http_request(
+    mut stream: TcpStream,
+    kind: HttpServerKind,
+    active_request: ActiveRequestGuard,
+) -> Result<()> {
+    let _active_request = active_request;
+
+    let request = match read_http_request_head(&mut stream) {
+        Ok(request) => request,
+        Err(HttpRequestError::TooLarge) => {
+            return write_http_response(
+                stream,
+                "431 Request Header Fields Too Large",
+                "application/json",
+                r#"{"error":"request headers too large"}"#,
+            );
         }
-        HttpServerKind::AgentCard => {
-            match first_line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                ["GET", "/.well-known/agent-card.json", _] => serve_agent_card(stream),
-                ["GET", "/health", _] => {
-                    write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
-                }
-                _ => write_http_response(
-                    stream,
-                    "404 Not Found",
-                    "application/json",
-                    r#"{"error":"not found"}"#,
-                ),
+        Err(HttpRequestError::PayloadTooLarge) => {
+            return write_http_response(
+                stream,
+                "413 Payload Too Large",
+                "application/json",
+                r#"{"error":"request body not allowed"}"#,
+            );
+        }
+        Err(HttpRequestError::BadRequest) => {
+            return write_http_response(
+                stream,
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":"bad request"}"#,
+            );
+        }
+        Err(HttpRequestError::Io(err)) => {
+            return Err(err).context("failed to read daemon API request");
+        }
+    };
+
+    if request.method != "GET" {
+        return write_http_response_with_headers(
+            stream,
+            "405 Method Not Allowed",
+            "application/json",
+            &[("Allow", "GET")],
+            r#"{"error":"method not allowed"}"#,
+        );
+    }
+
+    match kind {
+        HttpServerKind::Status => match request.path.as_str() {
+            "/status" => serve_status_file(stream),
+            "/health" => {
+                write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
             }
+            _ => write_http_response(
+                stream,
+                "404 Not Found",
+                "application/json",
+                r#"{"error":"not found"}"#,
+            ),
+        },
+        HttpServerKind::AgentCard => match request.path.as_str() {
+            "/.well-known/agent-card.json" => serve_agent_card(stream),
+            "/health" => {
+                write_http_response(stream, "200 OK", "application/json", r#"{"status":"ok"}"#)
+            }
+            _ => write_http_response(
+                stream,
+                "404 Not Found",
+                "application/json",
+                r#"{"error":"not found"}"#,
+            ),
+        },
+    }
+}
+
+fn read_http_request_head(
+    stream: &mut TcpStream,
+) -> std::result::Result<HttpRequestHead, HttpRequestError> {
+    let mut request = Vec::with_capacity(HTTP_READ_CHUNK_BYTES);
+    let mut chunk = [0u8; HTTP_READ_CHUNK_BYTES];
+
+    loop {
+        if let Some(header_end) = find_http_header_end(&request) {
+            return parse_http_request_head(&request[..header_end]);
+        }
+        if request.len() >= HTTP_MAX_HEADER_BYTES {
+            return Err(HttpRequestError::TooLarge);
+        }
+
+        let read_len = (HTTP_MAX_HEADER_BYTES - request.len()).min(HTTP_READ_CHUNK_BYTES);
+        match stream.read(&mut chunk[..read_len]) {
+            Ok(0) => return Err(HttpRequestError::BadRequest),
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+            Err(err) => return Err(HttpRequestError::Io(err)),
         }
     }
+}
+
+fn find_http_header_end(request: &[u8]) -> Option<usize> {
+    request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+}
+
+fn parse_http_request_head(
+    request: &[u8],
+) -> std::result::Result<HttpRequestHead, HttpRequestError> {
+    let request = std::str::from_utf8(request).map_err(|_| HttpRequestError::BadRequest)?;
+    let request = request
+        .strip_suffix("\r\n\r\n")
+        .ok_or(HttpRequestError::BadRequest)?;
+    let mut lines = request.split("\r\n");
+    let first_line = lines.next().ok_or(HttpRequestError::BadRequest)?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().ok_or(HttpRequestError::BadRequest)?;
+    let path = parts.next().ok_or(HttpRequestError::BadRequest)?;
+    let version = parts.next().ok_or(HttpRequestError::BadRequest)?;
+    if parts.next().is_some() || !version.starts_with("HTTP/") || !path.starts_with('/') {
+        return Err(HttpRequestError::BadRequest);
+    }
+
+    let method = method.to_string();
+    let path = path.to_string();
+    let mut content_length = 0u64;
+    let mut has_transfer_encoding = false;
+
+    for line in lines {
+        if line.is_empty() {
+            return Err(HttpRequestError::BadRequest);
+        }
+        let (name, value) = line.split_once(':').ok_or(HttpRequestError::BadRequest)?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(HttpRequestError::BadRequest);
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            has_transfer_encoding = true;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value
+                .trim()
+                .parse()
+                .map_err(|_| HttpRequestError::BadRequest)?;
+            content_length = content_length.max(parsed);
+        }
+    }
+
+    if has_transfer_encoding {
+        return Err(HttpRequestError::BadRequest);
+    }
+    if content_length > 0 {
+        return Err(HttpRequestError::PayloadTooLarge);
+    }
+
+    Ok(HttpRequestHead { method, path })
 }
 
 fn serve_status_file(stream: TcpStream) -> Result<()> {
@@ -393,17 +720,35 @@ fn serve_agent_card(stream: TcpStream) -> Result<()> {
 }
 
 fn write_http_response(
-    mut stream: TcpStream,
+    stream: TcpStream,
     status: &str,
     content_type: &str,
     body: &str,
 ) -> Result<()> {
+    write_http_response_with_headers(stream, status, content_type, &[], body)
+}
+
+fn write_http_response_with_headers(
+    mut stream: TcpStream,
+    status: &str,
+    content_type: &str,
+    extra_headers: &[(&str, &str)],
+    body: &str,
+) -> Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n"
+    )
+    .context("failed to write daemon API response")?;
+    for (name, value) in extra_headers {
+        write!(stream, "{name}: {value}\r\n").context("failed to write daemon API response")?;
+    }
+    write!(
+        stream,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
-    .context("failed to write status API response")
+    .context("failed to write daemon API response")
 }
 
 fn bootstrap_resources_ready(bootstrap: &BootstrapConfig, state: &DaemonState) -> Result<bool> {
