@@ -3191,3 +3191,14 @@ fn no_proxy_with_target_trims_whitespace_in_existing_entries() {
     let value = no_proxy_with_target("  localhost ,  127.0.0.1 ", "203.0.113.10");
     assert_eq!(value, "localhost,127.0.0.1,203.0.113.10");
 }
+
+#[test]
+fn secret_fetch_initrd_loads_tdx_guest_module() {
+    let setup = secret_fetch_module_setup();
+    assert!(setup.contains("instmods tdx_guest"));
+    assert!(setup.contains("usr/lib/modprobe.d"));
+    assert!(setup.contains("options tdx_guest tsm_api=1"));
+    assert!(setup.contains("usr/lib/modules-load.d"));
+    assert!(setup.contains("confidential-agent-tdx.conf"));
+    assert!(setup.contains("tdx_guest\\n"));
+}
