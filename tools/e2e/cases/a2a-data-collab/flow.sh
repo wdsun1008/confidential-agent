@@ -192,8 +192,8 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
     register_destroy_target "$ANALYST_STATE_DIR" analyst-agent
-    register_destroy_target "$DATA_OWNER_STATE_DIR" data-owner-agent
     ca_run "$ANALYST_STATE_DIR" deploy --spec "$ANALYST_DIR/analyst/analyst.yaml"
+    register_destroy_target "$DATA_OWNER_STATE_DIR" data-owner-agent
     ca_run "$DATA_OWNER_STATE_DIR" deploy --spec "$DATA_OWNER_DIR/data-owner/data-owner.yaml"
   fi
 
@@ -271,4 +271,7 @@ run_case() {
     --timeout-ms "$CHAT_TIMEOUT_MS" \
     >"$WORK_DIR/a2a-data-collab-result.json"
   record_file_as_block "A2A data collaboration result:" "$WORK_DIR/a2a-data-collab-result.json" json
+
+  run_report_probe "$ANALYST_STATE_DIR" "$WORK_DIR/analyst-attestation-report.json" analyst-agent data-owner
+  run_report_probe "$DATA_OWNER_STATE_DIR" "$WORK_DIR/data-owner-attestation-report.json" data-owner-agent analyst
 }

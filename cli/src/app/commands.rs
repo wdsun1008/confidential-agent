@@ -17,6 +17,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Migrate(args) => cmd_migrate(cli, args),
         Commands::Image(args) => cmd_image(cli, args),
         Commands::Status(args) => cmd_status(cli, args),
+        Commands::Report(args) => cmd_report(cli, args),
         Commands::Destroy(args) => cmd_destroy(cli, args),
         Commands::Version => {
             println!("confidential-agent {}", env!("CARGO_PKG_VERSION"));

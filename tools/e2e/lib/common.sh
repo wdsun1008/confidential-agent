@@ -60,6 +60,7 @@ record_file_as_block() {
     -e 's/"apiKey": "[^"]+"/"apiKey": "<redacted>"/g' \
     -e 's/"clientSecret": "[^"]+"/"clientSecret": "<redacted>"/g' \
     -e 's/"token": "[^"]+"/"token": "<redacted>"/g' \
+    -e 's/"ear_jwt": "[^"]+"/"ear_jwt": "<redacted>"/g' \
     "$path" >>"$STEP_LOG"
   record '```'
 }
@@ -734,4 +735,82 @@ run_openclaw_chat_probe() {
     --expect "$expect" \
     "$@" | tee "$output"
   record_file_as_block "OpenClaw chat probe:" "$output" json
+}
+
+run_report_probe() {
+  local state_dir="$1"
+  local output="$2"
+  local expected_services="$3"
+  local expected_a2a_peers="${4:-}"
+  local reference_values="${5:-$REFERENCE_VALUES}"
+  ca_run "$state_dir" report --include-a2a --json --out "$output"
+  record_file_as_block "Attestation report:" "$output" json
+  python3.11 - "$output" "$expected_services" "$expected_a2a_peers" "$reference_values" <<'PY'
+import json
+import sys
+
+path, services_arg, peers_arg, reference_values = sys.argv[1:5]
+expected_services = [item for item in services_arg.split(",") if item]
+expected_peers = [item for item in peers_arg.split(",") if item]
+
+with open(path, encoding="utf-8") as f:
+    report = json.load(f)
+
+def fail(message):
+    raise SystemExit(message)
+
+if report.get("schema") != "confidential-agent/attestation-report/v1":
+    fail(f"unexpected report schema: {report.get('schema')!r}")
+if not report.get("generated_at"):
+    fail("report generated_at is empty")
+
+services = {svc.get("service_id"): svc for svc in report.get("services", [])}
+missing_services = [svc for svc in expected_services if svc not in services]
+if missing_services:
+    fail(f"report missing services: {missing_services}")
+
+for service_id in expected_services:
+    svc = services[service_id]
+    if svc.get("phase") != "active":
+        fail(f"{service_id} phase is {svc.get('phase')!r}, expected active")
+    if svc.get("collect_status") != "ok":
+        fail(f"{service_id} collect_status is {svc.get('collect_status')!r}: {svc.get('collect_errors')}")
+    build = svc.get("build") or {}
+    for field in ("build_id", "image_name", "variant", "spec_sha256", "tee", "reference_values_mode"):
+        if not build.get(field):
+            fail(f"{service_id} build.{field} is empty")
+    tee_info = svc.get("tee_info") or {}
+    if tee_info.get("status") != "ok" or tee_info.get("tee") != "tdx":
+        fail(f"{service_id} tee_info is not ok/tdx: {tee_info}")
+    attestation = svc.get("attestation") or {}
+    if attestation.get("status") != "ok" or not attestation.get("ear_jwt") or not isinstance(attestation.get("ear_claims"), dict):
+        fail(f"{service_id} attestation is incomplete")
+    daemon = svc.get("daemon") or {}
+    if daemon.get("status") != "ok" or daemon.get("phase") != "running":
+        fail(f"{service_id} daemon is not running: {daemon}")
+    if daemon.get("app_ready") is not True or daemon.get("mesh_ready") is not True:
+        fail(f"{service_id} daemon readiness is not true: {daemon}")
+    rekor = svc.get("rekor") or {}
+    if reference_values == "rekor":
+        if rekor.get("status") != "found" or not rekor.get("entries"):
+            fail(f"{service_id} Rekor entries were not found: {rekor}")
+    elif rekor.get("status") != "not_applicable":
+        fail(f"{service_id} Rekor status should be not_applicable for {reference_values}: {rekor}")
+
+peers = {peer.get("alias") or peer.get("url"): peer for peer in report.get("a2a_peers", [])}
+missing_peers = [peer for peer in expected_peers if peer not in peers]
+if missing_peers:
+    fail(f"report missing A2A peers: {missing_peers}")
+
+for alias in expected_peers:
+    peer = peers[alias]
+    if peer.get("fetch_status") != "ok":
+        fail(f"A2A peer {alias} fetch_status is {peer.get('fetch_status')!r}")
+    card = peer.get("card") or {}
+    if card.get("tee") != "tdx" or not card.get("public_ip") or not card.get("ports"):
+        fail(f"A2A peer {alias} card is incomplete: {card}")
+    live = peer.get("live_status") or {}
+    if live.get("state") != "ok":
+        fail(f"A2A peer {alias} live_status is not ok: {live}")
+PY
 }

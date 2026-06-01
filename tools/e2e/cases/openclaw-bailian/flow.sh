@@ -66,9 +66,9 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
     register_destroy_target "$STATE_DIR" mcp
-    register_destroy_target "$STATE_DIR" openclaw
     log "deploying MCP"
     ca_run "$STATE_DIR" deploy --spec "$WORK_DIR/mcp/mcp-demo.yaml"
+    register_destroy_target "$STATE_DIR" openclaw
     log "deploying OpenClaw"
     ca_run "$STATE_DIR" deploy --spec "$WORK_DIR/openclaw/openclaw.yaml"
   fi
@@ -99,4 +99,6 @@ run_case() {
     "$CHAT_EXPECT" \
     "$WORK_DIR/chat-probe.json" \
     --timeout-ms "$CHAT_TIMEOUT_MS"
+
+  run_report_probe "$STATE_DIR" "$WORK_DIR/attestation-report.json" mcp,openclaw
 }

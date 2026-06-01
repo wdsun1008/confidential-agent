@@ -53,6 +53,7 @@ pub(crate) enum Commands {
     Migrate(MigrateArgs),
     Image(ImageArgs),
     Status(StatusArgs),
+    Report(ReportArgs),
     Destroy(DestroyArgs),
     Version,
 }
@@ -290,6 +291,18 @@ pub(crate) struct StatusArgs {
     pub(crate) json: bool,
     #[arg(long, help = "Query read-only status from live guest daemons")]
     pub(crate) live: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReportArgs {
+    #[arg(long)]
+    pub(crate) service: Option<String>,
+    #[arg(long)]
+    pub(crate) include_a2a: bool,
+    #[arg(long)]
+    pub(crate) json: bool,
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

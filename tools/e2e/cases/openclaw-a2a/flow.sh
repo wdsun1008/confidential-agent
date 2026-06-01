@@ -171,8 +171,8 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
     register_destroy_target "$ALPHA_STATE_DIR" openclaw
-    register_destroy_target "$BETA_STATE_DIR" openclaw
     ca_run "$ALPHA_STATE_DIR" deploy --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
+    register_destroy_target "$BETA_STATE_DIR" openclaw
     ca_run "$BETA_STATE_DIR" deploy --spec "$BETA_DIR/openclaw/openclaw.yaml"
   fi
 
@@ -212,4 +212,7 @@ run_case() {
 
   run_a2a_chat_probe alpha-to-beta "$ALPHA_STATE_DIR" "$alpha_token" beta CA_A2A_BETA_OK "$alpha_ip" "$alpha_key"
   run_a2a_chat_probe beta-to-alpha "$BETA_STATE_DIR" "$beta_token" alpha CA_A2A_ALPHA_OK "$beta_ip" "$beta_key"
+
+  run_report_probe "$ALPHA_STATE_DIR" "$WORK_DIR/alpha-attestation-report.json" openclaw beta
+  run_report_probe "$BETA_STATE_DIR" "$WORK_DIR/beta-attestation-report.json" openclaw alpha
 }

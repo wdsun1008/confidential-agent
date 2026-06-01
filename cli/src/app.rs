@@ -2,7 +2,7 @@ use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
     InjectArgs, MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands,
-    SpecArgs, SpecCommands, StatusArgs,
+    ReportArgs, SpecArgs, SpecCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -18,16 +18,17 @@ use confidential_agent_core::agent_card_fetch::{
 };
 use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{
-    AgentCard, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState, LocalDebugSshKey,
-    LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState, LocalSpecState,
-    MeshBundle, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
+    AgentCard, AppliedResourceState, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState,
+    LocalDebugSshKey, LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState,
+    LocalSpecState, MeshBundle, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
     LOCAL_SERVICE_STATE_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use confidential_agent_core::schema::{
-    AgentCardCapabilities, AgentCardConfidential, AgentCardPort, AgentCardRekor, AgentExtension,
-    AgentInterface, MESH_SCHEMA_VERSION,
+    AgentCardCapabilities, AgentCardConfidential, AgentExtension, AgentInterface,
+    MESH_SCHEMA_VERSION,
 };
+use confidential_agent_core::schema::{AgentCardPort, AgentCardRekor, DaemonA2aPeerStatus};
 use confidential_agent_core::spec::{AgentSpec, AttestationTee, ReferenceValueMode};
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use confidential_agent_shelter::{
@@ -432,6 +433,7 @@ const REQUIRED_GUEST_TNG_VERSION: &str = "tng 2.6.0";
 
 mod commands;
 use commands::deploy_shelter_args;
+use commands::fetch_daemon_status_from;
 pub(crate) use commands::run;
 
 mod self_describe;
@@ -678,6 +680,9 @@ use state::*;
 
 mod workflows;
 use workflows::*;
+
+mod report;
+use report::*;
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
