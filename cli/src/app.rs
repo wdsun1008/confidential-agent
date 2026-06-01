@@ -1,8 +1,8 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
-    InjectArgs, MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands,
-    ReportArgs, SpecArgs, SpecCommands, StatusArgs,
+    InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands, MigrateArgs, OutputFormat,
+    PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};

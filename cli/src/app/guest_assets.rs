@@ -65,13 +65,13 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         destination: "/opt/confidential-agent/hack/attestation-challenge-client".to_string(),
         executable: true,
     }];
-    if let Some(cosign) = stage_optional_host_binary(guest_staging_dir, "cosign")? {
-        extra_files.push(GuestFileAsset {
-            source: cosign,
-            destination: "/usr/local/bin/cosign".to_string(),
-            executable: true,
-        });
-    }
+    let staged_cosign =
+        stage_tools_image_asset(cli, guest_staging_dir, "/usr/bin/cosign", "cosign", 0o755)?;
+    extra_files.push(GuestFileAsset {
+        source: staged_cosign,
+        destination: "/usr/local/bin/cosign".to_string(),
+        executable: true,
+    });
 
     Ok(GuestAssets {
         agentd_bin: staged_bin,
@@ -85,31 +85,6 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         guest_setup_script,
         extra_files,
     })
-}
-
-fn stage_optional_host_binary(guest_staging_dir: &Path, name: &str) -> Result<Option<PathBuf>> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name}"))
-        .output()
-        .with_context(|| format!("failed to locate optional host binary '{name}'"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let source = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if source.as_os_str().is_empty() || !source.exists() {
-        return Ok(None);
-    }
-    let staged = guest_staging_dir.join(name);
-    fs::copy(&source, &staged).with_context(|| {
-        format!(
-            "failed to copy optional host binary '{}' to '{}'",
-            source.display(),
-            staged.display()
-        )
-    })?;
-    set_mode(&staged, 0o755)?;
-    Ok(Some(staged))
 }
 
 #[cfg(test)]

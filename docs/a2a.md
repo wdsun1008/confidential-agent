@@ -197,7 +197,7 @@ a2a:
     expected_subject: repo:org/repo:ref:refs/heads/main
 ```
 
-`deploy` / `inject` 阶段会调用 `cosign sign-blob`，对去掉 `signatures` 字段后的 canonical AgentCard JWS signing input 签名，并把 Sigstore bundle 写入 `signatures[].header["x-confidential-agent-sigstore-bundle"]`。
+`deploy` / `inject` 阶段会通过 tools 镜像调用 `cosign sign-blob`，对去掉 `signatures` 字段后的 canonical AgentCard JWS signing input 签名，并把 Sigstore bundle 写入 `signatures[].header["x-confidential-agent-sigstore-bundle"]`。
 
 非交互式 CI 建议设置：
 
@@ -424,7 +424,7 @@ Probe 代码在 `tools/e2e/probes/a2a-data-collab-probe.mjs`。通过条件：
 
 ### 6.4 运行方式
 
-默认 unsigned 模式需要 Aliyun、DashScope 和 Rekor/cosign：
+默认 unsigned 模式需要 Aliyun、DashScope 和 Rekor。`cosign`/`rekor-cli` 由 tools 镜像提供，不需要在部署机单独安装：
 
 ```bash
 export ALICLOUD_ACCESS_KEY='...'

@@ -48,7 +48,7 @@ _图1. OpenClaw 在 TDX 机密计算实例上接入百炼 API 的部署架构_
 
 ![部署使用流程](images/02-deployment-flow.svg)
 
-1. 源码获取与依赖安装：部署机下载 Confidential Agent 源码，安装 Docker、Rust、cosign、rekor-cli 等依赖；如果系统中没有 Shelter，则安装仓库 `hack/` 中内置的 Shelter RPM。
+1. 源码获取与依赖安装：部署机下载 Confidential Agent 源码，安装 Docker、Rust 等依赖；如果系统中没有 Shelter，则安装仓库 `hack/` 中内置的 Shelter RPM。`cosign` 和 `rekor-cli` 已内置在 `confidential-agent-tools` 镜像中，不需要在部署机单独安装。
 2. 制品构建与参考值公开：从源码构建 OpenClaw 可信镜像，提取 TDX/UKI 参考值并上传 Rekor 透明日志。
 3. 创建 TDX 机密实例：通过 Shelter 与 Terraform 创建 ECS 实例、VPC、交换机、安全组、OSS Bucket 和自定义镜像。
 4. 远程证明审计与机密资源注入：部署工具对实例执行远程证明，验证通过后注入 OpenClaw 配置、百炼 API Key、钉钉凭据和 Gateway Token。
@@ -85,6 +85,8 @@ Confidential Agent 部署中的核心数据均在 TEE（Trusted Execution Enviro
 > 部署机仅用于执行构建和部署操作，后续一键脚本会自动创建新的 TDX 机密实例承载 OpenClaw 服务。部署机本身无需是 TDX 实例。本文以 `ecs.g9i.xlarge`、地域 `cn-beijing`、可用区 `cn-beijing-i` 为默认示例。
 
 ## 操作步骤
+
+以下步骤展示 one-click 路径。如果你需要逐条执行 CLI 命令来审查或接入自己的自动化流水线，请参考 [OpenClaw CLI 分步部署示例](../openclaw-cli-step-by-step.md)。
 
 ### 步骤一：准备部署机
 
@@ -185,9 +187,9 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 脚本会自动完成以下动作：
 
 1.  安装 Alibaba Cloud Linux 3 主机依赖，使用系统源中的 `cargo`/`rust`、`python3.11` 和 Node.js，并写入 Aliyun Cargo sparse registry；默认不使用 rustup。
-2.  在缺少 Shelter 时安装内置 Shelter RPM，并校验 Shelter、cosign、rekor-cli 和 Docker。
+2.  在缺少 Shelter 时安装内置 Shelter RPM，并校验 Shelter 和 Docker。
 3.  构建 `confidential-agent`、`confidential-agentd`、`cai-pep`，并将 `confidential-agent` 安装到 `/usr/local/bin`。
-4.  构建 `confidential-agent-tools:latest`，并在部署机安装与镜像内匹配的 OpenClaw CLI。
+4.  构建内置 `cosign`、`rekor-cli`、TNG 和远程证明客户端的 `confidential-agent-tools:latest`，并在部署机安装与镜像内匹配的 OpenClaw CLI。
 5.  构建 OpenClaw 可信镜像，启用 FDE、dm-verity 和 UKI。
 6.  将镜像参考值上传 Rekor 透明日志。
 7.  创建阿里云云资源并启动 TDX ECS。
@@ -389,10 +391,11 @@ Created entry at index 1205944956, available at: https://rekor.sigstore.dev/api/
 
 ### 验证 Rekor 条目的包含性（inclusion proof）
 
-包含性证明用于确定记录着镜像参考值的条目确实存在于 Rekor 的默克尔树根（Merkle Root）中。可使用 `rekor-cli` 验证条目已被正确纳入透明日志：
+包含性证明用于确定记录着镜像参考值的条目确实存在于 Rekor 的默克尔树根（Merkle Root）中。可使用 tools 镜像内置的 `rekor-cli` 验证条目已被正确纳入透明日志：
 
 ```bash
-rekor-cli verify --log-index 1205944956 --rekor_server https://rekor.sigstore.dev
+docker run --rm --network host confidential-agent-tools:latest \
+  rekor-cli verify --log-index 1205944956 --rekor_server https://rekor.sigstore.dev
 ```
 
 如果输出中包含两段相同 hash 值，则说明验证成功：
@@ -407,7 +410,8 @@ Expected Root Hash: 1291abcee27148a4c00241ba8719f798ce060e8a5ccc8b18249017c25c6d
 一致性证明可确定一个较旧的默克尔树根（Root A）是较新的默克尔树根（Root B）的前缀或历史状态，从而确保 Rekor 上存储的参考值条目没有被删改：
 
 ```bash
-rekor-cli loginfo --rekor_server https://rekor.sigstore.dev
+docker run --rm --network host confidential-agent-tools:latest \
+  rekor-cli loginfo --rekor_server https://rekor.sigstore.dev
 ```
 
 如果看到输出中包含如下内容，则说明验证成功：

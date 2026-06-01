@@ -131,13 +131,6 @@ run_case() {
   require_cmd python3.11
   require_cmd ssh
   require_cmd aliyun
-  if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
-    require_cmd cosign
-    require_cmd rekor-cli
-  fi
-  if data_collab_signing_enabled; then
-    require_cmd cosign
-  fi
   require_aliyun_credentials
   require_bailian_credentials
   if data_collab_signing_enabled; then
@@ -151,6 +144,7 @@ run_case() {
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd
 
   local dashscope_key allowed_cidr cosign_key
   dashscope_key="$(resolve_dashscope_key)"
@@ -162,7 +156,6 @@ run_case() {
   export COSIGN_KEY="$cosign_key"
   export INSTANCE_TYPE
 
-  build_host_binaries -p confidential-agent-cli -p confidential-agentd
   render_case
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- DashScope API key loaded but not printed."

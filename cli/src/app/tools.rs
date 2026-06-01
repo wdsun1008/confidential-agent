@@ -218,6 +218,37 @@ pub(super) fn run_attestation_client(
     )
 }
 
+pub(super) fn run_containerized_host_tool(
+    cli: &Cli,
+    tool: &'static str,
+    tool_args: Vec<OsString>,
+    file_mounts: Vec<PathBuf>,
+    envs: Vec<(String, String)>,
+    inherit_stdio: bool,
+) -> Result<()> {
+    let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
+    let state_dir = absolute_path_for_state(&cli.state_dir);
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
+    let mut mounts = vec![workdir.clone(), state_dir];
+    for path in file_mounts {
+        mounts.extend(mounts_for_file(&path, &workdir));
+    }
+
+    run_tools_container(
+        cli,
+        ToolContainerSpec {
+            tool,
+            tool_args,
+            mounts,
+            envs,
+            workdir: Some(workdir),
+            container_name: None,
+        },
+        inherit_stdio,
+    )
+}
+
 pub(super) fn run_attestation_tool(
     cli: &Cli,
     state_dir: &Path,
@@ -265,6 +296,96 @@ pub(super) fn ensure_attestation_workdir(state_dir: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+pub(super) fn prepare_sigstore_tools_for_process(cli: &Cli) -> Result<()> {
+    let bin_dir = ensure_sigstore_tool_wrappers(cli)?;
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts = vec![bin_dir.clone()];
+    parts.extend(std::env::split_paths(&current_path));
+    let path =
+        std::env::join_paths(parts).context("failed to construct PATH for Sigstore tools")?;
+    std::env::set_var("PATH", path);
+    std::env::set_var("CA_TOOLS_IMAGE", &cli.tools_image);
+    Ok(())
+}
+
+pub(super) fn ensure_sigstore_tool_wrappers(cli: &Cli) -> Result<PathBuf> {
+    let root = absolute_path_for_state(&cli.state_dir).join("tools/bin");
+    fs::create_dir_all(&root).with_context(|| format!("failed to create '{}'", root.display()))?;
+    for tool in ["cosign", "rekor-cli"] {
+        let path = root.join(tool);
+        fs::write(&path, sigstore_tool_wrapper_script(cli, tool)?)
+            .with_context(|| format!("failed to write '{}'", path.display()))?;
+        set_mode(&path, 0o755)?;
+    }
+    Ok(root)
+}
+
+fn sigstore_tool_wrapper_script(cli: &Cli, tool: &str) -> Result<String> {
+    let state_dir = absolute_path_for_state(&cli.state_dir);
+    Ok(format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+tool={tool}
+image="${{CA_TOOLS_IMAGE:-}}"
+if [[ -z "$image" ]]; then
+  image={image}
+fi
+state_dir={state_dir}
+workdir="$(pwd -P 2>/dev/null || pwd)"
+
+mounts=()
+add_mount() {{
+  local input="$1" dir existing
+  [[ -n "$input" ]] || return 0
+  if [[ -d "$input" ]]; then
+    dir="$input"
+  else
+    dir="$(dirname "$input")"
+  fi
+  [[ -d "$dir" ]] || return 0
+  dir="$(cd "$dir" && pwd -P)"
+  for existing in "${{mounts[@]}}"; do
+    [[ "$existing" == "$dir" ]] && return 0
+  done
+  mounts+=("$dir")
+}}
+
+add_mount "$workdir"
+add_mount "$state_dir"
+for arg in "$@"; do
+  case "$arg" in
+    /*|*/*) add_mount "$arg" ;;
+  esac
+done
+
+docker_args=(run --rm --network host)
+for mount in "${{mounts[@]}}"; do
+  docker_args+=(--volume "$mount:$mount")
+done
+docker_args+=(--workdir "$workdir")
+
+while IFS='=' read -r key _; do
+  case "$key" in
+    http_proxy|https_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|\
+COSIGN_*|SIGSTORE_*|ACTIONS_ID_TOKEN_*|GITHUB_*|BUILDKITE_*|CI)
+      docker_args+=(--env "$key")
+      ;;
+  esac
+done < <(env)
+
+exec docker "${{docker_args[@]}}" "$image" "$tool" "$@"
+"#,
+        tool = shell_single_quote(tool),
+        image = shell_single_quote(&cli.tools_image),
+        state_dir = shell_single_quote(&state_dir.to_string_lossy()),
+    ))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'\''"#))
+}
+
 pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -283,9 +404,12 @@ pub(super) fn mounts_for_file(path: &Path, workdir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
     if parent.is_absolute() {
-        vec![parent.to_path_buf()]
+        vec![parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())]
     } else {
-        vec![workdir.join(parent)]
+        let joined = workdir.join(parent);
+        vec![joined.canonicalize().unwrap_or(joined)]
     }
 }
 

@@ -72,16 +72,14 @@ run_case() {
   require_cmd ssh
   require_cmd timeout
   require_cmd aliyun
-  if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
-    require_cmd cosign
-    require_cmd rekor-cli
-  fi
   require_aliyun_credentials
 
   init_step_log "Confidential Agent OpenClaw vLLM E2E"
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-pep
+  verify_cai_pep_binary
 
   local allowed_cidr token cosign_key
   allowed_cidr="$(resolve_allowed_cidr)"
@@ -92,8 +90,6 @@ run_case() {
   export INSTANCE_TYPE
   export DISK_GB
 
-  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-pep
-  verify_cai_pep_binary
   render_case
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- OpenClaw gateway token generated but not printed."

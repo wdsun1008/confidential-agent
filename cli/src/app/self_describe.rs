@@ -571,6 +571,7 @@ const OPS_DOC: &str = r#"
 Core commands:
 
 - `build --spec <path>` creates the confidential image; `build` defaults to `confidential-agent.yaml`.
+- `key generate-cosign --output-key-prefix ./cosign` creates a Rekor signing key pair through the tools image.
 - `deploy --spec <path>` provisions the cloud instance; `deploy` defaults to `confidential-agent.yaml`.
 - `status --service <id> --live --json` checks local and guest state.
 - `connect --render-only` prints the local forwarding config without starting the tunnel. The JSON includes `client_endpoints[]` with the exact host-side `127.0.0.1:<port>` URLs.
