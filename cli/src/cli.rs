@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 fn default_state_dir() -> PathBuf {
@@ -53,6 +54,7 @@ pub(crate) enum Commands {
     A2a(A2aArgs),
     Migrate(MigrateArgs),
     Image(ImageArgs),
+    Ssh(SshArgs),
     Status(StatusArgs),
     Report(ReportArgs),
     Destroy(DestroyArgs),
@@ -309,6 +311,13 @@ pub(crate) struct StatusArgs {
     pub(crate) json: bool,
     #[arg(long, help = "Query read-only status from live guest daemons")]
     pub(crate) live: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SshArgs {
+    pub(crate) service: String,
+    #[arg(last = true)]
+    pub(crate) ssh_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]

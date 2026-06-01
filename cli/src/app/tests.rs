@@ -1,15 +1,16 @@
 use super::commands::{
-    a2a_cli_preview_error_kind, cmd_a2a, cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject,
-    collect_image_entries, collect_live_status, debug_ssh_hint, deploy_shelter_args,
-    fetch_daemon_status_from, live_status_table_columns, status_table_columns, status_views,
-    validate_build_start, validate_deploy_start, wait_for_daemon_status_from,
+    a2a_cli_preview_error_kind, build_debug_ssh_command, cmd_a2a, cmd_build, cmd_deploy,
+    cmd_destroy, cmd_image, cmd_inject, collect_image_entries, collect_live_status, debug_ssh_hint,
+    deploy_shelter_args, fetch_daemon_status_from, live_status_table_columns,
+    resolve_debug_ssh_command, status_table_columns, status_views, validate_build_start,
+    validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
 use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, StatusArgs};
 use clap::Parser;
 use confidential_agent_core::agent_card_fetch::AgentCardFetchError;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -118,6 +119,34 @@ fn connect_cli_keeps_bare_mode_and_adds_start_stop() {
             other => panic!("expected connect stop, got {other:?}"),
         },
         other => panic!("expected connect command, got {other:?}"),
+    }
+}
+
+#[test]
+fn ssh_cli_accepts_service_and_trailing_args() {
+    let cli = Cli::parse_from([
+        "confidential-agent",
+        "ssh",
+        "openclaw",
+        "--",
+        "-vv",
+        "-L",
+        "127.0.0.1:8080:127.0.0.1:8080",
+    ]);
+
+    match cli.command {
+        Commands::Ssh(args) => {
+            assert_eq!(args.service, "openclaw");
+            assert_eq!(
+                args.ssh_args,
+                vec![
+                    OsString::from("-vv"),
+                    OsString::from("-L"),
+                    OsString::from("127.0.0.1:8080:127.0.0.1:8080"),
+                ]
+            );
+        }
+        other => panic!("expected ssh command, got {other:?}"),
     }
 }
 
@@ -2129,6 +2158,126 @@ fn debug_ssh_hint_uses_generated_private_key_and_public_ip() {
         hint,
         "openclaw: ssh -i /state/services/openclaw/secrets/debug_ssh root@39.0.0.1"
     );
+}
+
+#[test]
+fn debug_ssh_command_errors_when_state_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let err = resolve_debug_ssh_command(temp.path(), "openclaw", &[]).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("service 'openclaw' has no local state"));
+}
+
+#[test]
+fn debug_ssh_command_errors_without_debug_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = local_state("openclaw", vec![18789], vec![18789]);
+    write_state(temp.path(), &state);
+
+    let err = resolve_debug_ssh_command(temp.path(), "openclaw", &[]).unwrap_err();
+
+    assert!(err.to_string().contains("has no debug SSH key"));
+}
+
+#[test]
+fn debug_ssh_command_errors_without_ip() {
+    let mut state = debug_ssh_state("openclaw");
+    state.deploy.public_ip = None;
+    state.deploy.private_ip = None;
+
+    let err = build_debug_ssh_command(&state, &[]).unwrap_err();
+
+    assert!(err.to_string().contains("has no public_ip or private_ip"));
+}
+
+#[test]
+fn debug_ssh_command_appends_extra_args() {
+    let state = debug_ssh_state("openclaw");
+    let extras = vec![
+        OsString::from("-vv"),
+        OsString::from("-L"),
+        OsString::from("127.0.0.1:8080:127.0.0.1:8080"),
+    ];
+
+    let command = build_debug_ssh_command(&state, &extras).unwrap();
+
+    assert_eq!(
+        command.argv,
+        vec![
+            OsString::from("ssh"),
+            OsString::from("-i"),
+            OsString::from("/state/services/openclaw/secrets/debug_ssh"),
+            OsString::from("root@39.0.0.1"),
+            OsString::from("-vv"),
+            OsString::from("-L"),
+            OsString::from("127.0.0.1:8080:127.0.0.1:8080"),
+        ]
+    );
+}
+
+#[test]
+fn debug_ssh_command_prefers_public_ip() {
+    let mut state = debug_ssh_state("openclaw");
+    state.deploy.public_ip = Some("39.0.0.1".to_string());
+    state.deploy.private_ip = Some("10.0.1.20".to_string());
+
+    let command = build_debug_ssh_command(&state, &[]).unwrap();
+
+    assert_eq!(command.target, "39.0.0.1");
+    assert_eq!(
+        command.argv,
+        vec![
+            OsString::from("ssh"),
+            OsString::from("-i"),
+            OsString::from("/state/services/openclaw/secrets/debug_ssh"),
+            OsString::from("root@39.0.0.1"),
+        ]
+    );
+}
+
+#[test]
+fn debug_ssh_command_falls_back_to_private_ip() {
+    let mut state = debug_ssh_state("openclaw");
+    state.deploy.public_ip = None;
+    state.deploy.private_ip = Some("10.0.1.20".to_string());
+
+    let command = build_debug_ssh_command(&state, &[]).unwrap();
+
+    assert_eq!(command.target, "10.0.1.20");
+    assert_eq!(
+        command.argv,
+        vec![
+            OsString::from("ssh"),
+            OsString::from("-i"),
+            OsString::from("/state/services/openclaw/secrets/debug_ssh"),
+            OsString::from("root@10.0.1.20"),
+        ]
+    );
+}
+
+#[test]
+fn debug_ssh_command_treats_empty_public_ip_as_absent() {
+    let mut state = debug_ssh_state("openclaw");
+    state.deploy.public_ip = Some("   ".to_string());
+    state.deploy.private_ip = Some("10.0.1.20".to_string());
+
+    let command = build_debug_ssh_command(&state, &[]).unwrap();
+
+    assert_eq!(command.target, "10.0.1.20");
+}
+
+fn debug_ssh_state(service_id: &str) -> LocalServiceState {
+    let mut state = local_state(service_id, vec![18789], vec![18789]);
+    state.build.variant = "debug".to_string();
+    state.build.debug_ssh = Some(LocalDebugSshKey {
+        private_key: PathBuf::from(format!("/state/services/{service_id}/secrets/debug_ssh")),
+        public_key: PathBuf::from(format!(
+            "/state/services/{service_id}/secrets/debug_ssh.pub"
+        )),
+    });
+    state
 }
 
 #[test]
