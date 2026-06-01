@@ -118,7 +118,8 @@ fn renders_release_shelter_deploy_without_ssh_key_name() {
     assert!(!rendered.contains("/project/secrets/debug_ssh.pub"));
     assert!(rendered.contains("trustiflux:"));
     assert!(rendered.contains("tng: true"));
-    assert!(rendered.contains("cryptpilot-fde:"));
+    assert!(rendered.contains("cryptpilot-fde-host:"));
+    assert!(rendered.contains("cryptpilot-fde-guest:"));
     assert!(rendered.contains("disk-crypt:"));
     assert!(rendered.contains("fde_config_file: /build/fde.toml"));
     assert!(rendered.contains("99confidential-agent-secret-fetch"));
@@ -423,7 +424,7 @@ fn preferred_tool_path_uses_first_existing_candidate() {
     ));
     fs::create_dir_all(&dir).unwrap();
     let missing = dir.join("missing-tool");
-    let candidate = dir.join("cryptpilot-fde");
+    let candidate = dir.join("cryptpilot-fde-host");
     fs::write(&candidate, b"test").unwrap();
 
     let selected =
@@ -435,7 +436,8 @@ fn preferred_tool_path_uses_first_existing_candidate() {
 
 #[test]
 fn preferred_tool_path_falls_back_when_no_candidate_exists() {
-    let selected = preferred_existing_tool_path(["/definitely/missing/cryptpilot-fde"], "fallback");
+    let selected =
+        preferred_existing_tool_path(["/definitely/missing/cryptpilot-fde-host"], "fallback");
 
     assert_eq!(selected, "fallback");
 }
