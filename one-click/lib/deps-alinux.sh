@@ -283,54 +283,6 @@ ensure_rust_toolchain() {
   configure_cargo_mirror
 }
 
-verify_sha256() {
-  local file="$1"
-  local expected="$2"
-  require_cmd sha256sum
-  local actual
-  actual="$(sha256sum "$file" | awk '{print $1}')"
-  if [[ "$actual" != "$expected" ]]; then
-    rm -f "$file"
-    die "sha256 mismatch for $file: expected $expected, got $actual"
-  fi
-}
-
-download_pinned_binary() {
-  local url="$1" dest="$2" expected_sha="$3"
-  local tmp
-  tmp="$(mktemp)"
-  if ! curl -fL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 --max-time 600 -o "$tmp" "$url"; then
-    rm -f "$tmp"
-    die "failed to download $url"
-  fi
-  verify_sha256 "$tmp" "$expected_sha"
-  install -m 0755 "$tmp" "$dest"
-  rm -f "$tmp"
-}
-
-ensure_sigstore_tools() {
-  if [[ "${CA_REFERENCE_VALUES:-rekor}" != "rekor" ]]; then
-    return
-  fi
-  local cosign_version="${CA_COSIGN_VERSION:-3.0.6}"
-  local rekor_version="${CA_REKOR_VERSION:-1.5.1}"
-  local cosign_url="${CA_COSIGN_URL:-https://github.com/sigstore/cosign/releases/download/v${cosign_version}/cosign-linux-amd64}"
-  local rekor_url="${CA_REKOR_CLI_URL:-https://github.com/sigstore/rekor/releases/download/v${rekor_version}/rekor-cli-linux-amd64}"
-  local cosign_sha="${CA_COSIGN_SHA256:-c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74}"
-  local rekor_sha="${CA_REKOR_CLI_SHA256:-0b4964af85477892c37039fb80793b151864970d19838873eaa1a777ca2fb813}"
-
-  if ! command -v cosign >/dev/null 2>&1; then
-    is_root || die "cosign is missing and installation requires root. Re-run as root or install cosign first."
-    log "installing cosign v$cosign_version"
-    download_pinned_binary "$cosign_url" /usr/local/bin/cosign "$cosign_sha"
-  fi
-  if ! command -v rekor-cli >/dev/null 2>&1; then
-    is_root || die "rekor-cli is missing and installation requires root. Re-run as root or install rekor-cli first."
-    log "installing rekor-cli v$rekor_version"
-    download_pinned_binary "$rekor_url" /usr/local/bin/rekor-cli "$rekor_sha"
-  fi
-}
-
 ensure_docker_ready() {
   require_cmd docker
   if ! docker info >/dev/null 2>&1; then

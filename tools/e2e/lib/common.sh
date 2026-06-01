@@ -293,8 +293,11 @@ resolve_cosign_key() {
   mkdir -p "$WORK_DIR/secrets"
   local prefix="$WORK_DIR/secrets/cosign"
   if [[ ! -f "$prefix.key" ]]; then
-    record_cmd "COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix $(printf '%q' "$prefix")"
-    COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null
+    local tool_state="$WORK_DIR/tools-state"
+    mkdir -p "$tool_state"
+    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$tool_state" key generate-cosign --output-key-prefix "$prefix")
+    record_cmd "$(cmd_string "${cmd[@]}")"
+    "${cmd[@]}" >/dev/null
   fi
   printf '%s' "$prefix.key"
 }

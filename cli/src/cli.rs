@@ -43,6 +43,7 @@ pub(crate) enum Commands {
     Deploy(DeployArgs),
     Docs(DocsArgs),
     Spec(SpecArgs),
+    Key(KeyArgs),
     #[command(hide = true)]
     Inject(InjectArgs),
     #[command(hide = true)]
@@ -117,6 +118,23 @@ pub(crate) enum SpecCommands {
         spec: PathBuf,
         #[arg(long, value_enum, default_value = "markdown")]
         format: OutputFormat,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct KeyArgs {
+    #[command(subcommand)]
+    pub(crate) command: KeyCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum KeyCommands {
+    #[command(name = "generate-cosign")]
+    GenerateCosign {
+        #[arg(long, default_value = "./cosign")]
+        output_key_prefix: PathBuf,
+        #[arg(long)]
+        force: bool,
     },
 }
 

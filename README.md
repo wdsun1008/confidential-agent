@@ -80,7 +80,7 @@ flowchart TB
 
 ## 快速开始 (Quick Start)
 
-最短路径是 one-click installer。它会在本机安装依赖、在缺少 Shelter 时安装仓库内置的 Shelter RPM、构建当前源码、生成 OpenClaw 配置、交互式选择 operator CIDR，然后通过 Shelter 在阿里云上创建一台 TDX ECS。
+最短路径是 one-click installer。它会在本机安装依赖、在缺少 Shelter 时安装仓库内置的 Shelter RPM、构建当前源码、生成 OpenClaw 配置、交互式选择 operator CIDR，然后通过 Shelter 在阿里云上创建一台 TDX ECS。需要逐步控制每个 CLI 动作时，参考 [OpenClaw CLI 分步部署示例](docs/openclaw-cli-step-by-step.md)。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh
@@ -160,7 +160,7 @@ confidential-agent/
 ├── daemon/                # confidential-agentd (guest 控制面 + initrd-fetch)
 ├── cai-pep/               # Policy Enforcement Point，运行时 sandbox + attest helper
 ├── tools/
-│   ├── Dockerfile         # confidential-agent-tools 镜像（hack/tng-2.6.0 + attestation-challenge-client）
+│   ├── Dockerfile         # confidential-agent-tools 镜像（tng + attestation client + cosign/rekor-cli）
 │   ├── policies/          # Trustee/OPA rego（生产 + dev）
 │   └── e2e/               # 端到端测试 runner、case 模板与探针
 ├── hack/                  # 严格 pin 的 TNG 二进制、Shelter RPM、libtdx-verify RPM
@@ -176,4 +176,5 @@ confidential-agent/
 
 - [docs/architecture.md](docs/architecture.md) — 控制流与数据流详解（含序列图）
 - [docs/spec.md](docs/spec.md) — `confidential-agent/v1` AppSpec 完整字段参考
+- [docs/openclaw-cli-step-by-step.md](docs/openclaw-cli-step-by-step.md) — 不走 one-click 的 OpenClaw CLI 分步部署场景
 - [docs/a2a.md](docs/a2a.md) — 跨组织/跨用户 A2A：背景、架构、信任模型、step-by-step 上手与排错

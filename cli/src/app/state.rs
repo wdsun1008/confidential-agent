@@ -105,7 +105,12 @@ pub(super) fn absolute_path_for_state(path: &Path) -> PathBuf {
 
 pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
     let shelter_bin = effective_shelter_bin(cli);
-    let status = shelter_command_with_bin(&shelter_bin, args)
+    let sigstore_bin = ensure_sigstore_tool_wrappers(cli)?;
+    let mut command = shelter_command_with_bin(&shelter_bin, args);
+    command
+        .env("PATH", path_with_prepended_dir(&sigstore_bin)?)
+        .env("CA_TOOLS_IMAGE", &cli.tools_image);
+    let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -120,6 +125,13 @@ pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn path_with_prepended_dir(dir: &Path) -> Result<std::ffi::OsString> {
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts = vec![dir.to_path_buf()];
+    parts.extend(std::env::split_paths(&current_path));
+    std::env::join_paths(parts).context("failed to construct PATH for Shelter")
 }
 
 fn shelter_command_with_bin(bin: &Path, args: &mut [OsString]) -> Command {

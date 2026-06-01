@@ -28,7 +28,6 @@ ensure_cosign_key() {
   if [[ "${CA_REFERENCE_VALUES:-rekor}" != "rekor" ]]; then
     return
   fi
-  require_cmd cosign
   install -d -m 0700 "$CA_WORK_DIR/secrets"
   if [[ -n "${CA_COSIGN_KEY:-}" ]]; then
     [[ -f "$CA_COSIGN_KEY" ]] || die "cosign key does not exist: $CA_COSIGN_KEY"
@@ -36,8 +35,8 @@ ensure_cosign_key() {
   fi
   local prefix="$CA_WORK_DIR/secrets/cosign"
   if [[ ! -f "$prefix.key" ]]; then
-    log "generating local cosign key pair"
-    COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix "$prefix" >/dev/null
+    log "generating local cosign key pair with confidential-agent tools image"
+    ca_cmd key generate-cosign --output-key-prefix "$prefix" >/dev/null
     chmod 0600 "$prefix.key" "$prefix.pub" 2>/dev/null || true
   fi
   CA_COSIGN_KEY="$prefix.key"

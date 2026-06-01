@@ -49,6 +49,27 @@ fn common_commands_default_to_confidential_agent_yaml() {
         }) => assert_eq!(spec, PathBuf::from("confidential-agent.yaml")),
         other => panic!("expected spec validate command, got {other:?}"),
     }
+
+    let key = Cli::parse_from([
+        "confidential-agent",
+        "key",
+        "generate-cosign",
+        "--output-key-prefix",
+        "./secrets/cosign",
+    ]);
+    match key.command {
+        Commands::Key(KeyArgs {
+            command:
+                KeyCommands::GenerateCosign {
+                    output_key_prefix,
+                    force,
+                },
+        }) => {
+            assert_eq!(output_key_prefix, PathBuf::from("./secrets/cosign"));
+            assert!(!force);
+        }
+        other => panic!("expected key generate-cosign command, got {other:?}"),
+    }
 }
 
 #[test]

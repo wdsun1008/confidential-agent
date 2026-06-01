@@ -138,6 +138,14 @@ struct A2aPeerCardReport {
 }
 
 pub(super) fn cmd_report(cli: &Cli, args: &ReportArgs) -> Result<()> {
+    if args.include_a2a
+        && A2aStateFile::from_path(&a2a_state_path(&cli.state_dir))?
+            .peers
+            .iter()
+            .any(|peer| peer.signer.is_some())
+    {
+        prepare_sigstore_tools_for_process(cli)?;
+    }
     let mut states = read_service_states(&cli.state_dir)?;
     if let Some(service) = args.service.as_deref() {
         states.retain(|s| s.service_id == service);

@@ -124,10 +124,6 @@ run_case() {
   require_cmd python3.11
   require_cmd ssh
   require_cmd aliyun
-  if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
-    require_cmd cosign
-    require_cmd rekor-cli
-  fi
   require_aliyun_credentials
   require_bailian_credentials
 
@@ -135,6 +131,8 @@ run_case() {
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-pep
+  verify_cai_pep_binary
 
   local dashscope_key allowed_cidr cosign_key
   local alpha_token beta_token
@@ -150,8 +148,6 @@ run_case() {
   export A2A_AUDIT_PATH
   export INSTANCE_TYPE
 
-  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-pep
-  verify_cai_pep_binary
   render_case
   record "- allowed_cidr: \`$allowed_cidr\`"
 

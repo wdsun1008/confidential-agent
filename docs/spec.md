@@ -200,12 +200,18 @@ attestation:
 | `reference_values` | enum | ❌ | 默认 `sample`；可选 `rekor`。若选 `rekor` 则 `attestation.rekor` 必填 |
 | `rekor` | object | 条件必填 | `artifact_type` 与 `rekor_url` 非空；`required=true` 时 `cosign_key` 必填 |
 
+可用 CLI 生成本地 Rekor 签名 key，部署机不需要安装 host 版 `cosign`：
+
+```bash
+confidential-agent key generate-cosign --output-key-prefix ./cosign
+```
+
 两种 reference value 模式的差异：
 
 | 模式 | 来源 | 适用场景 | 失败行为 |
 |---|---|---|---|
 | `sample` | Shelter build 时本地生成的 sample reference value | 开发自验、QEMU 本地、policy=trustee-opa-local-dev | 验证不过，连接失败 |
-| `rekor` | Shelter 产出 in-toto SLSA provenance → cosign 签名 → 推 Rekor → 注入到 Trustee | 生产、对外可证明 | `required=true` 时整链失败；CLI 在 `set-reference-value-list` 阶段最多重试 5 次（间隔 30 s） |
+| `rekor` | Shelter 产出 in-toto SLSA provenance → tools 镜像内的 cosign/rekor-cli 签名并推 Rekor → 注入到 Trustee | 生产、对外可证明 | `required=true` 时整链失败；CLI 在 `set-reference-value-list` 阶段会做有限重试 |
 
 ---
 
@@ -290,7 +296,7 @@ a2a:
 
 AgentCard 按 A2A v1 发布：顶层包含 `protocolVersion`、`supportedInterfaces`、`capabilities`、`skills` 和可选 `signatures`。confidential-agent 扩展放在 `capabilities.extensions[]`，URI 为 `https://confidential-agent.dev/extensions/tee-rekor/v1`，其中包含本机 `publicIp`、`service.connect` 端口、TEE 类型和 Rekor 指针。`a2a` 需要 `attestation.reference_values=rekor` 且 `service.connect` 非空，否则没有可公开审计的 reference value metadata 或可公开接入端口，注入会失败。该 AgentCard 形态与旧版 top-level CA extension 不兼容；混合版本部署时应先升级发布 AgentCard 的服务端，再让调用方执行 `a2a add` / `a2a sync`。
 
-**AgentCard 签名**：`a2a.signing.required=true` 时，CLI 用 `cosign sign-blob` 的 keyless flow 对去除 `signatures` 后的 canonical AgentCard JWS signing input 签名，并把 Sigstore bundle 写入 `signatures[].header`。对端 `a2a add` 可通过 `--signer-issuer` / `--signer-subject` 配置 signer pin；daemon 在配置了 pin 时先用 `cosign verify-blob` 验签，再继续 Rekor allowlist 与 RATS-TLS reference value 处理。
+**AgentCard 签名**：`a2a.signing.required=true` 时，CLI 通过 tools 镜像中的 `cosign sign-blob` keyless flow 对去除 `signatures` 后的 canonical AgentCard JWS signing input 签名，并把 Sigstore bundle 写入 `signatures[].header`。对端 `a2a add` 可通过 `--signer-issuer` / `--signer-subject` 配置 signer pin；daemon 在配置了 pin 时先用随镜像注入 guest 的 `cosign verify-blob` 验签，再继续 Rekor allowlist 与 RATS-TLS reference value 处理。
 
 `CA_A2A_SIGSTORE_IDENTITY_TOKEN` 可选传给签名流程。设置后，CLI 会把它作为 `cosign sign-blob --identity-token` 使用，适合 CI 中复用 OIDC/JWT，避免 keyless signing 进入交互式登录。`a2a.signing.expected_issuer` / `expected_subject` 描述本服务发布 AgentCard 时预期使用的签名身份；对端消费这个 AgentCard 时，应把同一组值填入 `a2a add --signer-issuer` / `--signer-subject`。
 

@@ -41,7 +41,7 @@ The build phase must not read `peerings.yaml` and must not render Shelter `deplo
 
 The scripts do not unset proxy variables internally. On the current development host, OpenAI-facing tools may need a proxy, but mkosi/DNF access to `yum.tbsite.net` and deploy should run without proxy. Use the outer `env -u ...` wrapper shown above for full E2E runs.
 
-Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, `aliyun`, plus case-specific tools such as `cosign`/`rekor-cli` when `E2E_REFERENCE_VALUES=rekor`.
+Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, and `aliyun`. Rekor-mode `cosign`/`rekor-cli` calls run through `confidential-agent-tools`, so they are not host prerequisites.
 
 Common environment:
 
@@ -63,7 +63,7 @@ Provider credentials:
 
 - Aliyun: environment AK/SK or a usable active `aliyun` CLI profile.
 - Bailian cases: `DASHSCOPE_API_KEY` or `BAILIAN_API_KEY`.
-- Rekor mode: `cosign`, `rekor-cli`, and `E2E_COSIGN_KEY` or an auto-generated key under the work dir.
+- Rekor mode: `E2E_COSIGN_KEY` or an auto-generated key under the work dir. Auto-generation uses `confidential-agent key generate-cosign` with the configured tools image.
 - `a2a-data-collab`: defaults to unsigned AgentCards. Set `E2E_A2A_SIGNING=1` to exercise Sigstore keyless AgentCard signing; signed mode needs `CA_A2A_SIGSTORE_IDENTITY_TOKEN` or CI OIDC token request envs. `A2A_SIGNER_ISSUER` / `A2A_SIGNER_SUBJECT` may be set explicitly; otherwise a JWT `CA_A2A_SIGSTORE_IDENTITY_TOKEN` is decoded for `iss` / `sub`.
 
 Relative `E2E_WORK_DIR`, `E2E_STATE_DIR`, and `E2E_COSIGN_KEY` inputs are normalized to absolute paths before rendering AppSpecs, so validation behaves the same from any caller working directory.

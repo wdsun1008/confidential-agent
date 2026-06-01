@@ -9,6 +9,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Deploy(args) => cmd_deploy(cli, args),
         Commands::Docs(args) => cmd_docs(args),
         Commands::Spec(args) => cmd_spec(args),
+        Commands::Key(args) => cmd_key(cli, args),
         Commands::Inject(args) => cmd_inject(cli, args),
         Commands::Mesh(args) => cmd_mesh(cli, args),
         Commands::Connect(args) => cmd_connect(cli, args),
@@ -154,6 +155,79 @@ pub(super) fn validate_deploy_start(existing: Option<&LocalServiceState>) -> Res
     }
 }
 
+pub(super) fn cmd_key(cli: &Cli, args: &KeyArgs) -> Result<()> {
+    match &args.command {
+        KeyCommands::GenerateCosign {
+            output_key_prefix,
+            force,
+        } => generate_cosign_key_pair(cli, output_key_prefix, *force),
+    }
+}
+
+fn generate_cosign_key_pair(cli: &Cli, output_key_prefix: &Path, force: bool) -> Result<()> {
+    let key_path = path_with_suffix(output_key_prefix, ".key");
+    let pub_path = path_with_suffix(output_key_prefix, ".pub");
+    if !force && (key_path.exists() || pub_path.exists()) {
+        bail!(
+            "cosign key output already exists ('{}' or '{}'); pass --force to overwrite",
+            key_path.display(),
+            pub_path.display()
+        );
+    }
+    if force {
+        for path in [&key_path, &pub_path] {
+            if path.exists() {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to remove '{}'", path.display()))?;
+            }
+        }
+    }
+    if let Some(parent) = output_key_prefix
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+
+    run_containerized_host_tool(
+        cli,
+        "cosign",
+        vec![
+            OsString::from("generate-key-pair"),
+            OsString::from("--output-key-prefix"),
+            output_key_prefix.as_os_str().to_os_string(),
+        ],
+        vec![output_key_prefix.to_path_buf()],
+        vec![("COSIGN_PASSWORD".to_string(), String::new())],
+        true,
+    )?;
+    if key_path.exists() {
+        set_mode(&key_path, 0o600)?;
+    }
+    if pub_path.exists() {
+        set_mode(&pub_path, 0o644)?;
+    }
+    println!(
+        "[ca] cosign key pair generated: private={} public={}",
+        key_path.display(),
+        pub_path.display()
+    );
+    Ok(())
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn spec_requires_a2a_signing(spec: &AgentSpec) -> bool {
+    spec.a2a
+        .as_ref()
+        .is_some_and(|a2a| a2a.enabled && a2a.signing.required)
+}
+
 fn ensure_build_variant_present(
     state: &LocalServiceState,
     variant: &str,
@@ -181,6 +255,9 @@ fn ensure_build_variant_present(
 
 pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    if spec_requires_a2a_signing(&spec) {
+        prepare_sigstore_tools_for_process(cli)?;
+    }
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let current_state = read_service_state_file(&paths.service_state)?;
     validate_deploy_start(current_state.as_ref())?;
@@ -305,6 +382,9 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
 
 pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    if spec_requires_a2a_signing(&spec) {
+        prepare_sigstore_tools_for_process(cli)?;
+    }
     verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     validate_mesh_port_conflicts(
         &read_service_states(&cli.state_dir)?,
@@ -478,6 +558,9 @@ pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
                 (None, None) => None,
                 _ => bail!("--signer-issuer and --signer-subject must be provided together"),
             };
+            if signer.is_some() {
+                prepare_sigstore_tools_for_process(cli)?;
+            }
             let mut state = read_a2a_state_or_empty(&cli.state_dir)?;
             if state.peers.iter().any(|peer| peer.url == *agent_card_url) {
                 bail!("a2a peer URL '{}' already exists", agent_card_url);
@@ -585,6 +668,15 @@ pub(super) fn cmd_a2a(cli: &Cli, args: &A2aArgs) -> Result<()> {
                 bail!("use either --all or --alias, not both");
             }
             let mut state = read_a2a_state_or_empty(&cli.state_dir)?;
+            if state.peers.iter().any(|peer| {
+                let selected = alias
+                    .as_deref()
+                    .map(|alias| peer.alias.as_deref() == Some(alias))
+                    .unwrap_or(true);
+                selected && peer.signer.is_some()
+            }) {
+                prepare_sigstore_tools_for_process(cli)?;
+            }
             for peer in &mut state.peers {
                 let selected = alias
                     .as_deref()
