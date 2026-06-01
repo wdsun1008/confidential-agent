@@ -1,11 +1,75 @@
 use super::*;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+const TEST_BOOTSTRAP_RESOURCE: &str = "default/local-resources/cagent_bootstrap_config";
+const TEST_MESH_RESOURCE: &str = "default/local-resources/cagent_mesh_bundle";
+const TEST_A2A_BUNDLE_RESOURCE: &str = "default/local-resources/cagent_a2a_bundle";
+const DAEMON_ENV_VARS: &[&str] = &[
+    "CA_TNG_CONFIG_PATH",
+    "CA_SERVICE_DIRECTORY_PATH",
+    "CA_DAEMON_STATUS_PATH",
+    "CA_AGENT_CARD_PATH",
+    "CA_DAEMON_CACHE_DIR",
+    "CA_DAEMON_STATE_PATH",
+    "CA_SKIP_SYSTEMCTL",
+    "PATH",
+];
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvGuard {
+    fn new(vars: &[&'static str]) -> Self {
+        let lock = ENV_LOCK.lock().unwrap();
+        let saved = vars
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        Self { _lock: lock, saved }
+    }
+
+    fn set(&self, name: &'static str, value: impl AsRef<OsStr>) {
+        std::env::set_var(name, value);
+    }
+
+    fn set_path(&self, name: &'static str, path: &Path) {
+        self.set(name, path.as_os_str());
+    }
+
+    fn remove(&self, name: &'static str) {
+        std::env::remove_var(name);
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.iter().rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+struct NoTeeTestEnv {
+    _guard: EnvGuard,
+    tng_config: PathBuf,
+    service_directory: PathBuf,
+    status: PathBuf,
+    agent_card: PathBuf,
+    cache_dir: PathBuf,
+    state: PathBuf,
+}
 
 #[test]
 fn http_parser_accepts_headers_larger_than_1024_bytes() {
@@ -317,7 +381,7 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
 
 #[test]
 fn restart_service_reloads_systemd_before_touching_tng_unit() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL"]);
     let temp = tempfile::tempdir().unwrap();
     let fake_systemctl = temp.path().join("systemctl");
     let log_path = temp.path().join("systemctl.log");
@@ -331,15 +395,14 @@ fn restart_service_reloads_systemd_before_touching_tng_unit() {
     .unwrap();
     fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::set_var(
+    env.set(
         "PATH",
         format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
     );
-    std::env::remove_var("CA_SKIP_SYSTEMCTL");
+    env.remove("CA_SKIP_SYSTEMCTL");
 
     restart_service("trusted-network-gateway.service").unwrap();
 
-    std::env::set_var("PATH", old_path);
     let log = fs::read_to_string(log_path).unwrap();
     let commands: Vec<&str> = log.lines().collect();
     assert_eq!(commands[0], "daemon-reload");
@@ -350,7 +413,7 @@ fn restart_service_reloads_systemd_before_touching_tng_unit() {
 
 #[test]
 fn restart_service_ignores_reset_failed_for_never_loaded_tng_unit() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL"]);
     let temp = tempfile::tempdir().unwrap();
     let fake_systemctl = temp.path().join("systemctl");
     let log_path = temp.path().join("systemctl.log");
@@ -364,15 +427,14 @@ fn restart_service_ignores_reset_failed_for_never_loaded_tng_unit() {
         .unwrap();
     fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::set_var(
+    env.set(
         "PATH",
         format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
     );
-    std::env::remove_var("CA_SKIP_SYSTEMCTL");
+    env.remove("CA_SKIP_SYSTEMCTL");
 
     let result = restart_service("trusted-network-gateway.service");
 
-    std::env::set_var("PATH", old_path);
     result.unwrap();
     let log = fs::read_to_string(log_path).unwrap();
     let commands: Vec<&str> = log.lines().collect();
@@ -384,7 +446,7 @@ fn restart_service_ignores_reset_failed_for_never_loaded_tng_unit() {
 
 #[test]
 fn app_service_ready_requires_systemd_active_state() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL"]);
     let temp = tempfile::tempdir().unwrap();
     let fake_systemctl = temp.path().join("systemctl");
     let log_path = temp.path().join("systemctl.log");
@@ -398,11 +460,11 @@ fn app_service_ready_requires_systemd_active_state() {
         .unwrap();
     fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::set_var(
+    env.set(
         "PATH",
         format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
     );
-    std::env::remove_var("CA_SKIP_SYSTEMCTL");
+    env.remove("CA_SKIP_SYSTEMCTL");
     let bootstrap = BootstrapConfig {
         schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
         generation: 1,
@@ -418,7 +480,6 @@ fn app_service_ready_requires_systemd_active_state() {
 
     let ready = ensure_app_service_ready(&bootstrap);
 
-    std::env::set_var("PATH", old_path);
     assert!(!ready);
     let log = fs::read_to_string(log_path).unwrap();
     let commands: Vec<&str> = log.lines().collect();
@@ -431,7 +492,7 @@ fn app_service_ready_requires_systemd_active_state() {
 
 #[test]
 fn app_service_ready_requires_service_port_to_accept_connections() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL"]);
     let temp = tempfile::tempdir().unwrap();
     let fake_systemctl = temp.path().join("systemctl");
     let log_path = temp.path().join("systemctl.log");
@@ -445,11 +506,11 @@ fn app_service_ready_requires_service_port_to_accept_connections() {
     .unwrap();
     fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::set_var(
+    env.set(
         "PATH",
         format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
     );
-    std::env::remove_var("CA_SKIP_SYSTEMCTL");
+    env.remove("CA_SKIP_SYSTEMCTL");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let ready_port = listener.local_addr().unwrap().port();
     let mut bootstrap = BootstrapConfig {
@@ -469,13 +530,11 @@ fn app_service_ready_requires_service_port_to_accept_connections() {
     drop(listener);
     bootstrap.ports = vec![ready_port];
     assert!(!ensure_app_service_ready(&bootstrap));
-
-    std::env::set_var("PATH", old_path);
 }
 
 #[test]
 fn debug_ssh_ready_restarts_sshd_when_authorized_keys_exist() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL"]);
     let temp = tempfile::tempdir().unwrap();
     let auth_keys = temp.path().join("root/.ssh/authorized_keys");
     fs::create_dir_all(auth_keys.parent().unwrap()).unwrap();
@@ -509,17 +568,16 @@ fn debug_ssh_ready_restarts_sshd_when_authorized_keys_exist() {
     fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&fake_keygen, fs::Permissions::from_mode(0o755)).unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::set_var(
+    env.set(
         "PATH",
         format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
     );
-    std::env::remove_var("CA_SKIP_SYSTEMCTL");
+    env.remove("CA_SKIP_SYSTEMCTL");
     let dropin_dir = temp.path().join("sshd.service.d");
     let run_dir = temp.path().join("run/sshd");
 
     let ready = ensure_debug_ssh_ready_for(&marker, &auth_keys, &dropin_dir, &run_dir);
 
-    std::env::set_var("PATH", old_path);
     assert!(ready);
     assert!(dropin_dir.join("10-confidential-agent-debug.conf").exists());
     assert!(run_dir.exists());
@@ -1090,6 +1148,254 @@ fn bootstrap_ready_accepts_present_digestless_resources() {
 }
 
 #[test]
+fn no_tee_bootstrap_apply_writes_managed_resource_and_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/openclaw.json");
+    write_test_file(&source, b"{\"managed\":true}\n");
+    let digest = sha256_file(&source).unwrap();
+    let target = temp.path().join("managed/openclaw.json");
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/openclaw.json".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        sha256: Some(digest.clone()),
+    });
+    let mut state = DaemonState::default();
+
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "{\"managed\":true}\n");
+    assert_eq!(state.applied_resources["config"].sha256, digest);
+    let status = read_status_file(&env);
+    assert_eq!(status.phase, "resources-applied");
+    assert_eq!(status.bootstrap_generation, 1);
+    assert_eq!(status.applied_resources["config"].sha256, digest);
+    assert_eq!(status.applied_resources["config"].target, target);
+}
+
+#[test]
+fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    bootstrap.connect = vec![18789];
+    let mut state = DaemonState::default();
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [18789]
+                },
+                "mcp": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.11",
+                    "public_ip": "127.0.0.1",
+                    "ports": [3001],
+                    "connect": [3001]
+                }
+            },
+            "reference_values": {
+                "mcp": {"measurement.uki.SHA-384": ["peer-rv"]}
+            },
+            "rekor_reference_values": {}
+        }),
+    );
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let config: Value = read_json_file(&env.tng_config);
+    assert_eq!(
+        config["add_egress"][0]["netfilter"]["capture_dst"]["port"],
+        18789
+    );
+    assert_eq!(config["add_egress"][0]["netfilter"]["listen_port"], 39000);
+    assert_eq!(
+        config["add_ingress"][0]["mapping"]["out"]["host"],
+        "127.0.0.1"
+    );
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 3001);
+    assert_eq!(
+        config["add_ingress"][0]["verify"]["reference_values"][0]["type"],
+        "sample"
+    );
+    let directory: ServiceDirectory = read_json_file(&env.service_directory);
+    assert_eq!(directory.services["mcp"].ports[0].address, "127.0.0.1");
+    assert_eq!(directory.services["mcp"].ports[0].port, 3001);
+    assert_eq!(
+        directory.services["mcp"].ports[0].mode.as_deref(),
+        Some("connect")
+    );
+    assert!(env.cache_dir.join("mesh-bundle.json").exists());
+    let status = read_status_file(&env);
+    assert!(matches!(status.phase.as_str(), "starting-mesh" | "running"));
+    assert_eq!(status.mesh_generation, 42);
+}
+
+#[test]
+fn http_status_serves_status_file_not_health_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let body = r#"{"sentinel":"from-status-file"}"#;
+    write_test_file(&env.status, body.as_bytes());
+
+    let status_response = http_roundtrip(
+        HttpServerKind::Status,
+        b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    let health_response = http_roundtrip(
+        HttpServerKind::Status,
+        b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    assert!(status_response.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(http_response_body(&status_response), body);
+    assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(http_response_body(&health_response), r#"{"status":"ok"}"#);
+}
+
+#[test]
+fn no_tee_bootstrap_agent_card_writes_file_and_http_serves_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root);
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.agent_card = Some(test_agent_card("openclaw-card", &[18789]));
+    let mut state = DaemonState::default();
+
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
+
+    let written: confidential_agent_core::schema::AgentCard = read_json_file(&env.agent_card);
+    assert_eq!(written.name, "openclaw-card");
+    let response = http_roundtrip(
+        HttpServerKind::AgentCard,
+        b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    let served: confidential_agent_core::schema::AgentCard =
+        serde_json::from_str(http_response_body(&response)).unwrap();
+    assert_eq!(served.name, "openclaw-card");
+    assert_eq!(
+        served.supported_interfaces[0].url,
+        "http://127.0.0.1:18789/a2a"
+    );
+}
+
+#[test]
+fn no_tee_sync_mesh_a2a_peer_stale_fallback_persists_state_and_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    bootstrap.connect = vec![18789];
+    let mut state = DaemonState::default();
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
+    let card = test_agent_card("remote-agent", &[3001]);
+    let url = serve_agent_card_then_status(card, 503, "unavailable");
+    let bundle = test_a2a_bundle(Some("remote"), &url, &[]);
+    write_json_fixture(&cdh_root.join(TEST_A2A_BUNDLE_RESOURCE), &bundle);
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    write_daemon_state(&state).unwrap();
+
+    let config: Value = read_json_file(&env.tng_config);
+    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 3001);
+    assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 3001);
+    let directory: ServiceDirectory = read_json_file(&env.service_directory);
+    assert_eq!(directory.services["remote"].ports[0].port, 3001);
+    let status = read_status_file(&env);
+    assert_eq!(status.a2a_peers["remote"].state, "ok");
+    assert_eq!(status.a2a_peers["remote"].ports, vec![3001]);
+    let persisted: DaemonState = read_json_file(&env.state);
+    assert!(persisted.a2a_cache["remote"].error.is_none());
+
+    state.a2a_cache.get_mut("remote").unwrap().next_refresh_unix = 0;
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    write_daemon_state(&state).unwrap();
+
+    let stale_config: Value = read_json_file(&env.tng_config);
+    assert_eq!(
+        stale_config["add_ingress"][0]["mapping"]["in"]["port"],
+        3001
+    );
+    let stale_directory: ServiceDirectory = read_json_file(&env.service_directory);
+    assert_eq!(stale_directory.services["remote"].ports[0].port, 3001);
+    let stale_status = read_status_file(&env);
+    assert_eq!(stale_status.a2a_peers["remote"].state, "stale");
+    assert!(stale_status.a2a_peers["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("HTTP status 503"));
+    let stale_state: DaemonState = read_json_file(&env.state);
+    assert!(stale_state.a2a_cache["remote"]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("HTTP status 503"));
+    assert_eq!(stale_state.a2a_cache["remote"].ports[0].local, 3001);
+}
+
+#[test]
+fn resource_watcher_add_resource_paths_detects_new_dynamic_resource_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    fs::create_dir_all(cdh_root.join("default/local-resources")).unwrap();
+    fs::create_dir_all(cdh_root.join("default/dynamic-resources")).unwrap();
+    let dynamic = Path::new("default/dynamic-resources/runtime.json");
+    let mut watcher =
+        ResourceWatcher::new(&cdh_root, [Path::new(TEST_BOOTSTRAP_RESOURCE)]).unwrap();
+
+    watcher.add_resource_paths([dynamic]).unwrap();
+    assert_eq!(
+        watcher.wait(Some(Duration::from_secs(1))).unwrap(),
+        ResourceWatcherWait::Event
+    );
+
+    write_test_file(&cdh_root.join(dynamic), b"{\"runtime\":true}\n");
+    assert_eq!(
+        watcher.wait(Some(Duration::from_secs(1))).unwrap(),
+        ResourceWatcherWait::Event
+    );
+}
+
+#[test]
+fn write_json_if_changed_skips_identical_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let compact = r#"{"alpha":1,"nested":[true]}"#;
+    fs::write(&path, compact).unwrap();
+
+    let changed = write_json_if_changed(&path, &json!({"alpha": 1, "nested": [true]})).unwrap();
+
+    assert!(!changed);
+    assert_eq!(fs::read_to_string(&path).unwrap(), compact);
+    assert!(!path.with_extension("confidential-agent.tmp").exists());
+}
+
+#[test]
 fn a2a_tng_ingress_fetches_agent_card_and_generates_config() {
     let card = test_agent_card("remote-agent", &[3001, 3002]);
     let url = serve_agent_card_once(card);
@@ -1485,6 +1791,88 @@ fn a2a_tng_ingress_clamps_agent_card_cache_ttl() {
         cached.next_refresh_unix - cached.fetched_at_unix,
         A2A_CACHE_TTL_MIN_SEC
     );
+}
+
+fn no_tee_test_env(temp: &tempfile::TempDir) -> NoTeeTestEnv {
+    let guard = EnvGuard::new(DAEMON_ENV_VARS);
+    let root = temp.path().join("daemon-env");
+    let tng_config = root.join("etc/tng/config.json");
+    let service_directory = root.join("etc/cai/service-directory.json");
+    let status = root.join("run/confidential-agent/status.json");
+    let agent_card = root.join("opt/confidential-agent/agent-card.json");
+    let cache_dir = root.join("var/cache/confidential-agent");
+    let state = root.join("var/lib/confidential-agent/state.json");
+    guard.set_path("CA_TNG_CONFIG_PATH", &tng_config);
+    guard.set_path("CA_SERVICE_DIRECTORY_PATH", &service_directory);
+    guard.set_path("CA_DAEMON_STATUS_PATH", &status);
+    guard.set_path("CA_AGENT_CARD_PATH", &agent_card);
+    guard.set_path("CA_DAEMON_CACHE_DIR", &cache_dir);
+    guard.set_path("CA_DAEMON_STATE_PATH", &state);
+    guard.set("CA_SKIP_SYSTEMCTL", "1");
+    NoTeeTestEnv {
+        _guard: guard,
+        tng_config,
+        service_directory,
+        status,
+        agent_card,
+        cache_dir,
+        state,
+    }
+}
+
+fn test_run_args(cdh_root: PathBuf) -> RunArgs {
+    RunArgs {
+        cdh_root,
+        bootstrap_resource: TEST_BOOTSTRAP_RESOURCE.to_string(),
+        mesh_resource: TEST_MESH_RESOURCE.to_string(),
+        a2a_bundle_resource: TEST_A2A_BUNDLE_RESOURCE.to_string(),
+        poll_interval_sec: 5,
+        status_listen: "127.0.0.1:0".to_string(),
+        agent_card_listen: "127.0.0.1:0".to_string(),
+    }
+}
+
+fn test_bootstrap_config(service_id: &str) -> BootstrapConfig {
+    BootstrapConfig {
+        schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
+        generation: 1,
+        service_id: service_id.to_string(),
+        mode: "challenge".to_string(),
+        ports: Vec::new(),
+        connect: Vec::new(),
+        resources: Vec::new(),
+        app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
+    }
+}
+
+fn write_test_file(path: &Path, content: &[u8]) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, content).unwrap();
+}
+
+fn write_json_fixture(path: &Path, value: &impl serde::Serialize) {
+    let content = serde_json::to_vec_pretty(value).unwrap();
+    write_test_file(path, &content);
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+    let content = fs::read_to_string(path).unwrap();
+    serde_json::from_str(&content).unwrap()
+}
+
+fn read_status_file(env: &NoTeeTestEnv) -> DaemonStatus {
+    read_json_file(&env.status)
+}
+
+fn http_response_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap()
 }
 
 fn test_agent_card(id: &str, ports: &[u16]) -> confidential_agent_core::schema::AgentCard {
