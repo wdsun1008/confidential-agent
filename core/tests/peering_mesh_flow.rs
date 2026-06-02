@@ -58,6 +58,8 @@ fn service_state(
             debug_ssh: None,
             sample_rv: None,
             rekor_meta: None,
+            remote: false,
+            published: BTreeMap::new(),
         },
         deploy: LocalDeployState {
             provider: "aliyun".to_string(),
@@ -72,6 +74,7 @@ fn service_state(
             private_ip: Some(format!("10.0.0.{}", if id == "alpha" { 1 } else { 2 })),
             public_ip: Some(public_ip.to_string()),
             tee: "tdx".to_string(),
+            published_image_id: None,
         },
         service: LocalServiceNetwork { ports, connect },
         resources: BTreeMap::new(),

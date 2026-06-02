@@ -340,6 +340,130 @@ fn image_list_marks_current_build_and_local_image_presence() {
 }
 
 #[test]
+fn image_list_includes_published_image_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.build_id = "openclaw-agent-release-20260602112233".to_string();
+    let paths = context_paths(temp.path(), "openclaw");
+    state.build.image_path = paths
+        .shelter_work_dir
+        .join("images")
+        .join(&state.build.build_id)
+        .join("image.qcow2");
+    fs::create_dir_all(state.build.image_path.parent().unwrap()).unwrap();
+    fs::write(&state.build.image_path, "image").unwrap();
+    let source_sha256 = sha256_file(&state.build.image_path).unwrap();
+    state.build.published.insert(
+        "aliyun/cn-beijing/release/build/sha".to_string(),
+        test_published_image(&state.build.build_id, &source_sha256),
+    );
+    write_state(temp.path(), &state);
+    let result_path = shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id);
+    write_build_result(&result_path, &state.build.build_id, &state.build.image_path);
+
+    let entries = collect_image_entries(temp.path()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].published.as_deref(),
+        Some("cn-beijing:m-2ze123abc(avl)")
+    );
+}
+
+#[test]
+fn image_publish_unpublish_and_prune_args_parse() {
+    let publish = Cli::parse_from([
+        "confidential-agent",
+        "image",
+        "publish",
+        "openclaw",
+        "--region",
+        "cn-beijing",
+        "--variant",
+        "release",
+        "--no-wait",
+    ]);
+    match publish.command {
+        Commands::Image(ImageArgs {
+            command: ImageCommands::Publish(args),
+        }) => {
+            assert_eq!(args.service, "openclaw");
+            assert_eq!(args.region.as_deref(), Some("cn-beijing"));
+            assert_eq!(args.variant.as_deref(), Some("release"));
+            assert!(args.no_wait);
+        }
+        other => panic!("expected image publish, got {other:?}"),
+    }
+
+    let unpublish = Cli::parse_from([
+        "confidential-agent",
+        "image",
+        "unpublish",
+        "openclaw",
+        "--image-id",
+        "m-2ze123abc",
+        "--force",
+    ]);
+    match unpublish.command {
+        Commands::Image(ImageArgs {
+            command: ImageCommands::Unpublish(args),
+        }) => {
+            assert_eq!(args.service, "openclaw");
+            assert_eq!(args.image_id.as_deref(), Some("m-2ze123abc"));
+            assert!(args.force);
+        }
+        other => panic!("expected image unpublish, got {other:?}"),
+    }
+
+    let prune = Cli::parse_from(["confidential-agent", "image", "prune", "--dry-run"]);
+    match prune.command {
+        Commands::Image(ImageArgs {
+            command: ImageCommands::Prune(args),
+        }) => {
+            assert!(args.dry_run);
+            assert!(!args.all);
+        }
+        other => panic!("expected image prune, got {other:?}"),
+    }
+}
+
+#[test]
+fn local_state_without_published_fields_deserializes_with_defaults() {
+    let json = r#"{
+      "schema": "confidential-agent/service-state/v1",
+      "service_id": "openclaw",
+      "generation": 1,
+      "phase": "built",
+      "spec": {"path": "/spec.yaml", "sha256": "abc"},
+      "build": {
+        "build_id": "openclaw-agent-release",
+        "image_name": "openclaw-agent",
+        "variant": "release",
+        "image_path": "/state/image.qcow2",
+        "images_dir": "/state/images",
+        "cache_dir": "/state/cache"
+      },
+      "deploy": {
+        "provider": "aliyun",
+        "run_id": "",
+        "resource_name": "",
+        "tee": "tdx"
+      },
+      "service": {"ports": [18789], "connect": [18789]},
+      "resources": {},
+      "mesh_generation": 0,
+      "reference_values": "sample"
+    }"#;
+
+    let state: LocalServiceState = serde_json::from_str(json).unwrap();
+
+    assert!(!state.build.remote);
+    assert!(state.build.published.is_empty());
+    assert!(state.deploy.published_image_id.is_none());
+}
+
+#[test]
 fn status_view_separates_phase_from_local_image_presence() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = local_state("openclaw", vec![18789], vec![18789]);
@@ -381,6 +505,8 @@ fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<u16>) -> LocalSer
                 debug_ssh: None,
                 sample_rv: None,
                 rekor_meta: None,
+                remote: false,
+                published: BTreeMap::new(),
             },
             deploy: LocalDeployState {
                 provider: "aliyun".to_string(),
@@ -395,6 +521,7 @@ fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<u16>) -> LocalSer
                 private_ip: Some("10.0.1.20".to_string()),
                 public_ip: Some("39.0.0.1".to_string()),
                 tee: "tdx".to_string(),
+                published_image_id: None,
             },
             service: LocalServiceNetwork { ports, connect },
             resources: BTreeMap::new(),
@@ -442,6 +569,42 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
     fs::write(
         service_dir.join("manifest.json"),
         serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+fn test_published_image(build_id: &str, source_sha256: &str) -> PublishedImage {
+    PublishedImage {
+        provider: "aliyun".to_string(),
+        region: "cn-beijing".to_string(),
+        variant: "release".to_string(),
+        build_id: build_id.to_string(),
+        source_sha256: source_sha256.to_string(),
+        source_size: 5,
+        status: "available".to_string(),
+        image_name: format!("ca-pub-openclaw-release-{build_id}"),
+        image_id: Some("m-2ze123abc".to_string()),
+        import_task_id: Some("t-import".to_string()),
+        bucket: Some("ca-images-cn-beijing-test".to_string()),
+        object_key: Some("confidential-agent/images/openclaw/release/image.qcow2".to_string()),
+        created_at: "2026-06-02T00:00:00Z".to_string(),
+        updated_at: "2026-06-02T00:00:00Z".to_string(),
+        oss_cleaned: true,
+        error: None,
+    }
+}
+
+fn write_build_result(build_result: &Path, build_id: &str, image_path: &Path) {
+    fs::create_dir_all(build_result.parent().unwrap()).unwrap();
+    fs::write(
+        build_result,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": build_id,
+            "image_path": image_path,
+            "reference_value": null,
+            "rekor_value": null
+        }))
+        .unwrap(),
     )
     .unwrap();
 }
@@ -834,7 +997,10 @@ fn tools_container_wraps_challenge_client() {
     assert_eq!(args[0], "run");
     assert!(args.windows(2).any(|pair| pair == ["--network", "host"]));
     assert!(args.contains(&"/tmp/resources:/tmp/resources".to_string()));
-    assert!(args.contains(&"NO_PROXY=39.105.79.128".to_string()));
+    assert!(args.windows(2).any(|pair| pair == ["--env", "NO_PROXY"]));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.contains("NO_PROXY=39.105.79.128")));
     assert_eq!(
         args.iter()
             .position(|arg| arg == "confidential-agent-tools:test")
@@ -966,6 +1132,7 @@ fn deploy_args_use_positional_build_id_without_cloud_image_override() {
         deploy_names: None,
         terraform_dir: None,
         debug_ssh: None,
+        cloud_image_id: None,
     };
 
     let args = deploy_shelter_args(&prepared);
@@ -996,6 +1163,7 @@ fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
             "/state/services/openclaw/terraform/20260506130000",
         )),
         debug_ssh: None,
+        cloud_image_id: None,
     };
 
     let args = deploy_shelter_args(&prepared);
@@ -1784,6 +1952,7 @@ fn resolve_deploy_observation_reads_shelter_deploy_result_json() {
         deploy_names: None,
         terraform_dir: None,
         debug_ssh: None,
+        cloud_image_id: None,
     };
     let spec = AgentSpec::from_yaml(
         r#"
@@ -1876,6 +2045,7 @@ resources: {}
         deploy_names: Some(names.clone()),
         terraform_dir: Some(paths.service_dir.join("terraform/active")),
         debug_ssh: None,
+        cloud_image_id: None,
     };
 
     let state = build_service_state(
@@ -1892,6 +2062,114 @@ resources: {}
         state.deploy.image_import_name.as_deref(),
         Some(names.image_import_name.as_str())
     );
+}
+
+#[test]
+fn service_state_records_published_image_id_from_prepared_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec_path = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec_path,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let spec = AgentSpec::from_path(&spec_path).unwrap();
+    let paths = context_paths(temp.path(), "openclaw");
+    let build_id = shelter_build_id(&spec);
+    let build_result = shelter_build_result_path(&paths.shelter_work_dir, &build_id);
+    let image_path = temp.path().join("image.qcow2");
+    write_build_result(&build_result, &build_id, &image_path);
+    fs::write(&image_path, "image").unwrap();
+    let prepared = PreparedConfig {
+        rendered_config: paths.rendered_config.clone(),
+        shelter_build_id: build_id,
+        shelter_work_dir: paths.shelter_work_dir.clone(),
+        build_result,
+        deploy_result: shelter_deploy_result_path(&paths.service_dir.join("terraform/active")),
+        deploy_names: Some(DeployNames::new(&spec)),
+        terraform_dir: Some(paths.service_dir.join("terraform/active")),
+        debug_ssh: None,
+        cloud_image_id: Some("m-2ze123abc".to_string()),
+    };
+
+    let state = build_service_state(
+        temp.path(),
+        &spec_path,
+        &spec,
+        &DeployObservation::default(),
+        &prepared,
+        "deployed",
+    )
+    .unwrap();
+
+    assert_eq!(
+        state.deploy.published_image_id.as_deref(),
+        Some("m-2ze123abc")
+    );
+}
+
+#[test]
+fn render_service_config_from_state_preserves_published_image_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec_path = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec_path,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "active".to_string();
+    state.spec.path = spec_path;
+    state.deploy.published_image_id = Some("m-2ze123abc".to_string());
+    write_state(temp.path(), &state);
+    write_manifest(temp.path(), "openclaw", &state.build.build_id);
+
+    render_service_config_from_state(temp.path(), &state, Vec::new()).unwrap();
+
+    let rendered =
+        fs::read_to_string(context_paths(temp.path(), "openclaw").rendered_config).unwrap();
+    let deploy_section = rendered.split("deploy:").nth(1).unwrap();
+    assert!(deploy_section.contains("image_id: m-2ze123abc"));
+    assert!(!deploy_section.contains("image:\n"));
 }
 
 #[test]
@@ -2681,6 +2959,189 @@ resources: {}
 
     assert!(err.to_string().contains("local image"));
     assert!(err.to_string().contains("run build first"));
+}
+
+#[test]
+fn deploy_render_only_uses_published_image_without_local_qcow2() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openclaw.yaml");
+    fs::write(
+        &spec,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.spec.path = spec.clone();
+    state.build.image_path = temp.path().join("missing.qcow2");
+    let source_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    state.build.published.insert(
+        "aliyun/cn-beijing/release/build/sha".to_string(),
+        test_published_image(&state.build.build_id, source_sha256),
+    );
+    write_state(temp.path(), &state);
+    write_manifest(temp.path(), "openclaw", &state.build.build_id);
+    let build_result = shelter_build_result_path(
+        &temp.path().join("services/openclaw/shelter"),
+        &state.build.build_id,
+    );
+    write_build_result(
+        &build_result,
+        &state.build.build_id,
+        &state.build.image_path,
+    );
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().to_path_buf();
+
+    cmd_deploy(
+        &cli,
+        &DeployArgs {
+            spec,
+            skip_inject: false,
+            render_only: true,
+            skip_peering_check: true,
+        },
+    )
+    .unwrap();
+
+    let rendered =
+        fs::read_to_string(context_paths(temp.path(), "openclaw").rendered_config).unwrap();
+    let deploy_section = rendered.split("deploy:").nth(1).unwrap();
+    assert!(deploy_section.contains("image_id: m-2ze123abc"));
+    assert!(!deploy_section.contains("image:\n"));
+    assert!(!deploy_section.contains("nvme_support:"));
+}
+
+#[test]
+fn published_image_requires_build_result_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.image_path = temp.path().join("missing.qcow2");
+    state.build.published.insert(
+        "aliyun/cn-beijing/release/build/sha".to_string(),
+        test_published_image(
+            &state.build.build_id,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    );
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    let variant = BuildManifestVariant {
+        shelter_build_id: state.build.build_id.clone(),
+        build_result: temp.path().join("missing-build-result.json"),
+        extra_files: Vec::new(),
+        debug_ssh: None,
+    };
+
+    let image_id = publish::published_image_for_deploy(&state, &spec, &variant);
+
+    assert!(image_id.is_none());
+}
+
+#[test]
+fn published_image_for_deploy_skips_stale_entry_and_uses_valid_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.phase = "built".to_string();
+    state.build.image_path = temp.path().join("image.qcow2");
+    fs::write(&state.build.image_path, "image").unwrap();
+    let source_sha256 = sha256_file(&state.build.image_path).unwrap();
+    let build_result = temp.path().join("build-result.json");
+    write_build_result(
+        &build_result,
+        &state.build.build_id,
+        &state.build.image_path,
+    );
+    state.build.published.insert(
+        "aliyun/cn-beijing/release/build/000-stale".to_string(),
+        test_published_image(
+            &state.build.build_id,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    );
+    let mut valid = test_published_image(&state.build.build_id, &source_sha256);
+    valid.image_id = Some("m-valid".to_string());
+    state.build.published.insert(
+        "aliyun/cn-beijing/release/build/999-valid".to_string(),
+        valid,
+    );
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    let variant = BuildManifestVariant {
+        shelter_build_id: state.build.build_id.clone(),
+        build_result,
+        extra_files: Vec::new(),
+        debug_ssh: None,
+    };
+
+    let image_id = publish::published_image_for_deploy(&state, &spec, &variant);
+
+    assert_eq!(image_id.as_deref(), Some("m-valid"));
 }
 
 #[test]

@@ -465,7 +465,7 @@ fn collect_rekor_report(
             entries: Vec::new(),
         };
     };
-    let meta_content = match fs::read_to_string(&meta_path) {
+    let meta_content = match fs::read_to_string(meta_path) {
         Ok(c) => c,
         Err(err) => {
             errors.push(format!(
@@ -1058,6 +1058,8 @@ mod tests {
                 debug_ssh: None,
                 sample_rv: None,
                 rekor_meta: None,
+                remote: false,
+                published: BTreeMap::new(),
             },
             deploy: LocalDeployState {
                 provider: "aliyun".to_string(),
@@ -1072,6 +1074,7 @@ mod tests {
                 private_ip: None,
                 public_ip: None,
                 tee: "tdx".to_string(),
+                published_image_id: None,
             },
             service: LocalServiceNetwork {
                 ports: vec![],

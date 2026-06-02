@@ -235,6 +235,7 @@ fn ensure_build_variant_present(
     state: &LocalServiceState,
     variant: &str,
     manifest: &BuildManifestVariant,
+    allow_missing_local_image: bool,
 ) -> Result<()> {
     if !manifest.build_result.exists() {
         bail!(
@@ -245,6 +246,9 @@ fn ensure_build_variant_present(
         );
     }
     let result = read_shelter_build_result(&manifest.build_result, &manifest.shelter_build_id)?;
+    if allow_missing_local_image {
+        return Ok(());
+    }
     if !result.image_path.exists() {
         bail!(
             "local image for service '{}' variant '{}' was removed at '{}'; run build first",
@@ -279,7 +283,17 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     let deploy_variant = spec.image_variant().to_string();
     let build_variant =
         current_manifest.variant(&deploy_variant, Some(&current_state.build.variant))?;
-    ensure_build_variant_present(&current_state, &deploy_variant, &build_variant)?;
+    let published_image_id =
+        publish::published_image_for_deploy(&current_state, &spec, &build_variant);
+    ensure_build_variant_present(
+        &current_state,
+        &deploy_variant,
+        &build_variant,
+        published_image_id.is_some(),
+    )?;
+    if let Some(image_id) = published_image_id.as_deref() {
+        println!("[ca] using published image {image_id} for deploy (skipping upload+import)");
+    }
     validate_mesh_port_conflicts(
         &read_service_states(&cli.state_dir)?,
         &spec.service.id,
@@ -303,6 +317,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             deploy_names: Some(deploy_names.clone()),
             mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
             peerings,
+            cloud_image_id: published_image_id.clone(),
         },
     )?;
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
@@ -947,13 +962,15 @@ fn cmd_connect_stop(args: &ConnectStopArgs) -> Result<()> {
 
 fn start_tools_container_detached(cli: &Cli, spec: ToolContainerSpec) -> Result<String> {
     ensure_docker_available()?;
+    let envs = spec.envs.clone();
     let mut args = tools_container_args(cli, spec);
     args.insert(2, OsString::from("-d"));
-    let output = Command::new("docker")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("failed to execute 'docker'")?;
+    let mut command = Command::new("docker");
+    command.args(args).stdin(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().context("failed to execute 'docker'")?;
     if !output.status.success() {
         bail!(
             "docker run for connect tunnel failed with {}; stderr: {}; stdout: {}",
@@ -1133,6 +1150,9 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
             println!("removed local image state for service {}", service);
             Ok(())
         }
+        ImageCommands::Publish(args) => publish::cmd_image_publish(cli, args),
+        ImageCommands::Unpublish(args) => publish::cmd_image_unpublish(cli, args),
+        ImageCommands::Prune(args) => publish::cmd_image_prune(cli, args),
     }
 }
 
@@ -1194,11 +1214,14 @@ pub(super) fn collect_image_entries(state_dir: &Path) -> Result<Vec<ImageListEnt
                     current: state
                         .map(|state| state.build.build_id == build_id)
                         .unwrap_or(false),
-                    build_id,
+                    build_id: build_id.clone(),
                     image_present: image_size.is_some(),
                     image_size,
                     image_path,
                     build_result: result_path,
+                    published: state.and_then(|state| {
+                        published_info_for_build(&state.build.published, &build_id)
+                    }),
                 });
             }
         }
@@ -1223,6 +1246,10 @@ pub(super) fn collect_image_entries(state_dir: &Path) -> Result<Vec<ImageListEnt
                     image_present: image_size.is_some(),
                     image_size,
                     build_result: result_path,
+                    published: published_info_for_build(
+                        &state.build.published,
+                        &state.build.build_id,
+                    ),
                 });
             }
         }
@@ -1242,24 +1269,77 @@ fn print_image_table(entries: &[ImageListEntry]) {
         println!("no local images");
         return;
     }
+    let has_published = entries.iter().any(|entry| entry.published.is_some());
     println!("Confidential Agent Local Images");
-    println!(
-        "{:<18} {:<9} {:<7} {:<30} {:<12} IMAGE",
-        "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE"
-    );
-    for entry in entries {
+    if has_published {
         println!(
-            "{:<18} {:<9} {:<7} {:<30} {:<12} {}",
-            entry.service_id,
-            entry.phase.as_deref().unwrap_or("-"),
-            if entry.current { "yes" } else { "no" },
-            truncate_for_table(&entry.build_id, 30),
-            entry
-                .image_size
-                .map(format_bytes)
-                .unwrap_or_else(|| "-".to_string()),
-            entry.image_path.display()
+            "{:<18} {:<9} {:<7} {:<30} {:<12} {:<28} IMAGE",
+            "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE", "PUBLISHED"
         );
+    } else {
+        println!(
+            "{:<18} {:<9} {:<7} {:<30} {:<12} IMAGE",
+            "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE"
+        );
+    }
+    for entry in entries {
+        let size = entry
+            .image_size
+            .map(format_bytes)
+            .unwrap_or_else(|| "-".to_string());
+        if has_published {
+            println!(
+                "{:<18} {:<9} {:<7} {:<30} {:<12} {:<28} {}",
+                entry.service_id,
+                entry.phase.as_deref().unwrap_or("-"),
+                if entry.current { "yes" } else { "no" },
+                truncate_for_table(&entry.build_id, 30),
+                size,
+                entry.published.as_deref().unwrap_or("-"),
+                entry.image_path.display()
+            );
+        } else {
+            println!(
+                "{:<18} {:<9} {:<7} {:<30} {:<12} {}",
+                entry.service_id,
+                entry.phase.as_deref().unwrap_or("-"),
+                if entry.current { "yes" } else { "no" },
+                truncate_for_table(&entry.build_id, 30),
+                size,
+                entry.image_path.display()
+            );
+        }
+    }
+}
+
+fn published_info_for_build(
+    published: &BTreeMap<String, PublishedImage>,
+    build_id: &str,
+) -> Option<String> {
+    let values = published
+        .values()
+        .filter(|entry| entry.build_id == build_id)
+        .map(|entry| {
+            let status = match entry.status.as_str() {
+                "available" => "avl",
+                "importing" => "imp",
+                "uploaded" => "upl",
+                "uploading" => "upg",
+                "failed" => "err",
+                _ => "?",
+            };
+            format!(
+                "{}:{}({})",
+                entry.region,
+                entry.image_id.as_deref().unwrap_or("-"),
+                status
+            )
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(","))
     }
 }
 
@@ -1928,6 +2008,7 @@ fn clear_deploy_runtime_state(deploy: &mut LocalDeployState) {
     deploy.private_ip = None;
     deploy.public_ip = None;
     deploy.tee.clear();
+    deploy.published_image_id = None;
 }
 
 fn deploy_runtime_state_present(deploy: &LocalDeployState) -> bool {
@@ -1941,6 +2022,7 @@ fn deploy_runtime_state_present(deploy: &LocalDeployState) -> bool {
         || deploy.security_group_id.is_some()
         || deploy.private_ip.is_some()
         || deploy.public_ip.is_some()
+        || deploy.published_image_id.is_some()
         || !deploy.tee.is_empty()
 }
 

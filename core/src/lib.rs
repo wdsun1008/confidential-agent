@@ -43,6 +43,8 @@ mod schema_tests {
                 }),
                 sample_rv: None,
                 rekor_meta: None,
+                remote: false,
+                published: BTreeMap::new(),
             },
             deploy: LocalDeployState {
                 provider: "aliyun".to_string(),
@@ -57,6 +59,7 @@ mod schema_tests {
                 private_ip: Some("10.0.0.8".to_string()),
                 public_ip: Some("1.2.3.4".to_string()),
                 tee: "tdx".to_string(),
+                published_image_id: None,
             },
             service: LocalServiceNetwork {
                 ports: vec![18789],

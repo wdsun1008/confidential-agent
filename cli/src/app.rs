@@ -1,8 +1,9 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
-    InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands, MigrateArgs, OutputFormat,
-    PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands, SshArgs, StatusArgs,
+    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InjectArgs, KeyArgs, KeyCommands,
+    MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs,
+    SpecArgs, SpecCommands, SshArgs, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -20,8 +21,8 @@ use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope,
 use confidential_agent_core::schema::{
     AgentCard, AppliedResourceState, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState,
     LocalDebugSshKey, LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState,
-    LocalSpecState, MeshBundle, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
-    LOCAL_SERVICE_STATE_SCHEMA_VERSION,
+    LocalSpecState, MeshBundle, PublishedImage, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION,
+    DAEMON_STATUS_PORT, LOCAL_SERVICE_STATE_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use confidential_agent_core::schema::{
@@ -120,6 +121,7 @@ struct PreparedConfig {
     deploy_names: Option<DeployNames>,
     terraform_dir: Option<PathBuf>,
     debug_ssh: Option<LocalDebugSshKey>,
+    cloud_image_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,6 +132,7 @@ struct PrepareOptions {
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
     peerings: PeeringsFile,
+    cloud_image_id: Option<String>,
 }
 
 impl BuildManifest {
@@ -406,6 +409,8 @@ struct ImageListEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     image_size: Option<u64>,
     build_result: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published: Option<String>,
 }
 
 const MAX_SHELTER_IMAGE_BUCKET_LEN: usize = 63;
@@ -503,6 +508,7 @@ fn prepare(
                 .map(|names| names.image_import_name.clone()),
             mesh_peer_cidrs: options.mesh_peer_cidrs.clone(),
             peerings: options.peerings.clone(),
+            cloud_image_id: options.cloud_image_id.clone(),
         },
     )?;
 
@@ -551,6 +557,7 @@ fn prepare(
         deploy_names,
         terraform_dir,
         debug_ssh,
+        cloud_image_id: options.cloud_image_id,
     })
 }
 
@@ -680,6 +687,8 @@ use state::*;
 
 mod workflows;
 use workflows::*;
+
+mod publish;
 
 mod report;
 use report::*;

@@ -47,12 +47,42 @@ pub struct LocalBuildState {
     pub sample_rv: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rekor_meta: Option<PathBuf>,
+    #[serde(default)]
+    pub remote: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub published: BTreeMap<String, PublishedImage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalDebugSshKey {
     pub private_key: PathBuf,
     pub public_key: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedImage {
+    pub provider: String,
+    pub region: String,
+    pub variant: String,
+    pub build_id: String,
+    pub source_sha256: String,
+    pub source_size: u64,
+    pub status: String,
+    pub image_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub oss_cleaned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +107,8 @@ pub struct LocalDeployState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
     pub tee: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_image_id: Option<String>,
 }
 
 impl LocalDeployState {
