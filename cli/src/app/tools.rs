@@ -22,9 +22,9 @@ pub(super) fn tools_container_args(cli: &Cli, spec: ToolContainerSpec) -> Vec<Os
         }
     }
 
-    for (key, value) in spec.envs {
+    for (key, _) in spec.envs {
         args.push(OsString::from("--env"));
-        args.push(OsString::from(format!("{key}={value}")));
+        args.push(OsString::from(key));
     }
 
     if let Some(workdir) = spec.workdir {
@@ -774,7 +774,8 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         let env_idx = strs.iter().position(|s| s == "--env").unwrap();
-        assert_eq!(strs[env_idx + 1], "KEY=VALUE");
+        assert_eq!(strs[env_idx + 1], "KEY");
+        assert!(!strs.iter().any(|arg| arg.contains("VALUE")));
     }
 
     #[test]

@@ -301,6 +301,43 @@ pub(crate) enum ImageCommands {
         #[arg(long, short)]
         force: bool,
     },
+    Publish(ImagePublishArgs),
+    Unpublish(ImageUnpublishArgs),
+    Prune(ImagePruneArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ImagePublishArgs {
+    pub(crate) service: String,
+    #[arg(long, default_value = "confidential-agent.yaml")]
+    pub(crate) spec: PathBuf,
+    #[arg(long, help = "Target region; defaults to deploy.region in the spec")]
+    pub(crate) region: Option<String>,
+    #[arg(long, help = "Image variant; defaults to deploy.image_variant")]
+    pub(crate) variant: Option<String>,
+    #[arg(long, help = "Do not wait for ECS image import completion")]
+    pub(crate) no_wait: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ImageUnpublishArgs {
+    pub(crate) service: String,
+    #[arg(long)]
+    pub(crate) region: Option<String>,
+    #[arg(long)]
+    pub(crate) variant: Option<String>,
+    #[arg(long)]
+    pub(crate) image_id: Option<String>,
+    #[arg(long, short)]
+    pub(crate) force: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ImagePruneArgs {
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    #[arg(long)]
+    pub(crate) all: bool,
 }
 
 #[derive(Debug, Args)]

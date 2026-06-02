@@ -159,9 +159,9 @@ pub(super) fn build_service_state(
     phase: &str,
 ) -> Result<LocalServiceState> {
     let paths = context_paths(state_dir, &spec.service.id);
-    let old_generation = read_service_state_file(&paths.service_state)
-        .ok()
-        .flatten()
+    let old_state = read_service_state_file(&paths.service_state).ok().flatten();
+    let old_generation = old_state
+        .as_ref()
         .map(|state| state.generation)
         .unwrap_or(0);
     let resources = resource_states(spec)?;
@@ -193,6 +193,14 @@ pub(super) fn build_service_state(
             debug_ssh: prepared.debug_ssh.clone(),
             sample_rv: artifacts.sample_rv,
             rekor_meta: artifacts.rekor_meta,
+            remote: old_state
+                .as_ref()
+                .map(|state| state.build.remote)
+                .unwrap_or(false),
+            published: old_state
+                .as_ref()
+                .map(|state| state.build.published.clone())
+                .unwrap_or_default(),
         },
         deploy: LocalDeployState {
             provider: "aliyun".to_string(),
@@ -210,6 +218,7 @@ pub(super) fn build_service_state(
                 .or_else(|| spec.deploy.private_ip.clone()),
             public_ip: observation.public_ip.clone(),
             tee: tee_name(spec.attestation.tee).to_string(),
+            published_image_id: prepared.cloud_image_id.clone(),
         },
         service: LocalServiceNetwork {
             ports: spec.service.ports.clone(),
@@ -243,6 +252,8 @@ pub(super) fn activate_existing_service_state(
         debug_ssh: state.build.debug_ssh.clone(),
         sample_rv: state.build.sample_rv.clone(),
         rekor_meta: state.build.rekor_meta.clone(),
+        remote: state.build.remote,
+        published: state.build.published.clone(),
     };
     state.service = LocalServiceNetwork {
         ports: spec.service.ports.clone(),
@@ -356,6 +367,7 @@ pub(super) fn refresh_active_shelter_deploys(
             }),
             terraform_dir: service.deploy.terraform_dir.clone(),
             debug_ssh: variant.debug_ssh,
+            cloud_image_id: service.deploy.published_image_id.clone(),
         };
         let mut args = deploy_shelter_args(&prepared);
         run_shelter(cli, &mut args)?;
@@ -402,6 +414,7 @@ pub(super) fn render_service_config_from_state(
             local_image_source: None,
             deploy_resource_name: Some(state.deploy.resource_name.clone()),
             local_image_import_name: state.deploy.image_import_name.clone(),
+            cloud_image_id: state.deploy.published_image_id.clone(),
             mesh_peer_cidrs,
             peerings: read_peerings_or_empty(state_dir)?,
         },
@@ -1084,6 +1097,8 @@ mod tests {
                 debug_ssh: None,
                 sample_rv: Some(PathBuf::from("/state/rv.json")),
                 rekor_meta: None,
+                remote: false,
+                published: BTreeMap::new(),
                 image_path: PathBuf::from("/state/image.qcow2"),
                 images_dir: PathBuf::from("/state/images"),
                 cache_dir: PathBuf::from("/state/cache"),
@@ -1101,6 +1116,7 @@ mod tests {
                 image_import_name: None,
                 bucket: None,
                 tee: "tdx".to_string(),
+                published_image_id: None,
             },
             service: LocalServiceNetwork {
                 ports: ports.clone(),

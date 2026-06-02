@@ -460,3 +460,44 @@ fn renders_explicit_rootfs_integrity_for_modern_shelter() {
     assert!(rendered.contains("integrity: true"));
     assert!(!rendered.contains("extract_reference_values"));
 }
+
+#[test]
+fn render_deploy_with_cloud_image_id_omits_local_image_import() {
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            include_deploy: true,
+            cloud_image_id: Some("m-2ze123abc".to_string()),
+            peerings: operator_peerings(),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
+
+    let deploy_section = rendered.split("deploy:").nth(1).unwrap();
+    assert!(deploy_section.contains("image_id: m-2ze123abc"));
+    assert!(!deploy_section.contains("image:\n"));
+    assert!(!deploy_section.contains("nvme_support:"));
+}
+
+#[test]
+fn render_deploy_without_cloud_image_id_keeps_local_image_import() {
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let rendered = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            include_deploy: true,
+            peerings: operator_peerings(),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
+
+    let deploy_section = rendered.split("deploy:").nth(1).unwrap();
+    assert!(!deploy_section.contains("image_id:"));
+    assert!(deploy_section.contains("image:\n"));
+    assert!(deploy_section.contains("nvme_support: supported"));
+}

@@ -39,6 +39,7 @@ pub struct ShelterRenderOptions {
     pub local_image_source: Option<PathBuf>,
     pub deploy_resource_name: Option<String>,
     pub local_image_import_name: Option<String>,
+    pub cloud_image_id: Option<String>,
     pub mesh_peer_cidrs: Vec<String>,
     pub peerings: PeeringsFile,
 }
@@ -236,24 +237,27 @@ fn render_deploy_config(
             .into_iter()
             .next()
             .unwrap_or_else(|| "0.0.0.0/32".to_string()),
-        image_id: None,
-        image: Some(ShelterDeployImageConfig {
-            source: options
-                .local_image_source
-                .as_ref()
-                .map(|source| ShelterDeployImageSource {
-                    path: source.clone(),
-                    base: "config_dir".to_string(),
+        image_id: options.cloud_image_id.clone(),
+        image: if options.cloud_image_id.is_some() {
+            None
+        } else {
+            Some(ShelterDeployImageConfig {
+                source: options.local_image_source.as_ref().map(|source| {
+                    ShelterDeployImageSource {
+                        path: source.clone(),
+                        base: "config_dir".to_string(),
+                    }
                 }),
-            name: Some(
-                options
-                    .local_image_import_name
-                    .clone()
-                    .unwrap_or_else(|| shelter_build_id(spec)),
-            ),
-            bucket: None,
-            nvme_support: Some("supported".to_string()),
-        }),
+                name: Some(
+                    options
+                        .local_image_import_name
+                        .clone()
+                        .unwrap_or_else(|| shelter_build_id(spec)),
+                ),
+                bucket: None,
+                nvme_support: Some("supported".to_string()),
+            })
+        },
         vpc_id: deploy.vpc_id.clone(),
         vswitch_id: deploy.vswitch_id.clone(),
         security_group_id: deploy.security_group_id.clone(),
