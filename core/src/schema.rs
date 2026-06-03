@@ -491,3 +491,152 @@ pub fn default_bootstrap_mode() -> String {
 pub fn default_resource_mode() -> String {
     "0600".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confidential_ports_excludes_connect_ports() {
+        assert_eq!(confidential_ports(&[18789, 18800], &[18789]), vec![18800]);
+    }
+
+    #[test]
+    fn confidential_ports_returns_empty_when_all_are_connect() {
+        assert_eq!(confidential_ports(&[18789], &[18789]), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn confidential_ports_returns_all_when_no_connect() {
+        assert_eq!(
+            confidential_ports(&[3001, 3002], &[]),
+            vec![3001, 3002]
+        );
+    }
+
+    #[test]
+    fn confidential_ports_deduplicates_and_sorts() {
+        assert_eq!(
+            confidential_ports(&[18800, 18789, 18800], &[]),
+            vec![18789, 18800]
+        );
+    }
+
+    #[test]
+    fn preferred_injection_ip_prefers_public() {
+        let state = LocalDeployState {
+            provider: "aliyun".to_string(),
+            run_id: "run".to_string(),
+            resource_name: "res".to_string(),
+            terraform_dir: None,
+            image_source: None,
+            image_import_name: None,
+            bucket: None,
+            instance_id: None,
+            security_group_id: None,
+            private_ip: Some("10.0.0.1".to_string()),
+            public_ip: Some("1.2.3.4".to_string()),
+            tee: "tdx".to_string(),
+            published_image_id: None,
+        };
+        assert_eq!(state.preferred_injection_ip(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn preferred_injection_ip_falls_back_to_private() {
+        let state = LocalDeployState {
+            provider: "aliyun".to_string(),
+            run_id: "run".to_string(),
+            resource_name: "res".to_string(),
+            terraform_dir: None,
+            image_source: None,
+            image_import_name: None,
+            bucket: None,
+            instance_id: None,
+            security_group_id: None,
+            private_ip: Some("10.0.0.1".to_string()),
+            public_ip: None,
+            tee: "tdx".to_string(),
+            published_image_id: None,
+        };
+        assert_eq!(state.preferred_injection_ip(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn preferred_injection_ip_skips_empty_public() {
+        let state = LocalDeployState {
+            provider: "aliyun".to_string(),
+            run_id: "run".to_string(),
+            resource_name: "res".to_string(),
+            terraform_dir: None,
+            image_source: None,
+            image_import_name: None,
+            bucket: None,
+            instance_id: None,
+            security_group_id: None,
+            private_ip: Some("10.0.0.1".to_string()),
+            public_ip: Some("  ".to_string()),
+            tee: "tdx".to_string(),
+            published_image_id: None,
+        };
+        assert_eq!(state.preferred_injection_ip(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn preferred_injection_ip_none_when_both_absent() {
+        let state = LocalDeployState {
+            provider: "aliyun".to_string(),
+            run_id: "run".to_string(),
+            resource_name: "res".to_string(),
+            terraform_dir: None,
+            image_source: None,
+            image_import_name: None,
+            bucket: None,
+            instance_id: None,
+            security_group_id: None,
+            private_ip: None,
+            public_ip: None,
+            tee: "tdx".to_string(),
+            published_image_id: None,
+        };
+        assert_eq!(state.preferred_injection_ip(), None);
+    }
+
+    #[test]
+    fn private_mesh_ip_skips_empty_whitespace() {
+        let state = LocalDeployState {
+            provider: "aliyun".to_string(),
+            run_id: "run".to_string(),
+            resource_name: "res".to_string(),
+            terraform_dir: None,
+            image_source: None,
+            image_import_name: None,
+            bucket: None,
+            instance_id: None,
+            security_group_id: None,
+            private_ip: Some("  ".to_string()),
+            public_ip: None,
+            tee: "tdx".to_string(),
+            published_image_id: None,
+        };
+        assert_eq!(state.private_mesh_ip(), None);
+    }
+
+    #[test]
+    fn daemon_status_schema_version_is_stable() {
+        assert_eq!(
+            DAEMON_STATUS_SCHEMA_VERSION,
+            "confidential-agent/daemon-status/v1"
+        );
+    }
+
+    #[test]
+    fn default_bootstrap_mode_is_challenge() {
+        assert_eq!(default_bootstrap_mode(), "challenge");
+    }
+
+    #[test]
+    fn default_resource_mode_is_0600() {
+        assert_eq!(default_resource_mode(), "0600");
+    }
+}

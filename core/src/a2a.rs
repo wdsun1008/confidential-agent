@@ -532,6 +532,62 @@ mod tests {
     }
 
     #[test]
+    fn state_validate_rejects_empty_signer_issuer() {
+        let mut state = A2aStateFile {
+            version: 2,
+            peers: vec![peer(Some("beta"), "http://1.example/")],
+        };
+        state.peers[0].signer = Some(A2aSignerPin {
+            issuer: "  ".to_string(),
+            subject: "sub".to_string(),
+        });
+
+        let err = state.validate().unwrap_err();
+        assert!(err.to_string().contains("signer issuer must not be empty"));
+    }
+
+    #[test]
+    fn state_validate_rejects_empty_signer_subject() {
+        let mut state = A2aStateFile {
+            version: 2,
+            peers: vec![peer(Some("beta"), "http://1.example/")],
+        };
+        state.peers[0].signer = Some(A2aSignerPin {
+            issuer: "iss".to_string(),
+            subject: "".to_string(),
+        });
+
+        let err = state.validate().unwrap_err();
+        assert!(err.to_string().contains("signer subject must not be empty"));
+    }
+
+    #[test]
+    fn bundle_validate_rejects_empty_signer_issuer() {
+        let mut bundle = A2aBundle {
+            version: 2,
+            peers: vec![bundle_peer(Some("beta"), "http://1.example/")],
+        };
+        bundle.peers[0].signer = Some(A2aSignerPin {
+            issuer: "".to_string(),
+            subject: "sub".to_string(),
+        });
+
+        let err = bundle.validate().unwrap_err();
+        assert!(err.to_string().contains("signer issuer must not be empty"));
+    }
+
+    #[test]
+    fn a2a_signer_pin_converts_to_agent_card_signer_pin() {
+        let pin = A2aSignerPin {
+            issuer: "iss".to_string(),
+            subject: "sub".to_string(),
+        };
+        let converted: crate::agent_card_signing::AgentCardSignerPin = (&pin).into();
+        assert_eq!(converted.issuer, "iss");
+        assert_eq!(converted.subject, "sub");
+    }
+
+    #[test]
     fn from_path_propagates_validation_errors_for_duplicate_alias() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("a2a.json");

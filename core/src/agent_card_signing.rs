@@ -321,4 +321,87 @@ mod tests {
 
         assert!(err.to_string().contains("no signatures"));
     }
+
+    #[test]
+    fn verify_rejects_empty_signer_pin_through_public_api() {
+        let card = card_with_signature("YWJjZA==");
+
+        let err = verify_agent_card_signature(
+            &card,
+            &AgentCardSignerPin {
+                issuer: "".to_string(),
+                subject: "subject".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("issuer and subject pins"));
+    }
+
+    #[test]
+    fn verify_rejects_empty_protected_through_public_api() {
+        let mut card = card_with_signature("YWJjZA==");
+        card.signatures[0].protected = "".to_string();
+
+        let err = verify_agent_card_signature(
+            &card,
+            &AgentCardSignerPin {
+                issuer: "issuer".to_string(),
+                subject: "subject".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("protected/signature must not be empty"));
+    }
+
+    #[test]
+    fn verify_rejects_signature_missing_bundle_through_public_api() {
+        let mut card = card_with_signature("YWJjZA==");
+        card.signatures[0].header = Some(serde_json::json!({"other": true}));
+
+        let err = verify_agent_card_signature(
+            &card,
+            &AgentCardSignerPin {
+                issuer: "issuer".to_string(),
+                subject: "subject".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("missing sigstore bundle"));
+    }
+
+    #[test]
+    fn cosign_signature_stdout_rejects_empty_output() {
+        assert!(parse_cosign_signature_stdout(b"").is_err());
+        assert!(parse_cosign_signature_stdout(b"\n").is_err());
+    }
+
+    #[test]
+    fn jws_signing_input_uses_protected_header_and_canonical_payload() {
+        let card = card_with_signature("sig");
+        let protected = "dGVzdA";
+        let input = jws_signing_input(&card, protected).unwrap();
+
+        assert!(input.starts_with("dGVzdA."));
+        let payload_b64 = input.strip_prefix("dGVzdA.").unwrap();
+        let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(payload_b64).unwrap()).unwrap();
+        assert!(!payload.contains("signatures"));
+        assert!(payload.contains("signed-agent"));
+    }
+
+    #[test]
+    fn canonical_json_preserves_array_order() {
+        let value: Value = serde_json::from_str(r#"[3,1,2]"#).unwrap();
+        assert_eq!(canonical_json(&value).unwrap(), "[3,1,2]");
+    }
+
+    #[test]
+    fn canonical_json_handles_nested_types() {
+        let value: Value =
+            serde_json::from_str(r#"{"n":null,"b":true,"s":"hi","a":[1]}"#).unwrap();
+        let result = canonical_json(&value).unwrap();
+        assert_eq!(result, r#"{"a":[1],"b":true,"n":null,"s":"hi"}"#);
+    }
 }

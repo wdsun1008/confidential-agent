@@ -589,4 +589,62 @@ mod tests {
         let ingress = config["add_ingress"].as_array().unwrap();
         assert_eq!(ingress.len(), 2);
     }
+
+    #[test]
+    fn validate_card_rejects_whitespace_name() {
+        let mut card = test_card();
+        card.name = "   ".to_string();
+        assert!(validate_confidential_agent_card(&card).is_err());
+    }
+
+    #[test]
+    fn validate_card_rejects_empty_id() {
+        let mut card = test_card();
+        with_conf(&mut card, |c| c.id = "".to_string());
+        assert!(validate_confidential_agent_card(&card).is_err());
+    }
+
+    #[test]
+    fn render_agent_card_rejects_disabled_a2a() {
+        let spec = AgentSpec::from_yaml(
+            &format!(
+                "{}\n{}",
+                r#"
+schema: confidential-agent/v1
+service:
+  id: test
+  ports: [18789]
+  connect: [18789]
+build:
+  image_name: test-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+resources: {}"#
+                    .trim(),
+                r#"
+a2a:
+  enabled: false
+  id: test-agent
+  name: test-agent"#
+            ),
+            std::path::Path::new("/project"),
+        )
+        .unwrap();
+        let meta = json!({
+            "artifact_id": "test",
+            "artifact_version": "v1",
+            "artifact_type": "uki",
+            "rekor_url": "https://rekor.sigstore.dev"
+        });
+
+        let err = render_agent_card(&spec, "1.2.3.4", &meta, None).unwrap_err();
+        assert!(err.to_string().contains("a2a is disabled"));
+    }
 }
