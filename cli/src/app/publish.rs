@@ -327,32 +327,6 @@ fn describe_image_status(cli: &Cli, region: &str, image_id: &str) -> Result<Opti
         .map(str::to_string))
 }
 
-fn wait_for_image_available(cli: &Cli, region: &str, image_id: &str) -> Result<()> {
-    let timeout = Duration::from_secs(
-        std::env::var("CA_IMAGE_IMPORT_TIMEOUT_SEC")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1800),
-    );
-    let interval = Duration::from_secs(30);
-    let started = Instant::now();
-    loop {
-        match describe_image_status(cli, region, image_id)?.as_deref() {
-            Some("Available") => return Ok(()),
-            Some("Creating" | "Waiting") | None => {}
-            Some("CreateFailed") => bail!("ECS image import failed for {image_id}"),
-            Some(other) => eprintln!("[ca] image {image_id} status: {other}"),
-        }
-        if started.elapsed() >= timeout {
-            bail!(
-                "timed out after {}s waiting for image {image_id} to become Available",
-                timeout.as_secs()
-            );
-        }
-        thread::sleep(interval);
-    }
-}
-
 fn cleanup_oss_object(cli: &Cli, bucket: &str, object_key: &str, region: &str) -> Result<()> {
     run_ossutil(
         cli,
@@ -382,6 +356,159 @@ fn delete_cloud_image(cli: &Cli, region: &str, image_id: &str) -> Result<()> {
         region,
     )?;
     Ok(())
+}
+
+struct ImportImageResponse {
+    image_id: String,
+    task_id: Option<String>,
+}
+
+trait PublishCloudOps {
+    fn image_import_timeout(&self) -> Duration {
+        Duration::from_secs(
+            std::env::var("CA_IMAGE_IMPORT_TIMEOUT_SEC")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1800),
+        )
+    }
+
+    fn image_import_poll_interval(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
+    fn validate_credentials(&self, cli: &Cli, region: &str) -> Result<()>;
+
+    fn find_existing_published_image(
+        &self,
+        cli: &Cli,
+        region: &str,
+        service_id: &str,
+        variant: &str,
+        build_id: &str,
+        source_sha256: &str,
+    ) -> Result<Option<String>>;
+
+    fn describe_image_status(
+        &self,
+        cli: &Cli,
+        region: &str,
+        image_id: &str,
+    ) -> Result<Option<String>>;
+
+    fn ensure_publish_bucket(&self, cli: &Cli, bucket: &str, region: &str) -> Result<()>;
+
+    fn upload_image(
+        &self,
+        cli: &Cli,
+        image_path: &Path,
+        bucket: &str,
+        object_key: &str,
+        region: &str,
+    ) -> Result<()>;
+
+    fn import_image(
+        &self,
+        cli: &Cli,
+        request: ImportImageRequest<'_>,
+    ) -> Result<ImportImageResponse>;
+
+    fn cleanup_oss_object(
+        &self,
+        cli: &Cli,
+        bucket: &str,
+        object_key: &str,
+        region: &str,
+    ) -> Result<()>;
+
+    fn delete_cloud_image(&self, cli: &Cli, region: &str, image_id: &str) -> Result<()>;
+}
+
+struct RealPublishCloudOps;
+
+impl PublishCloudOps for RealPublishCloudOps {
+    fn validate_credentials(&self, cli: &Cli, region: &str) -> Result<()> {
+        validate_cloud_credentials(cli, region)
+    }
+
+    fn find_existing_published_image(
+        &self,
+        cli: &Cli,
+        region: &str,
+        service_id: &str,
+        variant: &str,
+        build_id: &str,
+        source_sha256: &str,
+    ) -> Result<Option<String>> {
+        find_existing_published_image(cli, region, service_id, variant, build_id, source_sha256)
+    }
+
+    fn describe_image_status(
+        &self,
+        cli: &Cli,
+        region: &str,
+        image_id: &str,
+    ) -> Result<Option<String>> {
+        describe_image_status(cli, region, image_id)
+    }
+
+    fn ensure_publish_bucket(&self, cli: &Cli, bucket: &str, region: &str) -> Result<()> {
+        ensure_publish_bucket(cli, bucket, region)
+    }
+
+    fn upload_image(
+        &self,
+        cli: &Cli,
+        image_path: &Path,
+        bucket: &str,
+        object_key: &str,
+        region: &str,
+    ) -> Result<()> {
+        run_ossutil(
+            cli,
+            vec![
+                "cp".to_string(),
+                image_path.to_string_lossy().to_string(),
+                format!("oss://{bucket}/{object_key}"),
+                "--force".to_string(),
+            ],
+            vec![image_path.to_path_buf()],
+            region,
+        )
+    }
+
+    fn import_image(
+        &self,
+        cli: &Cli,
+        request: ImportImageRequest<'_>,
+    ) -> Result<ImportImageResponse> {
+        let region = request.region;
+        let output = run_aliyun_cli(cli, import_image_args(request), region)?;
+        let resp: serde_json::Value =
+            serde_json::from_str(&output).context("failed to parse ImportImage response")?;
+        let image_id = resp["ImageId"]
+            .as_str()
+            .context("ImportImage response missing ImageId")?
+            .to_string();
+        Ok(ImportImageResponse {
+            image_id,
+            task_id: resp["TaskId"].as_str().map(str::to_string),
+        })
+    }
+
+    fn cleanup_oss_object(
+        &self,
+        cli: &Cli,
+        bucket: &str,
+        object_key: &str,
+        region: &str,
+    ) -> Result<()> {
+        cleanup_oss_object(cli, bucket, object_key, region)
+    }
+
+    fn delete_cloud_image(&self, cli: &Cli, region: &str, image_id: &str) -> Result<()> {
+        delete_cloud_image(cli, region, image_id)
+    }
 }
 
 struct PublishEntrySeed<'a> {
@@ -506,6 +633,65 @@ fn publish_variant_image(
     source_size: u64,
     wait: bool,
 ) -> Result<PublishedImage> {
+    publish_variant_image_with_ops(
+        cli,
+        &RealPublishCloudOps,
+        state,
+        key,
+        image_path,
+        region,
+        service_id,
+        variant,
+        build_id,
+        source_sha256,
+        source_size,
+        wait,
+    )
+}
+
+fn wait_for_image_available_with_ops(
+    cli: &Cli,
+    ops: &impl PublishCloudOps,
+    region: &str,
+    image_id: &str,
+) -> Result<()> {
+    let timeout = ops.image_import_timeout();
+    let interval = ops.image_import_poll_interval();
+    let started = Instant::now();
+    loop {
+        match ops.describe_image_status(cli, region, image_id)?.as_deref() {
+            Some("Available") => return Ok(()),
+            Some("Creating" | "Waiting") | None => {}
+            Some("CreateFailed") => bail!("ECS image import failed for {image_id}"),
+            Some(other) => eprintln!("[ca] image {image_id} status: {other}"),
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {}s waiting for image {image_id} to become Available",
+                timeout.as_secs()
+            );
+        }
+        if !interval.is_zero() {
+            thread::sleep(interval);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_variant_image_with_ops(
+    cli: &Cli,
+    ops: &impl PublishCloudOps,
+    state: &mut LocalServiceState,
+    key: &str,
+    image_path: &Path,
+    region: &str,
+    service_id: &str,
+    variant: &str,
+    build_id: &str,
+    source_sha256: &str,
+    source_size: u64,
+    wait: bool,
+) -> Result<PublishedImage> {
     let bucket = publish_bucket_name(region, &cli.state_dir);
     let object_key = publish_object_key(service_id, variant, build_id, source_sha256);
     let image_name = publish_image_name(service_id, variant, build_id, source_sha256);
@@ -522,11 +708,15 @@ fn publish_variant_image(
         })
     });
 
-    validate_cloud_credentials(cli, region)?;
+    ops.validate_credentials(cli, region)?;
 
     if let Some(image_id) = entry.image_id.clone() {
         if entry.status == STATUS_AVAILABLE {
-            if describe_image_status(cli, region, &image_id)?.as_deref() == Some("Available") {
+            if ops
+                .describe_image_status(cli, region, &image_id)?
+                .as_deref()
+                == Some("Available")
+            {
                 println!("[ca] image already published: {image_id}");
                 return Ok(entry);
             }
@@ -537,7 +727,8 @@ fn publish_variant_image(
             );
             persist_published(cli, state, key, entry.clone())?;
         } else if entry.status == STATUS_IMPORTING {
-            let import_still_running = match describe_image_status(cli, region, &image_id)?
+            let import_still_running = match ops
+                .describe_image_status(cli, region, &image_id)?
                 .as_deref()
             {
                 Some("Available") => {
@@ -545,8 +736,9 @@ fn publish_variant_image(
                     if let (Some(bucket), Some(object_key)) =
                         (entry.bucket.clone(), entry.object_key.clone())
                     {
-                        entry.oss_cleaned =
-                            cleanup_oss_object(cli, &bucket, &object_key, region).is_ok();
+                        entry.oss_cleaned = ops
+                            .cleanup_oss_object(cli, &bucket, &object_key, region)
+                            .is_ok();
                     }
                     persist_published(cli, state, key, entry.clone())?;
                     println!("[ca] image import completed: {image_id}");
@@ -559,7 +751,7 @@ fn publish_variant_image(
                         Some("ECS image import failed".to_string()),
                     );
                     persist_published(cli, state, key, entry.clone())?;
-                    delete_cloud_image(cli, region, &image_id).with_context(|| {
+                    ops.delete_cloud_image(cli, region, &image_id).with_context(|| {
                         format!(
                             "failed import image {image_id} could not be deleted; retry image unpublish"
                         )
@@ -580,32 +772,39 @@ fn publish_variant_image(
                     return Ok(entry);
                 }
                 println!("[ca] waiting for existing image import to complete: {image_id}");
-                wait_for_image_available(cli, region, &image_id)?;
+                wait_for_image_available_with_ops(cli, ops, region, &image_id)?;
                 update_entry_status(&mut entry, STATUS_AVAILABLE, None);
                 if let (Some(bucket), Some(object_key)) =
                     (entry.bucket.clone(), entry.object_key.clone())
                 {
-                    entry.oss_cleaned =
-                        cleanup_oss_object(cli, &bucket, &object_key, region).is_ok();
+                    entry.oss_cleaned = ops
+                        .cleanup_oss_object(cli, &bucket, &object_key, region)
+                        .is_ok();
                 }
                 persist_published(cli, state, key, entry.clone())?;
                 return Ok(entry);
             }
         } else if entry.status == STATUS_FAILED {
-            delete_cloud_image(cli, region, &image_id).with_context(|| {
-                format!(
+            ops.delete_cloud_image(cli, region, &image_id)
+                .with_context(|| {
+                    format!(
                     "failed published image {image_id} could not be deleted; retry image unpublish"
                 )
-            })?;
+                })?;
             entry.image_id = None;
             entry.import_task_id = None;
             persist_published(cli, state, key, entry.clone())?;
         }
     }
 
-    if let Some(existing_id) =
-        find_existing_published_image(cli, region, service_id, variant, build_id, source_sha256)?
-    {
+    if let Some(existing_id) = ops.find_existing_published_image(
+        cli,
+        region,
+        service_id,
+        variant,
+        build_id,
+        source_sha256,
+    )? {
         entry.image_id = Some(existing_id.clone());
         entry.oss_cleaned = true;
         update_entry_status(&mut entry, STATUS_AVAILABLE, None);
@@ -618,26 +817,16 @@ fn publish_variant_image(
         update_entry_status(&mut entry, STATUS_UPLOADING, None);
         persist_published(cli, state, key, entry.clone())?;
         println!("[ca] uploading image to OSS ({source_size} bytes)...");
-        ensure_publish_bucket(cli, &bucket, region)?;
-        run_ossutil(
-            cli,
-            vec![
-                "cp".to_string(),
-                image_path.to_string_lossy().to_string(),
-                format!("oss://{bucket}/{object_key}"),
-                "--force".to_string(),
-            ],
-            vec![image_path.to_path_buf()],
-            region,
-        )?;
+        ops.ensure_publish_bucket(cli, &bucket, region)?;
+        ops.upload_image(cli, image_path, &bucket, &object_key, region)?;
         update_entry_status(&mut entry, STATUS_UPLOADED, None);
         persist_published(cli, state, key, entry.clone())?;
     }
 
     println!("[ca] importing ECS image '{image_name}'...");
-    let import_output = run_aliyun_cli(
+    let imported = ops.import_image(
         cli,
-        import_image_args(ImportImageRequest {
+        ImportImageRequest {
             region,
             image_name: &image_name,
             bucket: &bucket,
@@ -646,17 +835,11 @@ fn publish_variant_image(
             build_id,
             variant,
             source_sha256,
-        }),
-        region,
+        },
     )?;
-    let resp: serde_json::Value =
-        serde_json::from_str(&import_output).context("failed to parse ImportImage response")?;
-    let image_id = resp["ImageId"]
-        .as_str()
-        .context("ImportImage response missing ImageId")?
-        .to_string();
+    let image_id = imported.image_id;
     entry.image_id = Some(image_id.clone());
-    entry.import_task_id = resp["TaskId"].as_str().map(str::to_string);
+    entry.import_task_id = imported.task_id;
     update_entry_status(&mut entry, STATUS_IMPORTING, None);
     persist_published(cli, state, key, entry.clone())?;
     println!("[ca] import started: image_id={image_id}");
@@ -666,8 +849,8 @@ fn publish_variant_image(
     }
 
     println!("[ca] waiting for image import to complete...");
-    if let Err(err) = wait_for_image_available(cli, region, &image_id) {
-        let status = match describe_image_status(cli, region, &image_id) {
+    if let Err(err) = wait_for_image_available_with_ops(cli, ops, region, &image_id) {
+        let status = match ops.describe_image_status(cli, region, &image_id) {
             Ok(Some(status)) if status == "CreateFailed" => STATUS_FAILED,
             _ => STATUS_IMPORTING,
         };
@@ -677,7 +860,9 @@ fn publish_variant_image(
     }
     if let (Some(bucket), Some(object_key)) = (entry.bucket.clone(), entry.object_key.clone()) {
         println!("[ca] cleaning up OSS object...");
-        entry.oss_cleaned = cleanup_oss_object(cli, &bucket, &object_key, region).is_ok();
+        entry.oss_cleaned = ops
+            .cleanup_oss_object(cli, &bucket, &object_key, region)
+            .is_ok();
     }
     update_entry_status(&mut entry, STATUS_AVAILABLE, None);
     persist_published(cli, state, key, entry.clone())?;
@@ -799,6 +984,14 @@ pub(super) fn cmd_image_publish(cli: &Cli, args: &ImagePublishArgs) -> Result<()
 }
 
 pub(super) fn cmd_image_unpublish(cli: &Cli, args: &ImageUnpublishArgs) -> Result<()> {
+    cmd_image_unpublish_with_ops(cli, &RealPublishCloudOps, args)
+}
+
+fn cmd_image_unpublish_with_ops(
+    cli: &Cli,
+    ops: &impl PublishCloudOps,
+    args: &ImageUnpublishArgs,
+) -> Result<()> {
     let paths = context_paths(&cli.state_dir, &args.service);
     let mut state = read_service_state_file(&paths.service_state)?
         .with_context(|| format!("no local state for service '{}'", args.service))?;
@@ -851,18 +1044,23 @@ pub(super) fn cmd_image_unpublish(cli: &Cli, args: &ImageUnpublishArgs) -> Resul
     for key in keys {
         let mut entry = state.build.published[&key].clone();
         let mut failed = false;
-        if let Some(image_id) = entry.image_id.as_deref() {
+        let mut deleted_image_id = None;
+        if let Some(image_id) = entry.image_id.clone() {
             println!("[ca] deleting ECS image {image_id} ({key})...");
-            if let Err(err) = delete_cloud_image(cli, &entry.region, image_id) {
+            if let Err(err) = ops.delete_cloud_image(cli, &entry.region, &image_id) {
                 eprintln!("[ca] warning: failed to delete image {image_id}: {err:#}");
                 failed = true;
+            } else {
+                deleted_image_id = Some(image_id);
+                entry.image_id = None;
+                entry.import_task_id = None;
             }
         }
         if !entry.oss_cleaned {
             if let (Some(bucket), Some(object_key)) =
                 (entry.bucket.as_deref(), entry.object_key.as_deref())
             {
-                if let Err(err) = cleanup_oss_object(cli, bucket, object_key, &entry.region) {
+                if let Err(err) = ops.cleanup_oss_object(cli, bucket, object_key, &entry.region) {
                     eprintln!("[ca] warning: failed to cleanup OSS object: {err:#}");
                     failed = true;
                 }
@@ -878,6 +1076,11 @@ pub(super) fn cmd_image_unpublish(cli: &Cli, args: &ImageUnpublishArgs) -> Resul
         } else {
             state.build.published.remove(&key);
             removed += 1;
+        }
+        if let Some(deleted) = deleted_image_id.as_deref() {
+            if state.deploy.published_image_id.as_deref() == Some(deleted) {
+                state.deploy.published_image_id = None;
+            }
         }
     }
     write_local_service_state(&cli.state_dir, &state)?;
@@ -904,6 +1107,14 @@ fn should_prune_published_entry(
 }
 
 pub(super) fn cmd_image_prune(cli: &Cli, args: &ImagePruneArgs) -> Result<()> {
+    cmd_image_prune_with_ops(cli, &RealPublishCloudOps, args)
+}
+
+fn cmd_image_prune_with_ops(
+    cli: &Cli,
+    ops: &impl PublishCloudOps,
+    args: &ImagePruneArgs,
+) -> Result<()> {
     let mut total = 0usize;
     for mut state in read_service_states(&cli.state_dir)? {
         let keys = state
@@ -923,8 +1134,8 @@ pub(super) fn cmd_image_prune(cli: &Cli, args: &ImagePruneArgs) -> Result<()> {
                     entry.image_id.as_deref().unwrap_or("-")
                 );
             } else {
-                if let Some(image_id) = entry.image_id.as_deref() {
-                    if let Err(err) = delete_cloud_image(cli, &entry.region, image_id) {
+                if let Some(image_id) = entry.image_id.clone() {
+                    if let Err(err) = ops.delete_cloud_image(cli, &entry.region, &image_id) {
                         eprintln!("[ca] warning: failed to delete image {image_id}: {err:#}");
                         update_entry_status(
                             &mut entry,
@@ -937,12 +1148,16 @@ pub(super) fn cmd_image_prune(cli: &Cli, args: &ImagePruneArgs) -> Result<()> {
                     }
                     entry.image_id = None;
                     entry.import_task_id = None;
+                    if state.deploy.published_image_id.as_deref() == Some(image_id.as_str()) {
+                        state.deploy.published_image_id = None;
+                    }
                 }
                 if !entry.oss_cleaned {
                     if let (Some(bucket), Some(object_key)) =
                         (entry.bucket.as_deref(), entry.object_key.as_deref())
                     {
-                        if let Err(err) = cleanup_oss_object(cli, bucket, object_key, &entry.region)
+                        if let Err(err) =
+                            ops.cleanup_oss_object(cli, bucket, object_key, &entry.region)
                         {
                             eprintln!("[ca] warning: failed to cleanup OSS object: {err:#}");
                             update_entry_status(
@@ -974,6 +1189,8 @@ pub(super) fn cmd_image_prune(cli: &Cli, args: &ImagePruneArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     #[test]
     fn publish_key_includes_build_and_hash() {
@@ -1064,6 +1281,642 @@ mod tests {
         assert!(!should_prune_published_entry(&state, &entry, true));
     }
 
+    #[test]
+    fn publish_fresh_no_wait_records_importing_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let ops = FakePublishCloudOps::default();
+
+        let published = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(published.status, STATUS_IMPORTING);
+        assert_eq!(published.image_id.as_deref(), Some("m-imported"));
+        assert_eq!(
+            ops.calls(),
+            vec![
+                "validate",
+                "find-existing",
+                "ensure-bucket",
+                "upload",
+                "import"
+            ]
+        );
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        let entry = written.build.published.get(&key).unwrap();
+        assert_eq!(entry.status, STATUS_IMPORTING);
+        assert_eq!(entry.import_task_id.as_deref(), Some("task-imported"));
+        assert!(!entry.oss_cleaned);
+    }
+
+    #[test]
+    fn publish_upload_failure_persists_uploading_state_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let ops = FakePublishCloudOps {
+            upload_error: Some("upload failed".to_string()),
+            ..FakePublishCloudOps::default()
+        };
+
+        let err = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("upload failed"));
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        assert_eq!(written.build.published[&key].status, STATUS_UPLOADING);
+        assert!(written.build.published[&key].image_id.is_none());
+    }
+
+    #[test]
+    fn publish_import_failure_keeps_uploaded_state_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let ops = FakePublishCloudOps {
+            import_error: Some("import failed".to_string()),
+            ..FakePublishCloudOps::default()
+        };
+
+        let err = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("import failed"));
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        assert_eq!(written.build.published[&key].status, STATUS_UPLOADED);
+        assert!(written.build.published[&key].image_id.is_none());
+        assert_eq!(
+            ops.calls(),
+            vec![
+                "validate",
+                "find-existing",
+                "ensure-bucket",
+                "upload",
+                "import"
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_fresh_wait_marks_available_and_cleans_oss() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let ops = FakePublishCloudOps {
+            statuses: RefCell::new(VecDeque::from([Some("Available".to_string())])),
+            ..FakePublishCloudOps::default()
+        };
+
+        let published = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(published.status, STATUS_AVAILABLE);
+        assert!(published.oss_cleaned);
+        assert_eq!(
+            ops.calls(),
+            vec![
+                "validate",
+                "find-existing",
+                "ensure-bucket",
+                "upload",
+                "import",
+                "describe:m-imported",
+                "cleanup-oss"
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_fresh_wait_create_failed_persists_failed_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let ops = FakePublishCloudOps {
+            statuses: RefCell::new(VecDeque::from([
+                Some("CreateFailed".to_string()),
+                Some("CreateFailed".to_string()),
+            ])),
+            ..FakePublishCloudOps::default()
+        };
+
+        let err = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("ECS image import failed"));
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        let entry = written.build.published.get(&key).unwrap();
+        assert_eq!(entry.status, STATUS_FAILED);
+        assert_eq!(entry.image_id.as_deref(), Some("m-imported"));
+        assert_eq!(
+            ops.calls(),
+            vec![
+                "validate",
+                "find-existing",
+                "ensure-bucket",
+                "upload",
+                "import",
+                "describe:m-imported",
+                "describe:m-imported"
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_for_image_available_times_out_without_sleeping() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let ops = FakePublishCloudOps {
+            statuses: RefCell::new(VecDeque::from([Some("Creating".to_string())])),
+            timeout: Duration::ZERO,
+            ..FakePublishCloudOps::default()
+        };
+
+        let err =
+            wait_for_image_available_with_ops(&cli, &ops, "cn-beijing", "m-waiting").unwrap_err();
+
+        assert!(err.to_string().contains("timed out after 0s"));
+        assert_eq!(ops.calls(), vec!["describe:m-waiting"]);
+    }
+
+    #[test]
+    fn publish_uploaded_retry_skips_upload_and_imports_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let mut entry = test_published_entry(&state.build.build_id, &source_sha256);
+        entry.status = STATUS_UPLOADED.to_string();
+        entry.image_id = None;
+        entry.import_task_id = None;
+        entry.oss_cleaned = false;
+        state.build.published.insert(key.clone(), entry);
+        let ops = FakePublishCloudOps::default();
+
+        let published = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(published.status, STATUS_IMPORTING);
+        assert_eq!(ops.calls(), vec!["validate", "find-existing", "import"]);
+    }
+
+    #[test]
+    fn publish_importing_no_wait_does_not_start_duplicate_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let mut entry = test_published_entry(&state.build.build_id, &source_sha256);
+        entry.status = STATUS_IMPORTING.to_string();
+        entry.image_id = Some("m-existing-import".to_string());
+        entry.oss_cleaned = false;
+        state.build.published.insert(key.clone(), entry);
+        let ops = FakePublishCloudOps {
+            statuses: RefCell::new(VecDeque::from([Some("Creating".to_string())])),
+            ..FakePublishCloudOps::default()
+        };
+
+        let published = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(published.status, STATUS_IMPORTING);
+        assert_eq!(published.image_id.as_deref(), Some("m-existing-import"));
+        assert_eq!(ops.calls(), vec!["validate", "describe:m-existing-import"]);
+    }
+
+    #[test]
+    fn publish_importing_available_marks_available_and_cleans_oss() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let mut entry = test_published_entry(&state.build.build_id, &source_sha256);
+        entry.status = STATUS_IMPORTING.to_string();
+        entry.image_id = Some("m-existing-import".to_string());
+        entry.oss_cleaned = false;
+        state.build.published.insert(key.clone(), entry);
+        let ops = FakePublishCloudOps {
+            statuses: RefCell::new(VecDeque::from([Some("Available".to_string())])),
+            ..FakePublishCloudOps::default()
+        };
+
+        let published = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(published.status, STATUS_AVAILABLE);
+        assert!(published.oss_cleaned);
+        assert_eq!(
+            ops.calls(),
+            vec!["validate", "describe:m-existing-import", "cleanup-oss"]
+        );
+    }
+
+    #[test]
+    fn publish_adopts_existing_available_cloud_image_without_uploading() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let image_path = temp.path().join("image.qcow2");
+        fs::write(&image_path, "image").unwrap();
+        let mut state = test_state("openclaw");
+        let source_sha256 = sha256_file(&image_path).unwrap();
+        let key = publish_key(
+            "cn-beijing",
+            "release",
+            &state.build.build_id,
+            &source_sha256,
+        );
+        let ops = FakePublishCloudOps {
+            existing_image: RefCell::new(Some("m-adopted".to_string())),
+            ..FakePublishCloudOps::default()
+        };
+
+        let published = publish_variant_image_with_ops(
+            &cli,
+            &ops,
+            &mut state,
+            &key,
+            &image_path,
+            "cn-beijing",
+            "openclaw",
+            "release",
+            "openclaw-agent-release",
+            &source_sha256,
+            5,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(published.status, STATUS_AVAILABLE);
+        assert_eq!(published.image_id.as_deref(), Some("m-adopted"));
+        assert!(published.oss_cleaned);
+        assert_eq!(ops.calls(), vec!["validate", "find-existing"]);
+    }
+
+    #[test]
+    fn unpublish_cleanup_failure_keeps_failed_entry_without_deleted_image_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut state = test_state("openclaw");
+        state.phase = "active".to_string();
+        state.deploy.published_image_id = Some("m-2ze123abc".to_string());
+        let key = "aliyun/cn-beijing/release/openclaw-agent-release/source".to_string();
+        let mut entry = test_published_entry(&state.build.build_id, "source");
+        entry.oss_cleaned = false;
+        state.build.published.insert(key.clone(), entry);
+        write_local_service_state(temp.path(), &state).unwrap();
+        let ops = FakePublishCloudOps {
+            cleanup_error: Some("oss cleanup failed".to_string()),
+            ..FakePublishCloudOps::default()
+        };
+
+        cmd_image_unpublish_with_ops(
+            &cli,
+            &ops,
+            &ImageUnpublishArgs {
+                service: "openclaw".to_string(),
+                region: None,
+                variant: None,
+                image_id: None,
+                force: true,
+            },
+        )
+        .unwrap();
+
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        let remaining = written.build.published.get(&key).unwrap();
+        assert_eq!(remaining.status, STATUS_FAILED);
+        assert!(remaining.image_id.is_none());
+        assert!(remaining.import_task_id.is_none());
+        assert_eq!(written.deploy.published_image_id, None);
+        assert_eq!(ops.calls(), vec!["delete:m-2ze123abc", "cleanup-oss"]);
+    }
+
+    #[test]
+    fn unpublish_delete_failure_keeps_failed_entry_with_image_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut state = test_state("openclaw");
+        let key = "aliyun/cn-beijing/release/openclaw-agent-release/source".to_string();
+        let mut entry = test_published_entry(&state.build.build_id, "source");
+        entry.oss_cleaned = true;
+        state.build.published.insert(key.clone(), entry);
+        write_local_service_state(temp.path(), &state).unwrap();
+        let ops = FakePublishCloudOps {
+            delete_error: Some("delete failed".to_string()),
+            ..FakePublishCloudOps::default()
+        };
+
+        cmd_image_unpublish_with_ops(
+            &cli,
+            &ops,
+            &ImageUnpublishArgs {
+                service: "openclaw".to_string(),
+                region: None,
+                variant: None,
+                image_id: None,
+                force: true,
+            },
+        )
+        .unwrap();
+
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        let remaining = written.build.published.get(&key).unwrap();
+        assert_eq!(remaining.status, STATUS_FAILED);
+        assert_eq!(remaining.image_id.as_deref(), Some("m-2ze123abc"));
+        assert_eq!(ops.calls(), vec!["delete:m-2ze123abc"]);
+    }
+
+    #[test]
+    fn prune_dry_run_does_not_call_cloud_or_mutate_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut state = test_state("openclaw");
+        let key = "aliyun/cn-beijing/release/old/source".to_string();
+        state
+            .build
+            .published
+            .insert(key.clone(), test_published_entry("old-build", "source"));
+        write_local_service_state(temp.path(), &state).unwrap();
+        let ops = FakePublishCloudOps::default();
+
+        cmd_image_prune_with_ops(
+            &cli,
+            &ops,
+            &ImagePruneArgs {
+                dry_run: true,
+                all: true,
+            },
+        )
+        .unwrap();
+
+        assert!(ops.calls().is_empty());
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        assert!(written.build.published.contains_key(&key));
+    }
+
+    #[test]
+    fn prune_cleanup_failure_keeps_failed_entry_without_deleted_image_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut state = test_state("openclaw");
+        let key = "aliyun/cn-beijing/release/old/source".to_string();
+        let mut entry = test_published_entry("old-build", "source");
+        entry.oss_cleaned = false;
+        state.build.published.insert(key.clone(), entry);
+        write_local_service_state(temp.path(), &state).unwrap();
+        let ops = FakePublishCloudOps {
+            cleanup_error: Some("oss cleanup failed".to_string()),
+            ..FakePublishCloudOps::default()
+        };
+
+        cmd_image_prune_with_ops(
+            &cli,
+            &ops,
+            &ImagePruneArgs {
+                dry_run: false,
+                all: false,
+            },
+        )
+        .unwrap();
+
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        let remaining = written.build.published.get(&key).unwrap();
+        assert_eq!(remaining.status, STATUS_FAILED);
+        assert!(remaining.image_id.is_none());
+        assert!(remaining.import_task_id.is_none());
+        assert_eq!(ops.calls(), vec!["delete:m-2ze123abc", "cleanup-oss"]);
+    }
+
+    #[test]
+    fn prune_clears_stale_deploy_published_image_id_after_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut state = test_state("openclaw");
+        state.phase = "built".to_string();
+        state.deploy.published_image_id = Some("m-2ze123abc".to_string());
+        let key = "aliyun/cn-beijing/release/old/source".to_string();
+        let mut entry = test_published_entry("old-build", "source");
+        entry.oss_cleaned = true;
+        state.build.published.insert(key.clone(), entry);
+        write_local_service_state(temp.path(), &state).unwrap();
+        let ops = FakePublishCloudOps::default();
+
+        cmd_image_prune_with_ops(
+            &cli,
+            &ops,
+            &ImagePruneArgs {
+                dry_run: false,
+                all: false,
+            },
+        )
+        .unwrap();
+
+        let written =
+            read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                .unwrap()
+                .unwrap();
+        assert!(!written.build.published.contains_key(&key));
+        assert_eq!(written.deploy.published_image_id, None);
+        assert_eq!(ops.calls(), vec!["delete:m-2ze123abc"]);
+    }
+
     fn test_state(service_id: &str) -> LocalServiceState {
         LocalServiceState {
             schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
@@ -1130,6 +1983,152 @@ mod tests {
             updated_at: "2026-06-02T00:00:00Z".to_string(),
             oss_cleaned: false,
             error: None,
+        }
+    }
+
+    fn test_cli(state_dir: &Path) -> Cli {
+        Cli {
+            command: Commands::Version,
+            shelter_bin: PathBuf::from("shelter"),
+            state_dir: state_dir.to_path_buf(),
+            tools_image: "confidential-agent-tools:test".to_string(),
+        }
+    }
+
+    struct FakePublishCloudOps {
+        calls: RefCell<Vec<String>>,
+        existing_image: RefCell<Option<String>>,
+        statuses: RefCell<VecDeque<Option<String>>>,
+        timeout: Duration,
+        poll_interval: Duration,
+        upload_error: Option<String>,
+        import_error: Option<String>,
+        cleanup_error: Option<String>,
+        delete_error: Option<String>,
+    }
+
+    impl Default for FakePublishCloudOps {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                existing_image: RefCell::new(None),
+                statuses: RefCell::new(VecDeque::new()),
+                timeout: Duration::from_secs(60),
+                poll_interval: Duration::ZERO,
+                upload_error: None,
+                import_error: None,
+                cleanup_error: None,
+                delete_error: None,
+            }
+        }
+    }
+
+    impl FakePublishCloudOps {
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls.borrow_mut().push(call.into());
+        }
+    }
+
+    impl PublishCloudOps for FakePublishCloudOps {
+        fn image_import_timeout(&self) -> Duration {
+            self.timeout
+        }
+
+        fn image_import_poll_interval(&self) -> Duration {
+            self.poll_interval
+        }
+
+        fn validate_credentials(&self, _cli: &Cli, _region: &str) -> Result<()> {
+            self.record("validate");
+            Ok(())
+        }
+
+        fn find_existing_published_image(
+            &self,
+            _cli: &Cli,
+            _region: &str,
+            _service_id: &str,
+            _variant: &str,
+            _build_id: &str,
+            _source_sha256: &str,
+        ) -> Result<Option<String>> {
+            self.record("find-existing");
+            Ok(self.existing_image.borrow().clone())
+        }
+
+        fn describe_image_status(
+            &self,
+            _cli: &Cli,
+            _region: &str,
+            image_id: &str,
+        ) -> Result<Option<String>> {
+            self.record(format!("describe:{image_id}"));
+            Ok(self
+                .statuses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Some("Available".to_string())))
+        }
+
+        fn ensure_publish_bucket(&self, _cli: &Cli, _bucket: &str, _region: &str) -> Result<()> {
+            self.record("ensure-bucket");
+            Ok(())
+        }
+
+        fn upload_image(
+            &self,
+            _cli: &Cli,
+            _image_path: &Path,
+            _bucket: &str,
+            _object_key: &str,
+            _region: &str,
+        ) -> Result<()> {
+            self.record("upload");
+            if let Some(err) = &self.upload_error {
+                bail!("{err}");
+            }
+            Ok(())
+        }
+
+        fn import_image(
+            &self,
+            _cli: &Cli,
+            _request: ImportImageRequest<'_>,
+        ) -> Result<ImportImageResponse> {
+            self.record("import");
+            if let Some(err) = &self.import_error {
+                bail!("{err}");
+            }
+            Ok(ImportImageResponse {
+                image_id: "m-imported".to_string(),
+                task_id: Some("task-imported".to_string()),
+            })
+        }
+
+        fn cleanup_oss_object(
+            &self,
+            _cli: &Cli,
+            _bucket: &str,
+            _object_key: &str,
+            _region: &str,
+        ) -> Result<()> {
+            self.record("cleanup-oss");
+            if let Some(err) = &self.cleanup_error {
+                bail!("{err}");
+            }
+            Ok(())
+        }
+
+        fn delete_cloud_image(&self, _cli: &Cli, _region: &str, image_id: &str) -> Result<()> {
+            self.record(format!("delete:{image_id}"));
+            if let Some(err) = &self.delete_error {
+                bail!("{err}");
+            }
+            Ok(())
         }
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 run_case() {
-  INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.g8i.xlarge}"
+  INSTANCE_TYPE="$DEFAULT_INSTANCE_TYPE"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-bailian-$E2E_RUN_ID}"
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"

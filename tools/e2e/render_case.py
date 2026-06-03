@@ -106,6 +106,18 @@ def context_from_env(work_dir):
         if not context.get(name):
             context[name] = value
 
+    def default_zone_id(region):
+        if region == "cn-hongkong":
+            return "cn-hongkong-d"
+        return "cn-beijing-i"
+
+    def default_instance_type(region):
+        if region == "cn-hongkong":
+            return "ecs.g8i.xlarge"
+        if region == "cn-beijing":
+            return "ecs.g9i.xlarge"
+        return "ecs.g8i.xlarge"
+
     default("ROOT_DIR", str(ROOT))
     context["WORK_DIR"] = str(work_dir)
     default("BUILD_BACKEND", "mkosi")
@@ -115,8 +127,9 @@ def context_from_env(work_dir):
     default("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     default("DASHSCOPE_MODEL", "qwen3.7-max")
     default("REGION", "cn-beijing")
-    default("ZONE_ID", "cn-beijing-l")
-    default("INSTANCE_TYPE", "ecs.g8i.xlarge")
+    default("ZONE_ID", default_zone_id(context["REGION"]))
+    default("INSTANCE_TYPE", default_instance_type(context["REGION"]))
+    default("MCP_SERVICE_ID", "mcp")
     default("DISK_GB", "200")
     default("CAI_PEP", str(ROOT / "target" / "debug" / "cai-pep"))
     context["BASE_IMAGE_LINE"] = render_base_image_line(context)

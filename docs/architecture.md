@@ -106,8 +106,13 @@ sequenceDiagram
     U->>CLI: deploy --spec foo.yaml
     CLI->>CLI: 检查 phase 必须是 built/deleted
     CLI->>CLI: 二次 render（含 mesh_peer_cidrs）
-    CLI->>SHB: shelter deploy
-    SHB->>TF: 上传 OSS / ImportImage / 创建 ECS / 配置安全组
+    alt 匹配的 published image 已 available
+        CLI->>SHB: shelter deploy (cloud_image_id)
+        SHB->>TF: 创建 ECS / 配置安全组
+    else 使用本地 build 产物
+        CLI->>SHB: shelter deploy
+        SHB->>TF: 上传 OSS / ImportImage / 创建 ECS / 配置安全组
+    end
     TF-->>SHB: deploy-result.json (instance_id, public_ip, …)
     SHB-->>CLI: 完成
     CLI->>CLI: write state.json (phase=deployed)
@@ -137,6 +142,8 @@ sequenceDiagram
 ```
 
 注入采用 `inject-resource` over `http://<ip>:8006`，对应代码 [`cli/src/app/tools.rs::challenge_inject`](../cli/src/app/tools.rs)。每个资源会先尝试 direct 网络，失败后 fallback 走 host 的代理环境变量。
+
+`image publish` 会把 build 产物预先导入为阿里云自定义镜像，并把 provider、region、variant、build id、镜像 hash 与 image id 记录在本地 state。`deploy` 只在这些字段匹配且发布状态为 `available` 时复用该 image；`destroy` 负责运行资源，published image 的删除由 `image unpublish` 或 `image prune` 管理。
 
 ---
 

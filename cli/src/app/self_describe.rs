@@ -548,11 +548,12 @@ const WORKFLOW_DOC: &str = r#"
 2. Write an AppSpec that installs the runtime into the guest image and enables one systemd service.
 3. Validate the spec locally.
 4. Build a release/debug image. Build does not use peerings or security group inputs.
-5. Add operator peering for the controller CIDR so deploy can render security group ingress.
-6. Deploy the selected image variant to Aliyun TDX ECS.
-7. Inject runtime resources and secrets.
-8. Use `peering apply` after later peering changes to refresh active service security groups.
-9. Connect, probe the service with normal tools, and collect logs/status for operations.
+5. Optionally run `image publish <service> --spec <path>` to import the built image as a reusable Aliyun custom image.
+6. Add operator peering for the controller CIDR so deploy can render security group ingress.
+7. Deploy the selected image variant to Aliyun TDX ECS. Deploy reuses an available published image only when provider, region, variant, build id, and source hash match.
+8. Inject runtime resources and secrets.
+9. Use `peering apply` after later peering changes to refresh active service security groups.
+10. Connect, probe the service with normal tools, and collect logs/status for operations.
 "#;
 
 const APPSPEC_DOC: &str = r#"
@@ -572,13 +573,16 @@ Core commands:
 
 - `build --spec <path>` creates the confidential image; `build` defaults to `confidential-agent.yaml`.
 - `key generate-cosign --output-key-prefix ./cosign` creates a Rekor signing key pair through the tools image.
-- `deploy --spec <path>` provisions the cloud instance; `deploy` defaults to `confidential-agent.yaml`.
+- `image publish <service> --spec <path> [--region <region>] [--no-wait]` uploads the built image to OSS, imports an Aliyun custom image, and records published state. `--no-wait` returns after the import task is created; rerun without it to wait for the same image to become available.
+- `deploy --spec <path>` provisions the cloud instance; `deploy` defaults to `confidential-agent.yaml`. If a matching available published image exists, deploy reuses its `image_id` and skips upload/import.
 - `status --service <id> --live --json` checks local and guest state.
 - `connect --render-only` prints the local forwarding config without starting the tunnel. The JSON includes `client_endpoints[]` with the exact host-side `127.0.0.1:<port>` URLs.
 - `connect --service <id>` selects one active local service by exact id; without it, connect covers all active services that expose `service.connect` ports.
 - `connect start --service <id> --ready-json connect-ready.json --wait-ready 120` starts the tunnel in the background, waits for local ports, and writes ready metadata. `connect stop --ready-json connect-ready.json` stops only that recorded tunnel.
 - `connect` without `start` remains the foreground human-operator mode and runs until stopped.
 - `destroy <service-id>` tears down provisioned resources.
+- `image unpublish <service> [--image-id <id>] [--force]` deletes published custom images and residual OSS objects tracked in local state. Active/deployed services using the image require `--force`.
+- `image prune --dry-run --all` audits published images eligible for cleanup; omit `--dry-run` to delete them. Without `--all`, prune targets old build ids and failed publish entries.
 
 For probes, use standard tools such as `curl`, `nc`, the controller agent API, or the workload's native client. Keep probe logic in evaluation scripts or skills rather than expanding the CLI surface.
 "#;
@@ -629,9 +633,9 @@ build:
 deploy:
   provider: aliyun
   image_variant: debug
-  instance_type: ecs.g8i.xlarge
+  instance_type: ecs.g9i.xlarge
   region: cn-beijing
-  zone_id: cn-beijing-l
+  zone_id: cn-beijing-i
 attestation:
   tee: tdx
   mode: challenge
