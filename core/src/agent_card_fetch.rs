@@ -279,6 +279,14 @@ pub fn verify_agent_card_trust(
     card: &AgentCard,
     parsed_url: &ParsedAgentCardUrl,
 ) -> std::result::Result<(), AgentCardFetchError> {
+    verify_agent_card_trust_with(card, parsed_url, &trusted_rekor_urls())
+}
+
+fn verify_agent_card_trust_with(
+    card: &AgentCard,
+    parsed_url: &ParsedAgentCardUrl,
+    trusted: &[String],
+) -> std::result::Result<(), AgentCardFetchError> {
     let ext = confidential_extension(card)
         .map_err(|err| AgentCardFetchError::SchemaValidation(err.to_string()))?;
     let declared = ext.public_ip.parse::<IpAddr>().map_err(|_| {
@@ -288,7 +296,6 @@ pub fn verify_agent_card_trust(
     if !resolved.contains(&declared) {
         return Err(AgentCardFetchError::PublicIpHostMismatch { declared, resolved });
     }
-    let trusted = trusted_rekor_urls();
     let rekor_url = normalize_url(&ext.rekor.rekor_url);
     if !trusted
         .iter()
@@ -296,7 +303,7 @@ pub fn verify_agent_card_trust(
     {
         return Err(AgentCardFetchError::RekorUrlNotTrusted {
             url: ext.rekor.rekor_url.clone(),
-            allowed: trusted,
+            allowed: trusted.to_vec(),
         });
     }
     Ok(())
@@ -582,5 +589,201 @@ mod tests {
     fn trusted_rekor_urls_falls_back_to_default_when_env_value_is_only_separators() {
         let urls = parse_trusted_rekor_urls(Some(", , ,"));
         assert_eq!(urls, vec![DEFAULT_TRUSTED_REKOR_URL.to_string()]);
+    }
+
+    #[test]
+    fn resolve_host_ipv4_parses_literal_ip() {
+        let addrs = resolve_host_ipv4("127.0.0.1", 8089).unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn resolve_host_ipv4_rejects_unresolvable_host() {
+        let err = resolve_host_ipv4("this-host-does-not-exist.invalid", 80).unwrap_err();
+        match err {
+            AgentCardFetchError::HostResolution { host, .. } => {
+                assert_eq!(host, "this-host-does-not-exist.invalid");
+            }
+            other => panic!("expected HostResolution, got {other:?}"),
+        }
+    }
+
+    fn test_agent_card(public_ip: &str, rekor_url: &str) -> AgentCard {
+        use crate::schema::*;
+        AgentCard {
+            protocol_version: "1.0".to_string(),
+            name: "test".to_string(),
+            description: "test card".to_string(),
+            version: None,
+            supported_interfaces: vec![AgentInterface {
+                url: format!("http://{public_ip}:18789/a2a"),
+                protocol_binding: "JSONRPC".to_string(),
+                protocol_version: "1.0".to_string(),
+                tenant: None,
+            }],
+            preferred_transport: None,
+            skills: Vec::new(),
+            default_input_modes: vec!["text".to_string()],
+            default_output_modes: vec!["text".to_string()],
+            capabilities: AgentCardCapabilities {
+                extensions: vec![AgentExtension {
+                    uri: CONFIDENTIAL_AGENT_EXTENSION.to_string(),
+                    description: None,
+                    required: true,
+                    params: serde_json::to_value(AgentCardConfidential {
+                        id: "test".to_string(),
+                        cache_ttl_sec: 300,
+                        public_ip: public_ip.to_string(),
+                        ports: vec![AgentCardPort {
+                            name: "a2a".to_string(),
+                            port: 18789,
+                        }],
+                        reference_values: None,
+                        rekor: AgentCardRekor {
+                            rekor_url: rekor_url.to_string(),
+                            artifact_id: "test-release".to_string(),
+                            artifact_type: "uki".to_string(),
+                            artifact_version: "20260512".to_string(),
+                            rv_name: "measurement.uki.SHA-384".to_string(),
+                        },
+                        tee: "tdx".to_string(),
+                    })
+                    .unwrap(),
+                }],
+                ..Default::default()
+            },
+            provider: None,
+            security_schemes: None,
+            security: Vec::new(),
+            supports_authenticated_extended_card: None,
+            signatures: Vec::new(),
+        }
+    }
+
+    fn default_trusted() -> Vec<String> {
+        vec![DEFAULT_TRUSTED_REKOR_URL.to_string()]
+    }
+
+    #[test]
+    fn verify_trust_accepts_matching_ipv4_and_default_rekor() {
+        let card = test_agent_card("127.0.0.1", DEFAULT_TRUSTED_REKOR_URL);
+        let parsed = ParsedAgentCardUrl {
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8089,
+        };
+
+        verify_agent_card_trust_with(&card, &parsed, &default_trusted()).unwrap();
+    }
+
+    #[test]
+    fn verify_trust_rejects_public_ip_mismatch() {
+        let card = test_agent_card("198.51.100.10", DEFAULT_TRUSTED_REKOR_URL);
+        let parsed = ParsedAgentCardUrl {
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8089,
+        };
+
+        let err = verify_agent_card_trust_with(&card, &parsed, &default_trusted()).unwrap_err();
+        match err {
+            AgentCardFetchError::PublicIpHostMismatch { declared, resolved } => {
+                assert_eq!(declared, "198.51.100.10".parse::<IpAddr>().unwrap());
+                assert!(resolved.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            }
+            other => panic!("expected PublicIpHostMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_trust_rejects_untrusted_rekor_url() {
+        let card = test_agent_card("127.0.0.1", "https://attacker.example/rekor");
+        let parsed = ParsedAgentCardUrl {
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8089,
+        };
+
+        let err = verify_agent_card_trust_with(&card, &parsed, &default_trusted()).unwrap_err();
+        match err {
+            AgentCardFetchError::RekorUrlNotTrusted { url, allowed } => {
+                assert_eq!(url, "https://attacker.example/rekor");
+                assert!(allowed.contains(&DEFAULT_TRUSTED_REKOR_URL.to_string()));
+            }
+            other => panic!("expected RekorUrlNotTrusted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_trust_accepts_rekor_url_with_trailing_slash() {
+        let card = test_agent_card("127.0.0.1", &format!("{DEFAULT_TRUSTED_REKOR_URL}/"));
+        let parsed = ParsedAgentCardUrl {
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8089,
+        };
+
+        verify_agent_card_trust_with(&card, &parsed, &default_trusted()).unwrap();
+    }
+
+    #[test]
+    fn is_json_content_type_rejects_text_json() {
+        assert!(!is_json_content_type("text/json"));
+    }
+
+    #[test]
+    fn is_json_content_type_handles_empty_and_whitespace() {
+        assert!(!is_json_content_type(""));
+        assert!(!is_json_content_type("   "));
+    }
+
+    #[test]
+    fn detects_no_legacy_extension_on_modern_card() {
+        let card = serde_json::json!({"name": "modern"});
+        assert!(!has_legacy_confidential_agent_extension(&card));
+    }
+
+    #[test]
+    fn detects_no_legacy_extension_on_empty_extensions() {
+        let card = serde_json::json!({"extensions": {}});
+        assert!(!has_legacy_confidential_agent_extension(&card));
+    }
+
+    #[test]
+    fn detects_legacy_extension_in_array_with_name_key() {
+        let card = serde_json::json!({
+            "extensions": [{"name": "x-confidential-agent/v1", "params": {}}]
+        });
+        assert!(has_legacy_confidential_agent_extension(&card));
+    }
+
+    #[test]
+    fn normalize_url_handles_bare_url_without_slash() {
+        assert_eq!(normalize_url("https://example"), "https://example");
+    }
+
+    #[test]
+    fn parse_rejects_url_with_query_after_valid_path() {
+        let err = parse("http://1.2.3.4/.well-known/agent-card.json?key=val").unwrap_err();
+        assert!(invalid_msg(err).contains("query"));
+    }
+
+    #[test]
+    fn resolve_host_ipv4_parses_various_ipv4() {
+        let addrs = resolve_host_ipv4("192.168.1.1", 80).unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4("192.168.1.1".parse().unwrap())]);
+    }
+
+    #[test]
+    fn verify_trust_accepts_custom_rekor_allowlist() {
+        let custom = vec!["https://custom-rekor.example".to_string()];
+        let card = test_agent_card("127.0.0.1", "https://custom-rekor.example");
+        let parsed = ParsedAgentCardUrl {
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8089,
+        };
+
+        verify_agent_card_trust_with(&card, &parsed, &custom).unwrap();
     }
 }

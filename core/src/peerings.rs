@@ -474,4 +474,44 @@ mod tests {
         assert!(file.peerings.is_empty());
         assert!(file.validate().is_ok());
     }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_overflow_octets() {
+        assert!(validate_ipv4_cidr("test", "256.0.0.0/8").is_err());
+        assert!(validate_ipv4_cidr("test", "10.300.0.0/16").is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_non_numeric_prefix() {
+        assert!(validate_ipv4_cidr("test", "10.0.0.0/abc").is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_negative_prefix() {
+        assert!(validate_ipv4_cidr("test", "10.0.0.0/-1").is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_empty_address() {
+        assert!(validate_ipv4_cidr("test", "/24").is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_rejects_ipv6() {
+        assert!(validate_ipv4_cidr("test", "::1/128").is_err());
+    }
+
+    #[test]
+    fn validate_label_rejects_special_characters() {
+        assert!(validate_label("test", "ops@home").is_err());
+        assert!(validate_label("test", "ops home").is_err());
+        assert!(validate_label("test", "ops/home").is_err());
+    }
+
+    #[test]
+    fn validate_label_accepts_valid_names() {
+        assert!(validate_label("test", "ops").is_ok());
+        assert!(validate_label("test", "ops-team").is_ok());
+        assert!(validate_label("test", "ops_team_2").is_ok());
+    }
 }

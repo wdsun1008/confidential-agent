@@ -1324,4 +1324,189 @@ mod tests {
         assert!(summary.ends_with("..."));
         assert_eq!(summary.len(), 123); // 120 chars + "..."
     }
+
+    #[test]
+    fn summarize_command_trims_whitespace() {
+        assert_eq!(summarize_command("  echo hi  "), "echo hi");
+    }
+
+    #[test]
+    fn pep_config_uses_defaults_when_empty_json() {
+        let config: PepConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.socket_path, DEFAULT_SOCKET_PATH);
+        assert_eq!(config.timeout_secs, 30);
+        assert_eq!(config.memory_mb, 512);
+        assert_eq!(config.pids_limit, 128);
+        assert_eq!(config.docker_network_mode, "none");
+        assert!(!config.denied_command_patterns.is_empty());
+        assert!(!config.denied_path_prefixes.is_empty());
+    }
+
+    #[test]
+    fn pep_config_denied_patterns_include_security_sensitive_commands() {
+        let patterns = default_denied_command_patterns();
+        assert!(patterns.iter().any(|p| p.contains("curl")));
+        assert!(patterns.iter().any(|p| p.contains("ssh")));
+        assert!(patterns.iter().any(|p| p.contains("docker")));
+    }
+
+    #[test]
+    fn pep_config_denied_path_prefixes_include_system_paths() {
+        let prefixes = default_denied_path_prefixes();
+        assert!(prefixes.contains(&"/etc".to_string()));
+        assert!(prefixes.contains(&"/proc".to_string()));
+        assert!(prefixes.contains(&"/dev".to_string()));
+    }
+
+    #[test]
+    fn ensure_command_policy_allows_when_patterns_are_empty() {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.denied_command_patterns = Vec::new();
+        config.denied_path_prefixes = Vec::new();
+
+        ensure_command_policy("curl http://evil.example", &config, "audit-1").unwrap();
+    }
+
+    #[test]
+    fn ensure_command_policy_denies_default_patterns() {
+        let config: PepConfig = serde_json::from_str("{}").unwrap();
+
+        for cmd in ["curl http://x", "wget http://x", "ssh root@host", "docker run x"] {
+            let err = ensure_command_policy(cmd, &config, "audit-1").unwrap_err();
+            assert_eq!(deny_rule(err), "command.deny_pattern");
+        }
+    }
+
+    #[test]
+    fn ensure_command_policy_denies_access_to_sensitive_paths() {
+        let config: PepConfig = serde_json::from_str("{}").unwrap();
+
+        let err = ensure_command_policy("cat /etc/shadow", &config, "audit-1").unwrap_err();
+        assert_eq!(deny_rule(err), "fs.deny_prefix");
+    }
+
+    #[test]
+    fn host_to_container_path_handles_workspace_at_root() {
+        let mut config: PepConfig = serde_json::from_str("{}").unwrap();
+        config.workspace_mount_target = "/work".to_string();
+        let root = Path::new("/data");
+        let nested = Path::new("/data/project/src");
+
+        let mapped = host_to_container_path(nested, root, &config).unwrap();
+        assert_eq!(mapped, "/work/project/src");
+    }
+
+    #[test]
+    fn canonicalize_existing_dir_rejects_nonexistent_path() {
+        let err = canonicalize_existing_dir("/this/does/not/exist").unwrap_err();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[test]
+    fn canonicalize_existing_dir_rejects_file_path() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let err = canonicalize_existing_dir(temp.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn intent_response_ok_has_no_error() {
+        let resp = IntentResponse::ok(
+            "req-1".to_string(),
+            IntentSuccessResult {
+                status: "ok".to_string(),
+                decision: "allow".to_string(),
+                backend: "docker".to_string(),
+                sandbox_profile: "default".to_string(),
+                stdout: "output".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+                duration_ms: 100,
+                audit_id: "audit-1".to_string(),
+            },
+        );
+        assert!(resp.error.is_none());
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn intent_response_deny_has_policy_code() {
+        let resp = IntentResponse::deny(
+            "req-1".to_string(),
+            "fs.workdir_prefix".to_string(),
+            "denied".to_string(),
+            json!({}),
+            "audit-1".to_string(),
+        );
+        assert!(resp.result.is_none());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "POLICY_DENY");
+        assert_eq!(err.rule_id.unwrap(), "fs.workdir_prefix");
+    }
+
+    #[test]
+    fn intent_response_bad_request_has_no_rule_id() {
+        let resp = IntentResponse::bad_request("req-1".to_string(), "bad".to_string());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.rule_id.is_none());
+        assert!(err.audit_id.is_none());
+    }
+
+    #[test]
+    fn intent_response_exec_failed_has_audit_id() {
+        let resp = IntentResponse::exec_failed(
+            "req-1".to_string(),
+            "boom".to_string(),
+            json!({"mode": "docker"}),
+            "audit-123".to_string(),
+        );
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "EXECUTION_FAILED");
+        assert_eq!(err.audit_id.unwrap(), "audit-123");
+    }
+
+    #[test]
+    fn try_parse_attestation_bare_cai_pep() {
+        let req = try_parse_attestation_shell_command(
+            "cai-pep attest collect-and-verify --claims",
+            "audit-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(req.claims);
+        assert_eq!(req.tee, "tdx");
+    }
+
+    #[test]
+    fn try_parse_attestation_returns_none_for_non_matching_binary_name() {
+        let result =
+            try_parse_attestation_shell_command("not-cai-pep attest collect-and-verify", "a")
+                .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_attestation_args_rejects_unknown_arg_after_subcommand() {
+        let err = parse_attestation_args(&[
+            "collect-and-verify".to_string(),
+            "--unknown-flag".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("unknown attest argument"));
+    }
+
+    #[test]
+    fn pep_config_load_rejects_missing_file() {
+        let err = PepConfig::load(Path::new("/nonexistent/config.json")).unwrap_err();
+        assert!(err.contains("failed to read config"));
+    }
+
+    #[test]
+    fn pep_config_load_rejects_invalid_json() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), "not json").unwrap();
+        let err = PepConfig::load(temp.path()).unwrap_err();
+        assert!(err.contains("failed to parse config"));
+    }
 }

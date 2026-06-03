@@ -1116,4 +1116,257 @@ peers:
         let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
         assert!(spec.a2a.is_none());
     }
+
+    #[test]
+    fn rejects_duplicate_service_ports() {
+        let err = AgentSpec::from_yaml(
+            &SPEC.replace("ports: [18789, 18800]", "ports: [18789, 18789]"),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate port 18789"));
+    }
+
+    #[test]
+    fn rejects_zero_service_port() {
+        let err = AgentSpec::from_yaml(
+            &SPEC
+                .replace("ports: [18789, 18800]", "ports: [0]")
+                .replace("connect: [18789]", "connect: []"),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("ports greater than 0"));
+    }
+
+    #[test]
+    fn rejects_duplicate_connect_ports() {
+        let err = AgentSpec::from_yaml(
+            &SPEC.replace("connect: [18789]", "connect: [18789, 18789]"),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate port 18789"));
+    }
+
+    #[test]
+    fn rejects_zero_connect_port() {
+        let err = AgentSpec::from_yaml(
+            &SPEC.replace("connect: [18789]", "connect: [0]"),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn rejects_resource_target_relative_path() {
+        let err = AgentSpec::from_yaml(
+            &SPEC.replace(
+                "target: /root/.openclaw/openclaw.json",
+                "target: root/.openclaw/openclaw.json",
+            ),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("resources.openclaw_config.target must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_build_file_target_relative_path() {
+        let err = AgentSpec::from_yaml(
+            &SPEC.replace(
+                "target: /usr/local/share/confidential-agent/openclaw/skill.md",
+                "target: usr/local/share/confidential-agent/openclaw/skill.md",
+            ),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("build.files[0].target must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_a2a_interface_port_not_in_connect() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  interfaces:
+    - port: 18800
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("a2a.interfaces[0].port must be listed in service.connect"));
+    }
+
+    #[test]
+    fn rejects_zero_a2a_interface_port() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  interfaces:
+    - port: 0
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("a2a.interfaces[0].port must be greater than 0"));
+    }
+
+    #[test]
+    fn rejects_signing_required_without_sigstore_mode() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  signing:
+    required: true
+    expected_issuer: https://issuer.example
+    expected_subject: subject@example.com
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("mode must be sigstore-keyless"));
+    }
+
+    #[test]
+    fn rejects_signing_required_without_expected_issuer() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  signing:
+    mode: sigstore-keyless
+    required: true
+    expected_subject: subject@example.com
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("expected_issuer is required"));
+    }
+
+    #[test]
+    fn rejects_signing_required_without_expected_subject() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: openclaw-agent
+  name: openclaw-agent
+  signing:
+    mode: sigstore-keyless
+    required: true
+    expected_issuer: https://issuer.example
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("expected_subject is required"));
+    }
+
+    #[test]
+    fn rejects_empty_service_ports() {
+        let err = AgentSpec::from_yaml(
+            &SPEC
+                .replace("ports: [18789, 18800]", "ports: []")
+                .replace("connect: [18789]", "connect: []"),
+            Path::new("/project"),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("service.ports must not be empty"));
+    }
+
+    #[test]
+    fn rejects_zero_a2a_cache_ttl() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            "a2a:\n  id: agent\n  name: agent\n  cacheTtlSec: 0\n"
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err.to_string().contains("cacheTtlSec must be greater than 0"));
+    }
+
+    #[test]
+    fn rejects_a2a_interface_non_absolute_path() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: agent
+  name: agent
+  interfaces:
+    - port: 18789
+      path: a2a
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("a2a.interfaces[0].path must start with '/'"));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_signing_issuer() {
+        let yaml = format!(
+            "{}\n{}",
+            SPEC.trim(),
+            r#"
+a2a:
+  id: agent
+  name: agent
+  signing:
+    mode: sigstore-keyless
+    required: true
+    expected_issuer: "   "
+    expected_subject: subject@example.com
+"#
+        );
+        let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+
+        assert!(err.to_string().contains("expected_issuer"));
+    }
 }
