@@ -9,7 +9,25 @@ BUILD_BACKEND="${E2E_BUILD_BACKEND:-mkosi}"
 REFERENCE_VALUES="${E2E_REFERENCE_VALUES:-rekor}"
 BASE_IMAGE="${E2E_BASE_IMAGE:-/root/images/alinux3.qcow2}"
 REGION="${E2E_REGION:-cn-beijing}"
-ZONE_ID="${E2E_ZONE_ID:-cn-beijing-l}"
+
+default_tdx_zone_id() {
+  case "$1" in
+    cn-hongkong) printf '%s\n' "cn-hongkong-d" ;;
+    cn-beijing) printf '%s\n' "cn-beijing-i" ;;
+    *) printf '%s\n' "cn-beijing-i" ;;
+  esac
+}
+
+default_tdx_instance_type() {
+  case "$1" in
+    cn-hongkong) printf '%s\n' "ecs.g8i.xlarge" ;;
+    cn-beijing) printf '%s\n' "ecs.g9i.xlarge" ;;
+    *) printf '%s\n' "ecs.g8i.xlarge" ;;
+  esac
+}
+
+ZONE_ID="${E2E_ZONE_ID:-$(default_tdx_zone_id "$REGION")}"
+DEFAULT_INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-$(default_tdx_instance_type "$REGION")}"
 SLSA_GENERATOR="${E2E_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
 DESTROY_ON_SUCCESS="${E2E_DESTROY_ON_SUCCESS:-1}"
 DESTROY_ON_FAILURE="${E2E_DESTROY_ON_FAILURE:-1}"
@@ -113,6 +131,7 @@ init_step_log() {
     printf '%s\n' "- reference_values: \`$REFERENCE_VALUES\`"
     printf '%s\n' "- region: \`$REGION\`"
     printf '%s\n' "- zone_id: \`$ZONE_ID\`"
+    printf '%s\n' "- instance_type: \`${INSTANCE_TYPE:-$DEFAULT_INSTANCE_TYPE}\`"
     printf '%s\n' "- proxy: inherited from the outer command; this script does not unset proxy variables"
   } >"$STEP_LOG"
 }

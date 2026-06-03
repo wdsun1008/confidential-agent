@@ -8,6 +8,7 @@ usage() {
 usage: tools/e2e/run.sh <case>
 
 cases:
+  cli-command-matrix
   openclaw-bailian
   openclaw-a2a
   a2a-data-collab
@@ -24,7 +25,7 @@ fi
 shift
 
 case "$CASE_NAME" in
-  openclaw-bailian | openclaw-a2a | a2a-data-collab | openclaw-vllm | cmaas) ;;
+  cli-command-matrix | openclaw-bailian | openclaw-a2a | a2a-data-collab | openclaw-vllm | cmaas) ;;
   *) usage; exit 2 ;;
 esac
 

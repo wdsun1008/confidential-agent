@@ -124,9 +124,9 @@ debug:
 deploy:
   provider: aliyun
   image_variant: release       # 可选，默认 release，可选值: release | debug
-  instance_type: ecs.g8i.xlarge
+  instance_type: ecs.g9i.xlarge
   region: cn-beijing
-  zone_id: cn-beijing-l        # 也接受 alias `availability_zone`
+  zone_id: cn-beijing-i        # 也接受 alias `availability_zone`
   disk_gb: 200                 # 可选
   vpc_id: vpc-xxx              # 可选，留空让 Terraform 自建
   vswitch_id: vsw-xxx          # 可选
@@ -146,6 +146,10 @@ deploy:
 | `private_ip` | string | ❌ | 期望分配的固定内网 IP |
 
 `deploy` 不再包含 `security.allowed_cidr` / `security.a2a_peer_cidrs`。所有入向安全组规则都从 `<state-dir>/peerings.yaml` 派生，由 `confidential-agent peering ...` 管理；旧字段会被严格模式拒绝，可用 `confidential-agent migrate <spec>` 迁移。`build` 阶段只产出镜像和 build artifact，不读取 `peerings.yaml`；operator peering 应在 build 完成后、首次 deploy 前添加。
+
+若先执行 `confidential-agent image publish <service> --spec <path>`，CLI 会在本地 service state 中记录 published image。后续 `deploy` 仅在 provider、region、variant、build id 和镜像内容 hash 均匹配，且本地发布状态为 `available` 时复用该 `image_id`，并在 Shelter deploy 配置中跳过本地镜像上传和 ImportImage。Published image 不由 `destroy` 统一删除；使用 `image unpublish` 删除指定服务的发布镜像，或使用 `image prune --dry-run --all` 审计后清理旧 build/failed 发布记录。
+
+当前 E2E 默认示例使用 `cn-beijing-i + ecs.g9i.xlarge`。香港 region 的 TDX 默认组合为 `cn-hongkong-d + ecs.g8i.xlarge`；实际可用性仍可能受账号库存和可用区限制影响，必要时显式覆盖 `region`、`zone_id` 和 `instance_type`。
 
 **安全组规则的自动构造**（详见 [`shelter/src/lib.rs::security_group_rules`](../shelter/src/lib.rs)）：
 
@@ -420,9 +424,9 @@ build:
 deploy:
   provider: aliyun
   image_variant: release
-  instance_type: ecs.g8i.xlarge
+  instance_type: ecs.g9i.xlarge
   region: cn-beijing
-  zone_id: cn-beijing-l
+  zone_id: cn-beijing-i
   disk_gb: 200
 
 attestation:

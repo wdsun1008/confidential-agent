@@ -22,6 +22,7 @@ Cases:
 | `a2a-data-collab` | Two real LLM-backed agents collaborate over A2A: Analyst delegates a natural-language aggregate data task to a Data Owner and verifies no raw private rows leak. |
 | `openclaw-vllm` | GPU TEE OpenClaw + local vLLM readiness and chat. |
 | `cmaas` | CMaaS memory service, attested mesh client, non-TEE baseline rejection, snapshot confidentiality check. |
+| `cli-command-matrix` | Local CLI branch matrix plus an optional real-cloud publish/deploy lane when `E2E_MATRIX_REAL_CLOUD=1`. |
 
 The runner intentionally mirrors the user command flow:
 
@@ -52,10 +53,12 @@ Common environment:
 | `E2E_BUILD_BACKEND` | `mkosi` |
 | `E2E_REFERENCE_VALUES` | `rekor` |
 | `E2E_REGION` | `cn-beijing` |
-| `E2E_ZONE_ID` | `cn-beijing-l` |
+| `E2E_ZONE_ID` | `cn-beijing-i` for `cn-beijing`, `cn-hongkong-d` for `cn-hongkong` |
+| `E2E_INSTANCE_TYPE` | `ecs.g9i.xlarge` for `cn-beijing`, `ecs.g8i.xlarge` for `cn-hongkong` |
 | `E2E_ALLOWED_CIDR` | detected public `/24` |
 | `E2E_DESTROY_ON_SUCCESS` | `1` |
 | `E2E_DESTROY_ON_FAILURE` | `1` |
+| `E2E_MATRIX_REAL_CLOUD` | `0`; set to `1` for the `cli-command-matrix` publish/deploy/unpublish cloud lane |
 | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `DASHSCOPE_MODEL` | `qwen3.7-max` |
 

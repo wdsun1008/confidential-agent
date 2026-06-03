@@ -90,7 +90,26 @@ confidential-agent status --json
 
 `build` 会调用 Shelter 生成 UKI/dm-verity 镜像、SLSA provenance，并通过 tools 容器中的 `cosign`/`rekor-cli` 完成 Rekor 上传。
 
-## 6. 部署并注入机密资源
+## 6. 可选：发布镜像供多次部署复用
+
+```bash
+confidential-agent image publish openclaw \
+  --spec ./openclaw.yaml \
+  --region cn-beijing \
+  --no-wait
+
+confidential-agent image publish openclaw \
+  --spec ./openclaw.yaml \
+  --region cn-beijing
+
+confidential-agent image list
+```
+
+`image publish` 会把本地 build 产物上传到 OSS，导入为阿里云自定义镜像，并把发布状态写入本地 service state。第一次用 `--no-wait` 时命令会在导入任务创建后返回，状态通常是 `importing`；后续不带 `--no-wait` 重跑会接续等待同一个导入任务，直到镜像 `available`，并清理临时 OSS 对象。直接不带 `--no-wait` 运行也可以一次性等待完成；等待时长可用 `CA_IMAGE_IMPORT_TIMEOUT_SEC` 调整。
+
+发布记录按 provider、region、variant、build id 和镜像内容 hash 匹配。后续 `deploy` 只有在这些字段匹配且本地发布状态为 `available` 时才复用 `image_id`，从而跳过 Shelter 的上传和 ImportImage 步骤。
+
+## 7. 部署并注入机密资源
 
 ```bash
 confidential-agent \
@@ -101,9 +120,9 @@ confidential-agent status --live
 confidential-agent report --include-a2a --json --out ./attestation-report.json
 ```
 
-`deploy` 会复用本地 build 产物创建云资源，远程证明通过后注入 `openclaw.json`、磁盘密钥和 mesh/A2A 配置。`report` 会汇总本地状态、Guest daemon 状态、EAR 证明和 Rekor 条目。
+如果存在匹配的 published image，`deploy` 会复用该自定义镜像创建云资源；否则会使用本地 build 产物并让 Shelter 执行上传和导入。远程证明通过后，CLI 会注入 `openclaw.json`、磁盘密钥和 mesh/A2A 配置。`report` 会汇总本地状态、Guest daemon 状态、EAR 证明和 Rekor 条目。
 
-## 7. 建立访问通道
+## 8. 建立访问通道
 
 ```bash
 confidential-agent connect start \
@@ -117,7 +136,7 @@ confidential-agent connect stop --ready-json ./connect-ready.json
 
 浏览器也可以访问 `http://127.0.0.1:18789/openclaw`。
 
-## 8. 可选：接入另一个 AgentCard
+## 9. 可选：接入另一个 AgentCard
 
 ```bash
 confidential-agent a2a add \
@@ -133,11 +152,13 @@ confidential-agent peering apply
 
 如果对端 AgentCard 启用了 Sigstore keyless 签名，在 `a2a add` 时同时传入 `--signer-issuer` 和 `--signer-subject`。
 
-## 9. 资源清理
+## 10. 资源清理
 
 ```bash
 confidential-agent destroy openclaw
-confidential-agent image rm openclaw --force
+confidential-agent image unpublish openclaw --force
+confidential-agent image prune --dry-run --all
+confidential-agent image rm openclaw
 ```
 
-`destroy` 会调用 Shelter/Terraform 删除 ECS、自定义镜像、OSS 对象、安全组和网络资源。确认云资源已释放后，再删除本地 state 目录。
+`destroy` 会删除已部署的 ECS、网络和安全组等运行资源。对于普通 deploy 路径，Shelter 仍负责清理它自己创建的临时镜像导入资源；对于 `image publish` 创建并记录的 published image，生命周期由 CLI 独立管理，需使用 `image unpublish` 删除对应自定义镜像并清理残留 OSS 对象。`image prune --dry-run --all` 可先审计所有可清理的 published image，确认后去掉 `--dry-run` 执行。最后再用 `image rm` 删除本地 build/state 记录。

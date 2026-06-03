@@ -104,7 +104,7 @@ fetch_guest_a2a_diagnostics() {
 }
 
 run_case() {
-  INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.g8i.xlarge}"
+  INSTANCE_TYPE="$DEFAULT_INSTANCE_TYPE"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-a2a-$E2E_RUN_ID}"
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   ALPHA_DIR="$WORK_DIR/org-alpha"
