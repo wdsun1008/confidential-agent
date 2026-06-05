@@ -134,7 +134,11 @@ def context_from_env(work_dir):
     default("CAI_PEP", str(ROOT / "target" / "debug" / "cai-pep"))
     context["BASE_IMAGE_LINE"] = render_base_image_line(context)
     context["REKOR_BLOCK"] = render_rekor_block(context)
-    context["DASHSCOPE_KEY"] = context.get("DASHSCOPE_API_KEY") or context.get("BAILIAN_API_KEY", "")
+    context["DASHSCOPE_KEY"] = (
+        context.get("DASHSCOPE_KEY")
+        or context.get("DASHSCOPE_API_KEY")
+        or context.get("BAILIAN_API_KEY", "")
+    )
     context["A2A_SIGNING_BLOCK"] = ""
     return context
 

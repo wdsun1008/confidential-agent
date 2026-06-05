@@ -39,4 +39,9 @@ attestation:
     slsa_generator: /usr/libexec/shelter/slsa/slsa-generator
     required: true
 
-resources: {}
+resources:
+  cmaas_agent_config:
+    source: ./agent-config.json
+    target: /etc/cai/cmaas-agent.json
+    mode: "0600"
+    required: true

@@ -5,7 +5,7 @@ Run full cloud E2E cases through the single case runner:
 ```bash
 export ALICLOUD_ACCESS_KEY='...'
 export ALICLOUD_SECRET_KEY='...'
-export DASHSCOPE_API_KEY='...'              # openclaw-bailian/openclaw-a2a
+export DASHSCOPE_API_KEY='...'              # openclaw-bailian/openclaw-a2a/cmaas
 export DASHSCOPE_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 export DASHSCOPE_MODEL='qwen3.7-max'
 
@@ -17,11 +17,12 @@ Cases:
 
 | Case | What it covers |
 |---|---|
-| `openclaw-bailian` | OpenClaw + Bailian chat over `connect`, plus a second MCP service in the mesh. |
+| `openclaw-bailian` | One-click OpenClaw + Bailian 主路径，使用 `--skip-deps` 保持 e2e 与用户流程一致但不改本地开发机依赖；默认启用 PEP。 |
+| `openclaw-bailian-no-pep` | 同一条 one-click 主路径，额外传入 `--disable-pep`，验证不安装、不启用 cai-pep 的部署分支。 |
 | `openclaw-a2a` | Legacy two-OpenClaw A2A bridge coverage. |
 | `a2a-data-collab` | Two real LLM-backed agents collaborate over A2A: Analyst delegates a natural-language aggregate data task to a Data Owner and verifies no raw private rows leak. |
 | `openclaw-vllm` | GPU TEE OpenClaw + local vLLM readiness and chat. |
-| `cmaas` | CMaaS memory service, attested mesh client, non-TEE baseline rejection, snapshot confidentiality check. |
+| `cmaas` | MCP 主测试：自然语言 agent 调用 memory MCP tools，验证 gateway 审计链、虚拟 MCP 审计 tools、TEE evidence 绑定、非 TEE baseline rejection 和 snapshot confidentiality。 |
 | `cli-command-matrix` | Local CLI branch matrix plus an optional real-cloud publish/deploy lane when `E2E_MATRIX_REAL_CLOUD=1`. |
 
 The runner intentionally mirrors the user command flow:

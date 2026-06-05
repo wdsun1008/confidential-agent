@@ -37,4 +37,9 @@ attestation:
   reference_values: {{yaml:REFERENCE_VALUES}}
 {{raw:REKOR_BLOCK}}
 
-resources: {}
+resources:
+  cmaas_agent_config:
+    source: ./agent-config.json
+    target: /etc/cai/cmaas-agent.json
+    mode: "0600"
+    required: true

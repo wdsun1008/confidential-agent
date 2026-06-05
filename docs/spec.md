@@ -35,6 +35,7 @@ service:
   id: openclaw                  # 服务唯一标识，作为 state-dir 子目录、安全组规则名前缀
   ports: [18789]                # 服务在 Guest 中实际监听的端口集合
   connect: [18789]              # ports 子集；允许 host connect / A2A / mesh service 单向 RA 接入
+  mcp_ports: []                 # ports 子集；声明哪些端口按 MCP 协议做 gateway 审计和 virtual tools 注入
   app_service: cai-openclaw-gateway.service  # 可选；daemon 用它判断应用 systemd unit + 端口是否 ready
 ```
 
@@ -43,11 +44,14 @@ service:
 | `id` | string | ✅ | 仅允许 `[A-Za-z0-9_-]`；不能为空 |
 | `ports` | `[u16]` | ✅ | 不能为空、不能含 0、不能重复 |
 | `connect` | `[u16]` | ❌ | 默认 `[]`；每个端口必须出现在 `ports` 中；不能重复 |
+| `mcp_ports` | `[u16]` | ❌ | 默认 `[]`；每个端口必须出现在 `ports` 中；不能重复 |
 | `app_service` | string | ❌ | 可选；设置后不能为空；应为 guest 内的 systemd unit 名，例如 `cai-openclaw-gateway.service` |
 
 `app_service` 会写入 daemon bootstrap。若设置，`confidential-agentd` 会启动并检查该 systemd unit，同时确认 `service.ports` 都在 guest 本地可连接；`status --live` 中的 `app_ready` 才会变成 ready。若不设置，`app_ready` 只表示资源和 TNG 层就绪，不证明用户应用已经启动。
 
 端口语义固定为：`service.ports` 是所有 TNG 保护的业务端口；`service.connect` 是其中允许 host CLI、非 TEE client、跨组织 A2A、同 state-dir mesh service 以单向 RA 访问的子集，调用方只验证服务端 TEE；`service.ports - service.connect` 是 confidential-only mesh 端口，调用双方都会做 RA。敏感的 confidential-only API 不应暴露在 `connect` 端口上。
+
+`service.mcp_ports` 不改变端口暴露契约，也不要求应用改监听端口。它只声明这些端口上的业务协议是 MCP：guest 内的 `cai-gateway` 会在 TNG 透明路由后按 MCP JSON-RPC 解析请求，给 `tools/list` 注入 `tee_attest`、`audit_status`、`audit_verify` 三个虚拟工具，并对 MCP 请求/响应追加哈希链审计记录。未列入 `mcp_ports` 的端口仍经过 gateway 传递调用方服务身份 token，但按 raw TCP 透传，不做 MCP tool 注入或 MCP audit 解析。
 
 **多服务约束**：跨服务的 `service.ports` 不允许冲突——`deploy/inject` 时 [`validate_mesh_port_conflicts`](../cli/src/app/workflows.rs) 会拒绝掉同 state-dir 下的端口重复。
 

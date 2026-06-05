@@ -39,6 +39,30 @@ aliyun_json() {
   record_file_as_block "Aliyun response: $*" "$out" json
 }
 
+assert_file_contains() {
+  local file="$1"
+  local needle="$2"
+  local label="$3"
+  record "- checking $label."
+  if ! grep -F "$needle" "$file" >/dev/null; then
+    echo "expected $label in $file, missing literal: $needle" >&2
+    tail -80 "$file" >&2 || true
+    return 1
+  fi
+}
+
+assert_jq() {
+  local file="$1"
+  local expr="$2"
+  local label="$3"
+  record "- checking $label."
+  if ! jq -e "$expr" "$file" >/dev/null; then
+    echo "expected $label in $file, jq expression failed: $expr" >&2
+    tail -80 "$file" >&2 || true
+    return 1
+  fi
+}
+
 describe_instance_field() {
   local instance_id="$1"
   local expr="$2"
@@ -349,6 +373,7 @@ run_case() {
   require_cmd ssh-keygen
   require_cmd aliyun
   require_aliyun_credentials
+  require_bailian_credentials
 
   init_step_log "Confidential Agent CMAAS E2E"
   install_exit_traps
@@ -356,15 +381,17 @@ run_case() {
   verify_slsa_generator
   build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-gateway
 
-  local allowed_cidr cosign_key
+  local allowed_cidr cosign_key dashscope_key
   allowed_cidr="$(resolve_allowed_cidr)"
   cosign_key="$(resolve_cosign_key)"
+  dashscope_key="$(resolve_dashscope_key)"
   export COSIGN_KEY="$cosign_key"
   export INSTANCE_TYPE
   export DISK_GB
 
-  render_case
+  DASHSCOPE_KEY="$dashscope_key" render_case
   record "- allowed_cidr: \`$allowed_cidr\`"
+  record "- DashScope API key resolved but not printed."
 
   validate_specs "$STATE_DIR" "$CMAAS_DIR/cmaas.yaml" "$AGENT_DIR/agent.yaml"
 
@@ -429,6 +456,13 @@ run_case() {
     sleep 10
   done
   record_file_as_block "Agent MCP roundtrip output:" "$WORK_DIR/agent-client-output.json" json
+  assert_file_contains "$WORK_DIR/agent-client-output.json" "$marker" "natural-language memory marker"
+  assert_file_contains "$WORK_DIR/agent-client-output.json" '"create_entities"' "create_entities tool call"
+  assert_file_contains "$WORK_DIR/agent-client-output.json" '"open_nodes"' "open_nodes tool call"
+  assert_file_contains "$WORK_DIR/agent-client-output.json" '"audit_status"' "audit_status tool call"
+  assert_file_contains "$WORK_DIR/agent-client-output.json" '"audit_verify"' "audit_verify tool call"
+  assert_file_contains "$WORK_DIR/agent-client-output.json" '"tee_attest"' "tee_attest tool call"
+  record "- natural-language CMaaS agent called memory, audit, and TEE attestation MCP tools."
   ssh_guest "$cmaas_key" "$cmaas_ip" "sync; grep -F '$observation' /var/lib/mcp-memory/memory.jsonl >/tmp/cmaas-marker.txt"
   record "- observation marker is present inside the running CMaaS guest memory file."
   record_cmd "ssh cmaas 'cai-gateway audit-verify --audit $audit_path'"
@@ -439,24 +473,30 @@ run_case() {
   record_cmd "ssh agent 'cmaas-agent-client --action tools_list'"
   ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action tools_list" >"$WORK_DIR/agent-tools-list.json"
   record_file_as_block "Agent MCP tools/list output:" "$WORK_DIR/agent-tools-list.json" json
-  grep -F '"name": "tee_attest"' "$WORK_DIR/agent-tools-list.json" >/dev/null
-  grep -F '"name": "audit_status"' "$WORK_DIR/agent-tools-list.json" >/dev/null
-  grep -F '"name": "audit_verify"' "$WORK_DIR/agent-tools-list.json" >/dev/null
+  assert_file_contains "$WORK_DIR/agent-tools-list.json" '"name": "tee_attest"' "tee_attest virtual tool"
+  assert_file_contains "$WORK_DIR/agent-tools-list.json" '"name": "audit_status"' "audit_status virtual tool"
+  assert_file_contains "$WORK_DIR/agent-tools-list.json" '"name": "audit_verify"' "audit_verify virtual tool"
   record "- gateway virtual MCP tools are visible to the mesh agent."
   record_cmd "ssh agent 'cmaas-agent-client --action audit_status'"
   ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action audit_status" >"$WORK_DIR/agent-audit-status.json"
   record_file_as_block "Agent audit_status output:" "$WORK_DIR/agent-audit-status.json" json
-  grep -F '"total_records"' "$WORK_DIR/agent-audit-status.json" >/dev/null
+  assert_jq "$WORK_DIR/agent-audit-status.json" '.result.structuredContent.total_records | type == "number"' "audit_status total_records"
   record_cmd "ssh agent 'cmaas-agent-client --action audit_verify'"
   ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action audit_verify" >"$WORK_DIR/agent-audit-verify.json"
   record_file_as_block "Agent audit_verify output:" "$WORK_DIR/agent-audit-verify.json" json
-  grep -F '"valid": true' "$WORK_DIR/agent-audit-verify.json" >/dev/null
+  assert_jq "$WORK_DIR/agent-audit-verify.json" '.result.structuredContent.valid == true' "audit_verify valid=true"
   record_cmd "ssh agent 'cmaas-agent-client --action tee_attest --marker $marker'"
   ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action tee_attest --marker '$marker'" >"$WORK_DIR/agent-tee-attest.json"
   record_file_as_block "Agent tee_attest output:" "$WORK_DIR/agent-tee-attest.json" json
-  grep -F '"evidence_sha256"' "$WORK_DIR/agent-tee-attest.json" >/dev/null
-  grep -F '"runtime_data_sha256"' "$WORK_DIR/agent-tee-attest.json" >/dev/null
-  grep -F '"audit_chain_digest"' "$WORK_DIR/agent-tee-attest.json" >/dev/null
+  assert_jq "$WORK_DIR/agent-tee-attest.json" '
+    .result.structuredContent.evidence_sha256 | type == "string" and length > 0
+  ' "tee_attest evidence hash"
+  assert_jq "$WORK_DIR/agent-tee-attest.json" '
+    .result.structuredContent.runtime_data_sha256 | type == "string" and length == 64
+  ' "tee_attest runtime data hash"
+  assert_jq "$WORK_DIR/agent-tee-attest.json" '
+    .result.structuredContent.runtime_binding.audit_chain_digest | type == "string" and length == 64
+  ' "tee_attest audit chain digest"
   record "- tee_attest returned TEE evidence bound to the gateway audit chain through a standard MCP tool call."
 
   provision_baseline "$cmaas_instance_id"
