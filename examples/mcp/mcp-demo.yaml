@@ -5,6 +5,8 @@ service:
   ports:
     - 3001
   connect: []
+  mcp_ports:
+    - 3001
   app_service: cai-mcp-server.service
 
 build:
