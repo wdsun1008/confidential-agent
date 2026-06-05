@@ -3,7 +3,8 @@ use confidential_agent_core::peerings::{
     ipv4_cidr_contains, validate_ipv4_cidr, PeeringEntry, PeeringRole, PeeringScope, PeeringsFile,
 };
 use confidential_agent_core::schema::{
-    LocalBuildState, LocalDeployState, LocalServiceNetwork, LocalServiceState, LocalSpecState,
+    LocalBuildState, LocalDeployState, LocalGatewayIdentity, LocalServiceNetwork,
+    LocalServiceState, LocalSpecState,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -76,7 +77,17 @@ fn service_state(
             tee: "tdx".to_string(),
             published_image_id: None,
         },
-        service: LocalServiceNetwork { ports, connect },
+        service: LocalServiceNetwork {
+            ports,
+            connect,
+            mcp_ports: Vec::new(),
+        },
+        gateway_identity: Some(LocalGatewayIdentity {
+            public_key: format!("{id}-pub"),
+            private_key_path: PathBuf::from(format!(
+                "/state/services/{id}/secrets/gateway_identity.seed"
+            )),
+        }),
         resources: BTreeMap::new(),
         mesh_generation: 1,
         reference_values: "sample".to_string(),

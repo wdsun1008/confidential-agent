@@ -1079,7 +1079,9 @@ mod tests {
             service: LocalServiceNetwork {
                 ports: vec![],
                 connect: vec![],
+                mcp_ports: Vec::new(),
             },
+            gateway_identity: None,
             resources: BTreeMap::new(),
             mesh_generation: 0,
             reference_values: "sample".to_string(),

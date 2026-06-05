@@ -30,6 +30,8 @@ pub struct ServiceSpec {
     #[serde(default)]
     pub connect: Vec<u16>,
     #[serde(default)]
+    pub mcp_ports: Vec<u16>,
+    #[serde(default)]
     pub app_service: Option<String>,
 }
 
@@ -354,6 +356,7 @@ impl AgentSpec {
         validate_id("build.image_name", &self.build.image_name)?;
         validate_ports("service.ports", &self.service.ports)?;
         validate_connect_ports(&self.service.ports, &self.service.connect)?;
+        validate_mcp_ports(&self.service.ports, &self.service.mcp_ports)?;
         if self
             .build
             .base_image
@@ -528,6 +531,23 @@ fn validate_connect_ports(ports: &[u16], connect: &[u16]) -> Result<()> {
     Ok(())
 }
 
+fn validate_mcp_ports(ports: &[u16], mcp_ports: &[u16]) -> Result<()> {
+    let allowed = ports.iter().copied().collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    for port in mcp_ports {
+        if *port == 0 {
+            bail!("service.mcp_ports must contain ports greater than 0");
+        }
+        if !allowed.contains(port) {
+            bail!("service.mcp_ports port {port} must be listed in service.ports");
+        }
+        if !seen.insert(*port) {
+            bail!("service.mcp_ports contains duplicate port {port}");
+        }
+    }
+    Ok(())
+}
+
 fn validate_build_packages(build: &BuildSpec) -> Result<()> {
     if build.base_image.is_some() {
         return Ok(());
@@ -692,6 +712,7 @@ service:
   id: openclaw
   ports: [18789, 18800]
   connect: [18789]
+  mcp_ports: [18800]
   app_service: cai-openclaw-gateway.service
 build:
   base_image: ./base.qcow2
@@ -739,6 +760,7 @@ resources:
         assert_eq!(spec.service.id, "openclaw");
         assert_eq!(spec.service.ports, vec![18789, 18800]);
         assert_eq!(spec.service.connect, vec![18789]);
+        assert_eq!(spec.service.mcp_ports, vec![18800]);
         assert_eq!(
             spec.service.app_service.as_deref(),
             Some("cai-openclaw-gateway.service")
@@ -961,6 +983,34 @@ delivery:
         assert!(err
             .to_string()
             .contains("service.connect port 3001 must be listed in service.ports"));
+    }
+
+    #[test]
+    fn rejects_mcp_port_not_in_ports() {
+        let yaml = r#"
+schema: confidential-agent/v1
+service:
+  id: app
+  ports: [8080]
+  mcp_ports: [9090]
+build:
+  image_name: app
+deploy:
+  provider: aliyun
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  disk_gb: 200
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#;
+        let err = AgentSpec::from_yaml(yaml, Path::new("/project")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("service.mcp_ports port 9090 must be listed in service.ports"));
     }
 
     #[test]

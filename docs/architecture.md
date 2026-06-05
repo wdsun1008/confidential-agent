@@ -67,9 +67,8 @@ sequenceDiagram
     CLI->>Core: AgentSpec::from_path
     Core-->>CLI: spec (validated)
     CLI->>FS: lock state-dir + check phase != active/deployed
-    CLI->>FS: prepare_guest_assets (staging confidential-agentd, fde.toml, dracut module, OPA policy)
+    CLI->>FS: prepare_guest_assets (staging confidential-agentd, cai-gateway, fde.toml, dracut module, OPA policy)
     CLI->>Docker: docker create + cp tools-image:/opt/.../tng-2.6.0 → staging
-    CLI->>Docker: docker create + cp tools-image:/opt/.../libtdx-verify.rpm → staging
     CLI->>CLI: verify "tng --version == tng 2.6.0"
     loop 每个 build.variants.*.enabled=true 的 variant
         CLI->>SH: render_build_config(spec with image_variant, assets, options)
@@ -171,7 +170,7 @@ flowchart TB
 
 关键 systemd unit 与依赖关系来自三处：
 - daemon 嵌入的 unit 文本：[`agentd_service_unit`](../cli/src/app.rs)、[`secret_fetch_service_unit`](../cli/src/app.rs)。
-- mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 装好 libtdx-verify、把 `tng-2.6.0` 软链到 `/usr/bin/tng`，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。
+- mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 把 `hack/tng-2.6.0` 覆盖安装到 `/usr/bin/tng`，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。`libtdx-verify` 由 Alinux3 软件源安装，不再作为仓库内 RPM 注入。
 - 每个示例自己的 `install-*.sh`，例如 [`examples/openclaw/install-openclaw.sh`](../examples/openclaw/install-openclaw.sh) 注册 `cai-openclaw-gateway.service`；spec 的 `service.app_service` 决定 daemon 是否把该 unit 纳入 `app_ready` 判定。
 
 ---

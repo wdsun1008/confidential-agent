@@ -7,8 +7,8 @@ use confidential_agent_core::agent_card_fetch::{
 use confidential_agent_core::schema::{
     confidential_ports, AppliedResourceState, BootstrapConfig, DaemonA2aPeerStatus, DaemonStatus,
     GuestResource, MeshBundle, ServiceDirectory, ServiceDirectoryPort, ServiceDirectoryService,
-    BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
-    SERVICE_DIRECTORY_SCHEMA_VERSION,
+    AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT, DAEMON_STATUS_SCHEMA_VERSION,
+    MESH_SCHEMA_VERSION, SERVICE_DIRECTORY_SCHEMA_VERSION,
 };
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use serde_json::{json, Value};
@@ -34,7 +34,13 @@ const DEFAULT_AA_SOCK: &str =
     "unix:///run/confidential-containers/attestation-agent/attestation-agent.sock";
 const DEFAULT_TNG_CONFIG_PATH: &str = "/etc/tng/config.json";
 const TNG_SERVICE: &str = "trusted-network-gateway.service";
+const GATEWAY_SERVICE: &str = "cai-gateway.service";
 const TNG_CONTROL_PORT: u16 = 50000;
+const DEFAULT_GATEWAY_CONFIG_PATH: &str = "/etc/cai/gateway.json";
+const TNG_EGRESS_PORT_BASE: u16 = 39000;
+const GATEWAY_SERVER_PORT_BASE: u16 = 39200;
+const TNG_INGRESS_PORT_BASE: u16 = 39400;
+const DEFAULT_TNG_SO_MARK: u32 = 565;
 const DEFAULT_POLICY_PATH: &str = "/opt/confidential-agent/policies/trustee-opa-default.rego";
 const DEFAULT_DAEMON_STATE_PATH: &str = "/var/lib/confidential-agent/state.json";
 const DEFAULT_DAEMON_STATUS_PATH: &str = "/run/confidential-agent/status.json";
@@ -70,6 +76,8 @@ struct DaemonState {
     mesh_generation: u64,
     applied_resources: BTreeMap<String, AppliedResourceState>,
     mesh_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_fingerprint: Option<String>,
     #[serde(default)]
     a2a_cache: BTreeMap<String, A2aCachedPeer>,
     #[serde(default)]
@@ -118,6 +126,10 @@ fn env_path(name: &str, default: &str) -> PathBuf {
 
 fn tng_config_path() -> PathBuf {
     env_path("CA_TNG_CONFIG_PATH", DEFAULT_TNG_CONFIG_PATH)
+}
+
+fn gateway_config_path() -> PathBuf {
+    env_path("CA_GATEWAY_CONFIG_PATH", DEFAULT_GATEWAY_CONFIG_PATH)
 }
 
 fn service_directory_path() -> PathBuf {
@@ -1445,12 +1457,14 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
 
     if !has_bundle && !has_a2a_peers {
         state.mesh_generation = 0;
+        let gateway_cfg = empty_gateway_config(bootstrap)?;
+        sync_gateway_service(&gateway_cfg, state)?;
         let readiness = ensure_runtime_ready(bootstrap, false);
         write_status(status_for(bootstrap, state, "waiting-mesh", readiness))?;
         return Ok(());
     }
 
-    let (mut config, mut directory) = if has_bundle {
+    let (mut config, mut directory, gateway_cfg) = if has_bundle {
         let bundle_content = fs::read_to_string(&bundle_path)
             .with_context(|| format!("failed to read mesh bundle '{}'", bundle_path.display()))?;
         let bundle: MeshBundle =
@@ -1468,10 +1482,12 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
             cache_dir.join("mesh-bundle.json"),
             serde_json::to_string_pretty(&bundle)?,
         )?;
-        let dir = service_directory(&bundle, &bootstrap.service_id);
-        let cfg = tng_config(&bundle, &bootstrap.service_id)?;
+        let plan = runtime_port_plan(&bundle, &bootstrap.service_id)?;
+        let dir = service_directory(&bundle, &bootstrap.service_id, &plan);
+        let cfg = tng_config(&bundle, &bootstrap.service_id, &plan)?;
+        let gateway_cfg = gateway_config(&bundle, &bootstrap.service_id, bootstrap, &plan)?;
         state.mesh_generation = bundle.generation;
-        (cfg, dir)
+        (cfg, dir, gateway_cfg)
     } else {
         // No mesh bundle; start with empty config that has egress for self ports
         state.mesh_generation = 0;
@@ -1506,7 +1522,7 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
             schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
             services: BTreeMap::new(),
         };
-        (cfg, dir)
+        (cfg, dir, empty_gateway_config(bootstrap)?)
     };
 
     if let Some(a2a_bundle) = a2a_bundle.as_ref() {
@@ -1532,6 +1548,7 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
         fs::create_dir_all(parent)?;
     }
     fs::write(&directory_path, serde_json::to_string_pretty(&directory)?)?;
+    sync_gateway_service(&gateway_cfg, state)?;
 
     let tng_path = tng_config_path();
     let changed = write_json_if_changed(&tng_path, &config)?;
@@ -1560,26 +1577,147 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
     Ok(())
 }
 
-fn service_directory(bundle: &MeshBundle, self_id: &str) -> ServiceDirectory {
+#[derive(Debug, Clone)]
+struct RuntimePortPlan {
+    self_routes: Vec<SelfGatewayRoute>,
+    peer_routes: Vec<PeerGatewayRoute>,
+}
+
+#[derive(Debug, Clone)]
+struct SelfGatewayRoute {
+    port: u16,
+    tng_egress_port: u16,
+    gateway_port: u16,
+    protocol: String,
+}
+
+#[derive(Debug, Clone)]
+struct PeerGatewayRoute {
+    service_id: String,
+    host: String,
+    remote_port: u16,
+    local_port: u16,
+    tng_ingress_port: u16,
+    protocol: String,
+    connect_mode: bool,
+}
+
+fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPlan> {
+    let service = bundle
+        .services
+        .get(self_id)
+        .with_context(|| format!("service '{self_id}' is not present in mesh bundle"))?;
+    if service.phase != "active" {
+        bail!("service '{self_id}' is not active in mesh bundle");
+    }
+
+    let mut used = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+    for service in bundle
+        .services
+        .values()
+        .filter(|service| service.phase == "active")
+    {
+        used.extend(service.ports.iter().copied());
+    }
+
+    let self_mcp_ports = service.mcp_ports.iter().copied().collect::<BTreeSet<_>>();
+    let mut self_ports = service.ports.clone();
+    self_ports.sort_unstable();
+    self_ports.dedup();
+    let mut self_routes = Vec::new();
+    for port in self_ports {
+        self_routes.push(SelfGatewayRoute {
+            port,
+            tng_egress_port: allocate_internal_port(TNG_EGRESS_PORT_BASE, &mut used)?,
+            gateway_port: allocate_internal_port(GATEWAY_SERVER_PORT_BASE, &mut used)?,
+            protocol: if self_mcp_ports.contains(&port) {
+                "mcp".to_string()
+            } else {
+                "raw".to_string()
+            },
+        });
+    }
+
+    let mut peer_routes = Vec::new();
+    let mut peers = bundle
+        .services
+        .iter()
+        .filter(|(id, service)| id.as_str() != self_id && service.phase == "active")
+        .collect::<Vec<_>>();
+    peers.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (service_id, service) in peers {
+        let host = service
+            .public_ip
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                service
+                    .private_ip
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .with_context(|| format!("active peer service '{service_id}' has no reachable IP"))?
+            .to_string();
+        let connect_ports = service.connect.iter().copied().collect::<BTreeSet<_>>();
+        let mcp_ports = service.mcp_ports.iter().copied().collect::<BTreeSet<_>>();
+        let mut ports = service.ports.clone();
+        ports.sort_unstable();
+        ports.dedup();
+        for port in ports {
+            peer_routes.push(PeerGatewayRoute {
+                service_id: service_id.clone(),
+                host: host.clone(),
+                remote_port: port,
+                local_port: port,
+                tng_ingress_port: allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used)?,
+                protocol: if mcp_ports.contains(&port) {
+                    "mcp".to_string()
+                } else {
+                    "raw".to_string()
+                },
+                connect_mode: connect_ports.contains(&port),
+            });
+        }
+    }
+
+    Ok(RuntimePortPlan {
+        self_routes,
+        peer_routes,
+    })
+}
+
+fn allocate_internal_port(base: u16, used: &mut BTreeSet<u16>) -> Result<u16> {
+    for port in base..=60999 {
+        if used.insert(port) {
+            return Ok(port);
+        }
+    }
+    bail!("no available internal gateway/TNG port from {base}")
+}
+
+fn service_directory(
+    bundle: &MeshBundle,
+    self_id: &str,
+    plan: &RuntimePortPlan,
+) -> ServiceDirectory {
     let mut services = BTreeMap::new();
     for (id, service) in &bundle.services {
         if id == self_id || service.phase != "active" {
             continue;
         }
-        let connect_ports = service.connect.iter().copied().collect::<BTreeSet<_>>();
-        let mut service_ports = service.ports.clone();
-        service_ports.sort_unstable();
-        service_ports.dedup();
-        let ports = service_ports
+        let ports = plan
+            .peer_routes
             .iter()
-            .map(|port| ServiceDirectoryPort {
+            .filter(|route| route.service_id == *id)
+            .map(|route| ServiceDirectoryPort {
                 address: "127.0.0.1".to_string(),
-                port: *port,
-                mode: Some(if connect_ports.contains(port) {
+                port: route.local_port,
+                mode: Some(if route.connect_mode {
                     "connect".to_string()
                 } else {
                     "mesh".to_string()
                 }),
+                protocol: Some(route.protocol.clone()),
             })
             .collect::<Vec<_>>();
         if ports.is_empty() {
@@ -1644,7 +1782,7 @@ fn mesh_peer_reference_values(bundle: &MeshBundle, self_id: &str) -> Result<Valu
     Ok(Value::Array(values))
 }
 
-fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
+fn tng_config(bundle: &MeshBundle, self_id: &str, plan: &RuntimePortPlan) -> Result<Value> {
     let mut egress = Vec::new();
     let service = bundle
         .services
@@ -1661,21 +1799,19 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
     } else {
         Some(mesh_peer_reference_values(bundle, self_id)?)
     };
-    let mut ports = service.ports.clone();
-    ports.sort_unstable();
-    ports.dedup();
-    for (idx, port) in ports.iter().enumerate() {
+    for route_plan in &plan.self_routes {
         let mut route = json!({
             "netfilter": {
                 "capture_dst": {
-                    "port": port,
+                    "port": route_plan.port,
                 },
                 "capture_local_traffic": false,
-                "listen_port": 39000 + idx as u16,
+                "listen_port": route_plan.tng_egress_port,
+                "so_mark": DEFAULT_TNG_SO_MARK,
             },
             "attest": tng_attest_config(),
         });
-        if confidential_port_set.contains(port) {
+        if confidential_port_set.contains(&route_plan.port) {
             route["verify"] = tng_verify_config(
                 peer_reference_values
                     .as_ref()
@@ -1687,51 +1823,25 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
     }
 
     let mut ingress = Vec::new();
-    let mut peers = bundle
-        .services
-        .iter()
-        .filter(|(id, service)| id.as_str() != self_id && service.phase == "active")
-        .collect::<Vec<_>>();
-    peers.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (service_id, service) in peers {
-        let connect_ports = service.connect.iter().copied().collect::<BTreeSet<_>>();
-        let mut ports = service.ports.clone();
-        ports.sort_unstable();
-        ports.dedup();
-        if ports.is_empty() {
-            continue;
-        }
-        let host = service
-            .public_ip
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                service
-                    .private_ip
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .with_context(|| format!("active peer service '{service_id}' has no reachable IP"))?;
-        let reference_values = tng_reference_values(bundle, service_id)?;
-        for port in ports {
-            let mut entry = json!({
-                "mapping": {
-                    "in": {
-                        "host": "127.0.0.1",
-                        "port": port,
-                    },
-                    "out": {
-                        "host": host,
-                        "port": port,
-                    },
+    for route_plan in &plan.peer_routes {
+        let reference_values = tng_reference_values(bundle, &route_plan.service_id)?;
+        let mut entry = json!({
+            "mapping": {
+                "in": {
+                    "host": "127.0.0.1",
+                    "port": route_plan.tng_ingress_port,
                 },
-                "verify": tng_verify_config(reference_values.clone()),
-            });
-            if !connect_ports.contains(&port) {
-                entry["attest"] = tng_attest_config();
-            }
-            ingress.push(entry);
+                "out": {
+                    "host": route_plan.host,
+                    "port": route_plan.remote_port,
+                },
+            },
+            "verify": tng_verify_config(reference_values),
+        });
+        if !route_plan.connect_mode {
+            entry["attest"] = tng_attest_config();
         }
+        ingress.push(entry);
     }
 
     Ok(json!({
@@ -1744,6 +1854,115 @@ fn tng_config(bundle: &MeshBundle, self_id: &str) -> Result<Value> {
         "add_egress": egress,
         "add_ingress": ingress,
     }))
+}
+
+fn gateway_config(
+    bundle: &MeshBundle,
+    self_id: &str,
+    bootstrap: &BootstrapConfig,
+    plan: &RuntimePortPlan,
+) -> Result<Value> {
+    let identity = bootstrap
+        .gateway_identity
+        .as_ref()
+        .context("bootstrap is missing gateway_identity")?;
+    let mut trusted_services = serde_json::Map::new();
+    for (service_id, service) in bundle
+        .services
+        .iter()
+        .filter(|(_, service)| service.phase == "active")
+    {
+        let public_key = service.gateway_public_key.as_ref().with_context(|| {
+            format!("active service '{service_id}' is missing gateway_public_key")
+        })?;
+        trusted_services.insert(
+            service_id.clone(),
+            json!({
+                "public_key": public_key,
+            }),
+        );
+    }
+    let client_routes = plan
+        .peer_routes
+        .iter()
+        .map(|route| {
+            json!({
+                "listen_host": "127.0.0.1",
+                "listen_port": route.local_port,
+                "tng_host": "127.0.0.1",
+                "tng_port": route.tng_ingress_port,
+                "target_service": route.service_id,
+                "target_port": route.remote_port,
+            })
+        })
+        .collect::<Vec<_>>();
+    let server_routes = plan
+        .self_routes
+        .iter()
+        .map(|route| {
+            json!({
+                "listen_host": "127.0.0.1",
+                "listen_port": route.gateway_port,
+                "upstream_host": "127.0.0.1",
+                "upstream_port": route.port,
+                "protocol": route.protocol,
+                "audit_path": format!("/var/lib/cai-gateway/audit-{}.jsonl", route.port),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "schema": "confidential-agent/gateway-config/v1",
+        "service_id": self_id,
+        "identity": {
+            "public_key": identity.public_key,
+            "private_key": identity.private_key,
+        },
+        "mesh_generation": bundle.generation,
+        "token_ttl_sec": 60,
+        "so_mark": DEFAULT_TNG_SO_MARK,
+        "trusted_services": trusted_services,
+        "client_routes": client_routes,
+        "server_routes": server_routes,
+    }))
+}
+
+fn empty_gateway_config(bootstrap: &BootstrapConfig) -> Result<Value> {
+    let identity = bootstrap
+        .gateway_identity
+        .as_ref()
+        .context("bootstrap is missing gateway_identity")?;
+    Ok(json!({
+        "schema": "confidential-agent/gateway-config/v1",
+        "service_id": bootstrap.service_id,
+        "identity": {
+            "public_key": identity.public_key,
+            "private_key": identity.private_key,
+        },
+        "mesh_generation": 0,
+        "token_ttl_sec": 60,
+        "so_mark": DEFAULT_TNG_SO_MARK,
+        "trusted_services": {},
+        "client_routes": [],
+        "server_routes": [],
+    }))
+}
+
+fn sync_gateway_service(config: &Value, state: &mut DaemonState) -> Result<()> {
+    let fingerprint = sha256_bytes(serde_json::to_vec(config)?.as_slice());
+    let path = gateway_config_path();
+    let changed = write_json_if_changed(&path, config)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to set private gateway config mode on '{}'",
+            path.display()
+        )
+    })?;
+    if changed || state.gateway_fingerprint.as_deref() != Some(&fingerprint) {
+        restart_service(GATEWAY_SERVICE)?;
+        state.gateway_fingerprint = Some(fingerprint);
+    }
+    Ok(())
 }
 
 fn tng_reference_values(bundle: &MeshBundle, service_id: &str) -> Result<Value> {
@@ -1869,6 +2088,7 @@ fn a2a_tng_ingress(
                         address: "127.0.0.1".to_string(),
                         port: port.local,
                         mode: Some("connect".to_string()),
+                        protocol: None,
                     });
                 }
                 peer_directory.insert(resolved.id, ServiceDirectoryService { ports: dir_ports });
@@ -2455,14 +2675,6 @@ fn restart_service(service: &str) -> Result<()> {
         .status()
         .with_context(|| format!("failed to reset failed state for service '{}'", service))?;
     let _ = reset_status;
-    let status = Command::new("systemctl")
-        .arg("enable")
-        .arg(service)
-        .status()
-        .with_context(|| format!("failed to enable service '{}'", service))?;
-    if !status.success() {
-        bail!("systemctl enable '{}' failed with {}", service, status);
-    }
     let status = Command::new("systemctl")
         .arg("restart")
         .arg(service)

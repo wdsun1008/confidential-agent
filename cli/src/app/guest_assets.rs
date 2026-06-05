@@ -23,6 +23,31 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
     fs::write(&staged_service, agentd_service_unit())
         .with_context(|| format!("failed to write '{}'", staged_service.display()))?;
 
+    let source_gateway = find_gateway_binary()?;
+    if !source_gateway.exists() {
+        bail!(
+            "cai-gateway binary '{}' does not exist",
+            source_gateway.display()
+        );
+    }
+    let staged_gateway = guest_staging_dir.join("cai-gateway");
+    fs::copy(&source_gateway, &staged_gateway).with_context(|| {
+        format!(
+            "failed to copy cai-gateway '{}' to '{}'",
+            source_gateway.display(),
+            staged_gateway.display()
+        )
+    })?;
+    set_mode(&staged_gateway, 0o755)?;
+
+    let staged_gateway_service = guest_staging_dir.join("cai-gateway.service");
+    fs::write(&staged_gateway_service, gateway_service_unit())
+        .with_context(|| format!("failed to write '{}'", staged_gateway_service.display()))?;
+
+    let staged_tng_service = guest_staging_dir.join("trusted-network-gateway.service");
+    fs::write(&staged_tng_service, tng_service_unit())
+        .with_context(|| format!("failed to write '{}'", staged_tng_service.display()))?;
+
     let initrd_secret_fetch_module = guest_staging_dir.join("99confidential-agent-secret-fetch");
     write_secret_fetch_module(&initrd_secret_fetch_module)?;
 
@@ -44,13 +69,6 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         0o755,
     )?);
     verify_guest_tng_binary(staged_guest_tng_bin.as_ref().unwrap())?;
-    let libtdx_verify_rpm = Some(stage_tools_image_asset(
-        cli,
-        guest_staging_dir,
-        "/opt/confidential-agent/hack/libtdx-verify.rpm",
-        "libtdx-verify.rpm",
-        0o644,
-    )?);
     let staged_attestation_client = stage_tools_image_asset(
         cli,
         guest_staging_dir,
@@ -76,40 +94,17 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
     Ok(GuestAssets {
         agentd_bin: staged_bin,
         agentd_service: staged_service,
+        gateway_bin: staged_gateway,
+        gateway_service: staged_gateway_service,
+        tng_service: staged_tng_service,
         initrd_secret_fetch_module,
         fde_config_file,
         policy_default,
         policy_local_dev,
         guest_tng_bin: staged_guest_tng_bin,
-        libtdx_verify_rpm,
         guest_setup_script,
         extra_files,
     })
-}
-
-#[cfg(test)]
-pub(super) fn stage_libtdx_verify_rpm(
-    guest_staging_dir: &Path,
-    explicit: Option<&PathBuf>,
-) -> Result<PathBuf> {
-    let source = explicit
-        .cloned()
-        .unwrap_or_else(|| repository_root().join("hack/libtdx-verify-1.22-4.al8.x86_64.rpm"));
-    if !source.exists() {
-        bail!(
-            "guest libtdx verify RPM '{}' does not exist in test fixture",
-            source.display()
-        );
-    }
-    let staged = guest_staging_dir.join("libtdx-verify.rpm");
-    fs::copy(&source, &staged).with_context(|| {
-        format!(
-            "failed to copy libtdx verify RPM '{}' to '{}'",
-            source.display(),
-            staged.display()
-        )
-    })?;
-    Ok(staged)
 }
 
 pub(super) fn stage_guest_setup_script(guest_staging_dir: &Path) -> Result<PathBuf> {
@@ -184,15 +179,6 @@ pub(super) fn ensure_docker_available() -> Result<()> {
         bail!("docker command is required to run Confidential Agent tools image");
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
 }
 
 #[cfg(test)]
@@ -318,6 +304,37 @@ pub(super) fn find_agentd_binary() -> Result<PathBuf> {
     );
 }
 
+pub(super) fn find_gateway_binary() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("failed to resolve current executable")?;
+    let Some(dir) = current.parent() else {
+        bail!("failed to resolve confidential-agent executable directory");
+    };
+    let sibling = dir.join("cai-gateway");
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+    if dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        if let Some(parent) = dir.parent() {
+            let target_debug = parent.join("cai-gateway");
+            if target_debug.exists() {
+                return Ok(target_debug);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    {
+        Ok(current)
+    }
+    #[cfg(not(test))]
+    {
+        bail!(
+            "could not find cai-gateway next to '{}'; build the workspace or install the gateway package",
+            current.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,9 +349,33 @@ mod tests {
     }
 
     #[test]
+    fn gateway_service_unit_points_to_gateway_config() {
+        let unit = gateway_service_unit();
+        assert!(unit
+            .contains("ExecStart=/usr/local/bin/cai-gateway serve --config /etc/cai/gateway.json"));
+    }
+
+    #[test]
+    fn tng_service_unit_launches_hack_replaced_tng_config() {
+        let unit = tng_service_unit();
+        assert!(unit.contains("ExecStart=/usr/bin/tng launch --config-file /etc/tng/config.json"));
+        assert!(unit.contains("After=network-online.target attestation-agent.service"));
+    }
+
+    #[test]
     fn guest_setup_script_is_executable_shell() {
         let script = guest_setup_script();
         assert!(script.starts_with("#!/"));
+    }
+
+    #[test]
+    fn guest_setup_script_overwrites_tng_with_hack_binary() {
+        let script = guest_setup_script();
+        assert!(
+            script.contains("install -m 0755 /opt/confidential-agent/hack/tng-2.6.0 /usr/bin/tng")
+        );
+        assert!(script.contains("/etc/systemd/system-preset/00-confidential-agent-tng.preset"));
+        assert!(script.contains("disable trusted-network-gateway.service"));
     }
 
     #[test]

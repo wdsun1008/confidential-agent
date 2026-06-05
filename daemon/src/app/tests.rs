@@ -1,4 +1,5 @@
 use super::*;
+use confidential_agent_core::schema::GatewayIdentity;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
@@ -64,6 +65,7 @@ impl Drop for EnvGuard {
 struct NoTeeTestEnv {
     _guard: EnvGuard,
     tng_config: PathBuf,
+    gateway_config: PathBuf,
     service_directory: PathBuf,
     status: PathBuf,
     agent_card: PathBuf,
@@ -335,11 +337,14 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
             },
             "peer": {
                 "phase": "active",
+                "public_ip": "39.105.93.168",
                 "ports": [3001, 3002],
-                "connect": [3002]
+                "connect": [3002],
+                "mcp_ports": [3001]
             },
             "connect-only": {
                 "phase": "active",
+                "public_ip": "39.105.93.169",
                 "ports": [4001],
                 "connect": [4001]
             },
@@ -354,7 +359,8 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     }))
     .unwrap();
 
-    let directory = serde_json::to_value(service_directory(&bundle, "self")).unwrap();
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+    let directory = serde_json::to_value(service_directory(&bundle, "self", &plan)).unwrap();
 
     assert!(directory["services"].get("self").is_none());
     assert!(directory["services"].get("old").is_none());
@@ -375,6 +381,7 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     );
     assert_eq!(directory["services"]["peer"]["ports"][0]["port"], 3001);
     assert_eq!(directory["services"]["peer"]["ports"][0]["mode"], "mesh");
+    assert_eq!(directory["services"]["peer"]["ports"][0]["protocol"], "mcp");
     assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 3002);
     assert_eq!(directory["services"]["peer"]["ports"][1]["mode"], "connect");
 }
@@ -407,8 +414,7 @@ fn restart_service_reloads_systemd_before_touching_tng_unit() {
     let commands: Vec<&str> = log.lines().collect();
     assert_eq!(commands[0], "daemon-reload");
     assert_eq!(commands[1], "reset-failed trusted-network-gateway.service");
-    assert_eq!(commands[2], "enable trusted-network-gateway.service");
-    assert_eq!(commands[3], "restart trusted-network-gateway.service");
+    assert_eq!(commands[2], "restart trusted-network-gateway.service");
 }
 
 #[test]
@@ -440,8 +446,7 @@ fn restart_service_ignores_reset_failed_for_never_loaded_tng_unit() {
     let commands: Vec<&str> = log.lines().collect();
     assert_eq!(commands[0], "daemon-reload");
     assert_eq!(commands[1], "reset-failed trusted-network-gateway.service");
-    assert_eq!(commands[2], "enable trusted-network-gateway.service");
-    assert_eq!(commands[3], "restart trusted-network-gateway.service");
+    assert_eq!(commands[2], "restart trusted-network-gateway.service");
 }
 
 #[test]
@@ -472,6 +477,8 @@ fn app_service_ready_requires_systemd_active_state() {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: Vec::new(),
         app_service: Some("cai-openclaw-gateway.service".to_string()),
         peers: Vec::new(),
@@ -520,6 +527,8 @@ fn app_service_ready_requires_service_port_to_accept_connections() {
         mode: "challenge".to_string(),
         ports: vec![ready_port],
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: Vec::new(),
         app_service: Some("cai-openclaw-gateway.service".to_string()),
         peers: Vec::new(),
@@ -588,9 +597,8 @@ fn debug_ssh_ready_restarts_sshd_when_authorized_keys_exist() {
     assert_eq!(commands[1], "is-active --quiet sshd.service");
     assert_eq!(commands[2], "daemon-reload");
     assert_eq!(commands[3], "reset-failed sshd.service");
-    assert_eq!(commands[4], "enable sshd.service");
-    assert_eq!(commands[5], "restart sshd.service");
-    assert_eq!(commands[6], "is-active --quiet sshd.service");
+    assert_eq!(commands[4], "restart sshd.service");
+    assert_eq!(commands[5], "is-active --quiet sshd.service");
 }
 
 #[test]
@@ -611,7 +619,8 @@ fn tng_config_adds_egress_for_self_ports() {
     }))
     .unwrap();
 
-    let config = tng_config(&bundle, "self").unwrap();
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+    let config = tng_config(&bundle, "self", &plan).unwrap();
 
     assert_eq!(
         config["add_egress"][0]["netfilter"]["capture_dst"]["port"],
@@ -660,7 +669,8 @@ fn tng_config_adds_verify_for_confidential_self_ports() {
     }))
     .unwrap();
 
-    let config = tng_config(&bundle, "self").unwrap();
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+    let config = tng_config(&bundle, "self", &plan).unwrap();
 
     assert!(config["add_egress"][0].get("verify").is_none());
     assert_eq!(
@@ -757,9 +767,10 @@ fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
     }))
     .unwrap();
 
-    let config = tng_config(&bundle, "openclaw").unwrap();
+    let plan = runtime_port_plan(&bundle, "openclaw").unwrap();
+    let config = tng_config(&bundle, "openclaw", &plan).unwrap();
 
-    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 3001);
+    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 39400);
     assert_eq!(
         config["add_ingress"][0]["mapping"]["out"]["host"],
         "39.105.93.168"
@@ -775,11 +786,11 @@ fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
         "sample"
     );
     assert_eq!(config["add_ingress"][0]["attest"]["aa_type"], "uds");
-    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 3002);
+    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 39401);
     assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 3002);
     assert_eq!(config["add_ingress"][1]["verify"]["as_type"], "builtin");
     assert!(config["add_ingress"][1].get("attest").is_none());
-    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 4001);
+    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 39402);
     assert_eq!(config["add_ingress"][2]["mapping"]["out"]["port"], 4001);
     assert_eq!(config["add_ingress"][2]["verify"]["as_type"], "builtin");
     assert!(config["add_ingress"][2].get("attest").is_none());
@@ -892,6 +903,8 @@ fn bootstrap_reapplies_resource_when_target_content_drifted() {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: vec![GuestResource {
             id: "config".to_string(),
             resource_path: "default/local-resources/config".to_string(),
@@ -949,6 +962,8 @@ fn bootstrap_rejects_oversized_resource() {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: vec![GuestResource {
             id: "config".to_string(),
             resource_path: "default/local-resources/config".to_string(),
@@ -994,6 +1009,8 @@ fn bootstrap_rejects_non_regular_resource_even_when_empty() {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: vec![GuestResource {
             id: "config".to_string(),
             resource_path: "default/local-resources/config".to_string(),
@@ -1058,6 +1075,8 @@ fn bootstrap_ready_requires_matching_generation_and_resource_digests() {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: vec![GuestResource {
             id: "config".to_string(),
             resource_path: "default/local-resources/config".to_string(),
@@ -1111,6 +1130,8 @@ fn bootstrap_ready_accepts_present_digestless_resources() {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
         resources: vec![GuestResource {
             id: "config".to_string(),
             resource_path: "default/local-resources/config".to_string(),
@@ -1204,14 +1225,17 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
                     "private_ip": "10.0.0.10",
                     "public_ip": "127.0.0.1",
                     "ports": [18789],
-                    "connect": [18789]
+                    "connect": [18789],
+                    "gateway_public_key": "openclaw-pub"
                 },
                 "mcp": {
                     "phase": "active",
                     "private_ip": "10.0.0.11",
                     "public_ip": "127.0.0.1",
                     "ports": [3001],
-                    "connect": [3001]
+                    "connect": [3001],
+                    "mcp_ports": [3001],
+                    "gateway_public_key": "mcp-pub"
                 }
             },
             "reference_values": {
@@ -1229,6 +1253,8 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
         18789
     );
     assert_eq!(config["add_egress"][0]["netfilter"]["listen_port"], 39000);
+    assert_eq!(config["add_egress"][0]["netfilter"]["so_mark"], 565);
+    assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 39400);
     assert_eq!(
         config["add_ingress"][0]["mapping"]["out"]["host"],
         "127.0.0.1"
@@ -1245,6 +1271,25 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
         directory.services["mcp"].ports[0].mode.as_deref(),
         Some("connect")
     );
+    assert_eq!(
+        directory.services["mcp"].ports[0].protocol.as_deref(),
+        Some("mcp")
+    );
+    let gateway: Value = read_json_file(&env.gateway_config);
+    assert_eq!(
+        fs::metadata(&env.gateway_config)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(gateway["service_id"], "openclaw");
+    assert_eq!(gateway["server_routes"][0]["listen_port"], 39200);
+    assert_eq!(gateway["server_routes"][0]["upstream_port"], 18789);
+    assert_eq!(gateway["client_routes"][0]["listen_port"], 3001);
+    assert_eq!(gateway["client_routes"][0]["tng_port"], 39400);
+    assert_eq!(gateway["trusted_services"]["mcp"]["public_key"], "mcp-pub");
     assert!(env.cache_dir.join("mesh-bundle.json").exists());
     let status = read_status_file(&env);
     assert!(matches!(status.phase.as_str(), "starting-mesh" | "running"));
@@ -1797,12 +1842,14 @@ fn no_tee_test_env(temp: &tempfile::TempDir) -> NoTeeTestEnv {
     let guard = EnvGuard::new(DAEMON_ENV_VARS);
     let root = temp.path().join("daemon-env");
     let tng_config = root.join("etc/tng/config.json");
+    let gateway_config = root.join("etc/cai/gateway.json");
     let service_directory = root.join("etc/cai/service-directory.json");
     let status = root.join("run/confidential-agent/status.json");
     let agent_card = root.join("opt/confidential-agent/agent-card.json");
     let cache_dir = root.join("var/cache/confidential-agent");
     let state = root.join("var/lib/confidential-agent/state.json");
     guard.set_path("CA_TNG_CONFIG_PATH", &tng_config);
+    guard.set_path("CA_GATEWAY_CONFIG_PATH", &gateway_config);
     guard.set_path("CA_SERVICE_DIRECTORY_PATH", &service_directory);
     guard.set_path("CA_DAEMON_STATUS_PATH", &status);
     guard.set_path("CA_AGENT_CARD_PATH", &agent_card);
@@ -1812,6 +1859,7 @@ fn no_tee_test_env(temp: &tempfile::TempDir) -> NoTeeTestEnv {
     NoTeeTestEnv {
         _guard: guard,
         tng_config,
+        gateway_config,
         service_directory,
         status,
         agent_card,
@@ -1840,6 +1888,11 @@ fn test_bootstrap_config(service_id: &str) -> BootstrapConfig {
         mode: "challenge".to_string(),
         ports: Vec::new(),
         connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: Some(GatewayIdentity {
+            public_key: "pub".to_string(),
+            private_key: "priv".to_string(),
+        }),
         resources: Vec::new(),
         app_service: None,
         peers: Vec::new(),

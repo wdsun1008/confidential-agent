@@ -6,7 +6,10 @@ use crate::cli::{
     SpecArgs, SpecCommands, SshArgs, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use confidential_agent_core::a2a::{
     A2aBundle, A2aBundlePeer, A2aCardSummary, A2aCliPreview, A2aCliPreviewError, A2aSignerPin,
     A2aStateFile, A2aStatePeer,
@@ -19,10 +22,11 @@ use confidential_agent_core::agent_card_fetch::{
 };
 use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{
-    AgentCard, AppliedResourceState, BootstrapConfig, DaemonStatus, GuestResource, LocalBuildState,
-    LocalDebugSshKey, LocalDeployState, LocalResourceState, LocalServiceNetwork, LocalServiceState,
-    LocalSpecState, MeshBundle, PublishedImage, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION,
-    DAEMON_STATUS_PORT, LOCAL_SERVICE_STATE_SCHEMA_VERSION,
+    AgentCard, AppliedResourceState, BootstrapConfig, DaemonStatus, GatewayIdentity, GuestResource,
+    LocalBuildState, LocalDebugSshKey, LocalDeployState, LocalGatewayIdentity, LocalResourceState,
+    LocalServiceNetwork, LocalServiceState, LocalSpecState, MeshBundle, PublishedImage,
+    AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
+    LOCAL_SERVICE_STATE_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use confidential_agent_core::schema::{
@@ -82,6 +86,9 @@ struct BuildManifest {
     shelter_config: PathBuf,
     agentd_bin: PathBuf,
     agentd_service: PathBuf,
+    gateway_bin: PathBuf,
+    gateway_service: PathBuf,
+    tng_service: PathBuf,
     initrd_secret_fetch_module: PathBuf,
     fde_config_file: PathBuf,
     policy_default: PathBuf,
@@ -90,8 +97,6 @@ struct BuildManifest {
     cache_dir: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     guest_tng_bin: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    libtdx_verify_rpm: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guest_setup_script: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -532,6 +537,9 @@ fn prepare(
         shelter_config: paths.rendered_config.clone(),
         agentd_bin: assets.agentd_bin,
         agentd_service: assets.agentd_service,
+        gateway_bin: assets.gateway_bin,
+        gateway_service: assets.gateway_service,
+        tng_service: assets.tng_service,
         initrd_secret_fetch_module: assets.initrd_secret_fetch_module,
         fde_config_file: assets.fde_config_file,
         policy_default: assets.policy_default,
@@ -539,7 +547,6 @@ fn prepare(
         images_dir: paths.artifacts_dir.clone(),
         cache_dir: paths.cache_dir.clone(),
         guest_tng_bin: assets.guest_tng_bin,
-        libtdx_verify_rpm: assets.libtdx_verify_rpm,
         guest_setup_script: assets.guest_setup_script,
         extra_files: assets.extra_files,
         debug_ssh: debug_ssh.clone(),
@@ -803,6 +810,7 @@ fn timestamped_resource_name(service: &str, run_id: &str) -> String {
 }
 
 fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapConfig> {
+    let gateway_identity = ensure_gateway_identity(paths)?;
     let resources = spec
         .resources
         .iter()
@@ -832,6 +840,19 @@ fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapC
         mode: "challenge".to_string(),
         ports: spec.service.ports.clone(),
         connect: spec.service.connect.clone(),
+        mcp_ports: spec.service.mcp_ports.clone(),
+        gateway_identity: Some(GatewayIdentity {
+            public_key: gateway_identity.public_key,
+            private_key: fs::read_to_string(&gateway_identity.private_key_path)
+                .with_context(|| {
+                    format!(
+                        "failed to read '{}'",
+                        gateway_identity.private_key_path.display()
+                    )
+                })?
+                .trim()
+                .to_string(),
+        }),
         resources,
         app_service: spec.service.app_service.clone(),
         peers: Vec::new(),
@@ -874,6 +895,70 @@ fn ensure_disk_passphrase(paths: &ContextPaths) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn ensure_gateway_identity(paths: &ContextPaths) -> Result<LocalGatewayIdentity> {
+    fs::create_dir_all(&paths.secrets_dir)
+        .with_context(|| format!("failed to create '{}'", paths.secrets_dir.display()))?;
+    let private_key_path = paths.secrets_dir.join("gateway_identity.seed");
+    let public_key_path = paths.secrets_dir.join("gateway_identity.pub");
+    match (private_key_path.exists(), public_key_path.exists()) {
+        (true, true) => {
+            let public_key = fs::read_to_string(&public_key_path)
+                .with_context(|| format!("failed to read '{}'", public_key_path.display()))?
+                .trim()
+                .to_string();
+            let private_key = fs::read_to_string(&private_key_path)
+                .with_context(|| format!("failed to read '{}'", private_key_path.display()))?
+                .trim()
+                .to_string();
+            validate_gateway_identity_pair(&private_key, &public_key)?;
+            set_mode(&private_key_path, 0o600)?;
+            set_mode(&public_key_path, 0o644)?;
+            Ok(LocalGatewayIdentity {
+                public_key,
+                private_key_path,
+            })
+        }
+        (false, false) => {
+            let mut seed = [0u8; 32];
+            File::open("/dev/urandom")
+                .context("failed to open /dev/urandom")?
+                .read_exact(&mut seed)
+                .context("failed to read gateway identity entropy")?;
+            let (public_key, _) = ed25519_keypair_from_seed(&seed);
+            let private_key = URL_SAFE_NO_PAD.encode(seed);
+            let public_key = URL_SAFE_NO_PAD.encode(public_key);
+            fs::write(&private_key_path, format!("{private_key}\n"))
+                .with_context(|| format!("failed to write '{}'", private_key_path.display()))?;
+            fs::write(&public_key_path, format!("{public_key}\n"))
+                .with_context(|| format!("failed to write '{}'", public_key_path.display()))?;
+            set_mode(&private_key_path, 0o600)?;
+            set_mode(&public_key_path, 0o644)?;
+            Ok(LocalGatewayIdentity {
+                public_key,
+                private_key_path,
+            })
+        }
+        _ => bail!(
+            "incomplete generated gateway identity under '{}'; remove both gateway_identity files before retrying",
+            paths.secrets_dir.display()
+        ),
+    }
+}
+
+fn validate_gateway_identity_pair(private_key: &str, public_key: &str) -> Result<()> {
+    let seed = URL_SAFE_NO_PAD
+        .decode(private_key)
+        .context("gateway private key must be base64url without padding")?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("gateway private key must decode to 32 bytes"))?;
+    let expected_public = URL_SAFE_NO_PAD.encode(ed25519_keypair_from_seed(&seed).0);
+    if expected_public != public_key {
+        bail!("gateway public key does not match private key seed");
+    }
+    Ok(())
+}
+
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(mode);
@@ -902,13 +987,49 @@ WantedBy=multi-user.target
 "#
 }
 
+fn gateway_service_unit() -> &'static str {
+    r#"[Unit]
+Description=Confidential Agent Gateway
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+Environment=CA_GATEWAY_CONFIG=/etc/cai/gateway.json
+ExecStart=/usr/local/bin/cai-gateway serve --config /etc/cai/gateway.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#
+}
+
+fn tng_service_unit() -> &'static str {
+    r#"[Unit]
+Description=Trusted Network Gateway
+Wants=network-online.target attestation-agent.service
+After=network-online.target attestation-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/tng launch --config-file /etc/tng/config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#
+}
+
 fn guest_setup_script() -> &'static str {
     r#"#!/bin/bash
 set -euo pipefail
 
-if [ -f /opt/confidential-agent/hack/libtdx-verify.rpm ]; then
-    rpm -Uvh --replacepkgs --nodeps /opt/confidential-agent/hack/libtdx-verify.rpm
-fi
 install_attestation_challenge_client() {
     if [ -x /usr/bin/attestation-challenge-client ]; then
         return 0
@@ -927,6 +1048,10 @@ install_attestation_challenge_client
 if [ -f /opt/confidential-agent/hack/tng-2.6.0 ]; then
     install -m 0755 /opt/confidential-agent/hack/tng-2.6.0 /usr/bin/tng
 fi
+mkdir -p /etc/systemd/system-preset
+cat > /etc/systemd/system-preset/00-confidential-agent-tng.preset <<'EOF'
+disable trusted-network-gateway.service
+EOF
 
 if command -v ssh-keygen >/dev/null 2>&1 && systemctl list-unit-files sshd.service >/dev/null 2>&1; then
     ssh-keygen -A || true

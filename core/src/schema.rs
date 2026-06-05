@@ -21,6 +21,8 @@ pub struct LocalServiceState {
     pub build: LocalBuildState,
     pub deploy: LocalDeployState,
     pub service: LocalServiceNetwork,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_identity: Option<LocalGatewayIdentity>,
     #[serde(default)]
     pub resources: BTreeMap<String, LocalResourceState>,
     pub mesh_generation: u64,
@@ -135,6 +137,14 @@ pub struct LocalServiceNetwork {
     pub ports: Vec<u16>,
     #[serde(default)]
     pub connect: Vec<u16>,
+    #[serde(default)]
+    pub mcp_ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalGatewayIdentity {
+    pub public_key: String,
+    pub private_key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +171,10 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub connect: Vec<u16>,
     #[serde(default)]
+    pub mcp_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_identity: Option<GatewayIdentity>,
+    #[serde(default)]
     pub resources: Vec<GuestResource>,
     #[serde(default)]
     pub app_service: Option<String>,
@@ -168,6 +182,12 @@ pub struct BootstrapConfig {
     pub peers: Vec<BootstrapPeer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_card: Option<AgentCard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayIdentity {
+    pub public_key: String,
+    pub private_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,6 +259,10 @@ pub struct MeshService {
     pub ports: Vec<u16>,
     #[serde(default)]
     pub connect: Vec<u16>,
+    #[serde(default)]
+    pub mcp_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_public_key: Option<String>,
 }
 
 pub fn confidential_ports(ports: &[u16], connect: &[u16]) -> Vec<u16> {
@@ -272,6 +296,8 @@ pub struct ServiceDirectoryPort {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

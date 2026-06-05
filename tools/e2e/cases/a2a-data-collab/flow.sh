@@ -144,7 +144,7 @@ run_case() {
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
-  build_host_binaries -p confidential-agent-cli -p confidential-agentd
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-gateway
 
   local dashscope_key allowed_cidr cosign_key
   dashscope_key="$(resolve_dashscope_key)"

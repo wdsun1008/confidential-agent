@@ -438,7 +438,8 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
         &build_variant.shelter_build_id,
         &args.target_ip,
     )?;
-    let mut active_state = activate_existing_service_state(&args.spec, &spec, state)?;
+    let mut active_state =
+        activate_existing_service_state(&cli.state_dir, &args.spec, &spec, state)?;
     if active_state.deploy.public_ip.is_none() && active_state.deploy.private_ip.is_none() {
         active_state.deploy.public_ip = Some(args.target_ip.clone());
     }

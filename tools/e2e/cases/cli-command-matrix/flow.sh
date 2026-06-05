@@ -602,7 +602,7 @@ run_case() {
 
   init_step_log "Confidential Agent CLI Command Matrix E2E"
   install_exit_traps
-  build_host_binaries -p confidential-agent-cli -p confidential-agentd
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-gateway
   matrix_generate_fixtures
   touch "$WORK_DIR/existing-cosign.key" "$WORK_DIR/existing-cosign.pub"
 

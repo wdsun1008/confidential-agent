@@ -47,12 +47,14 @@ fn assets() -> GuestAssets {
     GuestAssets {
         agentd_bin: PathBuf::from("/build/confidential-agentd"),
         agentd_service: PathBuf::from("/build/confidential-agentd.service"),
+        gateway_bin: PathBuf::from("/build/cai-gateway"),
+        gateway_service: PathBuf::from("/build/cai-gateway.service"),
+        tng_service: PathBuf::from("/build/trusted-network-gateway.service"),
         initrd_secret_fetch_module: PathBuf::from("/build/99confidential-agent-secret-fetch"),
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/trustee-opa-default.rego"),
         policy_local_dev: PathBuf::from("/build/trustee-opa-local-dev.rego"),
         guest_tng_bin: None,
-        libtdx_verify_rpm: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     }
@@ -169,6 +171,7 @@ fn renders_mkosi_build_without_from_or_legacy_variants() {
     assert!(!rendered.contains("from:"));
     assert!(!rendered.contains("variants:"));
     assert!(rendered.contains("packages:"));
+    assert!(rendered.contains("libtdx-verify"));
     assert!(rendered.contains("disk-crypt:"));
     assert!(rendered.contains("image:"));
     assert!(rendered.contains("name: openclaw-agent-release"));
@@ -303,18 +306,18 @@ fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
 }
 
 #[test]
-fn renders_guest_tng_overwrite_and_hack_rpm_setup() {
+fn renders_gateway_and_guest_tng_overwrite_setup() {
     let mut assets = assets();
     assets.guest_tng_bin = Some(PathBuf::from("/build/tng-2.6.0"));
-    assets.libtdx_verify_rpm = Some(PathBuf::from("/build/libtdx-verify.rpm"));
     assets.guest_setup_script = Some(PathBuf::from("/build/guest-setup.sh"));
 
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let rendered = render_build_config(&spec, &assets, &ShelterRenderOptions::default()).unwrap();
 
+    assert!(rendered.contains("destination: /usr/local/bin/cai-gateway"));
+    assert!(rendered.contains("destination: /etc/systemd/system/cai-gateway.service"));
+    assert!(rendered.contains("destination: /etc/systemd/system/trusted-network-gateway.service"));
     assert!(rendered.contains("destination: /opt/confidential-agent/hack/tng-2.6.0"));
-    assert!(rendered.contains("destination: /opt/confidential-agent/hack/libtdx-verify.rpm"));
-    assert!(rendered.contains("- rpm"));
     assert!(rendered.contains("path: /build/guest-setup.sh"));
     assert!(!rendered.contains("destination: /usr/bin/tng"));
     assert!(!rendered.contains("/usr/local/bin/tng"));
