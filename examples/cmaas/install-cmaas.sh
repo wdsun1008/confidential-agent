@@ -110,8 +110,6 @@ install -d -m 0755 /var/lib/mcp-memory
 install -d -m 0755 /usr/local/share/confidential-agent/cmaas
 install -d -m 0755 /usr/local/bin
 install -d -m 0755 "$CMAAS_NODE_PREFIX"
-touch /var/log/cmaas-access.log
-chmod 0644 /var/log/cmaas-access.log
 
 prepare_cmaas_node_prefix() {
     cd "$CMAAS_NODE_PREFIX"
@@ -155,7 +153,7 @@ Wants=network-online.target
 Type=simple
 Environment=MEMORY_FILE_PATH=/var/lib/mcp-memory/memory.jsonl
 Environment=PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin
-ExecStart=/usr/local/bin/cmaas-mcp-proxy --host 127.0.0.1 --port 8001 --server stream --streamEndpoint /mcp -- /usr/local/bin/cmaas-mcp-memory
+ExecStart=/usr/local/bin/cmaas-mcp-proxy --host 127.0.0.1 --port 8000 --server stream --streamEndpoint /mcp -- /usr/local/bin/cmaas-mcp-memory
 Restart=always
 RestartSec=5
 TimeoutStartSec=120
@@ -166,31 +164,8 @@ StandardError=journal+console
 WantedBy=multi-user.target
 EOF
 
-cat >/etc/systemd/system/cai-cmaas-access-proxy.service <<'EOF'
-[Unit]
-Description=CMaaS access logging proxy
-After=network-online.target cai-cmaas-mcp-proxy.service
-Wants=network-online.target cai-cmaas-mcp-proxy.service
-
-[Service]
-Type=simple
-Environment=CMAAS_TARGET=http://127.0.0.1:8001
-Environment=CMAAS_LISTEN_HOST=0.0.0.0
-Environment=CMAAS_LISTEN_PORT=8000
-Environment=CMAAS_ACCESS_LOG=/var/log/cmaas-access.log
-ExecStart=/usr/bin/env node /usr/local/share/confidential-agent/cmaas/cmaas-access-proxy.mjs
-Restart=always
-RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 systemctl daemon-reload || true
 systemctl enable cai-cmaas-mcp-proxy.service
-systemctl enable cai-cmaas-access-proxy.service
 npm cache clean --force || true
 if command -v yum >/dev/null 2>&1; then
     yum clean all || true
