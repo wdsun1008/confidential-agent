@@ -87,6 +87,9 @@ async function rpc(endpoint, session, id, method, params = {}) {
   if (!response.ok && response.status !== 202) {
     throw new Error(`MCP ${method} failed: HTTP ${response.status}: ${text.slice(0, 500)}`);
   }
+  if (notification) {
+    return null;
+  }
   const body = parseMcpBody(text);
   if (body?.error) {
     throw new Error(`MCP ${method} error: ${JSON.stringify(body.error)}`);
@@ -113,6 +116,16 @@ async function main() {
   if (action === "tools_list") {
     const result = await rpc(endpoint, session, id, "tools/list", {});
     console.log(JSON.stringify({ endpoint, result }, null, 2));
+    return;
+  }
+
+  if (action === "audit_status" || action === "audit_verify" || action === "tee_attest") {
+    const toolArgs = action === "tee_attest" ? { nonce: marker } : {};
+    const result = await rpc(endpoint, session, id, "tools/call", {
+      name: action,
+      arguments: toolArgs,
+    });
+    console.log(JSON.stringify({ endpoint, action, result }, null, 2));
     return;
   }
 

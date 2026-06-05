@@ -4,7 +4,8 @@ service:
   id: cmaas
   ports: [8000]
   connect: []
-  app_service: cai-cmaas-access-proxy.service
+  mcp_ports: [8000]
+  app_service: cai-cmaas-mcp-proxy.service
 
 build:
 {{raw:BASE_IMAGE_LINE}}
@@ -12,10 +13,6 @@ build:
   resize: 30G
   with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
-  files:
-    - source: ./files/cmaas-access-proxy.mjs
-      target: /usr/local/share/confidential-agent/cmaas/cmaas-access-proxy.mjs
-      executable: true
   scripts: [./install-cmaas.sh]
   variants:
     release:

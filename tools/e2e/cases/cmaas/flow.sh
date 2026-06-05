@@ -354,7 +354,7 @@ run_case() {
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
-  build_host_binaries -p confidential-agent-cli -p confidential-agentd
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-gateway
 
   local allowed_cidr cosign_key
   allowed_cidr="$(resolve_allowed_cidr)"
@@ -398,10 +398,25 @@ run_case() {
   wait_for_live_status cmaas-agent "$agent_ip" "$agent_generation" 900
   wait_for_ssh "$cmaas_ip" "$cmaas_key" 300
   wait_for_ssh "$agent_ip" "$agent_key" 300
+  local tng_runtime_check
+  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; a=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); b=\$(sha256sum /opt/confidential-agent/hack/tng-2.6.0 | cut -d' ' -f1); test \"\$a\" = \"\$b\"; echo tng_hash=\$a; systemctl is-enabled trusted-network-gateway.service || true"
+  record_cmd "ssh cmaas '<tng runtime check>'"
+  ssh_guest "$cmaas_key" "$cmaas_ip" "$tng_runtime_check" >"$WORK_DIR/cmaas-tng-runtime.txt"
+  record_file_as_block "CMaaS TNG runtime state:" "$WORK_DIR/cmaas-tng-runtime.txt" text
+  grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -E '^tng_hash=' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'disabled' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  record_cmd "ssh agent '<tng runtime check>'"
+  ssh_guest "$agent_key" "$agent_ip" "$tng_runtime_check" >"$WORK_DIR/agent-tng-runtime.txt"
+  record_file_as_block "Agent TNG runtime state:" "$WORK_DIR/agent-tng-runtime.txt" text
+  grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -E '^tng_hash=' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'disabled' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
 
-  local marker observation access_before access_after
+  local marker observation audit_before audit_after audit_path
   marker="cmaas_$(openssl rand -hex 8)"
   observation="penicillin_${marker}"
+  audit_path="/var/lib/cai-gateway/audit-8000.jsonl"
   record_cmd "ssh agent 'cmaas-agent-client --marker $marker --observation $observation'"
   for attempt in 1 2 3 4 5 6; do
     if ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --marker '$marker' --observation '$observation'" >"$WORK_DIR/agent-client-output.json" 2>"$WORK_DIR/agent-client-output.err"; then
@@ -416,13 +431,40 @@ run_case() {
   record_file_as_block "Agent MCP roundtrip output:" "$WORK_DIR/agent-client-output.json" json
   ssh_guest "$cmaas_key" "$cmaas_ip" "sync; grep -F '$observation' /var/lib/mcp-memory/memory.jsonl >/tmp/cmaas-marker.txt"
   record "- observation marker is present inside the running CMaaS guest memory file."
+  record_cmd "ssh cmaas 'cai-gateway audit-verify --audit $audit_path'"
+  ssh_guest "$cmaas_key" "$cmaas_ip" "cai-gateway audit-verify --audit '$audit_path'" >"$WORK_DIR/cmaas-audit-verify.json"
+  record_file_as_block "CMaaS gateway audit verify:" "$WORK_DIR/cmaas-audit-verify.json" json
+  ssh_guest "$cmaas_key" "$cmaas_ip" "grep -F '\"tool_name\":\"create_entities\"' '$audit_path' >/tmp/cmaas-audit-create.txt && grep -F '\"tool_name\":\"open_nodes\"' '$audit_path' >/tmp/cmaas-audit-open.txt"
+  record "- gateway audit contains MCP tool records for \`create_entities\` and \`open_nodes\`."
+  record_cmd "ssh agent 'cmaas-agent-client --action tools_list'"
+  ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action tools_list" >"$WORK_DIR/agent-tools-list.json"
+  record_file_as_block "Agent MCP tools/list output:" "$WORK_DIR/agent-tools-list.json" json
+  grep -F '"name": "tee_attest"' "$WORK_DIR/agent-tools-list.json" >/dev/null
+  grep -F '"name": "audit_status"' "$WORK_DIR/agent-tools-list.json" >/dev/null
+  grep -F '"name": "audit_verify"' "$WORK_DIR/agent-tools-list.json" >/dev/null
+  record "- gateway virtual MCP tools are visible to the mesh agent."
+  record_cmd "ssh agent 'cmaas-agent-client --action audit_status'"
+  ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action audit_status" >"$WORK_DIR/agent-audit-status.json"
+  record_file_as_block "Agent audit_status output:" "$WORK_DIR/agent-audit-status.json" json
+  grep -F '"total_records"' "$WORK_DIR/agent-audit-status.json" >/dev/null
+  record_cmd "ssh agent 'cmaas-agent-client --action audit_verify'"
+  ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action audit_verify" >"$WORK_DIR/agent-audit-verify.json"
+  record_file_as_block "Agent audit_verify output:" "$WORK_DIR/agent-audit-verify.json" json
+  grep -F '"valid": true' "$WORK_DIR/agent-audit-verify.json" >/dev/null
+  record_cmd "ssh agent 'cmaas-agent-client --action tee_attest --marker $marker'"
+  ssh_guest "$agent_key" "$agent_ip" "cmaas-agent-client --action tee_attest --marker '$marker'" >"$WORK_DIR/agent-tee-attest.json"
+  record_file_as_block "Agent tee_attest output:" "$WORK_DIR/agent-tee-attest.json" json
+  grep -F '"evidence_sha256"' "$WORK_DIR/agent-tee-attest.json" >/dev/null
+  grep -F '"runtime_data_sha256"' "$WORK_DIR/agent-tee-attest.json" >/dev/null
+  grep -F '"audit_chain_digest"' "$WORK_DIR/agent-tee-attest.json" >/dev/null
+  record "- tee_attest returned TEE evidence bound to the gateway audit chain through a standard MCP tool call."
 
   provision_baseline "$cmaas_instance_id"
   ca_run "$STATE_DIR" peering add --role peer --cidr "$BASELINE_IP/32" --label baseline --scope mesh
   ca_run "$STATE_DIR" peering apply
   sleep 10
 
-  access_before="$(ssh_guest "$cmaas_key" "$cmaas_ip" "wc -l < /var/log/cmaas-access.log")"
+  audit_before="$(ssh_guest "$cmaas_key" "$cmaas_ip" "wc -l < '$audit_path'")"
   record_cmd "ssh baseline 'TCP probe to cmaas:8000'"
   ssh_guest "$BASELINE_KEY" "$BASELINE_IP" "timeout 10 bash -lc '</dev/tcp/$cmaas_ip/8000'"
   record_cmd "ssh baseline 'curl -vk https://$cmaas_ip:8000/mcp'"
@@ -438,12 +480,12 @@ run_case() {
     record_file_as_block "Baseline curl stdout:" "$WORK_DIR/baseline-curl.out" text
     return 1
   fi
-  access_after="$(ssh_guest "$cmaas_key" "$cmaas_ip" "wc -l < /var/log/cmaas-access.log")"
-  if [[ "$access_before" != "$access_after" ]]; then
-    echo "CMaaS access log changed after rejected baseline request ($access_before -> $access_after)" >&2
+  audit_after="$(ssh_guest "$cmaas_key" "$cmaas_ip" "wc -l < '$audit_path'")"
+  if [[ "$audit_before" != "$audit_after" ]]; then
+    echo "CMaaS gateway audit changed after rejected baseline request ($audit_before -> $audit_after)" >&2
     return 1
   fi
-  record "- cmaas access log line count unchanged after baseline TLS failure: \`$access_after\`."
+  record "- gateway audit line count unchanged after baseline TLS failure: \`$audit_after\`."
 
   ssh_guest "$cmaas_key" "$cmaas_ip" "sync"
   assert_snapshot_lacks_marker "$cmaas_instance_id" "$marker"
