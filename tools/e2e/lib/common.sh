@@ -74,8 +74,12 @@ record_file_as_block() {
   record "\`\`\`$lang"
   sed -E \
     -e 's/[[:cntrl:]]\[[0-9;]*m//g' \
+    -e 's/(^|[[:space:]])--token "[^"]+"/\1--token "<redacted>"/g' \
+    -e 's/^([[:space:]]*token:[[:space:]]*).+$/\1<redacted>/g' \
     -e 's/token: "[^"]+"/token: "<redacted>"/g' \
     -e 's/"apiKey": "[^"]+"/"apiKey": "<redacted>"/g' \
+    -e 's/"authorization": "Bearer [^"]+"/"authorization": "Bearer <redacted>"/Ig' \
+    -e 's/(Authorization: Bearer )[[:graph:]]+/\1<redacted>/Ig' \
     -e 's/"clientSecret": "[^"]+"/"clientSecret": "<redacted>"/g' \
     -e 's/"token": "[^"]+"/"token": "<redacted>"/g' \
     -e 's/"ear_jwt": "[^"]+"/"ear_jwt": "<redacted>"/g' \
@@ -465,6 +469,7 @@ render_case() {
   INSTANCE_TYPE="${INSTANCE_TYPE:-}" \
   DISK_GB="${DISK_GB:-}" \
   CAI_PEP="$ROOT_DIR/target/debug/cai-pep" \
+  DASHSCOPE_KEY="${DASHSCOPE_KEY:-}" \
   python3.11 "$ROOT_DIR/tools/e2e/render_case.py" --case "$CASE_NAME" --work-dir "$WORK_DIR"
 }
 

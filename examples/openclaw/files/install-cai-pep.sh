@@ -78,15 +78,22 @@ install_openclaw_plugin() {
     local extensions_dir="$OPENCLAW_HOME/extensions"
     install -d -m 0755 "$extensions_dir"
     install -d -m 0755 "$OPENCLAW_HOME/skills"
-    rm -rf "$extensions_dir/cai-pep"
-    cp -a "$CAI_SHARE_DIR/cai-pep-plugin" "$extensions_dir/cai-pep"
-    local chown_paths=("$extensions_dir/cai-pep" "$OPENCLAW_HOME/skills")
+    local chown_paths=("$OPENCLAW_HOME/skills")
+    if [[ "${CA_DISABLE_PEP:-0}" != "1" ]]; then
+        rm -rf "$extensions_dir/cai-pep"
+        cp -a "$CAI_SHARE_DIR/cai-pep-plugin" "$extensions_dir/cai-pep"
+        chown_paths+=("$extensions_dir/cai-pep")
+    else
+        rm -rf "$extensions_dir/cai-pep"
+    fi
     if [[ -d "$CAI_SHARE_DIR/cai-a2a-plugin" ]]; then
         rm -rf "$extensions_dir/cai-a2a"
         cp -a "$CAI_SHARE_DIR/cai-a2a-plugin" "$extensions_dir/cai-a2a"
         chown_paths+=("$extensions_dir/cai-a2a")
     fi
-    node "$CAI_SHARE_DIR/patch-openclaw-cai-pep.js"
+    if [[ "${CA_DISABLE_PEP:-0}" != "1" ]]; then
+        node "$CAI_SHARE_DIR/patch-openclaw-cai-pep.js"
+    fi
     chown -R "$OPENCLAW_USER:openclaw" "${chown_paths[@]}"
 }
 
