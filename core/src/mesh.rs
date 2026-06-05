@@ -38,6 +38,11 @@ pub fn render_mesh_bundle_at(
                 public_ip: service.deploy.public_ip.clone(),
                 ports: service.service.ports.clone(),
                 connect: service.service.connect.clone(),
+                mcp_ports: service.service.mcp_ports.clone(),
+                gateway_public_key: service
+                    .gateway_identity
+                    .as_ref()
+                    .map(|identity| identity.public_key.clone()),
             },
         );
     }

@@ -174,6 +174,7 @@ pub(super) fn build_service_state(
         &prepared.build_result,
         &prepared.shelter_build_id,
     )?;
+    let gateway_identity = ensure_gateway_identity(&paths)?;
     Ok(LocalServiceState {
         schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
         service_id: spec.service.id.clone(),
@@ -223,7 +224,9 @@ pub(super) fn build_service_state(
         service: LocalServiceNetwork {
             ports: spec.service.ports.clone(),
             connect: spec.service.connect.clone(),
+            mcp_ports: spec.service.mcp_ports.clone(),
         },
+        gateway_identity: Some(gateway_identity),
         resources,
         mesh_generation: 0,
         reference_values: reference_value_mode_name(spec.attestation.reference_values).to_string(),
@@ -231,6 +234,7 @@ pub(super) fn build_service_state(
 }
 
 pub(super) fn activate_existing_service_state(
+    state_dir: &Path,
     spec_path: &Path,
     spec: &AgentSpec,
     mut state: LocalServiceState,
@@ -258,11 +262,16 @@ pub(super) fn activate_existing_service_state(
     state.service = LocalServiceNetwork {
         ports: spec.service.ports.clone(),
         connect: spec.service.connect.clone(),
+        mcp_ports: spec.service.mcp_ports.clone(),
     };
     state.resources = resource_states(spec)?;
     state.reference_values =
         reference_value_mode_name(spec.attestation.reference_values).to_string();
     state.deploy.tee = tee_name(spec.attestation.tee).to_string();
+    if state.gateway_identity.is_none() {
+        let paths = context_paths(state_dir, &spec.service.id);
+        state.gateway_identity = Some(ensure_gateway_identity(&paths)?);
+    }
     Ok(state)
 }
 
@@ -393,12 +402,14 @@ pub(super) fn render_service_config_from_state(
     let assets = GuestAssets {
         agentd_bin: manifest.agentd_bin,
         agentd_service: manifest.agentd_service,
+        gateway_bin: manifest.gateway_bin,
+        gateway_service: manifest.gateway_service,
+        tng_service: manifest.tng_service,
         initrd_secret_fetch_module: manifest.initrd_secret_fetch_module,
         fde_config_file: manifest.fde_config_file,
         policy_default: manifest.policy_default,
         policy_local_dev: manifest.policy_local_dev,
         guest_tng_bin: manifest.guest_tng_bin,
-        libtdx_verify_rpm: manifest.libtdx_verify_rpm,
         guest_setup_script: manifest.guest_setup_script,
         extra_files: variant.extra_files,
     };
@@ -1121,7 +1132,14 @@ mod tests {
             service: LocalServiceNetwork {
                 ports: ports.clone(),
                 connect: connect.clone(),
+                mcp_ports: Vec::new(),
             },
+            gateway_identity: Some(LocalGatewayIdentity {
+                public_key: "pub".to_string(),
+                private_key_path: PathBuf::from(format!(
+                    "/state/services/{id}/secrets/gateway_identity.seed"
+                )),
+            }),
             resources: BTreeMap::new(),
             mesh_generation: 1,
             reference_values: "sample".to_string(),

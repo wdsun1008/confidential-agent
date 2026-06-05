@@ -523,7 +523,17 @@ fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<u16>) -> LocalSer
                 tee: "tdx".to_string(),
                 published_image_id: None,
             },
-            service: LocalServiceNetwork { ports, connect },
+            service: LocalServiceNetwork {
+                ports,
+                connect,
+                mcp_ports: Vec::new(),
+            },
+            gateway_identity: Some(LocalGatewayIdentity {
+                public_key: "pub".to_string(),
+                private_key_path: PathBuf::from(format!(
+                    "/work/.confidential-agent/services/{service_id}/secrets/gateway_identity.seed"
+                )),
+            }),
             resources: BTreeMap::new(),
             mesh_generation: 0,
             reference_values: "sample".to_string(),
@@ -553,6 +563,9 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
         shelter_config: service_dir.join("shelter.yaml"),
         agentd_bin: PathBuf::from("/bin/confidential-agentd"),
         agentd_service: PathBuf::from("/etc/systemd/system/confidential-agentd.service"),
+        gateway_bin: PathBuf::from("/bin/cai-gateway"),
+        gateway_service: PathBuf::from("/etc/systemd/system/cai-gateway.service"),
+        tng_service: PathBuf::from("/etc/systemd/system/trusted-network-gateway.service"),
         initrd_secret_fetch_module: PathBuf::from("/build/99confidential-agent-secret-fetch"),
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/default.rego"),
@@ -560,7 +573,6 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
         images_dir: service_dir.join("artifacts"),
         cache_dir: service_dir.join("cache"),
         guest_tng_bin: None,
-        libtdx_verify_rpm: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
         debug_ssh: None,
@@ -1091,18 +1103,6 @@ fn stage_guest_tng_binary_rejects_wrong_version() {
 }
 
 #[test]
-fn stage_libtdx_verify_rpm_uses_explicit_source() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("custom-libtdx.rpm");
-    fs::write(&source, b"rpm").unwrap();
-
-    let staged = stage_libtdx_verify_rpm(temp.path(), Some(&source)).unwrap();
-
-    assert_eq!(staged.file_name().unwrap(), "libtdx-verify.rpm");
-    assert_eq!(fs::read(staged).unwrap(), b"rpm");
-}
-
-#[test]
 fn cryptpilot_fde_config_matches_current_schema() {
     let config = cryptpilot_fde_config();
 
@@ -1606,6 +1606,9 @@ resources: {}
             "shelter_config": service_dir.join("shelter.yaml"),
             "agentd_bin": "/bin/confidential-agentd",
             "agentd_service": "/etc/systemd/system/confidential-agentd.service",
+            "gateway_bin": "/bin/cai-gateway",
+            "gateway_service": "/etc/systemd/system/cai-gateway.service",
+            "tng_service": "/etc/systemd/system/trusted-network-gateway.service",
             "initrd_secret_fetch_module": "/build/99confidential-agent-secret-fetch",
             "fde_config_file": "/build/fde.toml",
             "policy_default": "/build/default.rego",
@@ -2300,6 +2303,11 @@ fn mkosi_debug_deploy_stages_authorized_keys() {
     let mut assets = GuestAssets {
         agentd_bin: paths.guest_staging_dir.join("confidential-agentd"),
         agentd_service: paths.guest_staging_dir.join("confidential-agentd.service"),
+        gateway_bin: paths.guest_staging_dir.join("cai-gateway"),
+        gateway_service: paths.guest_staging_dir.join("cai-gateway.service"),
+        tng_service: paths
+            .guest_staging_dir
+            .join("trusted-network-gateway.service"),
         initrd_secret_fetch_module: paths
             .guest_staging_dir
             .join("99confidential-agent-secret-fetch"),
@@ -2307,7 +2315,6 @@ fn mkosi_debug_deploy_stages_authorized_keys() {
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
         guest_tng_bin: None,
-        libtdx_verify_rpm: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     };
@@ -2344,6 +2351,11 @@ fn mkosi_debug_deploy_stages_configured_authorized_keys() {
     let mut assets = GuestAssets {
         agentd_bin: paths.guest_staging_dir.join("confidential-agentd"),
         agentd_service: paths.guest_staging_dir.join("confidential-agentd.service"),
+        gateway_bin: paths.guest_staging_dir.join("cai-gateway"),
+        gateway_service: paths.guest_staging_dir.join("cai-gateway.service"),
+        tng_service: paths
+            .guest_staging_dir
+            .join("trusted-network-gateway.service"),
         initrd_secret_fetch_module: paths
             .guest_staging_dir
             .join("99confidential-agent-secret-fetch"),
@@ -2351,7 +2363,6 @@ fn mkosi_debug_deploy_stages_configured_authorized_keys() {
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
         guest_tng_bin: None,
-        libtdx_verify_rpm: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     };
@@ -3179,7 +3190,7 @@ resources: {}
     state.deploy.run_id = "20260429110011".to_string();
     state.deploy.resource_name = "openclaw-20260429110011".to_string();
 
-    let activated = activate_existing_service_state(&spec_path, &spec, state).unwrap();
+    let activated = activate_existing_service_state(temp.path(), &spec_path, &spec, state).unwrap();
 
     assert_eq!(activated.phase, "active");
     assert_eq!(activated.generation, 2);
@@ -3187,6 +3198,68 @@ resources: {}
     assert_eq!(activated.deploy.resource_name, "openclaw-20260429110011");
     assert_eq!(activated.deploy.public_ip.as_deref(), Some("39.0.0.1"));
     assert_eq!(activated.service.ports, vec![18789, 18800]);
+    assert!(activated.gateway_identity.is_some());
+}
+
+#[test]
+fn activate_existing_service_state_generates_missing_gateway_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec_path = temp.path().join("confidential-agent.yaml");
+    fs::write(
+        &spec_path,
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+    )
+    .unwrap();
+    let spec = AgentSpec::from_path(&spec_path).unwrap();
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.gateway_identity = None;
+
+    let activated = activate_existing_service_state(temp.path(), &spec_path, &spec, state).unwrap();
+
+    let identity = activated.gateway_identity.expect("gateway identity");
+    assert!(!identity.public_key.is_empty());
+    assert!(identity.private_key_path.exists());
+}
+
+#[test]
+fn ensure_gateway_identity_rejects_mismatched_public_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = context_paths(temp.path(), "openclaw");
+    fs::create_dir_all(&paths.secrets_dir).unwrap();
+    let private_key = URL_SAFE_NO_PAD.encode([7u8; 32]);
+    let wrong_public_key = URL_SAFE_NO_PAD.encode([9u8; 32]);
+    fs::write(paths.secrets_dir.join("gateway_identity.seed"), private_key).unwrap();
+    fs::write(
+        paths.secrets_dir.join("gateway_identity.pub"),
+        wrong_public_key,
+    )
+    .unwrap();
+
+    let err = ensure_gateway_identity(&paths).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("gateway public key does not match private key seed"));
 }
 
 #[test]

@@ -1958,7 +1958,14 @@ mod tests {
             service: LocalServiceNetwork {
                 ports: vec![18789],
                 connect: vec![18789],
+                mcp_ports: Vec::new(),
             },
+            gateway_identity: Some(LocalGatewayIdentity {
+                public_key: "pub".to_string(),
+                private_key_path: PathBuf::from(format!(
+                    "/state/services/{service_id}/secrets/gateway_identity.seed"
+                )),
+            }),
             resources: BTreeMap::new(),
             mesh_generation: 0,
             reference_values: "sample".to_string(),

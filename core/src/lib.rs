@@ -11,10 +11,10 @@ pub mod util;
 #[cfg(test)]
 mod schema_tests {
     use crate::schema::{
-        confidential_ports, BootstrapConfig, GuestResource, LocalBuildState, LocalDebugSshKey,
-        LocalDeployState, LocalServiceNetwork, LocalServiceState, LocalSpecState, MeshBundle,
-        MeshService, BOOTSTRAP_SCHEMA_VERSION, LOCAL_SERVICE_STATE_SCHEMA_VERSION,
-        MESH_SCHEMA_VERSION,
+        confidential_ports, BootstrapConfig, GatewayIdentity, GuestResource, LocalBuildState,
+        LocalDebugSshKey, LocalDeployState, LocalGatewayIdentity, LocalServiceNetwork,
+        LocalServiceState, LocalSpecState, MeshBundle, MeshService, BOOTSTRAP_SCHEMA_VERSION,
+        LOCAL_SERVICE_STATE_SCHEMA_VERSION, MESH_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -64,7 +64,12 @@ mod schema_tests {
             service: LocalServiceNetwork {
                 ports: vec![18789],
                 connect: vec![18789],
+                mcp_ports: vec![18789],
             },
+            gateway_identity: Some(LocalGatewayIdentity {
+                public_key: "pub".to_string(),
+                private_key_path: PathBuf::from("/state/services/openclaw/secrets/gateway_identity.seed"),
+            }),
             resources: BTreeMap::new(),
             mesh_generation: 1,
             reference_values: "rekor".to_string(),
@@ -75,6 +80,8 @@ mod schema_tests {
 
         assert_eq!(decoded.service.ports, vec![18789]);
         assert_eq!(decoded.service.connect, vec![18789]);
+        assert_eq!(decoded.service.mcp_ports, vec![18789]);
+        assert_eq!(decoded.gateway_identity.unwrap().public_key, "pub");
         assert_eq!(decoded.deploy.private_mesh_ip(), Some("10.0.0.8"));
         assert_eq!(
             decoded.build.debug_ssh.unwrap().private_key,
@@ -96,6 +103,8 @@ mod schema_tests {
                     public_ip: Some("1.2.3.4".to_string()),
                     ports: vec![18789],
                     connect: vec![18789],
+                    mcp_ports: vec![18789],
+                    gateway_public_key: Some("pub".to_string()),
                 },
             )]),
             reference_values: BTreeMap::new(),
@@ -107,6 +116,11 @@ mod schema_tests {
 
         assert_eq!(decoded.services["svc-a"].ports, vec![18789]);
         assert_eq!(decoded.services["svc-a"].connect, vec![18789]);
+        assert_eq!(decoded.services["svc-a"].mcp_ports, vec![18789]);
+        assert_eq!(
+            decoded.services["svc-a"].gateway_public_key.as_deref(),
+            Some("pub")
+        );
     }
 
     #[test]
@@ -127,6 +141,11 @@ mod schema_tests {
             mode: "challenge".to_string(),
             ports: vec![18789],
             connect: vec![18789],
+            mcp_ports: vec![18789],
+            gateway_identity: Some(GatewayIdentity {
+                public_key: "pub".to_string(),
+                private_key: "priv".to_string(),
+            }),
             resources: vec![GuestResource {
                 id: "config".to_string(),
                 resource_path: "default/local-resources/config".to_string(),
@@ -170,6 +189,8 @@ mod schema_tests {
             mode: "challenge".to_string(),
             ports: vec![18789],
             connect: vec![18789],
+            mcp_ports: Vec::new(),
+            gateway_identity: None,
             resources: Vec::new(),
             app_service: None,
             peers: vec![BootstrapPeer {

@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 pub struct GuestAssets {
     pub agentd_bin: PathBuf,
     pub agentd_service: PathBuf,
+    pub gateway_bin: PathBuf,
+    pub gateway_service: PathBuf,
+    pub tng_service: PathBuf,
     pub initrd_secret_fetch_module: PathBuf,
     pub fde_config_file: PathBuf,
     pub policy_default: PathBuf,
     pub policy_local_dev: PathBuf,
     pub guest_tng_bin: Option<PathBuf>,
-    pub libtdx_verify_rpm: Option<PathBuf>,
     pub guest_setup_script: Option<PathBuf>,
     pub extra_files: Vec<GuestFileAsset>,
 }
@@ -95,22 +97,28 @@ pub fn render_build_config(
     serde_yaml::to_string(&config).map_err(Into::into)
 }
 
-fn shelter_packages(spec: &AgentSpec, assets: &GuestAssets) -> Vec<String> {
+fn shelter_packages(spec: &AgentSpec, _assets: &GuestAssets) -> Vec<String> {
     let mut packages = spec.build.packages.clone();
+    if !packages.iter().any(|package| package == "libtdx-verify") {
+        packages.push("libtdx-verify".to_string());
+    }
     if spec.deploys_debug_image() && !packages.iter().any(|package| package == "openssh-server") {
         packages.push("openssh-server".to_string());
-    }
-    if assets.libtdx_verify_rpm.is_some() && !packages.iter().any(|package| package == "rpm") {
-        packages.push("rpm".to_string());
     }
     packages
 }
 
 fn shelter_services(spec: &AgentSpec) -> Vec<ShelterServiceUnit> {
-    let mut services = vec![ShelterServiceUnit {
-        name: "confidential-agentd.service".to_string(),
-        enable: true,
-    }];
+    let mut services = vec![
+        ShelterServiceUnit {
+            name: "confidential-agentd.service".to_string(),
+            enable: true,
+        },
+        ShelterServiceUnit {
+            name: "cai-gateway.service".to_string(),
+            enable: true,
+        },
+    ];
     if spec.deploys_debug_image() {
         services.push(ShelterServiceUnit {
             name: "sshd.service".to_string(),
@@ -157,6 +165,21 @@ fn guest_files(assets: &GuestAssets) -> Vec<ShelterFileMapping> {
             executable: false,
         },
         ShelterFileMapping {
+            source: assets.gateway_bin.clone(),
+            destination: Some("/usr/local/bin/cai-gateway".to_string()),
+            executable: true,
+        },
+        ShelterFileMapping {
+            source: assets.gateway_service.clone(),
+            destination: Some("/etc/systemd/system/cai-gateway.service".to_string()),
+            executable: false,
+        },
+        ShelterFileMapping {
+            source: assets.tng_service.clone(),
+            destination: Some("/etc/systemd/system/trusted-network-gateway.service".to_string()),
+            executable: false,
+        },
+        ShelterFileMapping {
             source: assets.policy_default.clone(),
             destination: Some(
                 "/opt/confidential-agent/policies/trustee-opa-default.rego".to_string(),
@@ -177,13 +200,6 @@ fn guest_files(assets: &GuestAssets) -> Vec<ShelterFileMapping> {
             source: tng_bin.clone(),
             destination: Some("/opt/confidential-agent/hack/tng-2.6.0".to_string()),
             executable: true,
-        });
-    }
-    if let Some(rpm) = &assets.libtdx_verify_rpm {
-        files.push(ShelterFileMapping {
-            source: rpm.clone(),
-            destination: Some("/opt/confidential-agent/hack/libtdx-verify.rpm".to_string()),
-            executable: false,
         });
     }
     files.extend(assets.extra_files.iter().map(|asset| ShelterFileMapping {

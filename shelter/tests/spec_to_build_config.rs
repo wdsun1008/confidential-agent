@@ -48,12 +48,14 @@ fn assets() -> GuestAssets {
     GuestAssets {
         agentd_bin: PathBuf::from("/build/confidential-agentd"),
         agentd_service: PathBuf::from("/build/confidential-agentd.service"),
+        gateway_bin: PathBuf::from("/build/cai-gateway"),
+        gateway_service: PathBuf::from("/build/cai-gateway.service"),
+        tng_service: PathBuf::from("/build/trusted-network-gateway.service"),
         initrd_secret_fetch_module: PathBuf::from("/build/99confidential-agent-secret-fetch"),
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/trustee-opa-default.rego"),
         policy_local_dev: PathBuf::from("/build/trustee-opa-local-dev.rego"),
         guest_tng_bin: None,
-        libtdx_verify_rpm: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     }
@@ -164,6 +166,7 @@ fn spec_to_build_config_renders_release_and_debug_variant_matrix() {
 
         let packages = mapping_get(root, "packages").as_sequence().unwrap();
         assert!(sequence_contains_str(packages, "nodejs"));
+        assert!(sequence_contains_str(packages, "libtdx-verify"));
         assert_eq!(
             sequence_contains_str(packages, "openssh-server"),
             includes_debug_runtime
@@ -197,6 +200,7 @@ fn spec_to_build_config_mkosi_path_omits_from_and_variants_but_keeps_payload() {
 
     let packages = mapping_get(root, "packages").as_sequence().unwrap();
     assert!(sequence_contains_str(packages, "nodejs"));
+    assert!(sequence_contains_str(packages, "libtdx-verify"));
 
     let files = mapping_get(root, "files").as_sequence().unwrap();
     assert!(files.iter().any(|file| {
