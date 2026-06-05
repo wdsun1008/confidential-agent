@@ -52,15 +52,26 @@ build_confidential_agent() {
   if [[ "$CA_SKIP_CARGO_BUILD" == "1" ]]; then
     [[ -x "$CA_BIN" ]] || die "confidential-agent binary is missing: $CA_BIN"
     [[ -x "$CA_AGENTD_BIN" ]] || die "confidential-agentd binary is missing: $CA_AGENTD_BIN"
-    [[ -x "$CA_PEP_BIN" ]] || die "cai-pep binary is missing: $CA_PEP_BIN"
+    [[ -x "$CA_GATEWAY_BIN" ]] || die "cai-gateway binary is missing: $CA_GATEWAY_BIN"
+    if [[ "${CA_DISABLE_PEP:-0}" != "1" ]]; then
+      [[ -x "$CA_PEP_BIN" ]] || die "cai-pep binary is missing: $CA_PEP_BIN"
+    fi
     return
   fi
   ensure_rust_toolchain
-  log "building Confidential Agent host CLI, guest daemon and PEP"
-  (cd "$ROOT_DIR" && cargo build --release -p confidential-agent-cli -p confidential-agentd -p cai-pep)
+  if [[ "${CA_DISABLE_PEP:-0}" == "1" ]]; then
+    log "building Confidential Agent host CLI, guest daemon and gateway"
+    (cd "$ROOT_DIR" && cargo build --release -p confidential-agent-cli -p confidential-agentd -p cai-gateway)
+  else
+    log "building Confidential Agent host CLI, guest daemon, gateway and PEP"
+    (cd "$ROOT_DIR" && cargo build --release -p confidential-agent-cli -p confidential-agentd -p cai-gateway -p cai-pep)
+  fi
   [[ -x "$CA_BIN" ]] || die "confidential-agent binary was not built: $CA_BIN"
   [[ -x "$CA_AGENTD_BIN" ]] || die "confidential-agentd binary was not built: $CA_AGENTD_BIN"
-  [[ -x "$CA_PEP_BIN" ]] || die "cai-pep binary was not built: $CA_PEP_BIN"
+  [[ -x "$CA_GATEWAY_BIN" ]] || die "cai-gateway binary was not built: $CA_GATEWAY_BIN"
+  if [[ "${CA_DISABLE_PEP:-0}" != "1" ]]; then
+    [[ -x "$CA_PEP_BIN" ]] || die "cai-pep binary was not built: $CA_PEP_BIN"
+  fi
 }
 
 install_confidential_agent_cli() {
@@ -68,18 +79,27 @@ install_confidential_agent_cli() {
   is_root || die "installing confidential-agent to /usr/local/bin requires root"
   [[ -x "$CA_BIN" ]] || die "confidential-agent binary is missing: $CA_BIN"
   [[ -x "$CA_AGENTD_BIN" ]] || die "confidential-agentd binary is missing: $CA_AGENTD_BIN"
-  [[ -x "$CA_PEP_BIN" ]] || die "cai-pep binary is missing: $CA_PEP_BIN"
+  [[ -x "$CA_GATEWAY_BIN" ]] || die "cai-gateway binary is missing: $CA_GATEWAY_BIN"
   local cli_dest="/usr/local/bin/confidential-agent"
   local agentd_dest="/usr/local/bin/confidential-agentd"
-  local pep_dest="/usr/local/bin/cai-pep"
+  local gateway_dest="/usr/local/bin/cai-gateway"
   install -D -m 0755 "$CA_BIN" "$cli_dest"
   install -D -m 0755 "$CA_AGENTD_BIN" "$agentd_dest"
-  install -D -m 0755 "$CA_PEP_BIN" "$pep_dest"
+  install -D -m 0755 "$CA_GATEWAY_BIN" "$gateway_dest"
   CA_BIN="$cli_dest"
   CA_AGENTD_BIN="$agentd_dest"
-  CA_PEP_BIN="$pep_dest"
-  export CA_BIN CA_AGENTD_BIN CA_PEP_BIN
-  log "installed Confidential Agent binaries: $CA_BIN, $CA_AGENTD_BIN, $CA_PEP_BIN"
+  CA_GATEWAY_BIN="$gateway_dest"
+  if [[ "${CA_DISABLE_PEP:-0}" != "1" ]]; then
+    [[ -x "$CA_PEP_BIN" ]] || die "cai-pep binary is missing: $CA_PEP_BIN"
+    local pep_dest="/usr/local/bin/cai-pep"
+    install -D -m 0755 "$CA_PEP_BIN" "$pep_dest"
+    CA_PEP_BIN="$pep_dest"
+    export CA_BIN CA_AGENTD_BIN CA_GATEWAY_BIN CA_PEP_BIN
+    log "installed Confidential Agent binaries: $CA_BIN, $CA_AGENTD_BIN, $CA_GATEWAY_BIN, $CA_PEP_BIN"
+  else
+    export CA_BIN CA_AGENTD_BIN CA_GATEWAY_BIN
+    log "installed Confidential Agent binaries: $CA_BIN, $CA_AGENTD_BIN, $CA_GATEWAY_BIN"
+  fi
 }
 
 build_tools_image() {
@@ -400,6 +420,9 @@ run_gateway_probe() {
 }
 
 run_tdx_attestation_probe() {
+  if [[ "${CA_DISABLE_PEP:-0}" == "1" ]]; then
+    return
+  fi
   if [[ "${CA_RUN_TDX_SKILL_PROBE:-0}" != "1" || -z "${CA_CONNECT_PORT:-}" || "$CA_SKIP_CHAT_PROBE" == "1" ]]; then
     return
   fi
@@ -456,6 +479,7 @@ Confidential Agent one-click summary
   cidr:      $CA_ALLOWED_CIDR
   deployer:  ${CA_DEPLOYER_CIDR:-not detected}
   dingtalk:  $CA_ENABLE_DINGTALK
+  pep:       $([[ "${CA_DISABLE_PEP:-0}" == "1" ]] && printf disabled || printf enabled)
   token:     $CA_GATEWAY_TOKEN
 EOF
   if [[ -n "${CA_CONNECT_PORT:-}" ]]; then

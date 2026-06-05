@@ -136,6 +136,7 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 | npm Registry | `https://registry.npmmirror.com/` | OpenClaw 镜像构建时使用的 npm 源。 |
 | Reference Value | `rekor` | 构建后将参考值上传 Rekor，并在部署时使用 Rekor 验证。 |
 | State Dir | `$HOME/.confidential-agent` | 本地状态、密钥、Terraform 和构建产物目录。 |
+| PEP | enabled | 默认安装并启用 `cai-pep`。传入 `--disable-pep` 时不打包 PEP 二进制、OpenClaw PEP 插件、默认策略和 TDX attestation skill。 |
 
 非交互部署示例：
 
@@ -149,6 +150,17 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
   --disk-gb 200 \
   --enable-dingtalk
 ```
+
+默认部署会启用 PEP，并把 OpenClaw 的高风险工具执行接到 `cai-pep`。如果只想验证 OpenClaw/Bailian、TNG connect、远程证明资源注入和 gateway token 这条主链路，而暂时不安装 PEP，可以显式传入：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
+  --non-interactive \
+  --yes \
+  --disable-pep
+```
+
+`--disable-pep` 与 `--run-tdx-skill-probe` 互斥，因为该 probe 依赖镜像内的 `tdx-remote-attestation` skill 和 `cai-pep attest` 命令。
 
 如需仅安装本机依赖、构建 Confidential Agent 组件和 tools 镜像，不创建云资源，执行以下命令：
 
@@ -188,7 +200,7 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 
 1.  安装 Alibaba Cloud Linux 3 主机依赖，使用系统源中的 `cargo`/`rust`、`python3.11` 和 Node.js，并写入 Aliyun Cargo sparse registry；默认不使用 rustup。
 2.  在缺少 Shelter 时安装内置 Shelter RPM，并校验 Shelter 和 Docker。
-3.  构建 `confidential-agent`、`confidential-agentd`、`cai-pep`，并将 `confidential-agent` 安装到 `/usr/local/bin`。
+3.  构建 `confidential-agent`、`confidential-agentd` 和 `cai-gateway`，默认同时构建 `cai-pep`，并将这些二进制安装到 `/usr/local/bin`。传入 `--disable-pep` 时跳过 `cai-pep` 构建、安装和镜像打包。
 4.  构建内置 `cosign`、`rekor-cli`、TNG 和远程证明客户端的 `confidential-agent-tools:latest`，并在部署机安装与镜像内匹配的 OpenClaw CLI。
 5.  构建 OpenClaw 可信镜像，启用 FDE、dm-verity 和 UKI。
 6.  将镜像参考值上传 Rekor 透明日志。
@@ -208,6 +220,7 @@ Confidential Agent one-click summary
   instance:  ecs.g9i.xlarge
   cidr:      203.0.113.10/32
   dingtalk:  1
+  pep:       enabled
   token:     <generated-or-provided-token>
   web:       http://127.0.0.1:18789/openclaw
   ws/api:    ws://127.0.0.1:18789

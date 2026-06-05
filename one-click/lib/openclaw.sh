@@ -47,11 +47,11 @@ copy_openclaw_inputs() {
   local out="$dst/install-openclaw.sh"
   install -d -m 0755 "$dst"
   python3.11 - "$ROOT_DIR/examples/openclaw/install-openclaw.sh" "$out" \
-    "$CA_OPENCLAW_VERSION" "$CA_NODE_VERSION" "$CA_NPM_REGISTRY" <<'PY'
+    "$CA_OPENCLAW_VERSION" "$CA_NODE_VERSION" "$CA_NPM_REGISTRY" "$CA_DISABLE_PEP" <<'PY'
 import shlex
 import sys
 
-src, dst, openclaw_version, node_version, npm_registry = sys.argv[1:6]
+src, dst, openclaw_version, node_version, npm_registry, disable_pep = sys.argv[1:7]
 with open(src, encoding="utf-8") as f:
     text = f.read()
 marker = "set -euo pipefail\n"
@@ -63,6 +63,7 @@ exports = (
     f"export OPENCLAW_VERSION={shlex.quote(openclaw_version)}\n"
     f"export OPENCLAW_NODE_VERSION={shlex.quote(node_version)}\n"
     f"export NPM_REGISTRY={shlex.quote(npm_registry)}\n"
+    f"export CA_DISABLE_PEP={shlex.quote(disable_pep)}\n"
 )
 with open(dst, "w", encoding="utf-8") as f:
     f.write(text[:insert_at] + exports + text[insert_at:])
@@ -78,14 +79,33 @@ write_openclaw_json() {
   local base_url="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
   python3.11 - "$out" "$DASHSCOPE_API_KEY" "$CA_GATEWAY_TOKEN" "$enable_dingtalk" \
     "${DINGTALK_BOT_CLIENT_ID:-}" "${DINGTALK_BOT_CLIENT_SECRET:-}" "$base_url" \
-    "$CA_BAILIAN_MODEL" <<'PY'
+    "$CA_BAILIAN_MODEL" "$CA_DISABLE_PEP" <<'PY'
 import json
 import sys
 
-path, api_key, token, enable_dingtalk, ding_id, ding_secret, base_url, model_id = sys.argv[1:9]
+path, api_key, token, enable_dingtalk, ding_id, ding_secret, base_url, model_id, disable_pep = sys.argv[1:10]
 if model_id.startswith("bailian/"):
     model_id = model_id.split("/", 1)[1]
-allow = ["cai-pep", "cai-a2a"]
+allow = ["cai-a2a"]
+entries = {
+    "cai-a2a": {
+        "enabled": True,
+        "config": {"peers": {}},
+    },
+}
+if disable_pep != "1":
+    allow.insert(0, "cai-pep")
+    entries = {
+        "cai-pep": {
+            "enabled": True,
+            "config": {
+                "socketPath": "/run/cai/pep.sock",
+                "pepRequired": True,
+                "defaultWorkdir": "/workspace",
+            },
+        },
+        **entries,
+    }
 channels = {}
 dingtalk_entry = None
 if enable_dingtalk == "1":
@@ -138,20 +158,7 @@ config = {
     "plugins": {
         "enabled": True,
         "allow": allow,
-        "entries": {
-            "cai-pep": {
-                "enabled": True,
-                "config": {
-                    "socketPath": "/run/cai/pep.sock",
-                    "pepRequired": True,
-                    "defaultWorkdir": "/workspace",
-                },
-            },
-            "cai-a2a": {
-                "enabled": True,
-                "config": {"peers": {}},
-            },
-        },
+        "entries": entries,
     },
     "channels": channels,
     "gateway": {
@@ -202,27 +209,22 @@ EOF
   fi
 }
 
-write_openclaw_yaml() {
-  local out="$CA_WORK_DIR/openclaw/openclaw.yaml"
-  local base_image_yaml att_yaml
-  base_image_yaml="$(build_base_image_yaml)"
-  att_yaml="$(attestation_yaml)"
-  cat >"$out" <<EOF
-schema: confidential-agent/v1
+openclaw_files_yaml() {
+  if [[ "${CA_DISABLE_PEP:-0}" == "1" ]]; then
+    cat <<EOF
+    - source: ./files/install-cai-pep.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+      executable: true
+    - source: ./files/install-openclaw-runtime.sh
+      target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh
+      executable: true
+    - source: ./files/cai-a2a-plugin
+      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin
+EOF
+    return
+  fi
 
-service:
-  id: openclaw
-  ports: [18789]
-  connect: [18789]
-  app_service: cai-openclaw-gateway.service
-
-build:
-$base_image_yaml
-  image_name: openclaw-agent
-  resize: 30G
-  with_network: true
-  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
-  files:
+  cat <<EOF
     - source: $(yaml_quote "$CA_PEP_BIN")
       target: /usr/local/bin/cai-pep
       executable: true
@@ -243,6 +245,32 @@ $base_image_yaml
     - source: ./files/patch-openclaw-cai-pep.js
       target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js
       executable: true
+EOF
+}
+
+write_openclaw_yaml() {
+  local out="$CA_WORK_DIR/openclaw/openclaw.yaml"
+  local base_image_yaml att_yaml files_yaml
+  base_image_yaml="$(build_base_image_yaml)"
+  att_yaml="$(attestation_yaml)"
+  files_yaml="$(openclaw_files_yaml)"
+  cat >"$out" <<EOF
+schema: confidential-agent/v1
+
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+  app_service: cai-openclaw-gateway.service
+
+build:
+$base_image_yaml
+  image_name: openclaw-agent
+  resize: 30G
+  with_network: true
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
+  files:
+$files_yaml
   scripts: [./install-openclaw.sh]
   variants:
     release:

@@ -35,6 +35,7 @@ Common options:
   --skip-cargo-build             Reuse existing target/release binaries
   --skip-host-openclaw           Do not install Node.js/OpenClaw CLI on the deploy host during deploy-openclaw
   --rebuild-tools-image          Rebuild the tools image even if it exists
+  --disable-pep                  Do not install or enable the OpenClaw cai-pep runtime
   --help                         Show this help
 
 Deploy options:
@@ -59,7 +60,7 @@ Deploy options:
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
   --skip-chat-probe              Do not run the OpenClaw chat probe
-  --run-tdx-skill-probe          Also run the optional tdx-remote-attestation skill probe
+  --run-tdx-skill-probe          Also run the optional tdx-remote-attestation skill probe; requires PEP
   --tdx-probe-timeout-ms MS      Default: 300000; only used with --run-tdx-skill-probe
 
 Shelter options:
@@ -88,6 +89,7 @@ init_defaults() {
   CA_SKIP_HOST_OPENCLAW="${CA_SKIP_HOST_OPENCLAW:-0}"
   CA_REBUILD_TOOLS_IMAGE="${CA_REBUILD_TOOLS_IMAGE:-0}"
   CA_ENABLE_DINGTALK="${CA_ENABLE_DINGTALK:-0}"
+  CA_DISABLE_PEP="${CA_DISABLE_PEP:-0}"
   CA_START_CONNECT="${CA_START_CONNECT:-1}"
   CA_REGION="${CA_REGION:-cn-beijing}"
   CA_ZONE_ID="${CA_ZONE_ID:-cn-beijing-i}"
@@ -112,6 +114,7 @@ init_defaults() {
   CA_CONNECT_TIMEOUT_SEC="${CA_CONNECT_TIMEOUT_SEC:-240}"
   CA_BIN="${CA_BIN:-$ROOT_DIR/target/release/confidential-agent}"
   CA_AGENTD_BIN="${CA_AGENTD_BIN:-$(dirname "$CA_BIN")/confidential-agentd}"
+  CA_GATEWAY_BIN="${CA_GATEWAY_BIN:-$(dirname "$CA_BIN")/cai-gateway}"
   CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/release/cai-pep}"
 }
 
@@ -138,6 +141,7 @@ parse_args() {
       --skip-cargo-build) CA_SKIP_CARGO_BUILD=1; shift ;;
       --skip-host-openclaw) CA_SKIP_HOST_OPENCLAW=1; shift ;;
       --rebuild-tools-image) CA_REBUILD_TOOLS_IMAGE=1; shift ;;
+      --disable-pep) CA_DISABLE_PEP=1; shift ;;
       --region) CA_REGION="${2:?missing value for --region}"; shift 2 ;;
       --zone-id) CA_ZONE_ID="${2:?missing value for --zone-id}"; shift 2 ;;
       --instance-type) CA_INSTANCE_TYPE="${2:?missing value for --instance-type}"; shift 2 ;;
@@ -183,6 +187,9 @@ validate_options() {
   esac
   [[ "$CA_DISK_GB" =~ ^[0-9]+$ ]] || die "--disk-gb must be an integer"
   [[ -n "$CA_BAILIAN_MODEL" ]] || die "--bailian-model cannot be empty"
+  if [[ "$CA_DISABLE_PEP" == "1" && "$CA_RUN_TDX_SKILL_PROBE" == "1" ]]; then
+    die "--run-tdx-skill-probe requires PEP; remove --disable-pep or omit the TDX skill probe"
+  fi
 }
 
 print_startup_config() {
@@ -194,6 +201,7 @@ print_startup_config() {
   log "instance_type: $CA_INSTANCE_TYPE"
   log "bailian_model: $CA_BAILIAN_MODEL"
   log "reference_values: $CA_REFERENCE_VALUES"
+  log "pep: $([[ "$CA_DISABLE_PEP" == "1" ]] && printf disabled || printf enabled)"
 }
 
 main() {
