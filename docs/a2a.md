@@ -2,6 +2,12 @@
 
 Confidential Agent 的 A2A 能力用于把不同管理域里的 agent 连接起来：每一方仍独立管理云账号、state-dir、镜像构建、密钥和安全组，但应用可以通过 A2A AgentCard 发现对端，并通过 RATS-TLS/TNG 建立经过远程证明的本地转发通道。
 
+需要先明确三个边界：
+
+- A2A `connect` 指 peer `service.connect[]` 暴露的 RATS-TLS server 入口。调用方通过本地 TNG ingress 访问被调方，远程证明方向是调用方验证被调方，不是双向会话。
+- A2A 不接入 `cai-gateway` client，也不读取、映射或访问 MCP 的 `mcp_ports`。
+- A2A 的可追踪性来自 `peerings.yaml`、`a2a.json` 和 `a2a-bundle.json` 的配置状态；不要把它称为 MCP audit，MCP 调用审计属于 CMaaS/MCP gateway 链路。
+
 本文档描述当前实现，不描述计划中的兼容层。AppSpec 字段定义见 [`spec.md`](spec.md)。
 
 ## 目录
@@ -23,7 +29,7 @@ A2A 适合这几类场景：
 - **跨组织 agent 协作**：组织 A 的 agent 需要调用组织 B 的 agent，但双方不能共享 state-dir、云 AK/SK 或部署流水线。
 - **只开放证明后的服务端口**：对端只能访问 `:8089` AgentCard 发现端口和 `service.connect` 端口，不能直接进入内部 mesh 端口。
 - **自然语言 agent 编排**：应用层只需要知道 peer alias，例如 `data-owner`，实际 IP、端口、reference values 和 TNG ingress 由 daemon 动态生成。
-- **可审计接入**：网络放行由 `peerings.yaml` 管理，协议 desired state 由 `a2a.json` 管理，两个变更面分离。
+- **配置可追踪接入**：网络放行由 `peerings.yaml` 管理，协议 desired state 由 `a2a.json` 管理，两个变更面分离，便于追踪是谁放行网络、谁声明出向 peer。
 
 核心对象有三个：
 
@@ -50,7 +56,7 @@ alpha side:
   a2a add --alias beta http://<beta-ip>:8089/.well-known/agent-card.json
 ```
 
-如果业务需要双向调用，双方各自执行一次 `a2a add`。A2A 本身不是双向 invite/accept 协议。
+每条 `a2a add` 只声明“本域要调用对端”的出向 desired state，并驱动调用方到被调方的单向 RA/RATS-TLS 路径。如果业务需要双向调用，双方各自执行一次 `a2a add`。A2A 本身不是双向 invite/accept 协议。
 
 ### 2.2 端口与 scope
 
@@ -64,6 +70,8 @@ alpha side:
 | `service.ports - service.connect` | 内部 mesh 端口 | `mesh` |
 
 `role=operator` 默认包含 `control,status,ssh,agent_card,connect`；`role=peer` 默认包含 `agent_card,connect`。peer 默认不打开 `mesh`。
+
+A2A 只消费 `agent_card` 和 `connect` scope。即使某个服务同时声明 MCP `mcp_ports`，A2A peer 也不会因此获得 MCP 端口访问权限；MCP 端口的访问、代理和审计由 MCP/CMaaS 链路处理。
 
 ### 2.3 `a2a add` 后发生什么
 
@@ -180,7 +188,7 @@ a2a:
 
 - `service.connect` 至少包含一个端口。
 - `a2a.interfaces[].port` 必须在 `service.connect` 中。
-- `attestation.reference_values` 必须为 `rekor`，否则 AgentCard 中没有可公开审计的 Rekor metadata。
+- `attestation.reference_values` 必须为 `rekor`，否则 AgentCard 中没有可公开追踪和验证的 Rekor metadata。
 
 未显式配置 `interfaces` 时，CLI 会从 `service.connect[]` 推导 `JSONRPC` + `/a2a`。
 
@@ -342,6 +350,8 @@ confidential-agent --state-dir ./alpha-state a2a add \
 
 应用不直接写 beta IP。它读取 `/etc/cai/service-directory.json`，找到 peer alias 对应的本地端口，然后对 `127.0.0.1:<port>` 发起 HTTP/A2A 请求。该本地端口由 TNG ingress 转发到 beta 的 `service.connect` 端口，并在连接时完成 RATS-TLS 验证。
 
+这条路径不会启动或复用 `cai-gateway` client，也不会把 MCP `mcp_ports` 暴露给 A2A peer。如果同一服务还承载 MCP gateway，MCP 调用审计仍由 MCP gateway/CMaaS 路径独立产生。
+
 管理机调试本服务时使用：
 
 ```bash
@@ -408,6 +418,8 @@ E2E 覆盖的基础设施路径：
 6. daemon 通过 AgentCard、Rekor metadata 和可选 signer pin 生成 TNG ingress。
 7. Analyst 应用通过 `/etc/cai/service-directory.json` 找到 `data-owner`，发起真实 A2A 调用。
 8. Probe 通过 `connect start` 暴露 Analyst 的 `/a2a`，发送自然语言任务并验证结果。
+
+这里的 `connect start` 只用于让 E2E probe 访问 Analyst 的 A2A 入口；跨组织调用仍是 Analyst 侧 TNG ingress 到 Data Owner `service.connect` 的单向 RA 路径，不访问 MCP `mcp_ports`。
 
 ### 6.3 通过标准
 
@@ -552,6 +564,8 @@ CLI preview 状态：
 - 只支持 IPv4 host 解析。
 - `a2a.json` 只支持 version `2`，不自动迁移 version `1`。
 - 旧顶层 CA extension 不兼容；新版只消费 `capabilities.extensions[]`。
+- A2A/connect 是单向调用链路上的远程证明；反向调用必须单独配置反向 `a2a add` 和 peering。
+- A2A 不消费 MCP `mcp_ports`，不接入 `cai-gateway` client，也不产生 MCP audit 记录。
 - E2E 的数据不泄露断言覆盖样例数据中的客户姓名和订单号模式，不是通用 DLP 引擎。
 
 后续可以继续增强：

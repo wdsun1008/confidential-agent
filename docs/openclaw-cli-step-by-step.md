@@ -49,6 +49,8 @@ path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 ```
 
+`GATEWAY_TOKEN` 是 OpenClaw 应用层 `gateway.auth.token`，用于 Web、桌面客户端、TUI 和 WebSocket/API 访问鉴权。它不是 Confidential Agent `cai-gateway` 的 token，也不是 `cai-gateway` client 配置。
+
 ## 3. 生成 Rekor 签名 key
 
 ```bash
@@ -136,6 +138,8 @@ confidential-agent connect stop --ready-json ./connect-ready.json
 
 浏览器也可以访问 `http://127.0.0.1:18789/openclaw`。
 
+这里的 `connect start` 建立的是管理机到 OpenClaw `service.connect` 的 TNG/RATS-TLS 访问通道，远程证明方向是客户端验证服务端。它不接入 `cai-gateway` client，也不会映射或访问 MCP `mcp_ports`；访问鉴权仍由 OpenClaw 应用层 Gateway Token 完成。
+
 ## 9. 可选：接入另一个 AgentCard
 
 ```bash
@@ -151,6 +155,8 @@ confidential-agent peering apply
 ```
 
 如果对端 AgentCard 启用了 Sigstore keyless 签名，在 `a2a add` 时同时传入 `--signer-issuer` 和 `--signer-subject`。
+
+`a2a add` 只声明本服务出向调用 peer 的 desired state，并生成到 peer `service.connect` 的单向 RA 路径。反向调用需要对端单独配置 `a2a add` 和 peering；A2A 不访问 MCP `mcp_ports`。
 
 ## 10. 资源清理
 

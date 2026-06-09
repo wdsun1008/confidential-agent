@@ -177,7 +177,7 @@ flowchart TB
 
 ## 6. Mesh Bundle：跨实例可信寻址
 
-`MeshBundle` 是「所有 active 服务彼此都能信任地连到对方」的单一事实源。
+`MeshBundle` 是「所有 active 服务彼此都能信任地连到对方」的单一事实源。每个服务的 `ports` 是 Guest 内真实业务端口；`connect` 是 host connect / A2A 单向 RA 子集；`mesh_ports = ports - connect` 是双向 RA confidential-only 数据面。
 
 结构（来自 [`core/src/schema.rs`](../core/src/schema.rs)）：
 
@@ -200,13 +200,14 @@ flowchart TB
 2. 通过 `attestation-challenge-client inject-resource default/local-resources/cagent_mesh_bundle` 推到每台 Guest。
 3. Guest daemon [`sync_mesh`](../daemon/src/app.rs) 读到后：
    - 写 `/var/cache/confidential-agent/mesh-bundle.json`（持久化）；
-   - 写 `/etc/cai/service-directory.json`（包含对端所有 `service.ports`，每个端口标记 `mode=connect|mesh`，应用读这个文件做服务发现）；
-   - 渲染并写 `/etc/tng/config.json`，让本地 TNG 对本服务的 `connect` 端口只做服务端 attestation，对本服务的 `ports - connect` 端口同时验证调用方 attestation；访问对端 `connect` 端口时只验证对端服务端 attestation，访问对端 `ports - connect` 端口时同时携带本服务 attestation；
+   - 写 `/etc/cai/service-directory.json`（包含对端 `connect` 与 `mesh_ports`，每个端口标记 `mode=connect|mesh`，应用读这个文件做服务发现）；
+   - 渲染并写 `/etc/tng/config.json`，让本地 TNG 对本服务的 `connect` 端口只做服务端 attestation，对本服务的 `mesh_ports` 同时验证调用方 attestation；访问对端 `connect` 端口时只验证对端服务端 attestation，访问对端 `mesh_ports` 时同时携带本服务 attestation；
+   - 只为本服务 `mesh_ports` 配置 `cai-gateway`：raw mesh 端口只做 service identity，`service.mcp_ports` 端口才做 MCP parse/audit/virtual tools；
    - 如果配置 hash 变了，`systemctl restart trusted-network-gateway.service`。
 
 mesh-bundle 是按 active service 集合滚动生成的。新 service deploy 时 generation 会推进，已有 service 可能先收到包含新 RV 的 bundle，再等新 service 自身 ingress 完成重启；e2e 成功路径应等待 daemon `:8088/status` 的 `mesh_generation` 更新且 `mesh_ready=true` 后再断言双向 RA 生效。
 
-> 重点：`connect` 和 A2A 是单向 RA；同 state-dir confidential mesh 端口是双向 RA。应用需要通过端口拆分公开接入面和 confidential-only 能力。
+> 重点：`connect` 和 A2A 是单向 RA，不经过 gateway，也不携带 gateway client identity；同 state-dir `mesh_ports` 是双向 RA confidential-only。gateway 只覆盖 `mesh_ports`，其中只有 `service.mcp_ports` 做 MCP parse/audit/virtual tools。
 
 ---
 
@@ -289,8 +290,9 @@ sequenceDiagram
 | 8089 | confidential-agentd | A2A AgentCard discovery HTTP | `agent_card_8089_peer_<cidr>` |
 | 50000 | TNG control | 本地控制面 | (loopback only) |
 | 39000+i | TNG egress | 应用本地 capture/listen | (loopback only) |
-| `service.connect[]` | 用户应用 | host CLI / A2A / mesh service 经 RATS-TLS 接入，单向 RA | `connect_<port>_peer_<cidr>` + `mesh_<port>_peer_<cidr>` |
-| `service.ports[] - service.connect[]` | 用户应用 | confidential mesh 数据面，双向 RA | `mesh_<port>_peer_<cidr>` |
+| `service.connect[]` | 用户应用 | host connect / A2A 经 RATS-TLS 接入，单向 RA；不经过 gateway，不携带 gateway client identity | `connect_<port>_peer_<cidr>` |
+| `service.ports[] - service.connect[]` (`mesh_ports`) | 用户应用（gateway 透明覆盖） | confidential-only mesh 数据面，双向 RA；raw mesh 只做 service identity | `mesh_<port>_peer_<cidr>` |
+| `service.mcp_ports[]` | 用户应用（gateway 透明覆盖） | `mesh_ports` 子集；额外做 MCP parse/audit/virtual tools | 复用 `mesh_<port>_peer_<cidr>` |
 
 ---
 
