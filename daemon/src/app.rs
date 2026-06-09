@@ -1711,13 +1711,21 @@ fn service_directory(
             .filter(|route| route.service_id == *id)
             .map(|route| ServiceDirectoryPort {
                 address: "127.0.0.1".to_string(),
-                port: route.local_port,
+                port: if route.connect_mode {
+                    route.tng_ingress_port
+                } else {
+                    route.local_port
+                },
                 mode: Some(if route.connect_mode {
                     "connect".to_string()
                 } else {
                     "mesh".to_string()
                 }),
-                protocol: Some(route.protocol.clone()),
+                protocol: if route.connect_mode {
+                    None
+                } else {
+                    Some(route.protocol.clone())
+                },
             })
             .collect::<Vec<_>>();
         if ports.is_empty() {
@@ -1866,11 +1874,16 @@ fn gateway_config(
         .gateway_identity
         .as_ref()
         .context("bootstrap is missing gateway_identity")?;
+    let self_service = bundle
+        .services
+        .get(self_id)
+        .with_context(|| format!("service '{self_id}' is not present in mesh bundle"))?;
     let mut trusted_services = serde_json::Map::new();
     for (service_id, service) in bundle
         .services
         .iter()
         .filter(|(_, service)| service.phase == "active")
+        .filter(|(_, service)| !confidential_ports(&service.ports, &service.connect).is_empty())
     {
         let public_key = service.gateway_public_key.as_ref().with_context(|| {
             format!("active service '{service_id}' is missing gateway_public_key")
@@ -1885,6 +1898,7 @@ fn gateway_config(
     let client_routes = plan
         .peer_routes
         .iter()
+        .filter(|route| !route.connect_mode)
         .map(|route| {
             json!({
                 "listen_host": "127.0.0.1",
@@ -1896,9 +1910,13 @@ fn gateway_config(
             })
         })
         .collect::<Vec<_>>();
+    let self_mesh_ports = confidential_ports(&self_service.ports, &self_service.connect)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let server_routes = plan
         .self_routes
         .iter()
+        .filter(|route| self_mesh_ports.contains(&route.port))
         .map(|route| {
             json!({
                 "listen_host": "127.0.0.1",
@@ -1928,24 +1946,23 @@ fn gateway_config(
 }
 
 fn empty_gateway_config(bootstrap: &BootstrapConfig) -> Result<Value> {
-    let identity = bootstrap
-        .gateway_identity
-        .as_ref()
-        .context("bootstrap is missing gateway_identity")?;
-    Ok(json!({
+    let mut config = json!({
         "schema": "confidential-agent/gateway-config/v1",
         "service_id": bootstrap.service_id,
-        "identity": {
-            "public_key": identity.public_key,
-            "private_key": identity.private_key,
-        },
         "mesh_generation": 0,
         "token_ttl_sec": 60,
         "so_mark": DEFAULT_TNG_SO_MARK,
         "trusted_services": {},
         "client_routes": [],
         "server_routes": [],
-    }))
+    });
+    if let Some(identity) = bootstrap.gateway_identity.as_ref() {
+        config["identity"] = json!({
+            "public_key": identity.public_key,
+            "private_key": identity.private_key,
+        });
+    }
+    Ok(config)
 }
 
 fn sync_gateway_service(config: &Value, state: &mut DaemonState) -> Result<()> {

@@ -356,7 +356,11 @@ impl AgentSpec {
         validate_id("build.image_name", &self.build.image_name)?;
         validate_ports("service.ports", &self.service.ports)?;
         validate_connect_ports(&self.service.ports, &self.service.connect)?;
-        validate_mcp_ports(&self.service.ports, &self.service.mcp_ports)?;
+        validate_mcp_ports(
+            &self.service.ports,
+            &self.service.connect,
+            &self.service.mcp_ports,
+        )?;
         if self
             .build
             .base_image
@@ -531,8 +535,9 @@ fn validate_connect_ports(ports: &[u16], connect: &[u16]) -> Result<()> {
     Ok(())
 }
 
-fn validate_mcp_ports(ports: &[u16], mcp_ports: &[u16]) -> Result<()> {
+fn validate_mcp_ports(ports: &[u16], connect: &[u16], mcp_ports: &[u16]) -> Result<()> {
     let allowed = ports.iter().copied().collect::<BTreeSet<_>>();
+    let connect = connect.iter().copied().collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
     for port in mcp_ports {
         if *port == 0 {
@@ -540,6 +545,9 @@ fn validate_mcp_ports(ports: &[u16], mcp_ports: &[u16]) -> Result<()> {
         }
         if !allowed.contains(port) {
             bail!("service.mcp_ports port {port} must be listed in service.ports");
+        }
+        if connect.contains(port) {
+            bail!("service.mcp_ports port {port} must not be listed in service.connect");
         }
         if !seen.insert(*port) {
             bail!("service.mcp_ports contains duplicate port {port}");
@@ -1011,6 +1019,35 @@ resources: {}
         assert!(err
             .to_string()
             .contains("service.mcp_ports port 9090 must be listed in service.ports"));
+    }
+
+    #[test]
+    fn rejects_mcp_port_in_connect_ports() {
+        let yaml = r#"
+schema: confidential-agent/v1
+service:
+  id: app
+  ports: [8080]
+  connect: [8080]
+  mcp_ports: [8080]
+build:
+  image_name: app
+deploy:
+  provider: aliyun
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+  disk_gb: 200
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#;
+        let err = AgentSpec::from_yaml(yaml, Path::new("/project")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("service.mcp_ports port 8080 must not be listed in service.connect"));
     }
 
     #[test]

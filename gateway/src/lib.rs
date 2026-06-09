@@ -36,7 +36,8 @@ static JTI_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub struct GatewayConfig {
     pub schema: String,
     pub service_id: String,
-    pub identity: GatewayIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<GatewayIdentity>,
     #[serde(default)]
     pub mesh_generation: u64,
     #[serde(default)]
@@ -180,8 +181,12 @@ impl GatewayConfig {
         if self.service_id.trim().is_empty() {
             bail!("gateway service_id must not be empty");
         }
-        decode_key32(&self.identity.private_key, "identity.private_key")?;
-        decode_key32(&self.identity.public_key, "identity.public_key")?;
+        if let Some(identity) = &self.identity {
+            decode_key32(&identity.private_key, "identity.private_key")?;
+            decode_key32(&identity.public_key, "identity.public_key")?;
+        } else if !self.client_routes.is_empty() {
+            bail!("gateway identity is required when client_routes are configured");
+        }
         let mut listen_ports = BTreeSet::new();
         for route in &self.client_routes {
             if !listen_ports.insert(("client", route.listen_port)) {
@@ -389,7 +394,11 @@ fn sign_service_token(
     target_port: u16,
     now: u64,
 ) -> Result<String> {
-    let private_key = decode_key32(&config.identity.private_key, "identity.private_key")?;
+    let identity = config
+        .identity
+        .as_ref()
+        .context("gateway identity is required to sign service tokens")?;
+    let private_key = decode_key32(&identity.private_key, "identity.private_key")?;
     let signing_key = SigningKey::from_bytes(&private_key);
     let ttl = config.token_ttl_sec.unwrap_or(DEFAULT_TOKEN_TTL_SEC);
     let header = TokenHeader {
@@ -1525,10 +1534,10 @@ mod tests {
         GatewayConfig {
             schema: GATEWAY_CONFIG_SCHEMA.to_string(),
             service_id: "client".to_string(),
-            identity: GatewayIdentity {
+            identity: Some(GatewayIdentity {
                 public_key: public_key.clone(),
                 private_key,
-            },
+            }),
             mesh_generation: 1,
             token_ttl_sec: Some(60),
             so_mark: Some(DEFAULT_SO_MARK),
@@ -1554,6 +1563,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("audience"));
+    }
+
+    #[test]
+    fn empty_config_allows_missing_identity() {
+        let config = GatewayConfig {
+            schema: GATEWAY_CONFIG_SCHEMA.to_string(),
+            service_id: "connect-only".to_string(),
+            identity: None,
+            mesh_generation: 0,
+            token_ttl_sec: Some(60),
+            so_mark: Some(DEFAULT_SO_MARK),
+            trusted_services: BTreeMap::new(),
+            client_routes: Vec::new(),
+            server_routes: Vec::new(),
+        };
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn client_route_requires_identity() {
+        let config = GatewayConfig {
+            schema: GATEWAY_CONFIG_SCHEMA.to_string(),
+            service_id: "client".to_string(),
+            identity: None,
+            mesh_generation: 1,
+            token_ttl_sec: Some(60),
+            so_mark: Some(DEFAULT_SO_MARK),
+            trusted_services: BTreeMap::new(),
+            client_routes: vec![ClientRoute {
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: 31000,
+                tng_host: "127.0.0.1".to_string(),
+                tng_port: 32000,
+                target_service: "server".to_string(),
+                target_port: 8000,
+            }],
+            server_routes: Vec::new(),
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("identity"));
     }
 
     #[test]
@@ -1604,8 +1655,8 @@ mod tests {
 
     #[test]
     fn json_rpc_error_response_keeps_virtual_tool_errors_in_protocol() {
-        let response = json_rpc_error_response(json!(7), -32000, "attestation failed".to_string())
-            .unwrap();
+        let response =
+            json_rpc_error_response(json!(7), -32000, "attestation failed".to_string()).unwrap();
         let body: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert_eq!(response.status, 200);
@@ -1754,9 +1805,8 @@ mod tests {
             connection_close: true,
         };
 
-        let err =
-            forward_http_request_with_timeout(&route, &request, Duration::from_millis(25))
-                .unwrap_err();
+        let err = forward_http_request_with_timeout(&route, &request, Duration::from_millis(25))
+            .unwrap_err();
 
         handle.join().unwrap();
         let err = format!("{err:#}");
@@ -1770,7 +1820,8 @@ mod tests {
 
     #[test]
     fn inject_virtual_tools_handles_sse_tools_list_response() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
         let response = HttpResponse {
             status: 200,
             headers: vec![
