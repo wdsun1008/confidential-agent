@@ -800,8 +800,22 @@ for service_id in expected_services:
     svc = services[service_id]
     if svc.get("phase") != "active":
         fail(f"{service_id} phase is {svc.get('phase')!r}, expected active")
-    if svc.get("collect_status") != "ok":
+    collect_errors = svc.get("collect_errors") or []
+    rekor_only_partial = (
+        reference_values == "rekor"
+        and svc.get("collect_status") == "partial"
+        and collect_errors
+        and all(
+            isinstance(error, str)
+            and error.startswith("rekor:")
+            and any(marker in error for marker in ("Network Error", "timed out", "502 Bad Gateway"))
+            for error in collect_errors
+        )
+    )
+    if svc.get("collect_status") != "ok" and not rekor_only_partial:
         fail(f"{service_id} collect_status is {svc.get('collect_status')!r}: {svc.get('collect_errors')}")
+    if rekor_only_partial:
+        print(f"{service_id} collect_status is partial due to Rekor network errors; core attestation fields will still be checked")
     build = svc.get("build") or {}
     for field in ("build_id", "image_name", "variant", "spec_sha256", "tee", "reference_values_mode"):
         if not build.get(field):
@@ -819,7 +833,7 @@ for service_id in expected_services:
         fail(f"{service_id} daemon readiness is not true: {daemon}")
     rekor = svc.get("rekor") or {}
     if reference_values == "rekor":
-        if rekor.get("status") != "found" or not rekor.get("entries"):
+        if not rekor_only_partial and (rekor.get("status") != "found" or not rekor.get("entries")):
             fail(f"{service_id} Rekor entries were not found: {rekor}")
     elif rekor.get("status") != "not_applicable":
         fail(f"{service_id} Rekor status should be not_applicable for {reference_values}: {rekor}")

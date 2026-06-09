@@ -19,6 +19,36 @@ peer_local_port() {
     "jq -r --arg peer '$peer_id' '.services[\$peer].ports[0].port // empty' /etc/cai/service-directory.json"
 }
 
+ensure_peer_peering() {
+  local state_dir="$1"
+  local label="$2"
+  local cidr="$3"
+  local show_out="$WORK_DIR/peering-peer-$label.txt"
+  if ca_capture "$state_dir" "$show_out" "$WORK_DIR/peering-peer-$label.err" peering show "$label"; then
+    if grep -Fxq "cidr: $cidr" "$show_out"; then
+      record "- peer peering $label: already present for \`$cidr\`."
+      return 0
+    fi
+    ca_run "$state_dir" peering remove "$label"
+  fi
+  ca_run "$state_dir" peering add --role peer --cidr "$cidr" --label "$label"
+}
+
+ensure_a2a_peer() {
+  local state_dir="$1"
+  local alias="$2"
+  local url="$3"
+  local show_out="$WORK_DIR/a2a-peer-$alias.json"
+  if ca_capture "$state_dir" "$show_out" "$WORK_DIR/a2a-peer-$alias.err" a2a show "$alias"; then
+    if jq -e --arg url "$url" '.url == $url' "$show_out" >/dev/null; then
+      record "- A2A peer $alias: already present for \`$url\`."
+      return 0
+    fi
+    ca_run "$state_dir" a2a remove "$alias"
+  fi
+  ca_run "$state_dir" a2a add --alias "$alias" "$url"
+}
+
 run_from_card_probe() {
   local label="$1"
   local card_url="$2"
@@ -139,8 +169,8 @@ run_case() {
   dashscope_key="$(resolve_dashscope_key)"
   allowed_cidr="$(resolve_allowed_cidr)"
   cosign_key="$(resolve_cosign_key)"
-  alpha_token="$(openssl rand -hex 20)"
-  beta_token="$(openssl rand -hex 20)"
+  alpha_token="${E2E_ALPHA_TOKEN:-$(openssl rand -hex 20)}"
+  beta_token="${E2E_BETA_TOKEN:-$(openssl rand -hex 20)}"
   export DASHSCOPE_KEY="$dashscope_key"
   export COSIGN_KEY="$cosign_key"
   export ALPHA_TOKEN="$alpha_token"
@@ -182,13 +212,13 @@ run_case() {
   beta_key="$(state_value "$BETA_STATE_DIR" openclaw build.debug_ssh.private_key)"
   chmod 0600 "$alpha_key" "$beta_key"
 
-  ca_run "$ALPHA_STATE_DIR" peering add --role peer --cidr "$beta_ip/32" --label beta
-  ca_run "$BETA_STATE_DIR" peering add --role peer --cidr "$alpha_ip/32" --label alpha
+  ensure_peer_peering "$ALPHA_STATE_DIR" beta "$beta_ip/32"
+  ensure_peer_peering "$BETA_STATE_DIR" alpha "$alpha_ip/32"
   ca_run "$ALPHA_STATE_DIR" peering apply
   ca_run "$BETA_STATE_DIR" peering apply
 
-  ca_run "$ALPHA_STATE_DIR" a2a add --alias beta "http://$beta_ip:8089/.well-known/agent-card.json"
-  ca_run "$BETA_STATE_DIR" a2a add --alias alpha "http://$alpha_ip:8089/.well-known/agent-card.json"
+  ensure_a2a_peer "$ALPHA_STATE_DIR" beta "http://$beta_ip:8089/.well-known/agent-card.json"
+  ensure_a2a_peer "$BETA_STATE_DIR" alpha "http://$alpha_ip:8089/.well-known/agent-card.json"
 
   restart_openclaw_gateway alpha "$alpha_ip" "$alpha_key"
   restart_openclaw_gateway beta "$beta_ip" "$beta_key"

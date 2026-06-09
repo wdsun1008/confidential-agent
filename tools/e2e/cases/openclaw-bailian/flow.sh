@@ -43,7 +43,7 @@ run_case() {
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
-  build_host_binaries -p confidential-agent-cli
+  build_host_binaries -p confidential-agent-cli -p confidential-agentd -p cai-gateway -p cai-pep
 
   local dashscope_key allowed_cidr token cosign_key
   dashscope_key="$(resolve_dashscope_key)"
@@ -85,6 +85,9 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" == "1" ]]; then
     one_click_cmd+=(--skip-deploy)
   fi
+  if [[ "${E2E_SKIP_CARGO_BUILD:-0}" == "1" ]]; then
+    one_click_cmd+=(--skip-cargo-build)
+  fi
   if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" == "1" ]]; then
     one_click_cmd+=(--disable-pep)
   elif [[ "${E2E_RUN_TDX_SKILL_PROBE:-1}" == "1" ]]; then
@@ -94,11 +97,19 @@ run_case() {
   record_cmd "DASHSCOPE_API_KEY=<redacted> CA_GATEWAY_TOKEN=<redacted> $(cmd_string "${one_click_cmd[@]}")"
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$STATE_DIR" openclaw
+  local ca_agentd_bin ca_gateway_bin ca_pep_bin
+  ca_agentd_bin="${CA_AGENTD_BIN:-$ROOT_DIR/target/debug/confidential-agentd}"
+  ca_gateway_bin="${CA_GATEWAY_BIN:-$ROOT_DIR/target/debug/cai-gateway}"
+  ca_pep_bin="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
   if ! DASHSCOPE_API_KEY="$dashscope_key" \
       CA_GATEWAY_TOKEN="$token" \
       CA_CHAT_MESSAGE="$CHAT_MESSAGE" \
       CA_CHAT_EXPECT="$CHAT_EXPECT" \
       CA_CHAT_TIMEOUT_MS="$CHAT_TIMEOUT_MS" \
+      CA_BIN="$CA_BIN" \
+      CA_AGENTD_BIN="$ca_agentd_bin" \
+      CA_GATEWAY_BIN="$ca_gateway_bin" \
+      CA_PEP_BIN="$ca_pep_bin" \
       "${one_click_cmd[@]}" \
       >"$WORK_DIR/one-click.out" 2>"$WORK_DIR/one-click.err"; then
     record_file_as_block "one-click stdout:" "$WORK_DIR/one-click.out" text
@@ -109,7 +120,11 @@ run_case() {
   record_file_as_block "one-click stderr:" "$WORK_DIR/one-click.err" text
 
   validate_specs "$STATE_DIR" "$ONE_CLICK_WORK_DIR/openclaw/openclaw.yaml"
-  ca_run "$STATE_DIR" status --live | tee "$WORK_DIR/status-live.txt"
+  if ! ca_capture "$STATE_DIR" "$WORK_DIR/status-live.txt" "$WORK_DIR/status-live.err" status --live; then
+    record_file_as_block "Live status stdout:" "$WORK_DIR/status-live.txt" text
+    record_file_as_block "Live status stderr:" "$WORK_DIR/status-live.err" text
+    return 1
+  fi
   record_file_as_block "Live status output:" "$WORK_DIR/status-live.txt" text
   run_report_probe "$STATE_DIR" "$WORK_DIR/attestation-report.json" openclaw
 
