@@ -8,6 +8,7 @@ OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.5.7}"
 OPENCLAW_NODE_VERSION="${OPENCLAW_NODE_VERSION:-22.19.0}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
+install -d -m 1777 /tmp
 npm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
 
 ensure_openclaw_dirs() {
@@ -128,6 +129,7 @@ preinstall_openclaw_bundled_runtime_deps() {
                 exit 0
             fi
             if jq -e '(.devDependencies // {}) | to_entries | any(.value | type == "string" and startswith("workspace:"))' package.json >/dev/null; then
+                install -d -m 1777 /tmp
                 tmp_package="$(mktemp)"
                 jq 'del(.devDependencies)' package.json >"$tmp_package"
                 cp "$tmp_package" package.json

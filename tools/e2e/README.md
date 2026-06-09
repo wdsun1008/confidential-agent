@@ -17,15 +17,17 @@ Cases:
 
 | Case | What it covers |
 |---|---|
-| `openclaw-bailian` | One-click OpenClaw + Bailian 主路径，使用 `--skip-deps` 保持 e2e 与用户流程一致但不改本地开发机依赖；默认启用 PEP。 |
-| `openclaw-bailian-no-pep` | 同一条 one-click 主路径，额外传入 `--disable-pep`，验证不安装、不启用 cai-pep 的部署分支。 |
+| `openclaw-bailian` | One-click OpenClaw + Bailian 主路径，使用 `--skip-deps` 保持 e2e 与用户流程一致但不改本地开发机依赖；覆盖默认启用 PEP 的部署分支。 |
+| `openclaw-bailian-no-pep` | 同一条 one-click OpenClaw + Bailian 主路径，额外传入 `--disable-pep`，覆盖不安装、不启用 cai-pep 的部署分支。 |
 | `openclaw-a2a` | Legacy two-OpenClaw A2A bridge coverage. |
 | `a2a-data-collab` | Two real LLM-backed agents collaborate over A2A: Analyst delegates a natural-language aggregate data task to a Data Owner and verifies no raw private rows leak. |
 | `openclaw-vllm` | GPU TEE OpenClaw + local vLLM readiness and chat. |
-| `cmaas` | MCP 主测试：自然语言 agent 调用 memory MCP tools，验证 gateway 审计链、虚拟 MCP 审计 tools、TEE evidence 绑定、非 TEE baseline rejection 和 snapshot confidentiality。 |
+| `cmaas` | CMaaS 是主 MCP E2E：自然语言 agent 经 gateway 调用 memory MCP tools，验证 MCP audit 链、虚拟 MCP audit tools、TEE evidence 绑定、非 TEE baseline rejection 和 snapshot confidentiality；不通过 host connect 直连 MCP `mcp_ports`。 |
 | `cli-command-matrix` | Local CLI branch matrix plus an optional real-cloud publish/deploy lane when `E2E_MATRIX_REAL_CLOUD=1`. |
 
-The runner intentionally mirrors the user command flow:
+OpenClaw + Bailian 的主路径必须同时覆盖 PEP 和 no-PEP 两个分支。CMaaS 承担 MCP 端到端主覆盖，probe 通过 agent/gateway 入口触发 MCP 工具调用，不把 MCP 端口作为 host connect 的直接访问目标。
+
+Most E2E cases intentionally mirror the user command flow:
 
 ```bash
 confidential-agent spec validate --spec <case-spec>
@@ -40,6 +42,8 @@ confidential-agent connect stop --ready-json <ready-json>
 
 Business peers are added only after deployment, followed by `confidential-agent peering apply`.
 The build phase must not read `peerings.yaml` and must not render Shelter `deploy` or security group config.
+
+CMaaS is the exception to the host `connect start` probe pattern. Its MCP port is `mcp_ports ⊆ mesh_ports`, so the E2E probe runs from the peer agent inside the confidential mesh and also asserts that `connect --render-only --service cmaas` fails. The test must not expose or probe MCP `mcp_ports` through host connect.
 
 The scripts do not unset proxy variables internally. On the current development host, OpenAI-facing tools may need a proxy, but mkosi/DNF access to `yum.tbsite.net` and deploy should run without proxy. Use the outer `env -u ...` wrapper shown above for full E2E runs.
 
