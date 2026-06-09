@@ -440,6 +440,15 @@ run_case() {
   grep -E '^tng_hash=' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -Fx 'disabled' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
 
+  if ca_capture "$STATE_DIR" "$WORK_DIR/cmaas-connect-render.json" "$WORK_DIR/cmaas-connect-render.err" connect --render-only --service cmaas; then
+    record_file_as_block "Unexpected CMaaS connect render output:" "$WORK_DIR/cmaas-connect-render.json" json
+    echo "CMaaS MCP port unexpectedly appeared in host connect render output" >&2
+    return 1
+  fi
+  record_file_as_block "CMaaS connect render rejection:" "$WORK_DIR/cmaas-connect-render.err" text
+  assert_file_contains "$WORK_DIR/cmaas-connect-render.err" "service 'cmaas' does not expose any service.connect ports" "CMaaS connect exclusion"
+  record "- CMaaS MCP port is not exposed through host connect."
+
   local marker observation audit_before audit_after audit_path
   marker="cmaas_$(openssl rand -hex 8)"
   observation="penicillin_${marker}"

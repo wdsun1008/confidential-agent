@@ -111,6 +111,98 @@ if signatures:
 PY
 }
 
+fetch_data_collab_guest_diagnostics() {
+  local label="$1"
+  local host="$2"
+  local key="$3"
+  local output="$WORK_DIR/a2a-data-collab-$label-diagnostics.txt"
+
+  record_cmd "ssh -i <debug_ssh> root@$host '<a2a data collaboration diagnostics>'"
+  ssh_guest "$key" "$host" "set +e
+echo '--- health ---'
+curl -fsS http://127.0.0.1:18789/health || true
+echo
+echo '--- service status ---'
+systemctl --no-pager -l status cai-a2a-llm-agent.service || true
+echo
+echo '--- service journal ---'
+journalctl -u cai-a2a-llm-agent.service --no-pager -n 200 || true
+echo
+echo '--- platform services ---'
+systemctl --no-pager -l status trusted-network-gateway.service cai-gateway.service confidential-agentd.service || true
+echo
+echo '--- platform journal ---'
+journalctl -u trusted-network-gateway.service -u cai-gateway.service -u confidential-agentd.service --no-pager -n 300 || true
+echo
+echo '--- service directory ---'
+cat /etc/cai/service-directory.json 2>/dev/null || true
+echo
+echo '--- tng config ---'
+cat /etc/tng/config.json 2>/dev/null || true
+echo
+echo '--- gateway config redacted ---'
+python3.11 - <<'PY' || true
+import json
+from pathlib import Path
+path = Path('/etc/cai/gateway.json')
+if path.exists():
+    data = json.loads(path.read_text())
+    if isinstance(data.get('identity'), dict):
+        data['identity']['private_key'] = '<redacted>'
+    print(json.dumps(data, indent=2, sort_keys=True))
+PY
+echo
+echo '--- listening tcp sockets ---'
+ss -ltnp || true
+echo
+echo '--- nat rules ---'
+iptables -t nat -S 2>/dev/null | grep -E 'TNG|CAI|18789|18000|39000|39400' || true
+echo
+echo '--- audit tail ---'
+tail -n 200 /var/log/cai-a2a-data-collab.jsonl 2>/dev/null || true" >"$output" 2>&1 || true
+  record_file_as_block "$label A2A data collaboration guest diagnostics:" "$output" text
+}
+
+assert_a2a_connect_boundary() {
+  local label="$1"
+  local host="$2"
+  local key="$3"
+  local peer="$4"
+  local output="$WORK_DIR/a2a-data-collab-$label-connect-boundary.json"
+  local remote_peer
+
+  wait_for_ssh "$host" "$key" 300
+  record_cmd "ssh -i <debug_ssh> root@$host '<assert A2A peer uses connect semantics>'"
+  remote_peer="$(printf '%q' "$peer")"
+  ssh_guest "$key" "$host" "CAI_PEER=$remote_peer node -e '
+const fs = require(\"fs\");
+
+const peer = process.env.CAI_PEER;
+const directory = JSON.parse(fs.readFileSync(\"/etc/cai/service-directory.json\", \"utf8\"));
+const ports = ((directory.services || {})[peer] || {}).ports || [];
+if (ports.length === 0) {
+  throw new Error(\"missing service-directory ports for peer \" + peer);
+}
+const badPorts = ports.filter((port) => port.mode !== \"connect\" || port.protocol != null);
+if (badPorts.length > 0) {
+  throw new Error(\"A2A peer \" + peer + \" did not use pure connect ports: \" + JSON.stringify(badPorts));
+}
+
+let gateway = {};
+if (fs.existsSync(\"/etc/cai/gateway.json\")) {
+  gateway = JSON.parse(fs.readFileSync(\"/etc/cai/gateway.json\", \"utf8\"));
+}
+
+console.log(JSON.stringify({
+  peer,
+  ports,
+  gateway_client_routes: (gateway.client_routes || []).length,
+  gateway_server_routes: (gateway.server_routes || []).length,
+}, null, 2));
+' " >"$output"
+  record_file_as_block "$label A2A connect boundary:" "$output" json
+}
+
 run_case() {
   INSTANCE_TYPE="$DEFAULT_INSTANCE_TYPE"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/a2a-data-collab-$E2E_RUN_ID}"
@@ -193,12 +285,28 @@ run_case() {
   wait_for_status_service_ready "$ANALYST_STATE_DIR" analyst-agent 900
   wait_for_status_service_ready "$DATA_OWNER_STATE_DIR" data-owner-agent 900
 
-  local analyst_ip data_owner_ip
+  local analyst_ip data_owner_ip analyst_private_ip data_owner_private_ip
   analyst_ip="$(state_value "$ANALYST_STATE_DIR" analyst-agent deploy.public_ip)"
   data_owner_ip="$(state_value "$DATA_OWNER_STATE_DIR" data-owner-agent deploy.public_ip)"
+  analyst_private_ip="$(state_value "$ANALYST_STATE_DIR" analyst-agent deploy.private_ip)"
+  data_owner_private_ip="$(state_value "$DATA_OWNER_STATE_DIR" data-owner-agent deploy.private_ip)"
+  if [[ -z "$analyst_ip" || -z "$data_owner_ip" || -z "$analyst_private_ip" || -z "$data_owner_private_ip" ]]; then
+    echo "a2a-data-collab requires both deployed services to report public_ip and private_ip" >&2
+    return 1
+  fi
+  local analyst_key data_owner_key
+  analyst_key="$(state_value "$ANALYST_STATE_DIR" analyst-agent build.debug_ssh.private_key)"
+  data_owner_key="$(state_value "$DATA_OWNER_STATE_DIR" data-owner-agent build.debug_ssh.private_key)"
+  chmod 0600 "$analyst_key" "$data_owner_key"
 
-  ca_run "$ANALYST_STATE_DIR" peering add --role peer --cidr "$data_owner_ip/32" --label data-owner
-  ca_run "$DATA_OWNER_STATE_DIR" peering add --role peer --cidr "$analyst_ip/32" --label analyst
+  ca_run "$ANALYST_STATE_DIR" peering add --role peer --cidr "$data_owner_ip/32" --label data-owner-public
+  if [[ "$data_owner_private_ip" != "$data_owner_ip" ]]; then
+    ca_run "$ANALYST_STATE_DIR" peering add --role peer --cidr "$data_owner_private_ip/32" --label data-owner-private
+  fi
+  ca_run "$DATA_OWNER_STATE_DIR" peering add --role peer --cidr "$analyst_ip/32" --label analyst-public
+  if [[ "$analyst_private_ip" != "$analyst_ip" ]]; then
+    ca_run "$DATA_OWNER_STATE_DIR" peering add --role peer --cidr "$analyst_private_ip/32" --label analyst-private
+  fi
   ca_run "$ANALYST_STATE_DIR" peering apply
   ca_run "$DATA_OWNER_STATE_DIR" peering apply
 
@@ -251,6 +359,8 @@ run_case() {
   wait_for_status_service_ready "$ANALYST_STATE_DIR" analyst-agent 900
   wait_for_a2a_peer_state "$analyst_ip" data-owner ok "" 300
   wait_for_a2a_peer_state "$data_owner_ip" analyst ok "" 300
+  assert_a2a_connect_boundary analyst "$analyst_ip" "$analyst_key" data-owner
+  assert_a2a_connect_boundary data-owner "$data_owner_ip" "$data_owner_key" analyst
   ca_run "$ANALYST_STATE_DIR" status --live | tee "$WORK_DIR/status-live.txt"
   record_file_as_block "Analyst live status output:" "$WORK_DIR/status-live.txt" text
 
@@ -258,11 +368,17 @@ run_case() {
   connect_port="$(start_connect_until_http_ready "$ANALYST_STATE_DIR" analyst-agent /health 4 180 --service analyst-agent)"
   record "Connect mapped Analyst Agent to \`127.0.0.1:$connect_port\`."
 
-  node "$ROOT_DIR/tools/e2e/probes/a2a-data-collab-probe.mjs" \
+  if ! node "$ROOT_DIR/tools/e2e/probes/a2a-data-collab-probe.mjs" \
     --url "http://127.0.0.1:$connect_port/a2a" \
     --message "$TASK_MESSAGE" \
     --timeout-ms "$CHAT_TIMEOUT_MS" \
-    >"$WORK_DIR/a2a-data-collab-result.json"
+    >"$WORK_DIR/a2a-data-collab-result.json" \
+    2>"$WORK_DIR/a2a-data-collab-probe.err"; then
+    record_file_as_block "A2A data collaboration probe stderr:" "$WORK_DIR/a2a-data-collab-probe.err" text
+    fetch_data_collab_guest_diagnostics analyst "$analyst_ip" "$analyst_key"
+    fetch_data_collab_guest_diagnostics data-owner "$data_owner_ip" "$data_owner_key"
+    return 1
+  fi
   record_file_as_block "A2A data collaboration result:" "$WORK_DIR/a2a-data-collab-result.json" json
 
   run_report_probe "$ANALYST_STATE_DIR" "$WORK_DIR/analyst-attestation-report.json" analyst-agent data-owner

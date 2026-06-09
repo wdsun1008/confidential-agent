@@ -59,9 +59,18 @@ async function postJson(url, headers, body, timeoutMs = 180000) {
     }
     if (!res.ok) throw new Error(`${url} returned HTTP ${res.status}: ${JSON.stringify(parsed)}`);
     return parsed;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`${url} request aborted after ${timeoutMs}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function callLlm(config, messages, purpose) {
@@ -69,19 +78,24 @@ async function callLlm(config, messages, purpose) {
   const model = String(config.model || "qwen3.7-max");
   const apiKey = String(config.apiKey || "").trim();
   if (!apiKey) throw new Error("apiKey is required for real LLM inference");
-  const response = await postJson(
-    `${baseUrl}/chat/completions`,
-    { authorization: `Bearer ${apiKey}` },
-    {
-      model,
-      messages,
-      temperature: 0.1,
-      max_tokens: 1200,
-    },
-    Number(config.llmTimeoutMs || 180000),
-  );
+  let response;
+  try {
+    response = await postJson(
+      `${baseUrl}/chat/completions`,
+      { authorization: `Bearer ${apiKey}` },
+      {
+        model,
+        messages,
+        temperature: 0.1,
+        max_tokens: 1200,
+      },
+      Number(config.llmTimeoutMs || 180000),
+    );
+  } catch (error) {
+    throw new Error(`LLM call failed (${purpose}, model ${model}): ${errorMessage(error)}`);
+  }
   const content = String(response?.choices?.[0]?.message?.content ?? "").trim();
-  if (!content) throw new Error("LLM response content is empty");
+  if (!content) throw new Error(`LLM response content is empty (${purpose}, model ${model})`);
   writeAudit(config, {
     event: "llm_call",
     purpose,
@@ -228,7 +242,12 @@ async function callPeerA2a(config, peerAlias, message) {
       },
     },
   };
-  const response = await postJson(url, {}, body, Number(config.peerTimeoutMs || 240000));
+  let response;
+  try {
+    response = await postJson(url, {}, body, Number(config.peerTimeoutMs || 240000));
+  } catch (error) {
+    throw new Error(`peer A2A call failed (${peerAlias} at ${url}): ${errorMessage(error)}`);
+  }
   if (response?.error) throw new Error(`peer returned JSON-RPC error: ${JSON.stringify(response.error)}`);
   if (!response?.result) throw new Error(`peer returned no result: ${JSON.stringify(response)}`);
   writeAudit(config, { event: "peer_a2a_call", peer: peerAlias, url });
