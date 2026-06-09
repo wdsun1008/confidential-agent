@@ -62,9 +62,9 @@ mod schema_tests {
                 published_image_id: None,
             },
             service: LocalServiceNetwork {
-                ports: vec![18789],
+                ports: vec![18789, 18800],
                 connect: vec![18789],
-                mcp_ports: vec![18789],
+                mcp_ports: vec![18800],
             },
             gateway_identity: Some(LocalGatewayIdentity {
                 public_key: "pub".to_string(),
@@ -78,9 +78,9 @@ mod schema_tests {
         let encoded = serde_json::to_string(&state).unwrap();
         let decoded: LocalServiceState = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(decoded.service.ports, vec![18789]);
+        assert_eq!(decoded.service.ports, vec![18789, 18800]);
         assert_eq!(decoded.service.connect, vec![18789]);
-        assert_eq!(decoded.service.mcp_ports, vec![18789]);
+        assert_eq!(decoded.service.mcp_ports, vec![18800]);
         assert_eq!(decoded.gateway_identity.unwrap().public_key, "pub");
         assert_eq!(decoded.deploy.private_mesh_ip(), Some("10.0.0.8"));
         assert_eq!(
@@ -101,9 +101,9 @@ mod schema_tests {
                     phase: "active".to_string(),
                     private_ip: Some("10.0.0.7".to_string()),
                     public_ip: Some("1.2.3.4".to_string()),
-                    ports: vec![18789],
+                    ports: vec![18789, 18800],
                     connect: vec![18789],
-                    mcp_ports: vec![18789],
+                    mcp_ports: vec![18800],
                     gateway_public_key: Some("pub".to_string()),
                 },
             )]),
@@ -114,9 +114,9 @@ mod schema_tests {
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: MeshBundle = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(decoded.services["svc-a"].ports, vec![18789]);
+        assert_eq!(decoded.services["svc-a"].ports, vec![18789, 18800]);
         assert_eq!(decoded.services["svc-a"].connect, vec![18789]);
-        assert_eq!(decoded.services["svc-a"].mcp_ports, vec![18789]);
+        assert_eq!(decoded.services["svc-a"].mcp_ports, vec![18800]);
         assert_eq!(
             decoded.services["svc-a"].gateway_public_key.as_deref(),
             Some("pub")
@@ -139,9 +139,9 @@ mod schema_tests {
             generation: 3,
             service_id: "svc-a".to_string(),
             mode: "challenge".to_string(),
-            ports: vec![18789],
+            ports: vec![18789, 18800],
             connect: vec![18789],
-            mcp_ports: vec![18789],
+            mcp_ports: vec![18800],
             gateway_identity: Some(GatewayIdentity {
                 public_key: "pub".to_string(),
                 private_key: "priv".to_string(),

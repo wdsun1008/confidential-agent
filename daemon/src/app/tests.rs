@@ -366,12 +366,15 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     assert!(directory["services"].get("old").is_none());
     assert_eq!(
         directory["services"]["connect-only"]["ports"][0]["port"],
-        4001
+        39400
     );
     assert_eq!(
         directory["services"]["connect-only"]["ports"][0]["mode"],
         "connect"
     );
+    assert!(directory["services"]["connect-only"]["ports"][0]
+        .get("protocol")
+        .is_none());
     assert_eq!(
         directory["services"]["peer"]["ports"]
             .as_array()
@@ -382,8 +385,11 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     assert_eq!(directory["services"]["peer"]["ports"][0]["port"], 3001);
     assert_eq!(directory["services"]["peer"]["ports"][0]["mode"], "mesh");
     assert_eq!(directory["services"]["peer"]["ports"][0]["protocol"], "mcp");
-    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 3002);
+    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 39402);
     assert_eq!(directory["services"]["peer"]["ports"][1]["mode"], "connect");
+    assert!(directory["services"]["peer"]["ports"][1]
+        .get("protocol")
+        .is_none());
 }
 
 #[test]
@@ -798,6 +804,82 @@ fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
 }
 
 #[test]
+fn gateway_config_routes_only_confidential_mesh_ports() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": "confidential-agent/mesh-bundle/v1",
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "self": {
+                "phase": "active",
+                "private_ip": "10.0.1.10",
+                "public_ip": "47.95.242.63",
+                "ports": [18789, 18800, 18801],
+                "connect": [18789],
+                "mcp_ports": [18801],
+                "gateway_public_key": "self-pub"
+            },
+            "peer": {
+                "phase": "active",
+                "private_ip": "10.0.1.11",
+                "public_ip": "39.105.93.168",
+                "ports": [3001, 3002, 3003],
+                "connect": [3002],
+                "mcp_ports": [3001],
+                "gateway_public_key": "peer-pub"
+            },
+            "connect-only": {
+                "phase": "active",
+                "private_ip": "10.0.1.12",
+                "public_ip": "39.105.93.169",
+                "ports": [4001],
+                "connect": [4001]
+            }
+        },
+        "reference_values": {
+            "peer": {"measurement.uki.SHA-384": ["abc123"]},
+            "connect-only": {"measurement.uki.SHA-384": ["def456"]}
+        },
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+    let bootstrap = test_bootstrap_config("self");
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+
+    let config = gateway_config(&bundle, "self", &bootstrap, &plan).unwrap();
+
+    let server_routes = config["server_routes"].as_array().unwrap();
+    assert_eq!(server_routes.len(), 2);
+    assert_eq!(server_routes[0]["upstream_port"], 18800);
+    assert_eq!(server_routes[0]["protocol"], "raw");
+    assert_eq!(server_routes[1]["upstream_port"], 18801);
+    assert_eq!(server_routes[1]["protocol"], "mcp");
+
+    let client_routes = config["client_routes"].as_array().unwrap();
+    assert_eq!(client_routes.len(), 2);
+    assert_eq!(client_routes[0]["listen_port"], 3001);
+    assert_eq!(client_routes[0]["target_port"], 3001);
+    assert_eq!(client_routes[0]["tng_port"], 39401);
+    assert_eq!(client_routes[1]["listen_port"], 3003);
+    assert_eq!(client_routes[1]["target_port"], 3003);
+    assert_eq!(client_routes[1]["tng_port"], 39403);
+    assert_eq!(config["trusted_services"]["peer"]["public_key"], "peer-pub");
+    assert!(config["trusted_services"]["connect-only"].is_null());
+}
+
+#[test]
+fn empty_gateway_config_allows_missing_gateway_identity() {
+    let mut bootstrap = test_bootstrap_config("connect-only");
+    bootstrap.gateway_identity = None;
+
+    let config = empty_gateway_config(&bootstrap).unwrap();
+
+    assert!(config.get("identity").is_none());
+    assert!(config["client_routes"].as_array().unwrap().is_empty());
+    assert!(config["server_routes"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn resource_apply_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
@@ -1209,8 +1291,9 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
     let cdh_root = temp.path().join("cdh");
     let args = test_run_args(cdh_root.clone());
     let mut bootstrap = test_bootstrap_config("openclaw");
-    bootstrap.ports = vec![18789];
+    bootstrap.ports = vec![18789, 18800];
     bootstrap.connect = vec![18789];
+    bootstrap.mcp_ports = vec![18800];
     let mut state = DaemonState::default();
     assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
     write_json_fixture(
@@ -1224,8 +1307,9 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
                     "phase": "active",
                     "private_ip": "10.0.0.10",
                     "public_ip": "127.0.0.1",
-                    "ports": [18789],
+                    "ports": [18789, 18800],
                     "connect": [18789],
+                    "mcp_ports": [18800],
                     "gateway_public_key": "openclaw-pub"
                 },
                 "mcp": {
@@ -1233,7 +1317,7 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
                     "private_ip": "10.0.0.11",
                     "public_ip": "127.0.0.1",
                     "ports": [3001],
-                    "connect": [3001],
+                    "connect": [],
                     "mcp_ports": [3001],
                     "gateway_public_key": "mcp-pub"
                 }
@@ -1254,6 +1338,12 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
     );
     assert_eq!(config["add_egress"][0]["netfilter"]["listen_port"], 39000);
     assert_eq!(config["add_egress"][0]["netfilter"]["so_mark"], 565);
+    assert!(config["add_egress"][0].get("verify").is_none());
+    assert_eq!(
+        config["add_egress"][1]["netfilter"]["capture_dst"]["port"],
+        18800
+    );
+    assert_eq!(config["add_egress"][1]["verify"]["as_type"], "builtin");
     assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 39400);
     assert_eq!(
         config["add_ingress"][0]["mapping"]["out"]["host"],
@@ -1269,7 +1359,7 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
     assert_eq!(directory.services["mcp"].ports[0].port, 3001);
     assert_eq!(
         directory.services["mcp"].ports[0].mode.as_deref(),
-        Some("connect")
+        Some("mesh")
     );
     assert_eq!(
         directory.services["mcp"].ports[0].protocol.as_deref(),
@@ -1285,8 +1375,11 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
         0o600
     );
     assert_eq!(gateway["service_id"], "openclaw");
-    assert_eq!(gateway["server_routes"][0]["listen_port"], 39200);
-    assert_eq!(gateway["server_routes"][0]["upstream_port"], 18789);
+    assert_eq!(gateway["server_routes"].as_array().unwrap().len(), 1);
+    assert_eq!(gateway["server_routes"][0]["listen_port"], 39201);
+    assert_eq!(gateway["server_routes"][0]["upstream_port"], 18800);
+    assert_eq!(gateway["server_routes"][0]["protocol"], "mcp");
+    assert_eq!(gateway["client_routes"].as_array().unwrap().len(), 1);
     assert_eq!(gateway["client_routes"][0]["listen_port"], 3001);
     assert_eq!(gateway["client_routes"][0]["tng_port"], 39400);
     assert_eq!(gateway["trusted_services"]["mcp"]["public_key"], "mcp-pub");
