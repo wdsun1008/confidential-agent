@@ -14,6 +14,7 @@ const TEST_MESH_RESOURCE: &str = "default/local-resources/cagent_mesh_bundle";
 const TEST_A2A_BUNDLE_RESOURCE: &str = "default/local-resources/cagent_a2a_bundle";
 const DAEMON_ENV_VARS: &[&str] = &[
     "CA_TNG_CONFIG_PATH",
+    "CA_GATEWAY_CONFIG_PATH",
     "CA_SERVICE_DIRECTORY_PATH",
     "CA_DAEMON_STATUS_PATH",
     "CA_AGENT_CARD_PATH",
@@ -308,6 +309,95 @@ fn overdue_a2a_refresh_timeout_is_throttled() {
         Some(Duration::from_secs(A2A_OVERDUE_REFRESH_RETRY_SEC))
     );
     assert_eq!(next_a2a_refresh_timeout(&state, false), None);
+}
+
+#[test]
+fn active_bootstrap_polls_even_without_a2a_peers() {
+    let state = DaemonState::default();
+
+    assert_eq!(next_resource_refresh_timeout(&state, false), None);
+    assert_eq!(
+        next_resource_refresh_timeout(&state, true),
+        Some(Duration::from_secs(ACTIVE_BOOTSTRAP_IDLE_POLL_SEC))
+    );
+}
+
+#[test]
+fn active_bootstrap_uses_earlier_a2a_refresh_timeout() {
+    let mut state = DaemonState::default();
+    let now = now_unix();
+    state.a2a_cache.insert(
+        "peer".to_string(),
+        A2aCachedPeer {
+            url: "http://127.0.0.1/.well-known/agent-card.json".to_string(),
+            alias: None,
+            id: None,
+            ports: Vec::new(),
+            public_ip: None,
+            reference_values: json!({}),
+            fetched_at_unix: now.saturating_sub(120),
+            next_refresh_unix: now.saturating_sub(1),
+            fingerprint: "fingerprint".to_string(),
+            error: None,
+        },
+    );
+
+    assert_eq!(
+        next_resource_refresh_timeout(&state, true),
+        Some(Duration::from_secs(A2A_OVERDUE_REFRESH_RETRY_SEC))
+    );
+}
+
+#[test]
+fn active_bootstrap_uses_future_a2a_refresh_before_idle_poll() {
+    let mut state = DaemonState::default();
+    let now = now_unix();
+    state.a2a_cache.insert(
+        "peer".to_string(),
+        A2aCachedPeer {
+            url: "http://127.0.0.1/.well-known/agent-card.json".to_string(),
+            alias: None,
+            id: None,
+            ports: Vec::new(),
+            public_ip: None,
+            reference_values: json!({}),
+            fetched_at_unix: now,
+            next_refresh_unix: now + 15,
+            fingerprint: "fingerprint".to_string(),
+            error: None,
+        },
+    );
+
+    assert_eq!(
+        next_resource_refresh_timeout(&state, true),
+        Some(Duration::from_secs(15))
+    );
+}
+
+#[test]
+fn active_bootstrap_caps_late_a2a_refresh_to_idle_poll() {
+    let mut state = DaemonState::default();
+    let now = now_unix();
+    state.a2a_cache.insert(
+        "peer".to_string(),
+        A2aCachedPeer {
+            url: "http://127.0.0.1/.well-known/agent-card.json".to_string(),
+            alias: None,
+            id: None,
+            ports: Vec::new(),
+            public_ip: None,
+            reference_values: json!({}),
+            fetched_at_unix: now,
+            next_refresh_unix: now + ACTIVE_BOOTSTRAP_IDLE_POLL_SEC + 60,
+            fingerprint: "fingerprint".to_string(),
+            error: None,
+        },
+    );
+
+    assert_eq!(
+        next_resource_refresh_timeout(&state, true),
+        Some(Duration::from_secs(ACTIVE_BOOTSTRAP_IDLE_POLL_SEC))
+    );
 }
 
 #[test]
@@ -1387,6 +1477,468 @@ fn no_tee_sync_mesh_after_bootstrap_writes_config_directory_and_status() {
     let status = read_status_file(&env);
     assert!(matches!(status.phase.as_str(), "starting-mesh" | "running"));
     assert_eq!(status.mesh_generation, 42);
+}
+
+#[test]
+fn sync_mesh_restarts_tng_when_config_unchanged_but_service_inactive() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    bootstrap.connect = Vec::new();
+    let mut state = DaemonState::default();
+    let _control = std::net::TcpListener::bind(("127.0.0.1", TNG_CONTROL_PORT)).unwrap();
+    let _gateway = std::net::TcpListener::bind(("127.0.0.1", GATEWAY_SERVER_PORT_BASE)).unwrap();
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                }
+            },
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }),
+    );
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    let mesh_fingerprint = state.mesh_fingerprint.clone();
+    let gateway_fingerprint = state.gateway_fingerprint.clone();
+    state.mesh_last_restart_unix = None;
+
+    let fake_systemctl = temp.path().join("systemctl");
+    let systemctl_log = temp.path().join("systemctl.log");
+    let active_marker = temp.path().join("tng.active");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet trusted-network-gateway.service') [ -f '{}' ] && exit 0 || exit 3 ;;\n  'restart trusted-network-gateway.service') touch '{}'; exit 0 ;;\n  'daemon-reload') exit 0 ;;\n  'reset-failed trusted-network-gateway.service') exit 0 ;;\nesac\nexit 0\n",
+            systemctl_log.display(),
+            active_marker.display(),
+            active_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env._guard.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env._guard.remove("CA_SKIP_SYSTEMCTL");
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    assert_eq!(state.mesh_fingerprint, mesh_fingerprint);
+    assert_eq!(state.gateway_fingerprint, gateway_fingerprint);
+    let log = fs::read_to_string(systemctl_log).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        vec![
+            "is-active --quiet cai-gateway.service",
+            "is-active --quiet trusted-network-gateway.service",
+            "daemon-reload",
+            "reset-failed trusted-network-gateway.service",
+            "restart trusted-network-gateway.service",
+            "is-active --quiet trusted-network-gateway.service",
+        ]
+    );
+}
+
+#[test]
+fn sync_mesh_throttles_tng_restart_when_service_stays_inactive() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    let mut state = DaemonState::default();
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                }
+            },
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }),
+    );
+    let fake_systemctl = temp.path().join("systemctl");
+    let systemctl_log = temp.path().join("systemctl.log");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet trusted-network-gateway.service') exit 3 ;;\n  'restart trusted-network-gateway.service') exit 0 ;;\n  'is-active --quiet cai-gateway.service') exit 0 ;;\n  'daemon-reload') exit 0 ;;\n  'reset-failed '*) exit 0 ;;\n  'restart '*) exit 0 ;;\nesac\nexit 0\n",
+            systemctl_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env._guard.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env._guard.remove("CA_SKIP_SYSTEMCTL");
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let log = fs::read_to_string(systemctl_log).unwrap();
+    let tng_restarts = log
+        .lines()
+        .filter(|line| *line == "restart trusted-network-gateway.service")
+        .count();
+    assert_eq!(tng_restarts, 1);
+    assert!(state.mesh_fingerprint.is_none());
+}
+
+#[test]
+fn sync_mesh_clears_tng_config_when_mesh_and_a2a_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    let mut state = DaemonState::default();
+    let mesh_path = cdh_root.join(TEST_MESH_RESOURCE);
+    write_json_fixture(
+        &mesh_path,
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                },
+                "remote": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.20",
+                    "public_ip": "127.0.0.1",
+                    "ports": [3001],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "remote-pub"
+                }
+            },
+            "reference_values": {
+                "remote": {"measurement.uki.SHA-384": ["remote-rv"]}
+            },
+            "rekor_reference_values": {}
+        }),
+    );
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let mesh_config: Value = read_json_file(&env.tng_config);
+    assert!(!mesh_config["add_ingress"].as_array().unwrap().is_empty());
+    fs::remove_file(&mesh_path).unwrap();
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let cleared_config: Value = read_json_file(&env.tng_config);
+    assert!(cleared_config["add_ingress"].as_array().unwrap().is_empty());
+    assert!(cleared_config["add_egress"].as_array().unwrap().is_empty());
+    let directory: ServiceDirectory = read_json_file(&env.service_directory);
+    assert!(directory.services.is_empty());
+    let status = read_status_file(&env);
+    assert_eq!(status.phase, "waiting-mesh");
+    assert_eq!(status.mesh_generation, 0);
+    assert_eq!(state.mesh_generation, 0);
+}
+
+#[test]
+fn sync_mesh_waits_for_tng_ports_without_flapping_active_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    let mut state = DaemonState::default();
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                }
+            },
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }),
+    );
+    let fake_systemctl = temp.path().join("systemctl");
+    let systemctl_log = temp.path().join("systemctl.log");
+    let active_marker = temp.path().join("tng.active");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet trusted-network-gateway.service') [ -f '{}' ] && exit 0 || exit 3 ;;\n  'restart trusted-network-gateway.service') touch '{}'; exit 0 ;;\n  'daemon-reload') exit 0 ;;\n  'reset-failed '*) exit 0 ;;\n  'restart '*) exit 0 ;;\nesac\nexit 0\n",
+            systemctl_log.display(),
+            active_marker.display(),
+            active_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env._guard.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env._guard.remove("CA_SKIP_SYSTEMCTL");
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    assert!(state.mesh_fingerprint.is_none());
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    assert!(state.mesh_fingerprint.is_none());
+
+    let log = fs::read_to_string(systemctl_log).unwrap();
+    let tng_restarts = log
+        .lines()
+        .filter(|line| *line == "restart trusted-network-gateway.service")
+        .count();
+    assert_eq!(tng_restarts, 1);
+}
+
+#[test]
+fn sync_mesh_throttles_gateway_restart_when_service_stays_inactive() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    let mut state = DaemonState::default();
+    let _control = std::net::TcpListener::bind(("127.0.0.1", TNG_CONTROL_PORT)).unwrap();
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                }
+            },
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }),
+    );
+    let fake_systemctl = temp.path().join("systemctl");
+    let systemctl_log = temp.path().join("systemctl.log");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet cai-gateway.service') exit 3 ;;\n  'restart cai-gateway.service') exit 0 ;;\n  'is-active --quiet trusted-network-gateway.service') exit 0 ;;\n  'daemon-reload') exit 0 ;;\n  'reset-failed '*) exit 0 ;;\n  'restart '*) exit 0 ;;\nesac\nexit 0\n",
+            systemctl_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env._guard.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env._guard.remove("CA_SKIP_SYSTEMCTL");
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let log = fs::read_to_string(systemctl_log).unwrap();
+    let gateway_restarts = log
+        .lines()
+        .filter(|line| *line == "restart cai-gateway.service")
+        .count();
+    assert_eq!(gateway_restarts, 1);
+    assert!(state.gateway_fingerprint.is_none());
+}
+
+#[test]
+fn sync_mesh_waits_for_gateway_ports_without_flapping_active_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    let mut state = DaemonState::default();
+    let _control = std::net::TcpListener::bind(("127.0.0.1", TNG_CONTROL_PORT)).unwrap();
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                }
+            },
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }),
+    );
+    let fake_systemctl = temp.path().join("systemctl");
+    let systemctl_log = temp.path().join("systemctl.log");
+    let gateway_active_marker = temp.path().join("gateway.active");
+    let tng_active_marker = temp.path().join("tng.active");
+    fs::write(&tng_active_marker, "1").unwrap();
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet cai-gateway.service') [ -f '{}' ] && exit 0 || exit 3 ;;\n  'restart cai-gateway.service') touch '{}'; exit 0 ;;\n  'is-active --quiet trusted-network-gateway.service') [ -f '{}' ] && exit 0 || exit 3 ;;\n  'restart trusted-network-gateway.service') touch '{}'; exit 0 ;;\n  'daemon-reload') exit 0 ;;\n  'reset-failed '*) exit 0 ;;\nesac\nexit 0\n",
+            systemctl_log.display(),
+            gateway_active_marker.display(),
+            gateway_active_marker.display(),
+            tng_active_marker.display(),
+            tng_active_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env._guard.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env._guard.remove("CA_SKIP_SYSTEMCTL");
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    assert!(state.gateway_fingerprint.is_none());
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+    assert!(state.gateway_fingerprint.is_none());
+
+    let log = fs::read_to_string(systemctl_log).unwrap();
+    let gateway_restarts = log
+        .lines()
+        .filter(|line| *line == "restart cai-gateway.service")
+        .count();
+    assert_eq!(gateway_restarts, 1);
+}
+
+#[test]
+fn sync_mesh_skips_tng_restart_when_config_unchanged_and_service_active() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.ports = vec![18789];
+    bootstrap.connect = Vec::new();
+    let mut state = DaemonState::default();
+    let _control = std::net::TcpListener::bind(("127.0.0.1", TNG_CONTROL_PORT)).unwrap();
+    let _gateway = std::net::TcpListener::bind(("127.0.0.1", GATEWAY_SERVER_PORT_BASE)).unwrap();
+    write_json_fixture(
+        &cdh_root.join(TEST_MESH_RESOURCE),
+        &json!({
+            "schema": MESH_SCHEMA_VERSION,
+            "generation": 42,
+            "updated_at": 1,
+            "services": {
+                "openclaw": {
+                    "phase": "active",
+                    "private_ip": "10.0.0.10",
+                    "public_ip": "127.0.0.1",
+                    "ports": [18789],
+                    "connect": [],
+                    "mcp_ports": [],
+                    "gateway_public_key": "openclaw-pub"
+                }
+            },
+            "reference_values": {},
+            "rekor_reference_values": {}
+        }),
+    );
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let fake_systemctl = temp.path().join("systemctl");
+    let systemctl_log = temp.path().join("systemctl.log");
+    let active_marker = temp.path().join("tng.active");
+    fs::write(&active_marker, "1").unwrap();
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet trusted-network-gateway.service') [ -f '{}' ] && exit 0 || exit 3 ;;\n  'restart trusted-network-gateway.service') exit 99 ;;\nesac\nexit 0\n",
+            systemctl_log.display(),
+            active_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env._guard.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env._guard.remove("CA_SKIP_SYSTEMCTL");
+
+    sync_mesh(&args, &bootstrap, &mut state).unwrap();
+
+    let log = fs::read_to_string(systemctl_log).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        vec![
+            "is-active --quiet cai-gateway.service",
+            "is-active --quiet trusted-network-gateway.service",
+        ]
+    );
 }
 
 #[test]

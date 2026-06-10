@@ -1755,6 +1755,126 @@ resources: {}
 }
 
 #[test]
+fn write_bootstrap_file_protects_embedded_gateway_private_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    let paths = context_paths(temp.path(), "openclaw");
+    let bootstrap = render_bootstrap(&paths, &spec).unwrap();
+    fs::write(&paths.bootstrap_file, "{}\n").unwrap();
+    fs::set_permissions(&paths.bootstrap_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    write_bootstrap_file(&paths.bootstrap_file, &bootstrap).unwrap();
+
+    let persisted: BootstrapConfig =
+        serde_json::from_str(&fs::read_to_string(&paths.bootstrap_file).unwrap()).unwrap();
+    let identity = bootstrap
+        .gateway_identity
+        .as_ref()
+        .expect("bootstrap should embed gateway identity");
+    assert!(!identity.private_key.is_empty());
+    assert_eq!(
+        persisted.gateway_identity.as_ref().unwrap().private_key,
+        identity.private_key
+    );
+    assert_eq!(
+        fs::metadata(&paths.bootstrap_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(paths.service_dir.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&paths.service_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&paths.secrets_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn write_bootstrap_file_rejects_symlink_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = AgentSpec::from_yaml(
+        r#"
+schema: confidential-agent/v1
+service:
+  id: openclaw
+  ports: [18789]
+  connect: [18789]
+build:
+  base_image: /images/base.qcow2
+  image_name: openclaw-agent
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: ecs.g8i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-l
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
+"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    let paths = context_paths(temp.path(), "openclaw");
+    let bootstrap = render_bootstrap(&paths, &spec).unwrap();
+    let target = temp.path().join("target.json");
+    fs::write(&target, "sentinel\n").unwrap();
+    std::os::unix::fs::symlink(&target, &paths.bootstrap_file).unwrap();
+
+    let err = write_bootstrap_file(&paths.bootstrap_file, &bootstrap).unwrap_err();
+
+    assert!(format!("{err:#}").contains("symlink"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "sentinel\n");
+}
+
+#[test]
 fn render_agent_card_uses_rekor_metadata_and_rejects_disabled_a2a() {
     let yaml = r#"
 schema: confidential-agent/v1

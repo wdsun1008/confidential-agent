@@ -376,6 +376,8 @@ mod tests {
         );
         assert!(script.contains("/etc/systemd/system-preset/00-confidential-agent-tng.preset"));
         assert!(script.contains("disable trusted-network-gateway.service"));
+        assert!(script.contains("systemctl disable trusted-network-gateway.service"));
+        assert!(!script.contains("systemctl enable trusted-network-gateway.service"));
     }
 
     #[test]

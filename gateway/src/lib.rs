@@ -951,7 +951,7 @@ fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse> {
         .context("HTTP response missing header terminator")?;
     let head =
         String::from_utf8(all[..split].to_vec()).context("HTTP response headers are not UTF-8")?;
-    let body = all[split + 4..].to_vec();
+    let raw_body = all[split + 4..].to_vec();
     let mut lines = head.split("\r\n");
     let status_line = lines.next().context("missing HTTP status line")?;
     let status = status_line
@@ -961,20 +961,125 @@ fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse> {
         .parse::<u16>()
         .context("invalid HTTP status code")?;
     let mut headers = Vec::new();
+    let mut transfer_encodings = Vec::new();
+    let mut content_length = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let Some((name, value)) = line.split_once(':') else {
             bail!("invalid HTTP response header '{line}'");
         };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encodings.push(value.trim().to_string());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value.trim().parse::<u64>().with_context(|| {
+                format!("invalid HTTP response Content-Length '{}'", value.trim())
+            })?;
+            if let Some(existing) = content_length {
+                if existing != parsed {
+                    bail!("conflicting duplicate HTTP response Content-Length headers");
+                }
+            } else {
+                content_length = Some(parsed);
+            }
+        }
         if !is_hop_header(name) {
             headers.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
+    let chunked = transfer_encoding_is_chunked(&transfer_encodings)?;
+    if chunked && content_length.is_some() {
+        bail!("HTTP response has both Transfer-Encoding: chunked and Content-Length");
+    }
+    let body = if chunked {
+        decode_chunked_body(&raw_body)?
+    } else {
+        raw_body
+    };
     headers.push(("connection".to_string(), "close".to_string()));
     Ok(HttpResponse {
         status,
         headers,
         body,
     })
+}
+
+fn transfer_encoding_is_chunked(values: &[String]) -> Result<bool> {
+    let mut has_chunked = false;
+    for coding in values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|coding| coding.trim().to_ascii_lowercase())
+        .filter(|coding| !coding.is_empty())
+    {
+        if coding == "chunked" {
+            has_chunked = true;
+        } else {
+            bail!("unsupported HTTP transfer encoding '{coding}'");
+        }
+    }
+    Ok(has_chunked)
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        let line_end = body[pos..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| pos + offset)
+            .context("chunked HTTP response missing chunk-size terminator")?;
+        let size_line = std::str::from_utf8(&body[pos..line_end])
+            .context("chunked HTTP response chunk-size is not UTF-8")?;
+        let size_text = size_line
+            .split_once(';')
+            .map(|(size, _)| size)
+            .unwrap_or(size_line)
+            .trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .with_context(|| format!("invalid chunked HTTP response chunk size '{size_text}'"))?;
+        pos = line_end + 2;
+
+        if size == 0 {
+            loop {
+                let trailer_end = body[pos..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .map(|offset| pos + offset)
+                    .context("chunked HTTP response missing final trailer terminator")?;
+                let trailer = &body[pos..trailer_end];
+                std::str::from_utf8(trailer)
+                    .context("chunked HTTP response trailer is not UTF-8")?;
+                pos = trailer_end + 2;
+                if trailer.is_empty() {
+                    if pos != body.len() {
+                        bail!("chunked HTTP response has trailing data after final trailer");
+                    }
+                    return Ok(decoded);
+                }
+            }
+        }
+
+        let chunk_end = pos
+            .checked_add(size)
+            .context("chunked HTTP response chunk size overflow")?;
+        if chunk_end > body.len().saturating_sub(2) {
+            bail!("chunked HTTP response ended before chunk data completed");
+        }
+        if &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            bail!("chunked HTTP response chunk missing trailing CRLF");
+        }
+        if decoded
+            .len()
+            .checked_add(size)
+            .context("chunked HTTP response decoded size overflow")?
+            > MAX_HTTP_BODY_BYTES
+        {
+            bail!("HTTP response body too large");
+        }
+        decoded.extend_from_slice(&body[pos..chunk_end]);
+        pos = chunk_end + 2;
+    }
 }
 
 #[derive(Default)]
@@ -1816,6 +1921,161 @@ mod tests {
                 || err.contains("Resource temporarily unavailable"),
             "unexpected timeout error: {err}"
         );
+    }
+
+    #[test]
+    fn http_response_decodes_chunked_body_and_drops_transfer_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#.to_string();
+        let first = body[..body.len() / 2].to_string();
+        let second = body[body.len() / 2..].to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n{:x};source=test\r\n{}\r\n0\r\nX-Trailer: ok\r\n\r\n",
+                        first.len(),
+                        first,
+                        second.len(),
+                        second
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        let response = read_http_response(&mut stream).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(response.body, body.as_bytes());
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding")));
+        let rendered = String::from_utf8(response.to_bytes()).unwrap();
+        assert!(rendered.contains(&format!("content-length: {}\r\n", body.len())));
+        assert!(!rendered.contains("\r\n0\r\n"));
+    }
+
+    #[test]
+    fn http_response_rejects_chunked_with_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        let err = read_http_response(&mut stream).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err
+            .to_string()
+            .contains("both Transfer-Encoding: chunked and Content-Length"));
+    }
+
+    #[test]
+    fn http_response_rejects_chunked_trailing_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\njunk",
+                )
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        let err = read_http_response(&mut stream).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err
+            .to_string()
+            .contains("trailing data after final trailer"));
+    }
+
+    #[test]
+    fn http_response_rejects_conflicting_duplicate_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx",
+                )
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        let err = read_http_response(&mut stream).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err
+            .to_string()
+            .contains("conflicting duplicate HTTP response Content-Length"));
+    }
+
+    #[test]
+    fn mcp_tools_list_injection_handles_chunked_sse_upstream_response() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let first = body[..body.len() / 2].to_string();
+        let second = body[body.len() / 2..].to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        first.len(),
+                        first,
+                        second.len(),
+                        second
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let route = ServerRoute {
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 0,
+            upstream_host: "127.0.0.1".to_string(),
+            upstream_port,
+            protocol: "mcp".to_string(),
+            audit_path: None,
+        };
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/mcp".to_string(),
+            headers: Vec::new(),
+            body: br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec(),
+            connection_close: true,
+        };
+
+        let response = forward_http_request(&route, &request).unwrap();
+        handle.join().unwrap();
+        let response = inject_virtual_tools(response).unwrap();
+        let rendered = String::from_utf8(response.body).unwrap();
+
+        assert!(rendered.contains("\"name\":\"tee_attest\""));
+        assert!(rendered.contains("\"name\":\"audit_status\""));
+        assert!(rendered.contains("\"name\":\"audit_verify\""));
+        assert!(!rendered.contains("\r\n0\r\n"));
     }
 
     #[test]

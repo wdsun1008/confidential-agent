@@ -34,9 +34,13 @@ elif value is not None:
 aliyun_json() {
   local out="$1"
   shift
-  record_cmd "aliyun $(cmd_string "$@")"
-  aliyun "$@" >"$out"
+  record_cmd "aliyun --region $REGION $(cmd_string "$@")"
+  aliyun_cli "$@" >"$out"
   record_file_as_block "Aliyun response: $*" "$out" json
+}
+
+aliyun_cli() {
+  aliyun --region "$REGION" "$@"
 }
 
 assert_file_contains() {
@@ -67,7 +71,7 @@ describe_instance_field() {
   local instance_id="$1"
   local expr="$2"
   local out="$WORK_DIR/describe-instance-$instance_id.json"
-  aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$instance_id\"]" >"$out"
+  aliyun_cli ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$instance_id\"]" >"$out"
   python3.11 - "$out" "$expr" <<'PY'
 import json
 import sys
@@ -98,7 +102,7 @@ select_baseline_image() {
     return
   fi
   local out="$WORK_DIR/describe-images.json"
-  aliyun ecs DescribeImages \
+  aliyun_cli ecs DescribeImages \
     --RegionId "$REGION" \
     --ImageOwnerAlias system \
     --OSType linux \
@@ -144,8 +148,8 @@ provision_baseline() {
 
   rm -f "$BASELINE_KEY" "$BASELINE_KEY.pub"
   ssh-keygen -t ed25519 -N '' -f "$BASELINE_KEY" -C "$BASELINE_KEY_NAME" >/dev/null
-  record_cmd "aliyun ecs ImportKeyPair --RegionId $REGION --KeyPairName $BASELINE_KEY_NAME --PublicKeyBody <baseline.pub>"
-  aliyun ecs ImportKeyPair --RegionId "$REGION" --KeyPairName "$BASELINE_KEY_NAME" --PublicKeyBody "$(cat "$BASELINE_KEY.pub")" >/dev/null
+  record_cmd "aliyun --region $REGION ecs ImportKeyPair --RegionId $REGION --KeyPairName $BASELINE_KEY_NAME --PublicKeyBody <baseline.pub>"
+  aliyun_cli ecs ImportKeyPair --RegionId "$REGION" --KeyPairName "$BASELINE_KEY_NAME" --PublicKeyBody "$(cat "$BASELINE_KEY.pub")" >/dev/null
 
   run_out="$WORK_DIR/run-baseline.json"
   aliyun_json "$run_out" ecs RunInstances \
@@ -197,7 +201,7 @@ wait_snapshot_done() {
   local deadline=$((SECONDS + ${2:-1800}))
   while (( SECONDS < deadline )); do
     local out="$WORK_DIR/describe-snapshot-$snapshot_id.json"
-    if aliyun ecs DescribeSnapshots --RegionId "$REGION" --SnapshotIds "[\"$snapshot_id\"]" >"$out"; then
+    if aliyun_cli ecs DescribeSnapshots --RegionId "$REGION" --SnapshotIds "[\"$snapshot_id\"]" >"$out"; then
       local status
       status="$(python3.11 - "$out" <<'PY'
 import json
@@ -221,7 +225,7 @@ wait_disk_status() {
   local deadline=$((SECONDS + ${3:-600}))
   while (( SECONDS < deadline )); do
     local out="$WORK_DIR/describe-disk-$disk_id.json"
-    if aliyun ecs DescribeDisks --RegionId "$REGION" --DiskIds "[\"$disk_id\"]" >"$out"; then
+    if aliyun_cli ecs DescribeDisks --RegionId "$REGION" --DiskIds "[\"$disk_id\"]" >"$out"; then
       local status
       status="$(python3.11 - "$out" <<'PY'
 import json
@@ -242,7 +246,7 @@ PY
 system_disk_id() {
   local instance_id="$1"
   local out="$WORK_DIR/describe-system-disk-$instance_id.json"
-  aliyun ecs DescribeDisks --RegionId "$REGION" --InstanceId "$instance_id" --DiskType system >"$out"
+  aliyun_cli ecs DescribeDisks --RegionId "$REGION" --InstanceId "$instance_id" --DiskType system >"$out"
   python3.11 - "$out" <<'PY'
 import json
 import sys
@@ -333,21 +337,21 @@ case_cleanup() {
   fi
   [[ "$should_destroy" == "1" ]] || return 0
   if [[ "$SNAPSHOT_DISK_ATTACHED" == "1" && -n "$SNAPSHOT_DISK_ID" && -n "$BASELINE_ID" ]]; then
-    aliyun ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
+    aliyun_cli ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
     wait_disk_status "$SNAPSHOT_DISK_ID" Available 300 || true
     SNAPSHOT_DISK_ATTACHED=0
   fi
   if [[ -n "$SNAPSHOT_DISK_ID" ]]; then
-    aliyun ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
   fi
   if [[ -n "$SNAPSHOT_ID" ]]; then
-    aliyun ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || true
   fi
   if [[ -n "$BASELINE_ID" ]]; then
-    aliyun ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || true
   fi
   if [[ -n "$BASELINE_KEY_NAME" ]]; then
-    aliyun ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || true
   fi
 }
 
@@ -421,24 +425,50 @@ run_case() {
   agent_generation="$(state_value "$STATE_DIR" cmaas-agent mesh_generation)"
   cmaas_instance_id="$(state_value "$STATE_DIR" cmaas deploy.instance_id)"
   chmod 0600 "$cmaas_key" "$agent_key"
+  stat -c '%a' "$STATE_DIR/services/cmaas/bootstrap.json" >"$WORK_DIR/cmaas-bootstrap-mode.txt"
+  stat -c '%a' "$STATE_DIR/services/cmaas-agent/bootstrap.json" >"$WORK_DIR/agent-bootstrap-mode.txt"
+  record_file_as_block "CMaaS bootstrap.json mode:" "$WORK_DIR/cmaas-bootstrap-mode.txt" text
+  record_file_as_block "Agent bootstrap.json mode:" "$WORK_DIR/agent-bootstrap-mode.txt" text
+  grep -Fx '600' "$WORK_DIR/cmaas-bootstrap-mode.txt" >/dev/null
+  grep -Fx '600' "$WORK_DIR/agent-bootstrap-mode.txt" >/dev/null
   wait_for_live_status cmaas "$cmaas_ip" "$cmaas_generation" 900
   wait_for_live_status cmaas-agent "$agent_ip" "$agent_generation" 900
   wait_for_ssh "$cmaas_ip" "$cmaas_key" 300
   wait_for_ssh "$agent_ip" "$agent_key" 300
   local tng_runtime_check
-  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; a=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); b=\$(sha256sum /opt/confidential-agent/hack/tng-2.6.0 | cut -d' ' -f1); test \"\$a\" = \"\$b\"; echo tng_hash=\$a; systemctl is-enabled trusted-network-gateway.service || true"
+  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; a=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); b=\$(sha256sum /opt/confidential-agent/hack/tng-2.6.0 | cut -d' ' -f1); test \"\$a\" = \"\$b\"; echo tng_hash=\$a; enabled=\$(systemctl is-enabled trusted-network-gateway.service || true); echo tng_enabled=\$enabled; test \"\$enabled\" = disabled; systemctl is-active trusted-network-gateway.service"
   record_cmd "ssh cmaas '<tng runtime check>'"
   ssh_guest "$cmaas_key" "$cmaas_ip" "$tng_runtime_check" >"$WORK_DIR/cmaas-tng-runtime.txt"
   record_file_as_block "CMaaS TNG runtime state:" "$WORK_DIR/cmaas-tng-runtime.txt" text
   grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -E '^tng_hash=' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
-  grep -Fx 'disabled' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_enabled=disabled' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'active' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   record_cmd "ssh agent '<tng runtime check>'"
   ssh_guest "$agent_key" "$agent_ip" "$tng_runtime_check" >"$WORK_DIR/agent-tng-runtime.txt"
   record_file_as_block "Agent TNG runtime state:" "$WORK_DIR/agent-tng-runtime.txt" text
   grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -E '^tng_hash=' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
-  grep -Fx 'disabled' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_enabled=disabled' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'active' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+
+  local tng_inactive_recovery_check
+  tng_inactive_recovery_check="set -euo pipefail; before=\$(sha256sum /etc/tng/config.json | cut -d' ' -f1); echo tng_config_before=\$before; systemctl stop trusted-network-gateway.service; for _ in \$(seq 1 60); do if systemctl is-active --quiet trusted-network-gateway.service; then break; fi; sleep 5; done; if ! systemctl is-active --quiet trusted-network-gateway.service; then systemctl status --no-pager -l trusted-network-gateway.service || true; journalctl -u confidential-agentd.service -u trusted-network-gateway.service -n 200 --no-pager || true; echo 'timed out waiting for trusted-network-gateway.service recovery' >&2; exit 1; fi; after=\$(sha256sum /etc/tng/config.json | cut -d' ' -f1); echo tng_config_after=\$after; test \"\$before\" = \"\$after\"; systemctl is-active trusted-network-gateway.service"
+  record_cmd "ssh cmaas '<tng inactive recovery check>'"
+  ssh_guest "$cmaas_key" "$cmaas_ip" "$tng_inactive_recovery_check" >"$WORK_DIR/cmaas-tng-recovery.txt"
+  record_file_as_block "CMaaS TNG inactive recovery state:" "$WORK_DIR/cmaas-tng-recovery.txt" text
+  grep -E '^tng_config_before=' "$WORK_DIR/cmaas-tng-recovery.txt" >/dev/null
+  grep -E '^tng_config_after=' "$WORK_DIR/cmaas-tng-recovery.txt" >/dev/null
+  grep -Fx 'active' "$WORK_DIR/cmaas-tng-recovery.txt" >/dev/null
+  wait_for_live_status cmaas "$cmaas_ip" "$cmaas_generation" 900
+
+  record_cmd "ssh agent '<tng inactive recovery check>'"
+  ssh_guest "$agent_key" "$agent_ip" "$tng_inactive_recovery_check" >"$WORK_DIR/agent-tng-recovery.txt"
+  record_file_as_block "Agent TNG inactive recovery state:" "$WORK_DIR/agent-tng-recovery.txt" text
+  grep -E '^tng_config_before=' "$WORK_DIR/agent-tng-recovery.txt" >/dev/null
+  grep -E '^tng_config_after=' "$WORK_DIR/agent-tng-recovery.txt" >/dev/null
+  grep -Fx 'active' "$WORK_DIR/agent-tng-recovery.txt" >/dev/null
+  wait_for_live_status cmaas-agent "$agent_ip" "$agent_generation" 900
 
   if ca_capture "$STATE_DIR" "$WORK_DIR/cmaas-connect-render.json" "$WORK_DIR/cmaas-connect-render.err" connect --render-only --service cmaas; then
     record_file_as_block "Unexpected CMaaS connect render output:" "$WORK_DIR/cmaas-connect-render.json" json

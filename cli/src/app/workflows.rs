@@ -14,10 +14,7 @@ pub(super) fn inject_resources(
     spec.ensure_mvp_supported()?;
     let tee = tee_name(spec.attestation.tee);
     let paths = context_paths(state_dir, &spec.service.id);
-    fs::create_dir_all(&paths.service_dir)
-        .with_context(|| format!("failed to create '{}'", paths.service_dir.display()))?;
-    fs::create_dir_all(&paths.secrets_dir)
-        .with_context(|| format!("failed to create '{}'", paths.secrets_dir.display()))?;
+    ensure_private_context_dirs(&paths)?;
 
     let artifacts = materialize_shelter_build_artifacts(&paths, build_result, build_id)?;
     prepare_challenge_reference_values(
@@ -58,11 +55,7 @@ pub(super) fn inject_resources(
         bootstrap.agent_card = Some(card);
     }
 
-    fs::write(
-        &paths.bootstrap_file,
-        serde_json::to_string_pretty(&bootstrap)?,
-    )
-    .with_context(|| format!("failed to write '{}'", paths.bootstrap_file.display()))?;
+    write_bootstrap_file(&paths.bootstrap_file, &bootstrap)?;
 
     challenge_inject(
         cli,
@@ -119,6 +112,12 @@ pub(super) fn inject_resources(
 
     println!("injected resources for service {}", spec.service.id);
     Ok(())
+}
+
+pub(super) fn write_bootstrap_file(path: &Path, bootstrap: &BootstrapConfig) -> Result<()> {
+    let content = serde_json::to_vec_pretty(bootstrap)?;
+    write_private_file(path, &content, 0o600)
+        .with_context(|| format!("failed to write '{}'", path.display()))
 }
 
 pub(super) fn render_agent_card(
