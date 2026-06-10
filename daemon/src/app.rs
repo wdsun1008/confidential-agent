@@ -41,6 +41,8 @@ const TNG_EGRESS_PORT_BASE: u16 = 39000;
 const GATEWAY_SERVER_PORT_BASE: u16 = 39200;
 const TNG_INGRESS_PORT_BASE: u16 = 39400;
 const DEFAULT_TNG_SO_MARK: u32 = 565;
+const SERVICE_RESTART_MIN_INTERVAL_SEC: u64 = 30;
+const ACTIVE_BOOTSTRAP_IDLE_POLL_SEC: u64 = 30;
 const DEFAULT_POLICY_PATH: &str = "/opt/confidential-agent/policies/trustee-opa-default.rego";
 const DEFAULT_DAEMON_STATE_PATH: &str = "/var/lib/confidential-agent/state.json";
 const DEFAULT_DAEMON_STATUS_PATH: &str = "/run/confidential-agent/status.json";
@@ -77,7 +79,15 @@ struct DaemonState {
     applied_resources: BTreeMap<String, AppliedResourceState>,
     mesh_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh_started_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh_last_restart_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     gateway_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_started_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_last_restart_unix: Option<u64>,
     #[serde(default)]
     a2a_cache: BTreeMap<String, A2aCachedPeer>,
     #[serde(default)]
@@ -341,11 +351,23 @@ fn run_daemon(args: RunArgs) -> Result<()> {
             eprintln!("daemon state write failed: {err:#}");
         }
 
-        let refresh_timeout = next_a2a_refresh_timeout(&state, active_bootstrap.is_some());
+        let refresh_timeout = next_resource_refresh_timeout(&state, active_bootstrap.is_some());
         match resource_watcher.wait(refresh_timeout)? {
             ResourceWatcherWait::Event | ResourceWatcherWait::Timeout => {}
         }
     }
+}
+
+fn next_resource_refresh_timeout(state: &DaemonState, bootstrap_active: bool) -> Option<Duration> {
+    if !bootstrap_active {
+        return None;
+    }
+    let idle_poll = Duration::from_secs(ACTIVE_BOOTSTRAP_IDLE_POLL_SEC);
+    Some(
+        next_a2a_refresh_timeout(state, true)
+            .map(|timeout| timeout.min(idle_poll))
+            .unwrap_or(idle_poll),
+    )
 }
 
 fn next_a2a_refresh_timeout(state: &DaemonState, bootstrap_active: bool) -> Option<Duration> {
@@ -1457,8 +1479,15 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
 
     if !has_bundle && !has_a2a_peers {
         state.mesh_generation = 0;
+        let config = empty_tng_config();
+        let directory = ServiceDirectory {
+            schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
+            services: BTreeMap::new(),
+        };
+        write_service_directory(&directory)?;
         let gateway_cfg = empty_gateway_config(bootstrap)?;
         sync_gateway_service(&gateway_cfg, state)?;
+        let _ = sync_tng_service(&config, state, &[])?;
         let readiness = ensure_runtime_ready(bootstrap, false);
         write_status(status_for(bootstrap, state, "waiting-mesh", readiness))?;
         return Ok(());
@@ -1513,11 +1542,8 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
                 route
             })
             .collect::<Vec<_>>();
-        let cfg = json!({
-            "control_interface": { "restful": { "host": "127.0.0.1", "port": 50000 } },
-            "add_egress": egress,
-            "add_ingress": [],
-        });
+        let mut cfg = empty_tng_config();
+        cfg["add_egress"] = Value::Array(egress);
         let dir = ServiceDirectory {
             schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
             services: BTreeMap::new(),
@@ -1541,28 +1567,9 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
         }
     }
 
-    let fingerprint = sha256_bytes(serde_json::to_vec(&config)?.as_slice());
-
-    let directory_path = service_directory_path();
-    if let Some(parent) = directory_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&directory_path, serde_json::to_string_pretty(&directory)?)?;
+    write_service_directory(&directory)?;
     sync_gateway_service(&gateway_cfg, state)?;
-
-    let tng_path = tng_config_path();
-    let changed = write_json_if_changed(&tng_path, &config)?;
-    if changed || state.mesh_fingerprint.as_deref() != Some(&fingerprint) {
-        restart_service(TNG_SERVICE)?;
-        state.mesh_fingerprint = Some(fingerprint);
-    }
-
-    let mesh_ready = {
-        match service_is_active(TNG_SERVICE) {
-            Ok(true) => mesh_ports_ready(&service_directory_local_ports(&directory)),
-            _ => false,
-        }
-    };
+    let mesh_ready = sync_tng_service(&config, state, &service_directory_local_ports(&directory))?;
 
     let readiness = ensure_runtime_ready(bootstrap, mesh_ready);
     let phase = if !readiness.app_ready {
@@ -1575,6 +1582,45 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
     write_status(status_for(bootstrap, state, phase, readiness))?;
 
     Ok(())
+}
+
+fn empty_tng_config() -> Value {
+    json!({
+        "control_interface": { "restful": { "host": "127.0.0.1", "port": TNG_CONTROL_PORT } },
+        "add_egress": [],
+        "add_ingress": [],
+    })
+}
+
+fn write_service_directory(directory: &ServiceDirectory) -> Result<()> {
+    let directory_path = service_directory_path();
+    if let Some(parent) = directory_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&directory_path, serde_json::to_string_pretty(directory)?)?;
+    Ok(())
+}
+
+fn sync_tng_service(config: &Value, state: &mut DaemonState, ready_ports: &[u16]) -> Result<bool> {
+    let fingerprint = sha256_bytes(serde_json::to_vec(config)?.as_slice());
+    let tng_path = tng_config_path();
+    let changed = write_json_if_changed(&tng_path, config)?;
+    let mut restarted = false;
+    if changed || state.mesh_started_fingerprint.as_deref() != Some(&fingerprint) {
+        restart_service(TNG_SERVICE)?;
+        state.mesh_started_fingerprint = Some(fingerprint.clone());
+        state.mesh_last_restart_unix = Some(now_unix());
+        restarted = true;
+    }
+
+    let mesh_ready = ensure_tng_service_active(restarted, &mut state.mesh_last_restart_unix)
+        && mesh_ports_ready(ready_ports);
+    if mesh_ready {
+        state.mesh_fingerprint = Some(fingerprint);
+    } else {
+        state.mesh_fingerprint = None;
+    }
+    Ok(mesh_ready)
 }
 
 #[derive(Debug, Clone)]
@@ -1975,11 +2021,50 @@ fn sync_gateway_service(config: &Value, state: &mut DaemonState) -> Result<()> {
             path.display()
         )
     })?;
-    if changed || state.gateway_fingerprint.as_deref() != Some(&fingerprint) {
+    let mut restarted = false;
+    if changed || state.gateway_started_fingerprint.as_deref() != Some(&fingerprint) {
         restart_service(GATEWAY_SERVICE)?;
+        state.gateway_started_fingerprint = Some(fingerprint.clone());
+        state.gateway_last_restart_unix = Some(now_unix());
+        restarted = true;
+    }
+    let gateway_ready =
+        ensure_gateway_service_active(restarted, &mut state.gateway_last_restart_unix)
+            && gateway_ports_ready(config);
+    if gateway_ready {
         state.gateway_fingerprint = Some(fingerprint);
+    } else {
+        state.gateway_fingerprint = None;
     }
     Ok(())
+}
+
+fn gateway_ports_ready(config: &Value) -> bool {
+    gateway_config_listen_ports(config)
+        .iter()
+        .all(|port| local_tcp_port_ready(*port))
+}
+
+fn gateway_config_listen_ports(config: &Value) -> Vec<u16> {
+    let mut ports = ["client_routes", "server_routes"]
+        .into_iter()
+        .flat_map(|key| {
+            config
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|route| {
+            route
+                .get("listen_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+        })
+        .collect::<Vec<_>>();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 fn tng_reference_values(bundle: &MeshBundle, service_id: &str) -> Result<Value> {
@@ -2560,6 +2645,61 @@ fn app_ports_ready(ports: &[u16]) -> bool {
 fn mesh_ports_ready(peer_ports: &[u16]) -> bool {
     local_tcp_port_ready(TNG_CONTROL_PORT)
         && peer_ports.iter().all(|port| local_tcp_port_ready(*port))
+}
+
+fn ensure_tng_service_active(just_restarted: bool, last_restart_unix: &mut Option<u64>) -> bool {
+    ensure_service_active(TNG_SERVICE, "TNG", just_restarted, last_restart_unix)
+}
+
+fn ensure_gateway_service_active(
+    just_restarted: bool,
+    last_restart_unix: &mut Option<u64>,
+) -> bool {
+    ensure_service_active(
+        GATEWAY_SERVICE,
+        "gateway",
+        just_restarted,
+        last_restart_unix,
+    )
+}
+
+fn ensure_service_active(
+    service: &str,
+    label: &str,
+    just_restarted: bool,
+    last_restart_unix: &mut Option<u64>,
+) -> bool {
+    match service_is_active(service) {
+        Ok(true) => true,
+        Ok(false) => {
+            if just_restarted || restart_backoff_active(*last_restart_unix) {
+                return false;
+            }
+            if let Err(err) = restart_service(service) {
+                eprintln!("{label} service restart failed: {err:#}");
+                return false;
+            }
+            *last_restart_unix = Some(now_unix());
+            match service_is_active(service) {
+                Ok(active) => active,
+                Err(err) => {
+                    eprintln!("{label} service status check failed after restart: {err:#}");
+                    false
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("{label} service status check failed: {err:#}");
+            false
+        }
+    }
+}
+
+fn restart_backoff_active(last_restart_unix: Option<u64>) -> bool {
+    let Some(last_restart_unix) = last_restart_unix else {
+        return false;
+    };
+    now_unix().saturating_sub(last_restart_unix) < SERVICE_RESTART_MIN_INTERVAL_SEC
 }
 
 fn local_tcp_port_ready(port: u16) -> bool {

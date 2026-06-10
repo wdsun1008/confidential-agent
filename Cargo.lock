@@ -187,6 +187,7 @@ dependencies = [
  "confidential-agent-shelter",
  "ctrlc",
  "curve25519-dalek",
+ "libc",
  "rand_core",
  "serde",
  "serde_json",

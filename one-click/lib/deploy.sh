@@ -109,7 +109,17 @@ build_tools_image() {
     return
   fi
   log "building tools image: $CA_TOOLS_IMAGE"
-  (cd "$ROOT_DIR" && docker build -t "$CA_TOOLS_IMAGE" -f tools/Dockerfile .)
+  local build_args=()
+  if [[ -n "${CA_TOOLS_IMAGE_BUILD_ARGS:-}" ]]; then
+    # Whitespace-split simple docker build flags such as --network and --build-arg.
+    read -r -a build_args <<<"$CA_TOOLS_IMAGE_BUILD_ARGS"
+  fi
+  local build_cmd=(docker build)
+  if [[ ${#build_args[@]} -gt 0 ]]; then
+    build_cmd+=("${build_args[@]}")
+  fi
+  build_cmd+=(-t "$CA_TOOLS_IMAGE" -f tools/Dockerfile .)
+  (cd "$ROOT_DIR" && "${build_cmd[@]}")
 }
 
 ca_cmd() {

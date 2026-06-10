@@ -896,8 +896,7 @@ fn ensure_disk_passphrase(paths: &ContextPaths) -> Result<PathBuf> {
 }
 
 fn ensure_gateway_identity(paths: &ContextPaths) -> Result<LocalGatewayIdentity> {
-    fs::create_dir_all(&paths.secrets_dir)
-        .with_context(|| format!("failed to create '{}'", paths.secrets_dir.display()))?;
+    ensure_private_context_dirs(paths)?;
     let private_key_path = paths.secrets_dir.join("gateway_identity.seed");
     let public_key_path = paths.secrets_dir.join("gateway_identity.pub");
     match (private_key_path.exists(), public_key_path.exists()) {
@@ -963,6 +962,100 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(mode);
     fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "refusing to use private directory symlink '{}'",
+                    path.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "refusing to use private directory over non-directory '{}'",
+                    path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("failed to create '{}'", path.display()))?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat '{}'", path.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat '{}'", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!(
+            "refusing to use unsafe private directory '{}'",
+            path.display()
+        );
+    }
+    set_mode(path, 0o700).with_context(|| format!("failed to chmod '{}'", path.display()))
+}
+
+fn ensure_private_context_dirs(paths: &ContextPaths) -> Result<()> {
+    if let Some(services_dir) = paths.service_dir.parent() {
+        ensure_private_dir(services_dir)?;
+    }
+    ensure_private_dir(&paths.service_dir)?;
+    ensure_private_dir(&paths.secrets_dir)
+}
+
+fn write_private_file(path: &Path, content: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "refusing to write private file through symlink '{}'",
+                    path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "refusing to write private file over non-file '{}'",
+                    path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat '{}'", path.display()));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open '{}'", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat open file '{}'", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing to write private file over non-file '{}'",
+            path.display()
+        );
+    }
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to chmod '{}'", path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("failed to write '{}'", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to chmod '{}'", path.display()))?;
     Ok(())
 }
 
