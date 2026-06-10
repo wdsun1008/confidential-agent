@@ -1,0 +1,53 @@
+schema: confidential-agent/v1
+
+service:
+  id: hermes-agent
+  ports: [8642]
+  connect: [8642]
+  app_service: shelter-container-hermes-agent.service
+
+build:
+{{raw:BASE_IMAGE_LINE}}
+  image_name: hermes-agent
+  resize: 30G
+  with_network: true
+  container:
+    image: {{yaml:HERMES_IMAGE}}
+    mode: {{yaml:HERMES_CONTAINER_MODE}}
+    runtime: {{yaml:HERMES_CONTAINER_RUNTIME}}
+    name: hermes-agent
+    pull: missing
+    env:
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8642"
+      API_SERVER_KEY: {{yaml:HERMES_API_SERVER_KEY}}
+      DASHSCOPE_API_KEY: {{yaml:DASHSCOPE_KEY}}
+      DASHSCOPE_BASE_URL: {{yaml:DASHSCOPE_BASE_URL}}
+      HERMES_HOME: /opt/data
+      HERMES_MODEL: {{yaml:HERMES_MODEL}}
+    working_dir: /opt/data
+    network: true
+  packages: [ca-certificates, curl, jq]
+  scripts: [./prepare-hermes-data.sh]
+  variants:
+    release:
+      enabled: false
+    debug:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: {{yaml:INSTANCE_TYPE}}
+  region: {{yaml:REGION}}
+  zone_id: {{yaml:ZONE_ID}}
+  disk_gb: {{raw:DISK_GB}}
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: {{yaml:REFERENCE_VALUES}}
+{{raw:REKOR_BLOCK}}
+
+resources: {}

@@ -497,7 +497,7 @@ matrix_run_real_cloud_publish_flow() {
   REGION="$MATRIX_REAL_REGION" \
   ZONE_ID="$MATRIX_REAL_ZONE_ID" \
   INSTANCE_TYPE="$MATRIX_REAL_INSTANCE_TYPE" \
-  python3.11 "$ROOT_DIR/tools/e2e/render_case.py" --case openclaw-bailian --work-dir "$MATRIX_REAL_CASE_DIR"
+  python3.11 "$ROOT_DIR/tools/e2e/render_case.py" --case cli-command-matrix --work-dir "$MATRIX_REAL_CASE_DIR"
 
   validate_specs "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml"
   ca_run "$MATRIX_REAL_STATE_DIR" build --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml"

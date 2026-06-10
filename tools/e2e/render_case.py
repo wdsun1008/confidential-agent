@@ -126,6 +126,10 @@ def context_from_env(work_dir):
     default("SLSA_GENERATOR", "/usr/libexec/shelter/slsa/slsa-generator")
     default("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     default("DASHSCOPE_MODEL", "qwen3.7-max")
+    default("HERMES_IMAGE", context.get("E2E_HERMES_IMAGE", "nousresearch/hermes-agent:v2026.6.5"))
+    default("HERMES_CONTAINER_MODE", context.get("E2E_HERMES_CONTAINER_MODE", "rootfs"))
+    default("HERMES_CONTAINER_RUNTIME", context.get("E2E_HERMES_CONTAINER_RUNTIME", "containerd"))
+    default("HERMES_API_SERVER_KEY", context.get("E2E_HERMES_API_SERVER_KEY", ""))
     default("REGION", "cn-beijing")
     default("ZONE_ID", default_zone_id(context["REGION"]))
     default("INSTANCE_TYPE", default_instance_type(context["REGION"]))
@@ -139,6 +143,7 @@ def context_from_env(work_dir):
         or context.get("DASHSCOPE_API_KEY")
         or context.get("BAILIAN_API_KEY", "")
     )
+    context["HERMES_MODEL"] = context.get("HERMES_MODEL") or context["DASHSCOPE_MODEL"]
     context["A2A_SIGNING_BLOCK"] = ""
     return context
 

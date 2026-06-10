@@ -63,9 +63,19 @@ service:
 build:
   base_image: ./base.qcow2                    # 可选，存在则走 "convert/enhance" 模式；不写则走 mkosi 模式
   image_name: openclaw-agent                  # 必填，构建产物名 + cloud 镜像名 prefix
-  resize: 30G                                 # 可选，扩盘到的目标大小
+  resize: 30G                                 # 可选，渲染为 Shelter disk.size
   with_network: true                          # 可选，允许构建阶段访问网络
   kernel_cmdline_append: "swiotlb=4194304,any" # 可选，UKI cmdline 追加项
+  container:                                  # 可选，Shelter OCI workload payload
+    image: nousresearch/hermes-agent:v2026.6.5
+    mode: rootfs                              # runtime | rootfs
+    runtime: containerd                       # runtime 模式使用：containerd | podman
+    name: hermes-agent
+    pull: missing                             # missing | always | never；archive 模式只能 missing
+    env:
+      API_SERVER_ENABLED: "true"
+    working_dir: /opt/data
+    network: true
   packages: [nodejs, npm, jq, ...]            # 可选，注入到镜像里的 RPM/DEB 包列表
   files:
     - source: ../../target/debug/cai-pep
@@ -86,9 +96,10 @@ build:
 |---|---|:-:|---|---|
 | `base_image` | string (path 或 URL) | ❌ | `None` | 设了则不能为空；存在 `://` 视为 URL，否则按相对路径解析。**不写时**，Shelter 走 mkosi 流程 |
 | `image_name` | string | ✅ | — | 仅 `[A-Za-z0-9_-]` |
-| `resize` | string | ❌ | `None` | 例如 `30G`，原样透传给 Shelter |
+| `resize` | string | ❌ | `None` | 例如 `30G`，渲染为 Shelter `disk.size` |
 | `with_network` | bool | ❌ | `false` | 透传给 Shelter/mkosi 的 with-network；需要在 build/post-install/finalize 阶段执行 npm/pip/model 下载等网络安装时设为 `true` |
-| `kernel_cmdline_append` | string | ❌ | `None` | 当 `disk-crypt.uki=true` 时透传到 UKI cmdline |
+| `kernel_cmdline_append` | string | ❌ | `None` | 透传到 `security.disk.cryptpilot.uki_append_cmdline` |
+| `container` | object | ❌ | `None` | 原样渲染为 Shelter 顶层 `container:`；用于 OCI workload，不是 `base_image` |
 | `packages` | `[string]` | ❌ | `[]` | 透传给 Shelter `packages` |
 | `files` | `[BuildFileSpec]` | ❌ | `[]` | 见下表 |
 | `scripts` | `[path]` | ❌ | `[]` | 一律在 `post-install` 阶段执行，**早于** mkosi 模式下的 `confidential-agent-guest-setup.sh` 之后 |
@@ -103,7 +114,26 @@ build:
   executable: false                     # 可选，默认 false
 ```
 
-#### 3.2 `BuildVariantSpec`
+#### 3.2 `BuildContainerSpec`
+
+```yaml
+container:
+  image: docker.io/org/app:tag          # image 或 archive 至少一个
+  archive: ./app.oci.tar               # 可选，本地 OCI archive
+  mode: rootfs                         # 默认 runtime；可选 runtime/rootfs
+  runtime: containerd                  # 默认 containerd；runtime 模式使用
+  name: app                            # 仅允许 ASCII 字母、数字、.、_、-
+  pull: missing                        # 默认 missing；archive 模式只能 missing
+  command: ["/usr/local/bin/app"]      # 默认使用 image Entrypoint+Cmd
+  env:
+    APP_ENV: production                # key 必须是合法 shell 环境变量名
+  working_dir: /srv/app                # 必须是绝对路径
+  network: true                        # 显式要求 rootfs 网络
+```
+
+`container` 是 workload payload。CA 仍然以 `mkosi + cryptpilot` 生成 TDX guest/rootfs，并把 OCI payload 交给 Shelter master 的 `container:` 机制处理；不要把 Docker/OCI image 写到 `build.base_image`。
+
+#### 3.3 `BuildVariantSpec`
 
 ```yaml
 release:
@@ -174,12 +204,15 @@ deploy:
   backend: terraform
   cloud: alicloud
   region, zone_id, ip, instance_type, disk_size, ...
-  cc: tdx
-  tdx: true
+  cc_mode: tdx
+  security_group:
+    rules: [...]
   tags:
     confidential-agent-service: <id>
     confidential-agent-image-variant: <variant>
 ```
+
+Build 输出也使用 Shelter master schema：`build.resize` 渲染为顶层 `disk.size`，cryptpilot 渲染为 `security.disk.engine: cryptpilot` 和 `security.disk.cryptpilot.*`，不再输出旧 `resize`、`variants`、`security.disk-crypt`、`deploy.cc`、`deploy.tdx`、`security_group_ports` 或 `security_group_allowed_cidr`。
 
 ---
 

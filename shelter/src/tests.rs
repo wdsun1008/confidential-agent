@@ -89,8 +89,10 @@ fn build_config_omits_deploy_by_default() {
     .unwrap();
 
     assert!(rendered.contains("from: /images/base.qcow2"));
-    assert!(rendered.contains("variants:"));
-    assert!(rendered.contains("name: release"));
+    assert!(rendered.contains("disk:"));
+    assert!(rendered.contains("size: 30G"));
+    assert!(!rendered.contains("resize:"));
+    assert!(!rendered.contains("variants:"));
     assert!(!rendered.contains("deploy:"));
     assert!(!rendered.contains("backend: terraform"));
     assert!(!rendered.contains("security_group_ports:"));
@@ -112,8 +114,10 @@ fn renders_release_shelter_deploy_without_ssh_key_name() {
     .unwrap();
 
     assert!(rendered.contains("from: /images/base.qcow2"));
-    assert!(rendered.contains("variants:"));
-    assert!(rendered.contains("name: release"));
+    assert!(rendered.contains("disk:"));
+    assert!(rendered.contains("size: 30G"));
+    assert!(!rendered.contains("resize:"));
+    assert!(!rendered.contains("variants:"));
     assert!(!rendered.contains("name: debug"));
     assert!(!rendered.contains("harden_mode: partial"));
     assert!(!rendered.contains("ssh_key:"));
@@ -122,10 +126,14 @@ fn renders_release_shelter_deploy_without_ssh_key_name() {
     assert!(rendered.contains("tng: true"));
     assert!(rendered.contains("cryptpilot-fde-host:"));
     assert!(rendered.contains("cryptpilot-fde-guest:"));
-    assert!(rendered.contains("disk-crypt:"));
+    assert!(rendered.contains("disk:"));
+    assert!(rendered.contains("engine: cryptpilot"));
+    assert!(rendered.contains("cryptpilot:"));
+    assert!(!rendered.contains("disk-crypt:"));
     assert!(rendered.contains("fde_config_file: /build/fde.toml"));
     assert!(rendered.contains("99confidential-agent-secret-fetch"));
-    assert!(rendered.contains("security_group_ports: []"));
+    assert!(!rendered.contains("security_group_ports:"));
+    assert!(!rendered.contains("security_group_allowed_cidr:"));
     assert!(rendered.contains("backend: terraform"));
     assert!(!rendered.contains("image_id:"));
     assert!(rendered.contains("image:"));
@@ -133,8 +141,9 @@ fn renders_release_shelter_deploy_without_ssh_key_name() {
     assert!(rendered.contains("cloud: alicloud"));
     assert!(rendered.contains("region: cn-beijing"));
     assert!(rendered.contains("zone_id: cn-beijing-l"));
-    assert!(rendered.contains("cc: tdx"));
-    assert!(rendered.contains("tdx: true"));
+    assert!(rendered.contains("cc_mode: tdx"));
+    assert!(!rendered.contains("cc: tdx"));
+    assert!(!rendered.contains("tdx: true"));
     assert!(rendered.contains("name: control_8006_peer_203_0_113_0_24"));
     assert!(rendered.contains("port_range: 8006/8006"));
     assert!(rendered.contains("name: status_8088_peer_203_0_113_0_24"));
@@ -172,7 +181,8 @@ fn renders_mkosi_build_without_from_or_legacy_variants() {
     assert!(!rendered.contains("variants:"));
     assert!(rendered.contains("packages:"));
     assert!(rendered.contains("libtdx-verify"));
-    assert!(rendered.contains("disk-crypt:"));
+    assert!(rendered.contains("engine: cryptpilot"));
+    assert!(!rendered.contains("disk-crypt:"));
     assert!(rendered.contains("image:"));
     assert!(rendered.contains("name: openclaw-agent-release"));
 }
@@ -195,8 +205,9 @@ fn renders_debug_deploy_with_ssh_security_group() {
     )
     .unwrap();
 
-    assert!(rendered.contains("name: debug"));
-    assert!(!rendered.contains("name: release"));
+    assert!(!rendered.contains("variants:"));
+    assert!(!rendered.contains("name: debug"));
+    assert!(rendered.contains("mode: partial"));
     assert!(rendered.contains("openssh-server"));
     assert!(rendered.contains("sshd.service"));
     assert!(rendered.contains("ssh_key:"));
@@ -295,8 +306,8 @@ fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
     .unwrap();
 
     assert!(rendered.contains("name: openclaw-20260429201011"));
-    assert!(rendered.contains("images_dir: /state/services/openclaw/artifacts"));
-    assert!(rendered.contains("cache_dir: /state/services/openclaw/cache"));
+    assert!(!rendered.contains("images_dir:"));
+    assert!(!rendered.contains("cache_dir:"));
     assert!(rendered.contains("name: openclaw-agent-debug-20260429201011"));
     assert!(!rendered.contains("bucket:"));
     assert!(rendered.contains("name: mesh_18800_peer_39_105_93_168_32"));
@@ -447,20 +458,16 @@ fn preferred_tool_path_falls_back_when_no_candidate_exists() {
 
 #[test]
 fn renders_explicit_rootfs_integrity_for_modern_shelter() {
-    // Shelter >= 2026-05-14 (commit 09ae0f1 "Default builds to rootfs
-    // integrity") infers reference-value extraction from
-    // `disk-crypt.rootfs.integrity` and removed the dedicated
-    // `security.extract_reference_values` field. Render must therefore
-    // (a) include `rootfs: integrity: true` inside `disk-crypt:` so the
-    // intent survives any future default flip, and (b) NOT emit the
-    // legacy `extract_reference_values` field that newer SecurityConfig
-    // structs no longer document.
+    // Shelter infers reference-value extraction from
+    // `security.disk.cryptpilot.rootfs.integrity`.
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
 
-    assert!(rendered.contains("disk-crypt:"));
+    assert!(rendered.contains("engine: cryptpilot"));
+    assert!(rendered.contains("cryptpilot:"));
     assert!(rendered.contains("rootfs:"));
     assert!(rendered.contains("integrity: true"));
+    assert!(!rendered.contains("disk-crypt:"));
     assert!(!rendered.contains("extract_reference_values"));
 }
 

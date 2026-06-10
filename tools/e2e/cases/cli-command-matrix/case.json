@@ -1,4 +1,14 @@
 {
-  "assets": [],
-  "templates": []
+  "assets": [
+    {
+      "source": "examples/mcp/install-mcp.sh",
+      "target": "mcp/install-mcp.sh"
+    }
+  ],
+  "templates": [
+    {
+      "source": "templates/mcp-demo.yaml.tmpl",
+      "target": "mcp/mcp-demo.yaml"
+    }
+  ]
 }

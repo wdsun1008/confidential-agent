@@ -48,6 +48,8 @@ pub struct BuildSpec {
     #[serde(default)]
     pub with_network: bool,
     #[serde(default)]
+    pub container: Option<BuildContainerSpec>,
+    #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
     pub files: Vec<BuildFileSpec>,
@@ -55,6 +57,56 @@ pub struct BuildSpec {
     pub scripts: Vec<PathBuf>,
     #[serde(default)]
     pub variants: BuildVariantsSpec,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BuildContainerSpec {
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub archive: Option<PathBuf>,
+    #[serde(default)]
+    pub mode: ContainerMode,
+    #[serde(default)]
+    pub runtime: ContainerRuntime,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub pull: ContainerPullPolicy,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub network: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerMode {
+    #[default]
+    Runtime,
+    Rootfs,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerRuntime {
+    #[default]
+    Containerd,
+    Podman,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerPullPolicy {
+    #[default]
+    Missing,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -314,6 +366,11 @@ impl AgentSpec {
         for file in &mut self.build.files {
             resolve_pathbuf(&mut file.source, base_dir);
         }
+        if let Some(container) = &mut self.build.container {
+            if let Some(archive) = &mut container.archive {
+                resolve_pathbuf(archive, base_dir);
+            }
+        }
         if let Some(debug) = &mut self.build.variants.debug {
             if let Some(path) = &mut debug.ssh_public_key {
                 resolve_pathbuf(path, base_dir);
@@ -370,6 +427,9 @@ impl AgentSpec {
             bail!("build.base_image must not be empty when set");
         }
         validate_build_packages(&self.build)?;
+        if let Some(container) = &self.build.container {
+            validate_build_container(container)?;
+        }
         if self.deploy.instance_type.trim().is_empty() {
             bail!("deploy.instance_type must not be empty");
         }
@@ -566,6 +626,51 @@ fn validate_build_packages(build: &BuildSpec) -> Result<()> {
             bail!(
                 "build.packages[{index}]='{package}' uses a Debian/Ubuntu package name; default mkosi builds use Alinux/RHEL dnf packages, so use {replacement} instead"
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_container(container: &BuildContainerSpec) -> Result<()> {
+    if container
+        .image
+        .as_deref()
+        .is_some_and(|image| image.trim().is_empty())
+    {
+        bail!("build.container.image must not be empty when set");
+    }
+    if container.image.is_none() && container.archive.is_none() {
+        bail!("build.container.image or build.container.archive is required");
+    }
+    if container.archive.is_some() && container.pull != ContainerPullPolicy::Missing {
+        bail!("build.container.pull is only valid when build.container.archive is not set");
+    }
+    if let Some(name) = container.name.as_deref() {
+        if name.trim().is_empty() {
+            bail!("build.container.name must not be empty");
+        }
+        if !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        {
+            bail!("build.container.name may only contain ASCII letters, digits, '.', '_' and '-'");
+        }
+    }
+    for key in container.env.keys() {
+        if key.trim().is_empty()
+            || key.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            || !key
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            bail!(
+                "build.container.env key '{key}' must be a valid shell environment variable name"
+            );
+        }
+    }
+    if let Some(working_dir) = container.working_dir.as_deref() {
+        if !working_dir.starts_with('/') {
+            bail!("build.container.working_dir must be an absolute path");
         }
     }
     Ok(())
@@ -818,6 +923,72 @@ resources:
 
         assert!(spec.build.base_image.is_none());
         assert_eq!(spec.image_id(), "openclaw-agent");
+    }
+
+    #[test]
+    fn parses_and_resolves_build_container() {
+        let yaml = SPEC.replace(
+            "  with_network: true\n",
+            r#"  with_network: true
+  container:
+    archive: ./containers/hermes.oci.tar
+    mode: rootfs
+    runtime: containerd
+    name: hermes-agent
+    command: ["gateway", "run"]
+    env:
+      API_SERVER_ENABLED: "true"
+    working_dir: /opt/data
+    network: true
+"#,
+        );
+        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+        let container = spec.build.container.as_ref().unwrap();
+
+        assert_eq!(
+            container.archive.as_deref(),
+            Some(Path::new("/project/containers/hermes.oci.tar"))
+        );
+        assert_eq!(container.mode, ContainerMode::Rootfs);
+        assert_eq!(container.runtime, ContainerRuntime::Containerd);
+        assert_eq!(container.name.as_deref(), Some("hermes-agent"));
+        assert_eq!(container.command, vec!["gateway", "run"]);
+        assert_eq!(
+            container.env.get("API_SERVER_ENABLED").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(container.working_dir.as_deref(), Some("/opt/data"));
+        assert_eq!(container.network, Some(true));
+    }
+
+    #[test]
+    fn rejects_invalid_build_container_configs() {
+        for (snippet, expected) in [
+            ("  container: {}\n", "build.container.image or build.container.archive is required"),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    working_dir: opt/data\n",
+                "build.container.working_dir must be an absolute path",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    name: bad/name\n",
+                "build.container.name may only contain ASCII letters",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    env:\n      1BAD: value\n",
+                "build.container.env key '1BAD'",
+            ),
+            (
+                "  container:\n    archive: ./containers/hermes.oci.tar\n    pull: always\n",
+                "build.container.pull is only valid when build.container.archive is not set",
+            ),
+        ] {
+            let yaml = SPEC.replace("  with_network: true\n", &format!("  with_network: true\n{snippet}"));
+            let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err:#}"
+            );
+        }
     }
 
     #[test]
@@ -1336,9 +1507,7 @@ a2a:
         );
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("mode must be sigstore-keyless"));
+        assert!(err.to_string().contains("mode must be sigstore-keyless"));
     }
 
     #[test]
@@ -1358,9 +1527,7 @@ a2a:
         );
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("expected_issuer is required"));
+        assert!(err.to_string().contains("expected_issuer is required"));
     }
 
     #[test]
@@ -1380,9 +1547,7 @@ a2a:
         );
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("expected_subject is required"));
+        assert!(err.to_string().contains("expected_subject is required"));
     }
 
     #[test]
@@ -1410,7 +1575,9 @@ a2a:
         );
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err.to_string().contains("cacheTtlSec must be greater than 0"));
+        assert!(err
+            .to_string()
+            .contains("cacheTtlSec must be greater than 0"));
     }
 
     #[test]

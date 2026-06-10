@@ -150,19 +150,32 @@ fn spec_to_build_config_renders_release_and_debug_variant_matrix() {
             mapping_get(root, "from").as_str(),
             Some("/images/base.qcow2")
         );
+        assert!(!mapping_contains(root, "resize"));
+        assert!(!mapping_contains(root, "variants"));
 
-        let variants = mapping_get(root, "variants").as_sequence().unwrap();
-        assert_eq!(variants.len(), 1);
-        let variant = variants[0].as_mapping().unwrap();
-        assert_eq!(mapping_get(variant, "name").as_str(), Some(variant_name));
-        assert_eq!(
-            mapping_get(variant, "harden_mode").as_str(),
-            Some(harden_mode)
-        );
+        let disk = mapping_get(root, "disk").as_mapping().unwrap();
+        assert_eq!(mapping_get(disk, "size").as_str(), Some("30G"));
+
+        let security = mapping_get(root, "security").as_mapping().unwrap();
+        let harden = mapping_get(security, "harden").as_mapping().unwrap();
+        assert_eq!(mapping_get(harden, "mode").as_str(), Some(harden_mode));
         match ssh_key {
-            Some(expected) => assert_eq!(mapping_get(variant, "ssh_key").as_str(), Some(expected)),
-            None => assert!(!mapping_contains(variant, "ssh_key")),
+            Some(expected) => assert_eq!(mapping_get(harden, "ssh_key").as_str(), Some(expected)),
+            None => assert!(!mapping_contains(harden, "ssh_key")),
         }
+        let security_disk = mapping_get(security, "disk").as_mapping().unwrap();
+        assert_eq!(
+            mapping_get(security_disk, "engine").as_str(),
+            Some("cryptpilot")
+        );
+        let cryptpilot = mapping_get(security_disk, "cryptpilot")
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            mapping_get(cryptpilot, "fde_config_file").as_str(),
+            Some("/build/fde.toml")
+        );
+        assert!(!mapping_contains(security, "disk-crypt"));
 
         let packages = mapping_get(root, "packages").as_sequence().unwrap();
         assert!(sequence_contains_str(packages, "nodejs"));
@@ -197,6 +210,10 @@ fn spec_to_build_config_mkosi_path_omits_from_and_variants_but_keeps_payload() {
 
     assert!(!mapping_contains(root, "from"));
     assert!(!mapping_contains(root, "variants"));
+    assert!(!mapping_contains(root, "resize"));
+
+    let disk = mapping_get(root, "disk").as_mapping().unwrap();
+    assert_eq!(mapping_get(disk, "size").as_str(), Some("30G"));
 
     let packages = mapping_get(root, "packages").as_sequence().unwrap();
     assert!(sequence_contains_str(packages, "nodejs"));
@@ -222,6 +239,65 @@ fn spec_to_build_config_mkosi_path_omits_from_and_variants_but_keeps_payload() {
         "name",
         "confidential-agentd.service"
     ));
+}
+
+#[test]
+fn spec_to_build_config_renders_container_passthrough() {
+    let yaml = SPEC.replace(
+        "  packages:\n",
+        r#"  container:
+    image: nousresearch/hermes-agent:v2026.6.5
+    mode: rootfs
+    runtime: containerd
+    name: hermes-agent
+    pull: missing
+    command: ["gateway", "run"]
+    env:
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+    working_dir: /opt/data
+    network: true
+  packages:
+"#,
+    );
+    let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+    let parsed = render_yaml(&spec, ShelterRenderOptions::default());
+    let root = parsed.as_mapping().unwrap();
+    let container = mapping_get(root, "container").as_mapping().unwrap();
+
+    assert_eq!(
+        mapping_get(container, "image").as_str(),
+        Some("nousresearch/hermes-agent:v2026.6.5")
+    );
+    assert_eq!(mapping_get(container, "mode").as_str(), Some("rootfs"));
+    assert_eq!(
+        mapping_get(container, "runtime").as_str(),
+        Some("containerd")
+    );
+    assert_eq!(
+        mapping_get(container, "name").as_str(),
+        Some("hermes-agent")
+    );
+    assert_eq!(mapping_get(container, "pull").as_str(), Some("missing"));
+    assert_eq!(
+        mapping_get(container, "working_dir").as_str(),
+        Some("/opt/data")
+    );
+    assert_eq!(mapping_get(container, "network").as_bool(), Some(true));
+
+    let command = mapping_get(container, "command").as_sequence().unwrap();
+    assert!(sequence_contains_str(command, "gateway"));
+    assert!(sequence_contains_str(command, "run"));
+
+    let env = mapping_get(container, "env").as_mapping().unwrap();
+    assert_eq!(
+        mapping_get(env, "API_SERVER_ENABLED").as_str(),
+        Some("true")
+    );
+    assert_eq!(
+        mapping_get(env, "API_SERVER_HOST").as_str(),
+        Some("0.0.0.0")
+    );
 }
 
 #[test]
@@ -356,7 +432,12 @@ fn spec_to_build_config_with_deploy_includes_terraform() {
         mapping_get(deploy, "instance_type").as_str(),
         Some("ecs.g8i.xlarge")
     );
+    assert_eq!(mapping_get(deploy, "cc_mode").as_str(), Some("tdx"));
     assert_eq!(mapping_get(deploy, "disk_size").as_i64(), Some(200));
+    assert!(!mapping_contains(deploy, "cc"));
+    assert!(!mapping_contains(deploy, "tdx"));
+    assert!(!mapping_contains(deploy, "security_group_ports"));
+    assert!(!mapping_contains(deploy, "security_group_allowed_cidr"));
 
     let security_group = mapping_get(deploy, "security_group").as_mapping().unwrap();
     let rules = mapping_get(security_group, "rules").as_sequence().unwrap();

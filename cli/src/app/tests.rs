@@ -1324,7 +1324,8 @@ resources: {}
 
     let rendered =
         fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
-    assert!(rendered.contains("name: release"));
+    assert!(!rendered.contains("variants:"));
+    assert!(!rendered.contains("resize:"));
     assert!(!rendered.contains("deploy:"));
     assert!(!rendered.contains("security_group_ports:"));
     assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
@@ -1427,7 +1428,10 @@ resources: {}
         fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
     assert!(rendered.contains("deploy:"));
     assert!(rendered.contains("backend: terraform"));
-    assert!(rendered.contains("security_group_ports: []"));
+    assert!(rendered.contains("cc_mode: tdx"));
+    assert!(!rendered.contains("security_group_ports:"));
+    assert!(!rendered.contains("security_group_allowed_cidr:"));
+    assert!(!rendered.contains("tdx: true"));
     assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(rendered.contains("status_8088_peer_203_0_113_10_32"));
     assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));

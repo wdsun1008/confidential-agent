@@ -1,0 +1,7 @@
+{
+  "assets": [],
+  "templates": [
+    {"source": "templates/hermes-agent.yaml.tmpl", "target": "hermes-agent/hermes-agent.yaml"},
+    {"source": "templates/prepare-hermes-data.sh.tmpl", "target": "hermes-agent/prepare-hermes-data.sh", "mode": "0755"}
+  ]
+}

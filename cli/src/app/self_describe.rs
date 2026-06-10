@@ -108,6 +108,11 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
             for (index, script) in spec.build.scripts.iter().enumerate() {
                 push_path_check(&mut checks, format!("build.scripts[{index}]"), script);
             }
+            if let Some(container) = &spec.build.container {
+                if let Some(archive) = &container.archive {
+                    push_path_check(&mut checks, "build.container.archive", archive);
+                }
+            }
             push_script_package_checks(&mut checks, &spec);
             push_script_package_manager_checks(&mut checks, &spec);
             if let Some(debug) = &spec.build.variants.debug {
@@ -480,7 +485,9 @@ fn spec_schema_json() -> serde_json::Value {
         "build": {
             "image_name": "base Shelter image name",
             "base_image": "optional qcow2/raw disk image path or URL; omit for normal mkosi builds; not a Docker image",
+            "resize": "optional target disk size; rendered as Shelter disk.size",
             "with_network": "allow network during image build",
+            "container": "optional Shelter OCI workload payload; supports image/archive, mode, runtime, name, pull, command, env, working_dir, and network",
             "packages": "minimal OS packages installed by Shelter/mkosi",
             "files": "host files copied into the guest image",
             "scripts": "controller-local script paths executed inside the guest image build; use relative paths such as ./install-service.sh, not guest target paths such as /tmp/install.sh",
@@ -523,7 +530,7 @@ Common optional keys:
 
 Use `confidential-agent spec validate --spec <path> --format json` before build/deploy. Validation checks local file paths, common install-script command/package mismatches, OS package-manager use inside build scripts, and parse error details. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
-For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
+For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Use `build.container` for an OCI workload image or archive; it is rendered as Shelter `container:` and is not a replacement for the mkosi base image. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 `build.scripts` entries are local script paths from the controller work directory, usually the same file listed in `build.files[].source`; they are not the guest `build.files[].target` path.
 "#;
 
@@ -623,6 +630,8 @@ service:
 build:
   base_image: ./missing-base.qcow2
   image_name: openclaw-agent
+  container:
+    archive: ./missing-container.oci.tar
   scripts: [./missing-install.sh]
   variants:
     release:
@@ -658,6 +667,7 @@ resources: {}
 
         assert!(!report.ok);
         assert!(failed.contains(&"build.base_image"));
+        assert!(failed.contains(&"build.container.archive"));
         assert!(failed.contains(&"build.scripts[0]"));
         assert!(failed.contains(&"build.variants.debug.ssh_public_key"));
         assert!(failed.contains(&"attestation.rekor.cosign_key"));

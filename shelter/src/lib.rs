@@ -2,7 +2,7 @@ use anyhow::Result;
 use confidential_agent_core::peerings::{PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{AGENT_CARD_PORT, DAEMON_STATUS_PORT};
 use confidential_agent_core::spec::{
-    AgentSpec, AttestationMode, AttestationTee, ReferenceValueMode, RekorSpec,
+    AgentSpec, AttestationMode, AttestationTee, BuildContainerSpec, ReferenceValueMode, RekorSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,16 +55,12 @@ pub fn render_build_config(
 
     let config = ShelterBuildConfig {
         base_image: spec.build.base_image.clone(),
-        cache_dir: options.cache_dir.clone(),
-        images_dir: options.images_dir.clone(),
-        resize: spec.build.resize.clone(),
+        disk: spec.build.resize.as_ref().map(|size| ShelterDiskConfig {
+            size: Some(size.clone()),
+        }),
         with_network: spec.build.with_network,
+        container: spec.build.container.clone(),
         packages: shelter_packages(spec, assets),
-        variants: if spec.build.base_image.is_some() {
-            shelter_variants(spec)
-        } else {
-            Vec::new()
-        },
         files: guest_files(assets),
         scripts: assets
             .guest_setup_script
@@ -126,30 +122,6 @@ fn shelter_services(spec: &AgentSpec) -> Vec<ShelterServiceUnit> {
         });
     }
     services
-}
-
-fn shelter_variants(spec: &AgentSpec) -> Vec<ShelterVariant> {
-    match spec.image_variant() {
-        "release" => vec![ShelterVariant {
-            name: "release".to_string(),
-            harden_mode: "full".to_string(),
-            ssh_key: None,
-        }],
-        "debug" => {
-            let debug = spec
-                .build
-                .variants
-                .debug
-                .as_ref()
-                .expect("AgentSpec validation guarantees debug variant exists");
-            vec![ShelterVariant {
-                name: "debug".to_string(),
-                harden_mode: "partial".to_string(),
-                ssh_key: debug.ssh_public_key.clone(),
-            }]
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn guest_files(assets: &GuestAssets) -> Vec<ShelterFileMapping> {
@@ -238,21 +210,11 @@ fn render_deploy_config(
         zone_id: deploy.zone_id.clone(),
         ip: deploy.private_ip.clone(),
         instance_type: deploy.instance_type.clone(),
-        cc: Some(shelter_cc(spec.attestation.tee).to_string()),
-        tdx: spec.attestation.tee == AttestationTee::Tdx,
+        cc_mode: Some(shelter_cc(spec.attestation.tee).to_string()),
         disk_size: deploy.disk_gb,
-        security_group_ports: Vec::new(),
         security_group: ShelterDeploySecurityGroup {
             rules: security_group_rules(spec, options),
         },
-        // Shelter still requires this legacy scalar even when explicit
-        // security_group.rules carry the actual peerings-derived ingress set.
-        security_group_allowed_cidr: options
-            .peerings
-            .cidrs_for_scope(PeeringScope::Control)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "0.0.0.0/32".to_string()),
         image_id: options.cloud_image_id.clone(),
         image: if options.cloud_image_id.is_some() {
             None
@@ -385,17 +347,13 @@ struct ShelterBuildConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     base_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_dir: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    images_dir: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resize: Option<String>,
+    disk: Option<ShelterDiskConfig>,
     #[serde(skip_serializing_if = "is_false")]
     with_network: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<BuildContainerSpec>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     packages: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    variants: Vec<ShelterVariant>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     files: Vec<ShelterFileMapping>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -411,11 +369,9 @@ struct ShelterBuildConfig {
 }
 
 #[derive(Debug, Serialize)]
-struct ShelterVariant {
-    name: String,
-    harden_mode: String,
+struct ShelterDiskConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    ssh_key: Option<PathBuf>,
+    size: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -531,8 +487,7 @@ struct ShelterSecurity {
     harden: ShelterHarden,
     trustiflux: ShelterTrustiflux,
     tng: bool,
-    #[serde(rename = "disk-crypt")]
-    disk_crypt: ShelterDiskCrypt,
+    disk: ShelterSecurityDisk,
 }
 
 impl ShelterSecurity {
@@ -540,12 +495,25 @@ impl ShelterSecurity {
         Self {
             harden: ShelterHarden {
                 enabled: true,
-                mode: "full".to_string(),
-                ssh_key: None,
+                mode: if spec.deploys_debug_image() {
+                    "partial".to_string()
+                } else {
+                    "full".to_string()
+                },
+                ssh_key: spec
+                    .build
+                    .variants
+                    .debug
+                    .as_ref()
+                    .and_then(|debug| {
+                        spec.deploys_debug_image()
+                            .then(|| debug.ssh_public_key.clone())
+                    })
+                    .flatten(),
             },
             trustiflux: ShelterTrustiflux::challenge_defaults(),
             tng: true,
-            disk_crypt: ShelterDiskCrypt::writable_layer_defaults(assets, spec),
+            disk: ShelterSecurityDisk::cryptpilot_defaults(assets, spec),
         }
     }
 }
@@ -559,32 +527,42 @@ struct ShelterHarden {
 }
 
 #[derive(Debug, Serialize)]
-struct ShelterDiskCrypt {
+struct ShelterSecurityDisk {
+    engine: String,
+    cryptpilot: ShelterCryptpilotDisk,
+}
+
+impl ShelterSecurityDisk {
+    fn cryptpilot_defaults(assets: &GuestAssets, spec: &AgentSpec) -> Self {
+        Self {
+            engine: "cryptpilot".to_string(),
+            cryptpilot: ShelterCryptpilotDisk::writable_layer_defaults(assets, spec),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterCryptpilotDisk {
     fde_config_file: PathBuf,
-    rootfs: ShelterDiskCryptRootfs,
-    uki: bool,
+    rootfs: ShelterCryptpilotRootfs,
     #[serde(skip_serializing_if = "Option::is_none")]
     uki_append_cmdline: Option<String>,
 }
 
-impl ShelterDiskCrypt {
+impl ShelterCryptpilotDisk {
     fn writable_layer_defaults(assets: &GuestAssets, spec: &AgentSpec) -> Self {
         Self {
             fde_config_file: assets.fde_config_file.clone(),
-            // Shelter >= 2026-05-14 (commit 09ae0f1) drives reference-value
-            // extraction off `disk-crypt.rootfs.integrity` and dropped the
-            // `security.extract_reference_values` field. We always want
-            // dm-verity reference values for the rootfs UKI build, so set
-            // it explicitly rather than relying on shelter's default.
-            rootfs: ShelterDiskCryptRootfs { integrity: true },
-            uki: true,
+            // Shelter drives reference-value extraction off
+            // `security.disk.cryptpilot.rootfs.integrity`.
+            rootfs: ShelterCryptpilotRootfs { integrity: true },
             uki_append_cmdline: spec.build.kernel_cmdline_append.clone(),
         }
     }
 }
 
 #[derive(Debug, Serialize)]
-struct ShelterDiskCryptRootfs {
+struct ShelterCryptpilotRootfs {
     integrity: bool,
 }
 
@@ -711,13 +689,11 @@ struct ShelterDeployConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     ip: Option<String>,
     instance_type: String,
-    cc: Option<String>,
-    tdx: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cc_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_size: Option<u32>,
-    security_group_ports: Vec<String>,
     security_group: ShelterDeploySecurityGroup,
-    security_group_allowed_cidr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
