@@ -483,6 +483,53 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
 }
 
 #[test]
+fn client_only_service_can_discover_and_call_mesh_peer() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": "confidential-agent/mesh-bundle/v1",
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "job": {
+                "phase": "active",
+                "ports": [],
+                "connect": [],
+                "gateway_public_key": "job-pub"
+            },
+            "mcp": {
+                "phase": "active",
+                "public_ip": "39.105.93.168",
+                "ports": [3001],
+                "connect": [],
+                "mcp_ports": [3001],
+                "gateway_public_key": "mcp-pub"
+            }
+        },
+        "reference_values": {
+            "mcp": {"measurement.uki.SHA-384": ["abc123"]}
+        },
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+    let bootstrap = test_bootstrap_config("job");
+    let plan = runtime_port_plan(&bundle, "job").unwrap();
+
+    assert!(plan.self_routes.is_empty());
+    assert_eq!(plan.peer_routes.len(), 1);
+    let directory = serde_json::to_value(service_directory(&bundle, "job", &plan)).unwrap();
+    assert_eq!(directory["services"]["mcp"]["ports"][0]["port"], 3001);
+    assert_eq!(directory["services"]["mcp"]["ports"][0]["mode"], "mesh");
+    assert_eq!(directory["services"]["mcp"]["ports"][0]["protocol"], "mcp");
+
+    let gateway = gateway_config(&bundle, "job", &bootstrap, &plan).unwrap();
+    assert!(gateway["server_routes"].as_array().unwrap().is_empty());
+    assert_eq!(gateway["client_routes"].as_array().unwrap().len(), 1);
+    assert_eq!(gateway["client_routes"][0]["target_service"], "mcp");
+    assert_eq!(gateway["client_routes"][0]["target_port"], 3001);
+    assert_eq!(gateway["trusted_services"]["job"]["public_key"], "job-pub");
+    assert_eq!(gateway["trusted_services"]["mcp"]["public_key"], "mcp-pub");
+}
+
+#[test]
 fn restart_service_reloads_systemd_before_touching_tng_unit() {
     let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL"]);
     let temp = tempfile::tempdir().unwrap();
@@ -923,7 +970,8 @@ fn gateway_config_routes_only_confidential_mesh_ports() {
                 "private_ip": "10.0.1.12",
                 "public_ip": "39.105.93.169",
                 "ports": [4001],
-                "connect": [4001]
+                "connect": [4001],
+                "gateway_public_key": "connect-only-pub"
             }
         },
         "reference_values": {
@@ -954,7 +1002,10 @@ fn gateway_config_routes_only_confidential_mesh_ports() {
     assert_eq!(client_routes[1]["target_port"], 3003);
     assert_eq!(client_routes[1]["tng_port"], 39403);
     assert_eq!(config["trusted_services"]["peer"]["public_key"], "peer-pub");
-    assert!(config["trusted_services"]["connect-only"].is_null());
+    assert_eq!(
+        config["trusted_services"]["connect-only"]["public_key"],
+        "connect-only-pub"
+    );
 }
 
 #[test]

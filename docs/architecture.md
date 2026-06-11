@@ -177,7 +177,7 @@ flowchart TB
 
 ## 6. Mesh Bundle：跨实例可信寻址
 
-`MeshBundle` 是「所有 active 服务彼此都能信任地连到对方」的单一事实源。每个服务的 `ports` 是 Guest 内真实业务端口；`connect` 是 host connect / A2A 单向 RA 子集；`mesh_ports = ports - connect` 是双向 RA confidential-only 数据面。
+`MeshBundle` 是「所有 active 服务彼此都能信任地连到对方」的单一事实源。每个服务的 `ports` 是 Guest 内真实业务端口，可为空表示 client-only/job；`connect` 是 host connect / A2A 单向 RA 子集；`mesh_ports = ports - connect` 是双向 RA confidential-only 数据面。
 
 结构（来自 [`core/src/schema.rs`](../core/src/schema.rs)）：
 
@@ -188,7 +188,8 @@ flowchart TB
   "updated_at": 1714000000,
   "services": {
     "openclaw":      { "phase": "active", "public_ip": "1.2.3.4",  "private_ip": "10.0.0.8", "ports": [18789, 18800], "connect": [18789] },
-    "openclaw-vllm": { "phase": "active", "public_ip": "5.6.7.8",  "private_ip": "10.0.0.9", "ports": [3001], "connect": [] }
+    "openclaw-vllm": { "phase": "active", "public_ip": "5.6.7.8",  "private_ip": "10.0.0.9", "ports": [3001], "connect": [] },
+    "job-agent":     { "phase": "active", "public_ip": "5.6.7.9",  "private_ip": "10.0.0.10", "ports": [], "connect": [] }
   },
   "reference_values":      { "openclaw": ..., "openclaw-vllm": ... },   // sample 模式
   "rekor_reference_values":{ "openclaw": ..., "openclaw-vllm": ... }    // rekor 模式
@@ -200,7 +201,7 @@ flowchart TB
 2. 通过 `attestation-challenge-client inject-resource default/local-resources/cagent_mesh_bundle` 推到每台 Guest。
 3. Guest daemon [`sync_mesh`](../daemon/src/app.rs) 读到后：
    - 写 `/var/cache/confidential-agent/mesh-bundle.json`（持久化）；
-   - 写 `/etc/cai/service-directory.json`（包含对端 `connect` 与 `mesh_ports`，每个端口标记 `mode=connect|mesh`，应用读这个文件做服务发现）；
+   - 写 `/etc/cai/service-directory.json`（包含对端 `connect` 与 `mesh_ports`，每个端口标记 `mode=connect|mesh`，应用读这个文件做服务发现；无端口 peer 不会作为被调用目标出现）；
    - 渲染并写 `/etc/tng/config.json`，让本地 TNG 对本服务的 `connect` 端口只做服务端 attestation，对本服务的 `mesh_ports` 同时验证调用方 attestation；访问对端 `connect` 端口时只验证对端服务端 attestation，访问对端 `mesh_ports` 时同时携带本服务 attestation；
    - 只为本服务 `mesh_ports` 配置 `cai-gateway`：raw mesh 端口只做 service identity，`service.mcp_ports` 端口才做 MCP parse/audit/virtual tools；
    - 如果配置 hash 变了，`systemctl restart trusted-network-gateway.service`。

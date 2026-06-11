@@ -1929,7 +1929,6 @@ fn gateway_config(
         .services
         .iter()
         .filter(|(_, service)| service.phase == "active")
-        .filter(|(_, service)| !confidential_ports(&service.ports, &service.connect).is_empty())
     {
         let public_key = service.gateway_public_key.as_ref().with_context(|| {
             format!("active service '{service_id}' is missing gateway_public_key")
