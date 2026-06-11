@@ -1089,6 +1089,43 @@ mod tests {
         config
     }
 
+    fn test_intent(method: &str, tool_name: &str, command: &str, workdir: &Path) -> IntentEnvelope {
+        IntentEnvelope {
+            method: method.to_string(),
+            id: "req-test".to_string(),
+            params: IntentParams {
+                version: 1,
+                run_id: "run-test".to_string(),
+                session_key: "session-test".to_string(),
+                agent_id: "agent-test".to_string(),
+                tool_name: tool_name.to_string(),
+                skill_id: "skill-test".to_string(),
+                params: ExecParams {
+                    command: command.to_string(),
+                    workdir: workdir.display().to_string(),
+                },
+                request_context: None,
+                security_profile_ref: None,
+                issued_at_ms: 1,
+            },
+        }
+    }
+
+    fn exchange_with_handle_stream(request: &IntentEnvelope, config: PepConfig) -> Value {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let config = Arc::new(config);
+        let handle = thread::spawn(move || handle_stream(server, config).unwrap());
+
+        let body = serde_json::to_vec(request).unwrap();
+        client.write_all(&body).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        handle.join().unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
     fn deny_rule(err: PepError) -> String {
         match err {
             PepError::PolicyDeny { rule_id, .. } => rule_id,
@@ -1135,6 +1172,12 @@ mod tests {
     #[test]
     fn parse_attestation_args_requires_a_subcommand() {
         let err = parse_attestation_args(&[]).unwrap_err();
+        assert!(err.contains("attest requires a subcommand"));
+    }
+
+    #[test]
+    fn run_attest_surfaces_parse_errors_before_invoking_helper() {
+        let err = run_attest(&[]).unwrap_err();
         assert!(err.contains("attest requires a subcommand"));
     }
 
@@ -1371,7 +1414,12 @@ mod tests {
     fn ensure_command_policy_denies_default_patterns() {
         let config: PepConfig = serde_json::from_str("{}").unwrap();
 
-        for cmd in ["curl http://x", "wget http://x", "ssh root@host", "docker run x"] {
+        for cmd in [
+            "curl http://x",
+            "wget http://x",
+            "ssh root@host",
+            "docker run x",
+        ] {
             let err = ensure_command_policy(cmd, &config, "audit-1").unwrap_err();
             assert_eq!(deny_rule(err), "command.deny_pattern");
         }
@@ -1407,6 +1455,238 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let err = canonicalize_existing_dir(temp.path().to_str().unwrap()).unwrap_err();
         assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn usage_lists_documented_entrypoints() {
+        let text = usage();
+
+        assert!(text.contains("cai-pep serve"));
+        assert!(text.contains("cai-pep submit"));
+        assert!(text.contains("cai-pep attest collect-and-verify"));
+    }
+
+    #[test]
+    fn run_serve_rejects_invalid_arguments_before_loading_config() {
+        let err = run_serve(&["--config".to_string()]).unwrap_err();
+        assert!(err.contains("--config requires a value"));
+
+        let err = run_serve(&["--socket".to_string()]).unwrap_err();
+        assert!(err.contains("--socket requires a value"));
+
+        let err = run_serve(&["--bogus".to_string()]).unwrap_err();
+        assert!(err.contains("unknown serve argument: --bogus"));
+    }
+
+    #[test]
+    fn run_submit_validates_arguments_before_connecting() {
+        let cases = [
+            (vec![], "--command is required"),
+            (vec!["--socket"], "--socket requires a value"),
+            (vec!["--command"], "--command requires a value"),
+            (vec!["--workdir"], "--workdir requires a value"),
+            (vec!["--run-id"], "--run-id requires a value"),
+            (vec!["--session-key"], "--session-key requires a value"),
+            (vec!["--agent-id"], "--agent-id requires a value"),
+            (vec!["--skill-id"], "--skill-id requires a value"),
+            (vec!["--bogus"], "unknown submit argument: --bogus"),
+        ];
+
+        for (args, expected) in cases {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let err = run_submit(&args).unwrap_err();
+            assert!(
+                err.contains(expected),
+                "expected '{err}' to contain '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn run_submit_sends_intent_to_socket_and_accepts_json_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("pep.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).unwrap();
+            let request: IntentEnvelope = serde_json::from_str(&raw).unwrap();
+
+            assert_eq!(request.method, "submit_intent");
+            assert_eq!(request.params.run_id, "run-1");
+            assert_eq!(request.params.session_key, "session-1");
+            assert_eq!(request.params.agent_id, "agent-1");
+            assert_eq!(request.params.skill_id, "skill-1");
+            assert_eq!(request.params.tool_name, "exec");
+            assert_eq!(request.params.params.command, "echo hi");
+            assert_eq!(request.params.params.workdir, "/tmp");
+            assert_eq!(
+                request.params.request_context.unwrap()["provider"],
+                "manual-cli"
+            );
+
+            stream
+                .write_all(br#"{"id":"req-test","result":{"status":"ok"}}"#)
+                .unwrap();
+        });
+
+        run_submit(&[
+            "--socket".to_string(),
+            socket_path.display().to_string(),
+            "--command".to_string(),
+            "echo hi".to_string(),
+            "--workdir".to_string(),
+            "/tmp".to_string(),
+            "--run-id".to_string(),
+            "run-1".to_string(),
+            "--session-key".to_string(),
+            "session-1".to_string(),
+            "--agent-id".to_string(),
+            "agent-1".to_string(),
+            "--skill-id".to_string(),
+            "skill-1".to_string(),
+        ])
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_request_reports_connection_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = test_intent("submit_intent", "exec", "echo hi", temp.path());
+        let missing = temp.path().join("missing.sock");
+
+        let err = send_request(missing.to_str().unwrap(), &request).unwrap_err();
+
+        assert!(err.contains("failed to connect"));
+    }
+
+    #[test]
+    fn handle_stream_maps_bad_method_to_json_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_allowed(vec![temp.path().display().to_string()]);
+        let request = test_intent("unknown_method", "exec", "echo hi", temp.path());
+
+        let response = exchange_with_handle_stream(&request, config);
+
+        assert_eq!(response["error"]["code"], "BAD_REQUEST");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported method"));
+    }
+
+    #[test]
+    fn handle_stream_maps_policy_denial_to_json_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_allowed(vec![temp.path().display().to_string()]);
+        let missing = temp.path().join("missing");
+        let request = test_intent("submit_intent", "exec", "echo hi", &missing);
+
+        let response = exchange_with_handle_stream(&request, config);
+
+        assert_eq!(response["error"]["code"], "POLICY_DENY");
+        assert_eq!(response["error"]["rule_id"], "fs.invalid_workdir");
+        assert!(response["error"]["audit_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("audit-"));
+    }
+
+    #[test]
+    fn handle_stream_maps_execution_setup_failures_to_json_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let mut config = config_with_allowed(vec![workdir.display().to_string()]);
+        config.denied_command_patterns = Vec::new();
+        config.denied_path_prefixes = Vec::new();
+        config.workspace_host_path = temp.path().join("missing-root").display().to_string();
+        let request = test_intent("submit_intent", "exec", "echo hi", &workdir);
+
+        let response = exchange_with_handle_stream(&request, config);
+
+        assert_eq!(response["error"]["code"], "EXECUTION_FAILED");
+        assert_eq!(response["error"]["detail"]["mode"], "docker");
+        assert!(response["error"]["audit_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("audit-"));
+    }
+
+    #[test]
+    fn handle_intent_rejects_unsupported_tool_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_allowed(vec![temp.path().display().to_string()]);
+        let request = test_intent("submit_intent", "read_file", "echo hi", temp.path());
+
+        let err = handle_intent(&request, &config).unwrap_err();
+
+        match err {
+            PepError::BadRequest(message) => {
+                assert!(message.contains("unsupported tool_name: read_file"));
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_capped_reader_reports_truncation() {
+        let reader = std::io::Cursor::new(b"abcdef".to_vec());
+
+        let (buf, truncated) = spawn_capped_reader(reader, 3).join().unwrap();
+
+        assert_eq!(buf, b"abc");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn run_command_and_capture_collects_stdout_stderr_and_exit_code() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf out; printf err >&2; exit 7")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_command_and_capture(&mut command, 1024, 1024, 5).unwrap();
+
+        assert_eq!(output.stdout, "out");
+        assert_eq!(output.stderr, "err");
+        assert_eq!(output.exit_code, 7);
+    }
+
+    #[test]
+    fn run_command_and_capture_marks_truncated_streams() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 0123456789; printf abcdef >&2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_command_and_capture(&mut command, 4, 3, 5).unwrap();
+
+        assert_eq!(output.stdout, "0123\n[truncated by cai-pep]");
+        assert_eq!(output.stderr, "abc\n[truncated by cai-pep]");
+        assert_eq!(output.exit_code, 0);
+    }
+
+    #[test]
+    fn run_command_and_capture_marks_timeouts() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_command_and_capture(&mut command, 1024, 1024, 0).unwrap();
+
+        assert!(output.stderr.contains("[timed out by cai-pep]"));
+        assert_ne!(output.exit_code, 0);
     }
 
     #[test]
@@ -1508,5 +1788,27 @@ mod tests {
         std::fs::write(temp.path(), "not json").unwrap();
         let err = PepConfig::load(temp.path()).unwrap_err();
         assert!(err.contains("failed to parse config"));
+    }
+
+    #[test]
+    fn pep_config_load_accepts_partial_config_with_defaults() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            temp.path(),
+            r#"{
+                "socket_path": "/tmp/pep.sock",
+                "timeout_secs": 9,
+                "allowed_workspace_prefixes": ["/tmp"]
+            }"#,
+        )
+        .unwrap();
+
+        let config = PepConfig::load(temp.path()).unwrap();
+
+        assert_eq!(config.socket_path, "/tmp/pep.sock");
+        assert_eq!(config.timeout_secs, 9);
+        assert_eq!(config.allowed_workspace_prefixes, vec!["/tmp"]);
+        assert_eq!(config.docker_network_mode, "none");
+        assert_eq!(config.workspace_mount_target, "/workspace");
     }
 }

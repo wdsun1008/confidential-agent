@@ -2342,3 +2342,384 @@ fn migrate_security_peerings(
     }
     peerings.validate()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cli() -> Cli {
+        Cli {
+            command: Commands::Status(StatusArgs {
+                service: None,
+                json: false,
+                live: false,
+            }),
+            shelter_bin: PathBuf::from("shelter"),
+            state_dir: PathBuf::from("/tmp/confidential-agent-test-state"),
+            tools_image: "confidential-agent-tools:test".to_string(),
+        }
+    }
+
+    fn deploy_state_with_runtime() -> LocalDeployState {
+        LocalDeployState {
+            provider: "aliyun".to_string(),
+            run_id: "run-1".to_string(),
+            resource_name: "svc-run-1".to_string(),
+            terraform_dir: Some(PathBuf::from("/tmp/tf")),
+            image_source: Some(PathBuf::from("/tmp/image.qcow2")),
+            image_import_name: Some("image-import".to_string()),
+            bucket: Some("bucket".to_string()),
+            instance_id: Some("i-123".to_string()),
+            security_group_id: Some("sg-123".to_string()),
+            private_ip: Some("10.0.0.10".to_string()),
+            public_ip: Some("203.0.113.10".to_string()),
+            tee: "tdx".to_string(),
+            published_image_id: Some("m-123".to_string()),
+        }
+    }
+
+    fn a2a_state_with_peer() -> A2aStateFile {
+        A2aStateFile {
+            version: 2,
+            peers: vec![A2aStatePeer {
+                alias: Some("peer-alpha".to_string()),
+                url: "http://203.0.113.8:8089/.well-known/agent-card.json".to_string(),
+                scoped_services: vec!["svc-a".to_string()],
+                signer: Some(A2aSignerPin {
+                    issuer: "https://issuer.example".to_string(),
+                    subject: "peer@example.com".to_string(),
+                }),
+                added_at: "2026-06-11T00:00:00Z".to_string(),
+                cli_preview: None,
+                cli_preview_error: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn connect_command_rejects_invalid_option_combinations_before_external_work() {
+        let cli = test_cli();
+        let start_args = ConnectArgs {
+            render_only: false,
+            from_card: Some("http://one.example/card.json".to_string()),
+            service: None,
+            command: Some(ConnectCommands::Start(ConnectStartArgs {
+                from_card: Some("http://two.example/card.json".to_string()),
+                service: None,
+                ready_json: PathBuf::from("connect-ready.json"),
+                wait_ready: 1,
+                log_file: None,
+            })),
+        };
+
+        let err = cmd_connect(&cli, &start_args).unwrap_err();
+        assert!(err.to_string().contains("conflicting --from-card values"));
+
+        let stop_args = ConnectArgs {
+            render_only: true,
+            from_card: None,
+            service: None,
+            command: Some(ConnectCommands::Stop(ConnectStopArgs {
+                ready_json: PathBuf::from("connect-ready.json"),
+            })),
+        };
+
+        let err = cmd_connect(&cli, &stop_args).unwrap_err();
+        assert!(err.to_string().contains("connect stop only accepts"));
+    }
+
+    #[test]
+    fn merge_connect_option_accepts_absent_matching_and_single_sources() {
+        assert_eq!(merge_connect_option("service", None, None).unwrap(), None);
+
+        let top = "svc-a".to_string();
+        assert_eq!(
+            merge_connect_option("service", Some(&top), None).unwrap(),
+            Some("svc-a")
+        );
+
+        let sub = "svc-a".to_string();
+        assert_eq!(
+            merge_connect_option("service", Some(&top), Some(&sub)).unwrap(),
+            Some("svc-a")
+        );
+
+        let other = "svc-b".to_string();
+        let err = merge_connect_option("service", Some(&top), Some(&other)).unwrap_err();
+        assert!(err.to_string().contains("conflicting --service values"));
+    }
+
+    #[test]
+    fn tng_launch_config_removes_cli_only_client_endpoints() {
+        let config = serde_json::json!({
+            "client_endpoints": [{"service": "svc-a"}],
+            "control_interface": {"restful": {"host": "127.0.0.1", "port": 50000}},
+            "add_ingress": []
+        });
+
+        let launch = tng_launch_config(&config);
+
+        assert!(launch.get("client_endpoints").is_none());
+        assert!(config.get("client_endpoints").is_some());
+        assert_eq!(launch["control_interface"]["restful"]["port"], 50000);
+    }
+
+    #[test]
+    fn connect_client_endpoints_validates_presence_shape_and_non_empty() {
+        let config = serde_json::json!({
+            "client_endpoints": [{
+                "service": "svc-a",
+                "guest_port": 18789,
+                "local_host": "127.0.0.1",
+                "local_port": 49152,
+                "protocol": "http",
+                "http_base_url": "http://127.0.0.1:49152"
+            }]
+        });
+
+        let endpoints = connect_client_endpoints(&config).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].service, "svc-a");
+        assert_eq!(endpoints[0].guest_port, 18789);
+
+        let err = connect_client_endpoints(&serde_json::json!({})).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("connect config has no client_endpoints"));
+
+        let err =
+            connect_client_endpoints(&serde_json::json!({"client_endpoints": []})).unwrap_err();
+        assert!(err.to_string().contains("no client endpoints"));
+
+        let err = connect_client_endpoints(
+            &serde_json::json!({"client_endpoints": [{"service": "svc-a"}]}),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("connect config client_endpoints are invalid"));
+    }
+
+    #[test]
+    fn guard_existing_connect_ready_allows_missing_invalid_and_stopped_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.json");
+        guard_existing_connect_ready(&missing).unwrap();
+
+        let invalid = temp.path().join("invalid.json");
+        fs::write(&invalid, "not-json").unwrap();
+        guard_existing_connect_ready(&invalid).unwrap();
+
+        let ready = ConnectReadyFile {
+            schema: "confidential-agent/connect-ready/v1".to_string(),
+            container_name: format!("ca-connect-unit-test-not-running-{}", std::process::id()),
+            container_id: "container-id".to_string(),
+            started_at: "2026-06-11T00:00:00Z".to_string(),
+            client_endpoints: vec![ConnectClientEndpoint {
+                service: "svc-a".to_string(),
+                guest_port: 18789,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 49152,
+                protocol: "http".to_string(),
+                http_base_url: "http://127.0.0.1:49152".to_string(),
+            }],
+        };
+        let ready_path = temp.path().join("ready.json");
+        fs::write(&ready_path, serde_json::to_string(&ready).unwrap()).unwrap();
+        guard_existing_connect_ready(&ready_path).unwrap();
+    }
+
+    #[test]
+    fn daemon_status_fetch_parses_local_http_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 512];
+            let read = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            assert!(request.starts_with("GET /status HTTP/1.1"));
+
+            let body = serde_json::json!({
+                "schema": "confidential-agent/daemon-status/v1",
+                "service_id": "svc-a",
+                "phase": "running",
+                "bootstrap_generation": 2,
+                "mesh_generation": 3,
+                "applied_resources": {},
+                "mesh_fingerprint": "abc",
+                "app_ready": true,
+                "mesh_ready": true,
+                "debug_ssh_ready": false,
+                "a2a_peers": {},
+                "last_error": null
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let status = fetch_daemon_status_from("127.0.0.1", port, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(status.service_id, "svc-a");
+        assert_eq!(status.bootstrap_generation, 2);
+        assert!(status.app_ready);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_status_fetch_rejects_invalid_address_before_connecting() {
+        let err = fetch_daemon_status_from("not a host", 8088, Duration::from_secs(1)).unwrap_err();
+
+        assert!(err.to_string().contains("invalid daemon status address"));
+    }
+
+    #[test]
+    fn table_formatting_helpers_cover_boundaries() {
+        assert_eq!(join_ports(&[]), "");
+        assert_eq!(join_ports(&[8080, 8081]), "8080,8081");
+        assert_eq!(truncate_for_table("short", 10), "short");
+        assert_eq!(truncate_for_table("abcdefghij", 8), "abcde...");
+        assert_eq!(format_bytes(42), "42B");
+        assert_eq!(format_bytes(2048), "2.0KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0MiB");
+        assert_eq!(format_unix_age(None), "-");
+
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        assert_eq!(format_unix_age(Some(future)), "now");
+    }
+
+    #[test]
+    fn deploy_runtime_state_helpers_clear_all_runtime_fields() {
+        let mut deploy = deploy_state_with_runtime();
+        assert!(deploy_runtime_state_present(&deploy));
+
+        clear_deploy_runtime_state(&mut deploy);
+
+        assert!(!deploy_runtime_state_present(&deploy));
+        assert_eq!(deploy.provider, "aliyun");
+        assert_eq!(deploy.run_id, "");
+        assert_eq!(deploy.resource_name, "");
+        assert_eq!(deploy.tee, "");
+        assert!(deploy.public_ip.is_none());
+        assert!(deploy.published_image_id.is_none());
+    }
+
+    #[test]
+    fn peering_parsers_accept_documented_values_and_reject_unknowns() {
+        assert_eq!(
+            parse_peering_role("operator").unwrap(),
+            PeeringRole::Operator
+        );
+        assert_eq!(parse_peering_role("peer").unwrap(), PeeringRole::Peer);
+        assert_eq!(peering_role_name(PeeringRole::Operator), "operator");
+        assert!(parse_peering_role("admin").is_err());
+
+        let values = vec![
+            "control".to_string(),
+            "status".to_string(),
+            "ssh".to_string(),
+            "agent-card".to_string(),
+            "connect".to_string(),
+            "mesh".to_string(),
+        ];
+        let scopes = parse_peering_scopes(&values).unwrap();
+        assert_eq!(scopes.len(), 6);
+        assert_eq!(scopes[3], PeeringScope::AgentCard);
+        assert_eq!(peering_scope_name(PeeringScope::AgentCard), "agent_card");
+        assert!(parse_peering_scope("unknown").is_err());
+    }
+
+    #[test]
+    fn a2a_state_helpers_round_trip_and_detect_alias_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = read_a2a_state_or_empty(temp.path()).unwrap();
+        assert_eq!(empty.version, 2);
+        assert!(empty.peers.is_empty());
+
+        let state = a2a_state_with_peer();
+        write_a2a_state(temp.path(), &state).unwrap();
+        let reloaded = read_a2a_state_or_empty(temp.path()).unwrap();
+        assert_eq!(reloaded, state);
+
+        let peer = find_a2a_peer(&reloaded, "peer-alpha").unwrap();
+        assert_eq!(peer.scoped_services, vec!["svc-a"]);
+        let peer = find_a2a_peer(&reloaded, &peer.url).unwrap();
+        assert_eq!(peer.alias.as_deref(), Some("peer-alpha"));
+
+        ensure_a2a_alias_available(temp.path(), "peer-alpha", Some(&peer.url)).unwrap();
+        let err = ensure_a2a_alias_available(temp.path(), "peer-alpha", None).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(find_a2a_peer(&reloaded, "missing").is_err());
+    }
+
+    #[test]
+    fn render_a2a_bundle_hashes_peer_identity_fields() {
+        let state = a2a_state_with_peer();
+
+        let bundle = render_a2a_bundle(&state).unwrap();
+
+        assert_eq!(bundle.version, 2);
+        assert_eq!(bundle.peers.len(), 1);
+        assert_eq!(bundle.peers[0].alias.as_deref(), Some("peer-alpha"));
+        assert_eq!(bundle.peers[0].scoped_services, vec!["svc-a"]);
+        assert_eq!(bundle.peers[0].fingerprint.len(), 64);
+
+        let mut changed = state.clone();
+        changed.peers[0].alias = Some("peer-beta".to_string());
+        let changed_bundle = render_a2a_bundle(&changed).unwrap();
+        assert_ne!(
+            bundle.peers[0].fingerprint,
+            changed_bundle.peers[0].fingerprint
+        );
+    }
+
+    #[test]
+    fn a2a_cli_preview_error_includes_kind_and_display_message() {
+        let error = AgentCardFetchError::InvalidUrl("missing scheme".to_string());
+
+        let preview = a2a_cli_preview_error(&error);
+
+        assert_eq!(preview.kind, "invalid");
+        assert!(preview.message.contains("invalid agent card URL"));
+        assert!(!preview.checked_at.is_empty());
+    }
+
+    #[test]
+    fn debug_ssh_helpers_build_expected_command_lines() {
+        let argv = build_debug_ssh_argv(
+            Path::new("/tmp/debug.key"),
+            "203.0.113.10",
+            &[OsString::from("-vv"), OsString::from("uptime")],
+        );
+
+        let rendered = argv
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            vec![
+                "ssh",
+                "-i",
+                "/tmp/debug.key",
+                "root@203.0.113.10",
+                "-vv",
+                "uptime"
+            ]
+        );
+
+        assert_eq!(non_empty_ip(Some(" 10.0.0.8 ")), Some("10.0.0.8"));
+        assert_eq!(non_empty_ip(Some("   ")), None);
+        assert_eq!(non_empty_ip(None), None);
+    }
+}

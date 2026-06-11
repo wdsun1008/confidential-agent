@@ -107,3 +107,20 @@ fn default_status_listen() -> String {
 fn default_agent_card_listen() -> String {
     format!("0.0.0.0:{AGENT_CARD_PORT}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_defaults_use_well_known_ports() {
+        assert_eq!(
+            default_status_listen(),
+            format!("0.0.0.0:{DAEMON_STATUS_PORT}")
+        );
+        assert_eq!(
+            default_agent_card_listen(),
+            format!("0.0.0.0:{AGENT_CARD_PORT}")
+        );
+    }
+}

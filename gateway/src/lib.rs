@@ -1890,9 +1890,10 @@ mod tests {
     fn upstream_response_read_is_bounded() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
             let (_stream, _) = upstream_listener.accept().unwrap();
-            thread::sleep(Duration::from_millis(250));
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
         let route = ServerRoute {
             listen_host: "127.0.0.1".to_string(),
@@ -1910,8 +1911,9 @@ mod tests {
             connection_close: true,
         };
 
-        let err = forward_http_request_with_timeout(&route, &request, Duration::from_millis(25))
+        let err = forward_http_request_with_timeout(&route, &request, Duration::from_millis(100))
             .unwrap_err();
+        let _ = release_tx.send(());
 
         handle.join().unwrap();
         let err = format!("{err:#}");
