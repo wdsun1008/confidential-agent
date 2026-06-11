@@ -2483,6 +2483,388 @@ fn a2a_tng_ingress_clamps_agent_card_cache_ttl() {
     );
 }
 
+#[test]
+fn initrd_fetch_stages_disk_key_with_private_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    let bootstrap_path = cdh_root.join(TEST_BOOTSTRAP_RESOURCE);
+    let disk_key_resource = "default/local-resources/disk_passphrase";
+    let disk_key_path = cdh_root.join(disk_key_resource);
+    write_json_fixture(&bootstrap_path, &test_bootstrap_config("openclaw"));
+    write_test_file(&disk_key_path, b"secret-passphrase\n");
+    let stage_dir = temp.path().join("stage");
+
+    initrd_fetch(InitrdFetchArgs {
+        cdh_root,
+        bootstrap_resource: TEST_BOOTSTRAP_RESOURCE.to_string(),
+        disk_key_resource: disk_key_resource.to_string(),
+        stage_dir: stage_dir.clone(),
+        wait_timeout_sec: 1,
+        retry_interval_sec: 1,
+    })
+    .unwrap();
+
+    let staged_key = stage_dir.join("disk_key");
+    assert_eq!(fs::read(&staged_key).unwrap(), b"secret-passphrase\n");
+    assert_eq!(
+        fs::metadata(staged_key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn initrd_fail_closed_honors_poweroff_skip() {
+    let env = EnvGuard::new(&["CA_SKIP_INITRD_POWEROFF"]);
+    env.set("CA_SKIP_INITRD_POWEROFF", "1");
+
+    let err = initrd_fail_closed("missing initrd secret".to_string()).unwrap_err();
+
+    assert!(err.to_string().contains("missing initrd secret"));
+}
+
+#[test]
+fn read_bootstrap_handles_absent_empty_and_invalid_resources() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+
+    assert!(read_bootstrap(&args).unwrap().is_none());
+    write_test_file(&cdh_root.join(TEST_BOOTSTRAP_RESOURCE), b"");
+    assert!(read_bootstrap(&args).unwrap().is_none());
+
+    let mut unsupported = test_bootstrap_config("openclaw");
+    unsupported.mode = "trustee".to_string();
+    write_json_fixture(&cdh_root.join(TEST_BOOTSTRAP_RESOURCE), &unsupported);
+
+    let err = read_bootstrap(&args).unwrap_err();
+    assert!(err.to_string().contains("not supported"));
+}
+
+#[test]
+fn bootstrap_apply_reports_waiting_for_missing_required_resource() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root);
+    let target = temp.path().join("managed/config.json");
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config.json".to_string(),
+        target,
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        sha256: None,
+    });
+    let mut state = DaemonState::default();
+
+    let ready = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert!(!ready);
+    assert_eq!(state.bootstrap_generation, 1);
+    let status = read_status_file(&env);
+    assert_eq!(status.phase, "waiting-resources");
+    assert!(status.applied_resources.is_empty());
+}
+
+#[test]
+fn bootstrap_apply_rejects_digest_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/config.json");
+    write_test_file(&source, b"{\"version\":1}\n");
+    let mut bootstrap = test_bootstrap_config("openclaw");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config.json".to_string(),
+        target: temp.path().join("managed/config.json"),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        sha256: Some("0".repeat(64)),
+    });
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    assert!(err.to_string().contains("digest mismatch"));
+}
+
+#[test]
+fn read_a2a_bundle_none_empty_then_caches_valid_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let bundle_path = cdh_root.join(TEST_A2A_BUNDLE_RESOURCE);
+
+    assert!(read_a2a_bundle(&args).unwrap().is_none());
+    write_test_file(&bundle_path, b"");
+    assert!(read_a2a_bundle(&args).unwrap().is_none());
+
+    let bundle = test_a2a_bundle(
+        Some("remote"),
+        "http://127.0.0.1:65535/.well-known/agent-card.json",
+        &["openclaw"],
+    );
+    write_json_fixture(&bundle_path, &bundle);
+
+    let read = read_a2a_bundle(&args).unwrap().unwrap();
+
+    assert_eq!(read.peers[0].alias.as_deref(), Some("remote"));
+    assert!(env.cache_dir.join("a2a-bundle.json").exists());
+}
+
+#[test]
+fn runtime_port_plan_rejects_invalid_mesh_shapes() {
+    let missing_self: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION,
+        "generation": 1,
+        "updated_at": 0,
+        "services": {},
+        "reference_values": {},
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+    assert!(runtime_port_plan(&missing_self, "self")
+        .unwrap_err()
+        .to_string()
+        .contains("not present"));
+
+    let inactive_self: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION,
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "self": {"phase": "deleted", "ports": [18789], "connect": []}
+        },
+        "reference_values": {},
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+    assert!(runtime_port_plan(&inactive_self, "self")
+        .unwrap_err()
+        .to_string()
+        .contains("not active"));
+
+    let peer_without_ip: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION,
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [18789], "connect": []},
+            "peer": {"phase": "active", "ports": [3001], "connect": []}
+        },
+        "reference_values": {"peer": {"measurement.uki.SHA-384": ["rv"]}},
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+    assert!(runtime_port_plan(&peer_without_ip, "self")
+        .unwrap_err()
+        .to_string()
+        .contains("no reachable IP"));
+}
+
+#[test]
+fn allocate_internal_port_reports_exhaustion() {
+    let mut used = (TNG_INGRESS_PORT_BASE..=60999).collect::<BTreeSet<_>>();
+
+    let err = allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used).unwrap_err();
+
+    assert!(err.to_string().contains("no available internal"));
+}
+
+#[test]
+fn tng_reference_values_accepts_rekor_and_rejects_missing_peer_values() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION,
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "peer": {
+                "phase": "active",
+                "public_ip": "127.0.0.1",
+                "ports": [3001],
+                "connect": []
+            }
+        },
+        "reference_values": {},
+        "rekor_reference_values": {
+            "peer": {
+                "artifact_id": "peer-disk",
+                "artifact_version": "20260601000000",
+                "artifact_type": "uki",
+                "rekor_url": "https://rekor.sigstore.dev",
+                "rv_name": "measurement.uki.SHA-384"
+            }
+        }
+    }))
+    .unwrap();
+
+    let values = tng_reference_values(&bundle, "peer").unwrap();
+    assert_eq!(values[0]["type"], "slsa");
+    assert_eq!(
+        values[0]["payload"]["content"]["rv_list"][0]["id"],
+        "peer-disk"
+    );
+
+    let err = tng_reference_values(&bundle, "missing").unwrap_err();
+    assert!(err.to_string().contains("missing reference values"));
+}
+
+#[test]
+fn gateway_config_rejects_missing_identity_and_peer_gateway_key() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION,
+        "generation": 1,
+        "updated_at": 0,
+        "services": {
+            "self": {
+                "phase": "active",
+                "public_ip": "127.0.0.1",
+                "ports": [18789, 18800],
+                "connect": [18789],
+                "gateway_public_key": "self-pub"
+            },
+            "peer": {
+                "phase": "active",
+                "public_ip": "127.0.0.1",
+                "ports": [3001],
+                "connect": []
+            }
+        },
+        "reference_values": {"peer": {"measurement.uki.SHA-384": ["rv"]}},
+        "rekor_reference_values": {}
+    }))
+    .unwrap();
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+    let mut bootstrap = test_bootstrap_config("self");
+    bootstrap.gateway_identity = None;
+
+    let err = gateway_config(&bundle, "self", &bootstrap, &plan).unwrap_err();
+    assert!(err.to_string().contains("missing gateway_identity"));
+
+    bootstrap.gateway_identity = Some(GatewayIdentity {
+        public_key: "pub".to_string(),
+        private_key: "priv".to_string(),
+    });
+    let err = gateway_config(&bundle, "self", &bootstrap, &plan).unwrap_err();
+    assert!(err.to_string().contains("missing gateway_public_key"));
+}
+
+#[test]
+fn gateway_config_listen_ports_deduplicates_and_ignores_invalid_values() {
+    let config = json!({
+        "client_routes": [
+            {"listen_port": 3001},
+            {"listen_port": 3001},
+            {"listen_port": 70000},
+            {"listen_port": "3002"}
+        ],
+        "server_routes": [
+            {"listen_port": 39200},
+            {"missing": true}
+        ]
+    });
+
+    assert_eq!(gateway_config_listen_ports(&config), vec![3001, 39200]);
+}
+
+#[test]
+fn daemon_state_round_trips_through_configured_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let mut state = read_daemon_state().unwrap();
+    assert_eq!(state.bootstrap_generation, 0);
+    state.bootstrap_generation = 9;
+    state.mesh_generation = 42;
+    state.last_error = Some("last failure".to_string());
+
+    write_daemon_state(&state).unwrap();
+    let read = read_daemon_state().unwrap();
+
+    assert_eq!(read.bootstrap_generation, 9);
+    assert_eq!(read.mesh_generation, 42);
+    assert_eq!(read.last_error.as_deref(), Some("last failure"));
+    assert!(env.state.exists());
+}
+
+#[test]
+fn a2a_cache_helpers_clamp_reassign_and_validate_cached_peers() {
+    assert_eq!(a2a_cache_ttl_sec(1), A2A_CACHE_TTL_MIN_SEC);
+    assert_eq!(a2a_cache_ttl_sec(u64::MAX), A2A_CACHE_TTL_MAX_SEC);
+
+    let mut cached = A2aCachedPeer {
+        url: "http://127.0.0.1/card.json".to_string(),
+        alias: Some("alias".to_string()),
+        id: Some("remote".to_string()),
+        ports: vec![A2aCachedPort {
+            remote: 3001,
+            local: 3001,
+        }],
+        public_ip: Some("127.0.0.1".to_string()),
+        reference_values: json!([{"type": "sample"}]),
+        fetched_at_unix: 10,
+        next_refresh_unix: 20,
+        fingerprint: "fingerprint".to_string(),
+        error: None,
+    };
+    let mut used = BTreeSet::from([3001]);
+    ensure_cached_ports_available(&mut cached, &mut used).unwrap();
+
+    assert_ne!(cached.ports[0].local, 3001);
+    assert!(used.contains(&cached.ports[0].local));
+    let resolved = resolved_from_cache(&cached).unwrap();
+    assert_eq!(resolved.id, "alias");
+
+    cached.id = None;
+    cached.alias = None;
+    assert!(resolved_from_cache(&cached)
+        .unwrap_err()
+        .to_string()
+        .contains("no id"));
+}
+
+#[test]
+fn a2a_peer_scope_key_and_negative_cache_are_stable() {
+    let peer = A2aBundlePeer {
+        alias: Some("beta".to_string()),
+        url: "http://127.0.0.1/card.json".to_string(),
+        scoped_services: vec!["openclaw".to_string()],
+        signer: None,
+        fingerprint: "fingerprint".to_string(),
+    };
+
+    assert!(a2a_peer_scoped_to_service(&peer, "openclaw"));
+    assert!(!a2a_peer_scoped_to_service(&peer, "other"));
+    assert_eq!(a2a_peer_key(&peer), "beta");
+
+    let cached = negative_a2a_cache(&peer, 100, "fetch failed".to_string());
+    assert_eq!(
+        cached.next_refresh_unix,
+        100 + A2A_FETCH_FAILURE_BACKOFF_SEC
+    );
+    assert!(!cached_peer_is_resolvable(&cached));
+    assert_eq!(cached.error.as_deref(), Some("fetch failed"));
+}
+
+#[test]
+fn agent_card_http_returns_404_when_card_file_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+
+    let response = http_roundtrip(
+        HttpServerKind::AgentCard,
+        b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+}
+
 fn no_tee_test_env(temp: &tempfile::TempDir) -> NoTeeTestEnv {
     let guard = EnvGuard::new(DAEMON_ENV_VARS);
     let root = temp.path().join("daemon-env");

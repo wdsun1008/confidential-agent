@@ -9,6 +9,48 @@ fn default_state_dir() -> PathBuf {
         .join(".confidential-agent")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_state_dir_uses_home_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/ca-home");
+
+        assert_eq!(
+            default_state_dir(),
+            PathBuf::from("/tmp/ca-home/.confidential-agent")
+        );
+
+        if let Some(value) = previous {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn default_state_dir_falls_back_to_root_without_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+
+        assert_eq!(
+            default_state_dir(),
+            PathBuf::from("/root/.confidential-agent")
+        );
+
+        if let Some(value) = previous {
+            std::env::set_var("HOME", value);
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "confidential-agent")]
 #[command(about = "Confidential Agent host CLI")]
