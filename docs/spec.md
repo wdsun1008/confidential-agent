@@ -33,7 +33,7 @@ a2a:            { ... }         # 可选，跨组织 Agent 发现
 ```yaml
 service:
   id: openclaw                  # 服务唯一标识，作为 state-dir 子目录、安全组规则名前缀
-  ports: [18789]                # 服务在 Guest 中真实监听的业务端口集合
+  ports: [18789]                # 服务在 Guest 中真实监听的业务端口集合；可为 [] 表示 client-only/job
   connect: [18789]              # ports 子集；允许 host connect / A2A 单向 RA 接入
   mcp_ports: []                 # mesh_ports 子集；按 MCP 协议做 gateway 审计和 virtual tools 注入
   app_service: cai-openclaw-gateway.service  # 可选；daemon 用它判断应用 systemd unit + 端口是否 ready
@@ -42,14 +42,14 @@ service:
 | 字段 | 类型 | 必填 | 校验 |
 |---|---|:-:|---|
 | `id` | string | ✅ | 仅允许 `[A-Za-z0-9_-]`；不能为空 |
-| `ports` | `[u16]` | ✅ | 不能为空、不能含 0、不能重复 |
+| `ports` | `[u16]` | ✅ | 可为空；不能含 0、不能重复。空列表表示该 workload 不暴露入站业务端口，但仍作为 mesh identity 可访问其他 active 服务 |
 | `connect` | `[u16]` | ❌ | 默认 `[]`；每个端口必须出现在 `ports` 中；不能重复 |
 | `mcp_ports` | `[u16]` | ❌ | 默认 `[]`；每个端口必须属于 `service.ports - service.connect`（即 `mesh_ports`）；不能重复 |
 | `app_service` | string | ❌ | 可选；设置后不能为空；应为 guest 内的 systemd unit 名，例如 `cai-openclaw-gateway.service` |
 
 `app_service` 会写入 daemon bootstrap。若设置，`confidential-agentd` 会启动并检查该 systemd unit，同时确认 `service.ports` 都在 guest 本地可连接；`status --live` 中的 `app_ready` 才会变成 ready。若不设置，`app_ready` 只表示资源和 TNG 层就绪，不证明用户应用已经启动。
 
-端口语义固定为：`service.ports` 是应用在 Guest 内真实监听的业务端口集合，也是 TNG 对外建立 ingress/egress 的端口全集；gateway 和 MCP 不会引入新的业务端口。`service.connect` 是其中允许 host connect 和跨组织 A2A 以单向 RA 访问的子集，调用方只验证服务端 TEE。`mesh_ports = service.ports - service.connect` 是同 state-dir confidential-only mesh 端口，调用双方都会做 RA。敏感的 confidential-only API 只能放在 `mesh_ports` 上，不应暴露在 `connect` 端口上。
+端口语义固定为：`service.ports` 是应用在 Guest 内真实监听的业务端口集合，也是 TNG 对外建立 ingress/egress 的端口全集；gateway 和 MCP 不会引入新的业务端口。`service.ports: []` 表示该 workload 是 client-only/job，不暴露入站业务端口，但仍会获得 gateway identity、进入 mesh bundle，并可通过 `/etc/cai/service-directory.json` 访问其他 active 服务。`service.connect` 是其中允许 host connect 和跨组织 A2A 以单向 RA 访问的子集，调用方只验证服务端 TEE。`mesh_ports = service.ports - service.connect` 是同 state-dir confidential-only mesh 端口，调用双方都会做 RA。敏感的 confidential-only API 只能放在 `mesh_ports` 上，不应暴露在 `connect` 端口上。
 
 `service.mcp_ports` 不改变端口暴露契约，也不要求应用改监听端口，但它必须是 `mesh_ports` 子集。guest 内的 `cai-gateway` 只覆盖 `mesh_ports`：列入 `mcp_ports` 的端口按 MCP JSON-RPC 解析请求，给 `tools/list` 注入 `tee_attest`、`audit_status`、`audit_verify` 三个虚拟工具，并对 MCP 请求/响应追加哈希链审计记录；未列入 `mcp_ports` 的 mesh 端口按 raw TCP 透传，只做 service identity，不做 MCP tool 注入或 MCP audit 解析。`connect` / A2A / AgentCard 路径不经过 gateway，也不携带 gateway client identity。
 

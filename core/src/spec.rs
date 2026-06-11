@@ -503,9 +503,6 @@ impl AgentSpec {
 }
 
 fn validate_ports(field: &str, ports: &[u16]) -> Result<()> {
-    if ports.is_empty() {
-        bail!("{field} must not be empty");
-    }
     let mut seen = BTreeSet::new();
     for port in ports {
         if *port == 0 {
@@ -1389,18 +1386,19 @@ a2a:
     }
 
     #[test]
-    fn rejects_empty_service_ports() {
-        let err = AgentSpec::from_yaml(
+    fn allows_empty_service_ports_for_client_only_workload() {
+        let spec = AgentSpec::from_yaml(
             &SPEC
                 .replace("ports: [18789, 18800]", "ports: []")
-                .replace("connect: [18789]", "connect: []"),
+                .replace("connect: [18789]", "connect: []")
+                .replace("mcp_ports: [18800]", "mcp_ports: []"),
             Path::new("/project"),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("service.ports must not be empty"));
+        assert!(spec.service.ports.is_empty());
+        assert!(spec.service.connect.is_empty());
+        assert!(spec.service.mcp_ports.is_empty());
     }
 
     #[test]
