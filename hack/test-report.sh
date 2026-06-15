@@ -34,7 +34,7 @@ TOTAL_FUNCS=$(awk -F'\t' '{s+=$3} END{print s+0}' "$INVENTORY")
 printf "  %-14s %8s %8s %12s %12s\n" "Crate" "Tests" "Funcs" "Files" "Tested"
 printf "  %-14s %8s %8s %12s %12s\n" "──────────────" "────────" "────────" "────────────" "────────────"
 
-CRATES=("core" "cli" "daemon" "shelter" "cai-pep")
+CRATES=("core" "cli" "daemon" "shelter" "gateway" "cai-pep")
 for crate in "${CRATES[@]}"; do
   t=$(awk -F'\t' -v c="$crate/src/" '$1 ~ "^"c {s+=$2} END{print s+0}' "$INVENTORY")
   f=$(awk -F'\t' -v c="$crate/src/" '$1 ~ "^"c {s+=$3} END{print s+0}' "$INVENTORY")

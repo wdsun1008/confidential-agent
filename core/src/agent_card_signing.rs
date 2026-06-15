@@ -352,7 +352,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("protected/signature must not be empty"));
+        assert!(err
+            .to_string()
+            .contains("protected/signature must not be empty"));
     }
 
     #[test]
@@ -399,8 +401,7 @@ mod tests {
 
     #[test]
     fn canonical_json_handles_nested_types() {
-        let value: Value =
-            serde_json::from_str(r#"{"n":null,"b":true,"s":"hi","a":[1]}"#).unwrap();
+        let value: Value = serde_json::from_str(r#"{"n":null,"b":true,"s":"hi","a":[1]}"#).unwrap();
         let result = canonical_json(&value).unwrap();
         assert_eq!(result, r#"{"a":[1],"b":true,"n":null,"s":"hi"}"#);
     }
