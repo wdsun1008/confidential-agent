@@ -311,7 +311,7 @@ fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
     assert!(rendered.contains("name: openclaw-agent-debug-20260429201011"));
     assert!(!rendered.contains("bucket:"));
     assert!(rendered.contains("name: mesh_18800_peer_39_105_93_168_32"));
-    assert!(rendered.contains("name: mesh_18789_peer_39_105_93_168_32"));
+    assert!(!rendered.contains("name: mesh_18789_peer_39_105_93_168_32"));
     assert!(rendered.contains("cidr: 39.105.93.168/32"));
     assert!(!rendered.contains("cidr: vpc"));
 }

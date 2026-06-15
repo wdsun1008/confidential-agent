@@ -247,7 +247,7 @@ fn spec_to_build_config_renders_container_passthrough() {
         "  packages:\n",
         r#"  container:
     image: nousresearch/hermes-agent:v2026.6.5
-    mode: rootfs
+    mode: runtime
     runtime: containerd
     name: hermes-agent
     pull: missing
@@ -257,6 +257,12 @@ fn spec_to_build_config_renders_container_passthrough() {
       API_SERVER_HOST: 0.0.0.0
     working_dir: /opt/data
     network: true
+    mounts:
+      - source: /var/lib/hermes/data
+        target: /opt/data
+      - source: /var/lib/hermes/readonly
+        target: /etc/hermes/readonly
+        read_only: true
   packages:
 "#,
     );
@@ -269,7 +275,7 @@ fn spec_to_build_config_renders_container_passthrough() {
         mapping_get(container, "image").as_str(),
         Some("nousresearch/hermes-agent:v2026.6.5")
     );
-    assert_eq!(mapping_get(container, "mode").as_str(), Some("rootfs"));
+    assert_eq!(mapping_get(container, "mode").as_str(), Some("runtime"));
     assert_eq!(
         mapping_get(container, "runtime").as_str(),
         Some("containerd")
@@ -284,6 +290,25 @@ fn spec_to_build_config_renders_container_passthrough() {
         Some("/opt/data")
     );
     assert_eq!(mapping_get(container, "network").as_bool(), Some(true));
+    let mounts = mapping_get(container, "mounts").as_sequence().unwrap();
+    assert_eq!(mounts.len(), 2);
+    let rw_mount = mounts[0].as_mapping().unwrap();
+    assert_eq!(
+        mapping_get(rw_mount, "source").as_str(),
+        Some("/var/lib/hermes/data")
+    );
+    assert_eq!(mapping_get(rw_mount, "target").as_str(), Some("/opt/data"));
+    assert_eq!(mapping_get(rw_mount, "read_only").as_bool(), Some(false));
+    let ro_mount = mounts[1].as_mapping().unwrap();
+    assert_eq!(
+        mapping_get(ro_mount, "source").as_str(),
+        Some("/var/lib/hermes/readonly")
+    );
+    assert_eq!(
+        mapping_get(ro_mount, "target").as_str(),
+        Some("/etc/hermes/readonly")
+    );
+    assert_eq!(mapping_get(ro_mount, "read_only").as_bool(), Some(true));
 
     let command = mapping_get(container, "command").as_sequence().unwrap();
     assert!(sequence_contains_str(command, "gateway"));

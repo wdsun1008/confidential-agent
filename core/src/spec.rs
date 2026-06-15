@@ -82,6 +82,17 @@ pub struct BuildContainerSpec {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub network: Option<bool>,
+    #[serde(default)]
+    pub mounts: Vec<ContainerMountSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerMountSpec {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -251,6 +262,8 @@ pub struct ResourceSpec {
     pub mode: Option<String>,
     #[serde(default = "default_true")]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -649,6 +662,9 @@ fn validate_build_container(container: &BuildContainerSpec) -> Result<()> {
         if name.trim().is_empty() {
             bail!("build.container.name must not be empty");
         }
+        if name.len() > 64 {
+            bail!("build.container.name must be at most 64 bytes");
+        }
         if !name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
@@ -672,6 +688,62 @@ fn validate_build_container(container: &BuildContainerSpec) -> Result<()> {
         if !working_dir.starts_with('/') {
             bail!("build.container.working_dir must be an absolute path");
         }
+    }
+    if container.mode == ContainerMode::Rootfs && !container.mounts.is_empty() {
+        bail!("build.container.mounts is only supported with build.container.mode: runtime");
+    }
+    let mut mount_targets = BTreeSet::new();
+    for (index, mount) in container.mounts.iter().enumerate() {
+        validate_container_mount_path(
+            &format!("build.container.mounts[{index}].source"),
+            &mount.source,
+        )?;
+        validate_container_mount_path(
+            &format!("build.container.mounts[{index}].target"),
+            &mount.target,
+        )?;
+        if mount.source.contains([':', ',']) || mount.target.contains([':', ',']) {
+            bail!(
+                "build.container.mounts[{index}] paths must not contain ':' or ',' because runtime mount syntax is delimiter-based"
+            );
+        }
+        let target_path = comparable_mount_path(&mount.target);
+        if !mount_targets.insert(target_path) {
+            bail!("build.container.mounts[{index}].target duplicates an earlier mount target");
+        }
+    }
+    Ok(())
+}
+
+fn comparable_mount_path(value: &str) -> &str {
+    let trimmed = value.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+fn validate_container_mount_path(field: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if value.bytes().any(|byte| byte < 0x20) {
+        bail!("{field} must not contain control characters");
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        bail!("{field} must be an absolute guest path");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::CurDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        bail!("{field} must not contain '.', '..', or platform prefixes");
     }
     Ok(())
 }
@@ -805,6 +877,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_enabled_variant() -> BuildVariantSpec {
     BuildVariantSpec {
         enabled: true,
@@ -911,6 +987,19 @@ resources:
             PathBuf::from("/project/secrets/openclaw.json")
         );
         assert!(spec.resources["openclaw_config"].required);
+        assert!(!spec.resources["openclaw_config"].mutable);
+    }
+
+    #[test]
+    fn parses_mutable_resource_policy() {
+        let yaml = SPEC.replace(
+            "    required: true\n",
+            "    required: true\n    mutable: true\n",
+        );
+
+        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+
+        assert!(spec.resources["openclaw_config"].mutable);
     }
 
     #[test]
@@ -932,7 +1021,7 @@ resources:
             r#"  with_network: true
   container:
     archive: ./containers/hermes.oci.tar
-    mode: rootfs
+    mode: runtime
     runtime: containerd
     name: hermes-agent
     command: ["gateway", "run"]
@@ -940,6 +1029,12 @@ resources:
       API_SERVER_ENABLED: "true"
     working_dir: /opt/data
     network: true
+    mounts:
+      - source: /var/lib/hermes/data
+        target: /opt/data
+      - source: /var/lib/hermes/readonly
+        target: /etc/hermes/readonly
+        read_only: true
 "#,
         );
         let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
@@ -949,7 +1044,7 @@ resources:
             container.archive.as_deref(),
             Some(Path::new("/project/containers/hermes.oci.tar"))
         );
-        assert_eq!(container.mode, ContainerMode::Rootfs);
+        assert_eq!(container.mode, ContainerMode::Runtime);
         assert_eq!(container.runtime, ContainerRuntime::Containerd);
         assert_eq!(container.name.as_deref(), Some("hermes-agent"));
         assert_eq!(container.command, vec!["gateway", "run"]);
@@ -959,6 +1054,13 @@ resources:
         );
         assert_eq!(container.working_dir.as_deref(), Some("/opt/data"));
         assert_eq!(container.network, Some(true));
+        assert_eq!(container.mounts.len(), 2);
+        assert_eq!(container.mounts[0].source, "/var/lib/hermes/data");
+        assert_eq!(container.mounts[0].target, "/opt/data");
+        assert!(!container.mounts[0].read_only);
+        assert_eq!(container.mounts[1].source, "/var/lib/hermes/readonly");
+        assert_eq!(container.mounts[1].target, "/etc/hermes/readonly");
+        assert!(container.mounts[1].read_only);
     }
 
     #[test]
@@ -974,12 +1076,40 @@ resources:
                 "build.container.name may only contain ASCII letters",
             ),
             (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "build.container.name must be at most 64 bytes",
+            ),
+            (
                 "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    env:\n      1BAD: value\n",
                 "build.container.env key '1BAD'",
             ),
             (
                 "  container:\n    archive: ./containers/hermes.oci.tar\n    pull: always\n",
                 "build.container.pull is only valid when build.container.archive is not set",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    mounts:\n      - source: var/lib/hermes/data\n        target: /opt/data\n",
+                "build.container.mounts[0].source must be an absolute guest path",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    mounts:\n      - source: /var/lib/hermes,data\n        target: /opt/data\n",
+                "build.container.mounts[0] paths must not contain ':' or ','",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    mounts:\n      - source: \"/var/lib/hermes\\ndata\"\n        target: /opt/data\n",
+                "build.container.mounts[0].source must not contain control characters",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    mounts:\n      - source: /var/lib/hermes/data\n        target: /opt/data\n      - source: /var/lib/hermes/other\n        target: /opt/data\n",
+                "build.container.mounts[1].target duplicates an earlier mount target",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    mounts:\n      - source: /var/lib/hermes/data\n        target: /opt/data\n      - source: /var/lib/hermes/other\n        target: /opt/data/\n",
+                "build.container.mounts[1].target duplicates an earlier mount target",
+            ),
+            (
+                "  container:\n    image: nousresearch/hermes-agent:v2026.6.5\n    mode: rootfs\n    mounts:\n      - source: /var/lib/hermes/data\n        target: /opt/data\n",
+                "build.container.mounts is only supported with build.container.mode: runtime",
             ),
         ] {
             let yaml = SPEC.replace("  with_network: true\n", &format!("  with_network: true\n{snippet}"));

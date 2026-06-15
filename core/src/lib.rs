@@ -154,6 +154,7 @@ mod schema_tests {
                 group: None,
                 mode: "0600".to_string(),
                 required: true,
+                mutable: false,
                 sha256: Some("abc".to_string()),
             }],
             app_service: Some("app.service".to_string()),

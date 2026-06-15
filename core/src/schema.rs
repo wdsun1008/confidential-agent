@@ -157,6 +157,8 @@ pub struct LocalResourceState {
     pub group: Option<String>,
     pub mode: String,
     pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +205,8 @@ pub struct GuestResource {
     pub mode: String,
     #[serde(default)]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
@@ -309,6 +313,8 @@ pub struct AppliedResourceState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -534,10 +540,7 @@ mod tests {
 
     #[test]
     fn confidential_ports_returns_all_when_no_connect() {
-        assert_eq!(
-            confidential_ports(&[3001, 3002], &[]),
-            vec![3001, 3002]
-        );
+        assert_eq!(confidential_ports(&[3001, 3002], &[]), vec![3001, 3002]);
     }
 
     #[test]

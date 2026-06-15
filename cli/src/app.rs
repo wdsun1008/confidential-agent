@@ -823,6 +823,7 @@ fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapC
                 group: resource.group.clone(),
                 mode: resource.mode.clone().unwrap_or_else(|| "0600".to_string()),
                 required: resource.required,
+                mutable: resource.mutable,
                 sha256: Some(sha256_file(&resource.source)?),
             })
         })

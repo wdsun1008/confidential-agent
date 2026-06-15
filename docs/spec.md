@@ -128,10 +128,15 @@ container:
   env:
     APP_ENV: production                # key 必须是合法 shell 环境变量名
   working_dir: /srv/app                # 必须是绝对路径
-  network: true                        # 显式要求 rootfs 网络
+  network: true                        # 显式要求 guest/container 网络
+  mounts:                              # runtime 模式可选；guest path bind 到容器内
+    - source: /var/lib/app/data        # guest 上的绝对路径
+      target: /opt/data                # 容器内绝对路径
+      read_only: false                 # 默认 false
 ```
 
 `container` 是 workload payload。CA 仍然以 `mkosi + cryptpilot` 生成 TDX guest/rootfs，并把 OCI payload 交给 Shelter master 的 `container:` 机制处理；不要把 Docker/OCI image 写到 `build.base_image`。
+`container.mounts` 只描述 runtime 容器的 bind mount；如果文件来自 CA runtime `resources`，仍然需要在顶层 `resources` 中显式声明资源注入到 guest 上的 `source` 路径，再把该 guest 路径 mount 到容器。
 
 #### 3.3 `BuildVariantSpec`
 
@@ -280,6 +285,7 @@ resources:
     group: openclaw                             # 可选；同 /etc/group
     mode: "0600"                                # 可选；默认 "0600"
     required: true                              # 默认 true；false 时 daemon 找不到该资源不会 fail
+    mutable: false                              # 默认 false；true 表示首次写入后应用可改写内容
 ```
 
 工作过程（[`cli/src/app/workflows.rs::inject_resources`](../cli/src/app/workflows.rs)）：
@@ -288,6 +294,8 @@ resources:
 2. CLI 通过 `attestation-challenge-client inject-resource` 把内容写到 Guest CDH 的 `default/local-resources/<id>` 资源路径。
 3. Guest `confidential-agentd` 监测到 bootstrap 后，把 CDH 那份资源原子复制到 `target`，并强制校验 sha256 / mode / owner / group（[`daemon/src/app.rs::apply_resource_once`](../daemon/src/app.rs)）。
 4. Daemon 校验失败会拒绝写文件并把状态停在 `waiting-resources`。
+
+`mutable: true` 用于应用会在启动后迁移或改写的初始化文件。daemon 仍会校验注入源文件的 sha256，并在首次缺失时写入 `target`；写入成功后只维护目标路径、mode、owner、group，不再因为目标内容被应用改写而覆盖文件或重启 `app_service`。如果应用删除了目标文件，daemon 会按原始注入内容重新 seed。不要把长期必须强一致的 secret 标成 mutable。
 
 约束：
 - `target` 必须绝对路径。

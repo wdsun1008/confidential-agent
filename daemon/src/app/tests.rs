@@ -1,7 +1,7 @@
 use super::*;
 use confidential_agent_core::schema::GatewayIdentity;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1035,6 +1035,7 @@ fn resource_apply_is_idempotent() {
         group: None,
         mode: "0600".to_string(),
         required: true,
+        mutable: false,
         sha256: Some(digest_v1.clone()),
     };
 
@@ -1073,6 +1074,7 @@ fn resource_apply_removes_stale_tmp_before_replace() {
         group: None,
         mode: "0600".to_string(),
         required: true,
+        mutable: false,
         sha256: Some(digest.clone()),
     };
 
@@ -1081,6 +1083,135 @@ fn resource_apply_removes_stale_tmp_before_replace() {
     assert_eq!(outcome, ApplyOutcome::Updated);
     assert_eq!(fs::read_to_string(target).unwrap(), "managed");
     assert!(!stale_tmp.exists());
+}
+
+#[test]
+fn resource_apply_rejects_symlink_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    let linked = temp.path().join("linked");
+    fs::write(&source, "managed").unwrap();
+    fs::write(&linked, "managed").unwrap();
+    fs::set_permissions(&linked, fs::Permissions::from_mode(0o644)).unwrap();
+    symlink(&linked, &target).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let resource = GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest.clone()),
+    };
+
+    let err = apply_resource_once(&resource, &source, &digest).unwrap_err();
+
+    assert!(err.to_string().contains("invalid resource target"));
+    assert!(fs::symlink_metadata(&target)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::metadata(&linked).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn resource_apply_rejects_stale_tmp_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    let stale_tmp = target.with_extension("confidential-agent.tmp");
+    let linked = temp.path().join("linked");
+    fs::write(&source, "managed").unwrap();
+    fs::write(&linked, "outside").unwrap();
+    symlink(&linked, &stale_tmp).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let resource = GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest.clone()),
+    };
+
+    let err = apply_resource_once(&resource, &source, &digest).unwrap_err();
+
+    assert!(err.to_string().contains("invalid resource temporary path"));
+    assert_eq!(fs::read_to_string(&linked).unwrap(), "outside");
+    assert!(fs::symlink_metadata(&stale_tmp)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn resource_apply_rejects_mutable_symlink_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    let linked = temp.path().join("linked");
+    fs::write(&source, "managed").unwrap();
+    fs::write(&linked, "managed").unwrap();
+    symlink(&linked, &target).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let resource = GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: true,
+        sha256: Some(digest.clone()),
+    };
+
+    let err = apply_resource_once(&resource, &source, &digest).unwrap_err();
+
+    assert!(err.to_string().contains("invalid resource target"));
+    assert!(fs::symlink_metadata(&target)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn resource_apply_rejects_symlink_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let real_parent = temp.path().join("real-parent");
+    let link_parent = temp.path().join("link-parent");
+    let target = link_parent.join("target");
+    fs::write(&source, "managed").unwrap();
+    fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &link_parent).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let resource = GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest.clone()),
+    };
+
+    let err = apply_resource_once(&resource, &source, &digest).unwrap_err();
+
+    assert!(err.to_string().contains("invalid resource target"));
+    assert!(!real_parent.join("target").exists());
 }
 
 #[test]
@@ -1096,6 +1227,7 @@ fn resource_apply_supports_numeric_owner_and_group() {
         target: target.clone(),
         mode: "0600".to_string(),
         required: true,
+        mutable: false,
         sha256: Some(digest.clone()),
         owner: Some("65534".to_string()),
         group: Some("65534".to_string()),
@@ -1136,6 +1268,7 @@ fn bootstrap_reapplies_resource_when_target_content_drifted() {
             group: None,
             mode: "0600".to_string(),
             required: true,
+            mutable: false,
             sha256: Some(digest.clone()),
         }],
         app_service: None,
@@ -1160,12 +1293,682 @@ fn bootstrap_reapplies_resource_when_target_content_drifted() {
             owner: None,
             group: None,
             mode: "0600".to_string(),
+            mutable: false,
         },
     );
 
     apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
 
     assert_eq!(fs::read_to_string(target).unwrap(), "managed-v1");
+}
+
+#[test]
+fn bootstrap_seeds_mutable_resource_when_target_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"seed-config");
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: true,
+        sha256: Some(digest.clone()),
+    });
+    let mut state = DaemonState::default();
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "seed-config");
+    assert!(state.applied_resources["config"].mutable);
+    assert_eq!(state.applied_resources["config"].sha256, digest);
+}
+
+#[test]
+fn bootstrap_does_not_reapply_mutable_resource_when_target_content_drifted() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"seed-config");
+    write_test_file(&target, b"application-mutated");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    let source_digest = sha256_file(&source).unwrap();
+    let target_digest = sha256_file(&target).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.generation = 2;
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: true,
+        sha256: Some(source_digest),
+    });
+    let mut state = DaemonState {
+        bootstrap_generation: 1,
+        applied_resources: BTreeMap::from([(
+            "config".to_string(),
+            AppliedResourceState {
+                sha256: target_digest.clone(),
+                target: target.clone(),
+                owner: None,
+                group: None,
+                mode: "0600".to_string(),
+                mutable: true,
+            },
+        )]),
+        ..DaemonState::default()
+    };
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "application-mutated");
+    assert_eq!(state.bootstrap_generation, 2);
+    assert_eq!(state.applied_resources["config"].sha256, target_digest);
+}
+
+#[test]
+fn bootstrap_fixes_mutable_resource_metadata_without_overwriting_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"seed-config");
+    write_test_file(&target, b"application-mutated");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let source_digest = sha256_file(&source).unwrap();
+    let target_digest = sha256_file(&target).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: true,
+        sha256: Some(source_digest),
+    });
+    let mut state = DaemonState {
+        bootstrap_generation: 1,
+        applied_resources: BTreeMap::from([(
+            "config".to_string(),
+            AppliedResourceState {
+                sha256: target_digest.clone(),
+                target: target.clone(),
+                owner: None,
+                group: None,
+                mode: "0600".to_string(),
+                mutable: true,
+            },
+        )]),
+        ..DaemonState::default()
+    };
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "application-mutated");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(state.applied_resources["config"].sha256, target_digest);
+}
+
+#[test]
+fn bootstrap_fixes_mutable_metadata_without_stopping_app_service() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = install_fake_systemctl(&env, &temp);
+
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"seed-config");
+    write_test_file(&target, b"application-mutated");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let source_digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: true,
+        sha256: Some(source_digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let mut state = DaemonState {
+        bootstrap_generation: 1,
+        applied_resources: BTreeMap::from([(
+            "config".to_string(),
+            AppliedResourceState {
+                sha256: "previous-audit-digest".to_string(),
+                target: target.clone(),
+                owner: None,
+                group: None,
+                mode: "0600".to_string(),
+                mutable: true,
+            },
+        )]),
+        ..DaemonState::default()
+    };
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "application-mutated");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        state.applied_resources["config"].sha256,
+        "previous-audit-digest"
+    );
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        [
+            "start --no-block shelter-container-hermes-agent.service",
+            "is-active --quiet shelter-container-hermes-agent.service",
+        ]
+    );
+}
+
+#[test]
+fn bootstrap_reseeds_mutable_resource_when_target_is_deleted() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let cdh_root = temp.path().join("cdh");
+    let args = test_run_args(cdh_root.clone());
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"seed-config");
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.generation = 2;
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: true,
+        sha256: Some(digest.clone()),
+    });
+    let mut state = DaemonState {
+        bootstrap_generation: 1,
+        applied_resources: BTreeMap::from([(
+            "config".to_string(),
+            AppliedResourceState {
+                sha256: "previous-target-digest".to_string(),
+                target: target.clone(),
+                owner: None,
+                group: None,
+                mode: "0600".to_string(),
+                mutable: true,
+            },
+        )]),
+        ..DaemonState::default()
+    };
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "seed-config");
+    assert_eq!(state.applied_resources["config"].sha256, digest);
+}
+
+#[test]
+fn bootstrap_ready_accepts_mutable_resource_content_drift_after_apply() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("config.yaml");
+    fs::write(&target, "application-mutated").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    let bootstrap = BootstrapConfig {
+        schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
+        generation: 7,
+        service_id: "hermes-agent".to_string(),
+        mode: "challenge".to_string(),
+        ports: Vec::new(),
+        connect: Vec::new(),
+        mcp_ports: Vec::new(),
+        gateway_identity: None,
+        resources: vec![GuestResource {
+            id: "config".to_string(),
+            resource_path: "default/local-resources/config".to_string(),
+            target: target.clone(),
+            owner: None,
+            group: None,
+            mode: "0600".to_string(),
+            required: true,
+            mutable: true,
+            sha256: Some("seed-source-digest".to_string()),
+        }],
+        app_service: None,
+        peers: Vec::new(),
+        agent_card: None,
+    };
+    let state = DaemonState {
+        bootstrap_generation: 7,
+        applied_resources: BTreeMap::from([(
+            "config".to_string(),
+            AppliedResourceState {
+                sha256: "old-target-digest".to_string(),
+                target,
+                owner: None,
+                group: None,
+                mode: "0600".to_string(),
+                mutable: true,
+            },
+        )]),
+        ..DaemonState::default()
+    };
+
+    assert!(bootstrap_resources_ready(&bootstrap, &state).unwrap());
+}
+
+#[test]
+fn bootstrap_apply_stops_resource_backed_app_before_starting_it() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = install_fake_systemctl(&env, &temp);
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"managed");
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(target).unwrap(), "managed");
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands[0],
+        "is-active --quiet shelter-container-hermes-agent.service"
+    );
+    assert_eq!(commands[1], "stop shelter-container-hermes-agent.service");
+    assert_eq!(
+        commands[2],
+        "reset-failed shelter-container-hermes-agent.service"
+    );
+    assert_eq!(
+        commands[3],
+        "start --no-block shelter-container-hermes-agent.service"
+    );
+    assert_eq!(
+        commands[4],
+        "is-active --quiet shelter-container-hermes-agent.service"
+    );
+}
+
+#[test]
+fn bootstrap_apply_writes_resource_when_app_service_unit_is_not_loaded() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let fake_systemctl = temp.path().join("systemctl");
+    let log_path = temp.path().join("systemctl.log");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = stop ]; then echo 'translated missing unit message' >&2; exit 5; fi\nexit 0\n",
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env.remove("CA_SKIP_SYSTEMCTL");
+    env.set_path("CA_DAEMON_STATUS_PATH", &temp.path().join("status.json"));
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"managed");
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
+
+    assert_eq!(fs::read_to_string(target).unwrap(), "managed");
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        [
+            "is-active --quiet shelter-container-hermes-agent.service",
+            "stop shelter-container-hermes-agent.service",
+            "start --no-block shelter-container-hermes-agent.service",
+            "is-active --quiet shelter-container-hermes-agent.service",
+        ]
+    );
+}
+
+#[test]
+fn bootstrap_apply_missing_resource_does_not_stop_app_service() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = install_fake_systemctl(&env, &temp);
+
+    let cdh_root = temp.path().join("cdh");
+    let target = temp.path().join("target");
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target,
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: None,
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    assert!(!apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
+    assert!(!log_path.exists());
+}
+
+#[test]
+fn bootstrap_apply_digest_mismatch_does_not_stop_app_service() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = install_fake_systemctl(&env, &temp);
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"managed");
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target,
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some("not-the-source-digest".to_string()),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    assert!(err.to_string().contains("digest mismatch"));
+    assert!(!log_path.exists());
+}
+
+#[test]
+fn bootstrap_apply_unchanged_resource_does_not_stop_app_service() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = install_fake_systemctl(&env, &temp);
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"managed");
+    write_test_file(&target, b"managed");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target,
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap());
+
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        [
+            "start --no-block shelter-container-hermes-agent.service",
+            "is-active --quiet shelter-container-hermes-agent.service",
+        ]
+    );
+}
+
+#[test]
+fn bootstrap_apply_restarts_app_service_when_resource_write_fails_after_stop() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = install_fake_systemctl(&env, &temp);
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    let stale_tmp = target.with_extension("confidential-agent.tmp");
+    write_test_file(&source, b"managed");
+    fs::create_dir(&stale_tmp).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target,
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    assert!(format!("{err:#}").contains("failed to remove stale"));
+    assert_eq!(state.bootstrap_generation, 0);
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        [
+            "is-active --quiet shelter-container-hermes-agent.service",
+            "stop shelter-container-hermes-agent.service",
+            "reset-failed shelter-container-hermes-agent.service",
+            "start --no-block shelter-container-hermes-agent.service",
+        ]
+    );
+}
+
+#[test]
+fn bootstrap_apply_does_not_start_inactive_app_when_resource_write_fails_after_stop() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let fake_systemctl = temp.path().join("systemctl");
+    let log_path = temp.path().join("systemctl.log");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  'is-active --quiet shelter-container-hermes-agent.service') exit 3 ;;\n  'start --no-block shelter-container-hermes-agent.service') exit 99 ;;\nesac\nexit 0\n",
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env.remove("CA_SKIP_SYSTEMCTL");
+    env.set_path("CA_DAEMON_STATUS_PATH", &temp.path().join("status.json"));
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    let stale_tmp = target.with_extension("confidential-agent.tmp");
+    write_test_file(&source, b"managed");
+    fs::create_dir(&stale_tmp).unwrap();
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target,
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    assert!(format!("{err:#}").contains("failed to remove stale"));
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        [
+            "is-active --quiet shelter-container-hermes-agent.service",
+            "stop shelter-container-hermes-agent.service",
+            "reset-failed shelter-container-hermes-agent.service",
+        ]
+    );
+}
+
+#[test]
+fn bootstrap_apply_does_not_write_resource_when_app_service_stop_fails() {
+    let env = EnvGuard::new(&["PATH", "CA_SKIP_SYSTEMCTL", "CA_DAEMON_STATUS_PATH"]);
+    let temp = tempfile::tempdir().unwrap();
+    let fake_systemctl = temp.path().join("systemctl");
+    let log_path = temp.path().join("systemctl.log");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = stop ]; then echo 'permission denied' >&2; exit 1; fi\nexit 0\n",
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env.remove("CA_SKIP_SYSTEMCTL");
+    env.set_path("CA_DAEMON_STATUS_PATH", &temp.path().join("status.json"));
+
+    let cdh_root = temp.path().join("cdh");
+    let source = cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("target");
+    write_test_file(&source, b"managed");
+    let digest = sha256_file(&source).unwrap();
+    let mut bootstrap = test_bootstrap_config("hermes-agent");
+    bootstrap.resources.push(GuestResource {
+        id: "config".to_string(),
+        resource_path: "default/local-resources/config".to_string(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".to_string(),
+        required: true,
+        mutable: false,
+        sha256: Some(digest),
+    });
+    bootstrap.app_service = Some("shelter-container-hermes-agent.service".to_string());
+    let args = test_run_args(cdh_root);
+    let mut state = DaemonState::default();
+
+    let err = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap_err();
+
+    assert!(err.to_string().contains("systemctl stop"));
+    assert!(!target.exists());
+    let log = fs::read_to_string(log_path).unwrap();
+    let commands: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        commands,
+        [
+            "is-active --quiet shelter-container-hermes-agent.service",
+            "stop shelter-container-hermes-agent.service",
+        ]
+    );
 }
 
 #[test]
@@ -1195,6 +1998,7 @@ fn bootstrap_rejects_oversized_resource() {
             group: None,
             mode: "0600".to_string(),
             required: true,
+            mutable: false,
             sha256: None,
         }],
         app_service: None,
@@ -1242,6 +2046,7 @@ fn bootstrap_rejects_non_regular_resource_even_when_empty() {
             group: None,
             mode: "0600".to_string(),
             required: true,
+            mutable: false,
             sha256: None,
         }],
         app_service: None,
@@ -1308,6 +2113,7 @@ fn bootstrap_ready_requires_matching_generation_and_resource_digests() {
             group: None,
             mode: "0600".to_string(),
             required: true,
+            mutable: false,
             sha256: Some(digest.clone()),
         }],
         app_service: None,
@@ -1328,6 +2134,7 @@ fn bootstrap_ready_requires_matching_generation_and_resource_digests() {
             owner: None,
             group: None,
             mode: "0600".to_string(),
+            mutable: false,
         },
     );
 
@@ -1363,6 +2170,7 @@ fn bootstrap_ready_accepts_present_digestless_resources() {
             group: None,
             mode: "0600".to_string(),
             required: true,
+            mutable: false,
             sha256: None,
         }],
         app_service: None,
@@ -1383,6 +2191,7 @@ fn bootstrap_ready_accepts_present_digestless_resources() {
             owner: None,
             group: None,
             mode: "0600".to_string(),
+            mutable: false,
         },
     );
 
@@ -1410,6 +2219,7 @@ fn no_tee_bootstrap_apply_writes_managed_resource_and_status() {
         group: None,
         mode: "0600".to_string(),
         required: true,
+        mutable: false,
         sha256: Some(digest.clone()),
     });
     let mut state = DaemonState::default();
@@ -2607,6 +3417,7 @@ fn bootstrap_apply_reports_waiting_for_missing_required_resource() {
         group: None,
         mode: "0600".to_string(),
         required: true,
+        mutable: false,
         sha256: None,
     });
     let mut state = DaemonState::default();
@@ -2614,8 +3425,9 @@ fn bootstrap_apply_reports_waiting_for_missing_required_resource() {
     let ready = apply_bootstrap(&args, &bootstrap, &mut state, false).unwrap();
 
     assert!(!ready);
-    assert_eq!(state.bootstrap_generation, 1);
+    assert_eq!(state.bootstrap_generation, 0);
     let status = read_status_file(&env);
+    assert_eq!(status.bootstrap_generation, 1);
     assert_eq!(status.phase, "waiting-resources");
     assert!(status.applied_resources.is_empty());
 }
@@ -2636,6 +3448,7 @@ fn bootstrap_apply_rejects_digest_mismatch() {
         group: None,
         mode: "0600".to_string(),
         required: true,
+        mutable: false,
         sha256: Some("0".repeat(64)),
     });
     let mut state = DaemonState::default();
@@ -2983,6 +3796,28 @@ fn write_test_file(path: &Path, content: &[u8]) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn install_fake_systemctl(env: &EnvGuard, temp: &tempfile::TempDir) -> PathBuf {
+    let fake_systemctl = temp.path().join("systemctl");
+    let log_path = temp.path().join("systemctl.log");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    env.set(
+        "PATH",
+        format!("{}:{}", temp.path().display(), old_path.to_string_lossy()),
+    );
+    env.remove("CA_SKIP_SYSTEMCTL");
+    env.set_path("CA_DAEMON_STATUS_PATH", &temp.path().join("status.json"));
+    log_path
 }
 
 fn write_json_fixture(path: &Path, value: &impl serde::Serialize) {

@@ -294,6 +294,7 @@ pub(super) fn resource_states(spec: &AgentSpec) -> Result<BTreeMap<String, Local
                 group: resource.group.clone(),
                 mode: resource.mode.clone().unwrap_or_else(|| "0600".to_string()),
                 required: resource.required,
+                mutable: resource.mutable,
             },
         );
     }

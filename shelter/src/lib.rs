@@ -1,6 +1,6 @@
 use anyhow::Result;
 use confidential_agent_core::peerings::{PeeringScope, PeeringsFile};
-use confidential_agent_core::schema::{AGENT_CARD_PORT, DAEMON_STATUS_PORT};
+use confidential_agent_core::schema::{confidential_ports, AGENT_CARD_PORT, DAEMON_STATUS_PORT};
 use confidential_agent_core::spec::{
     AgentSpec, AttestationMode, AttestationTee, BuildContainerSpec, ReferenceValueMode, RekorSpec,
 };
@@ -315,7 +315,7 @@ fn security_group_rules(
             ));
         }
     }
-    let mesh_ports = spec.service.ports.iter().copied().collect::<BTreeSet<_>>();
+    let mesh_ports = confidential_ports(&spec.service.ports, &spec.service.connect);
     let peer_mesh_cidrs = options
         .mesh_peer_cidrs
         .iter()

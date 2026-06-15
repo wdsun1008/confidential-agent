@@ -19,9 +19,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
-use std::os::unix::io::RawFd;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{chown, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1130,15 +1130,20 @@ fn bootstrap_resources_ready(bootstrap: &BootstrapConfig, state: &DaemonState) -
             || applied.mode != resource.mode
             || applied.owner != resource.owner
             || applied.group != resource.group
+            || applied.mutable != resource.mutable
         {
             return Ok(false);
         }
-        if let Some(expected) = &resource.sha256 {
-            if applied.sha256 != *expected {
+        if !resource.mutable {
+            if let Some(expected) = &resource.sha256 {
+                if applied.sha256 != *expected {
+                    return Ok(false);
+                }
+            }
+            if !resource_target_matches(resource, &applied.sha256)? {
                 return Ok(false);
             }
-        }
-        if !resource_target_matches(resource, &applied.sha256)? {
+        } else if !resource_target_metadata_matches(resource)? {
             return Ok(false);
         }
     }
@@ -1185,7 +1190,22 @@ fn apply_bootstrap(
     state: &mut DaemonState,
     fail_missing: bool,
 ) -> Result<bool> {
+    struct PlannedResource<'a> {
+        resource: &'a GuestResource,
+        source: PathBuf,
+        digest: String,
+        update: ResourceUpdate,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ResourceUpdate {
+        None,
+        WriteContent,
+        MetadataOnly,
+    }
+
     let mut missing_required = Vec::new();
+    let mut planned_resources = Vec::new();
     let resource_ids = bootstrap
         .resources
         .iter()
@@ -1253,25 +1273,34 @@ fn apply_bootstrap(
                 );
             }
         }
-        let outcome = apply_resource_once(resource, &source, &digest)?;
-        if outcome == ApplyOutcome::Updated {
-            println!(
-                "applied resource '{}' to '{}'",
-                resource.id,
-                resource.target.display()
-            );
-        }
-        state.applied_resources.insert(
-            resource.id.clone(),
-            applied_resource_state(resource, &digest),
-        );
+        let update = if resource.mutable {
+            match state.applied_resources.get(&resource.id) {
+                None => ResourceUpdate::WriteContent,
+                Some(_) if !resource.target.exists() => ResourceUpdate::WriteContent,
+                Some(_) if !resource_target_metadata_matches(resource)? => {
+                    ResourceUpdate::MetadataOnly
+                }
+                Some(_) => ResourceUpdate::None,
+            }
+        } else if resource_target_matches(resource, &digest)? {
+            ResourceUpdate::None
+        } else {
+            ResourceUpdate::WriteContent
+        };
+        planned_resources.push(PlannedResource {
+            resource,
+            source,
+            digest,
+            update,
+        });
     }
 
-    state.bootstrap_generation = bootstrap.generation;
     if !missing_required.is_empty() {
+        let mut status_state = state.clone();
+        status_state.bootstrap_generation = bootstrap.generation;
         write_status(status_for(
             bootstrap,
-            state,
+            &status_state,
             "waiting-resources",
             RuntimeReadiness {
                 app_ready: false,
@@ -1288,6 +1317,69 @@ fn apply_bootstrap(
         return Ok(false);
     }
 
+    let app_service_prepared = if planned_resources
+        .iter()
+        .any(|planned| planned.update == ResourceUpdate::WriteContent)
+    {
+        prepare_app_service_for_resource_apply(bootstrap)?
+    } else {
+        false
+    };
+    let apply_result = (|| -> Result<()> {
+        for planned in planned_resources {
+            let outcome = match planned.update {
+                ResourceUpdate::None => ApplyOutcome::Unchanged,
+                ResourceUpdate::WriteContent => {
+                    apply_resource_once(planned.resource, &planned.source, &planned.digest)?
+                }
+                ResourceUpdate::MetadataOnly => {
+                    apply_resource_metadata_for_resource(planned.resource)?;
+                    ApplyOutcome::Updated
+                }
+            };
+            if outcome == ApplyOutcome::Updated {
+                println!(
+                    "applied resource '{}' to '{}'",
+                    planned.resource.id,
+                    planned.resource.target.display()
+                );
+            }
+            let recorded_digest = if planned.resource.mutable {
+                match planned.update {
+                    ResourceUpdate::None => state
+                        .applied_resources
+                        .get(&planned.resource.id)
+                        .map(|applied| applied.sha256.clone())
+                        .unwrap_or_else(|| planned.digest.clone()),
+                    ResourceUpdate::WriteContent => {
+                        // For mutable resources this digest is status/audit data only;
+                        // readiness intentionally validates metadata, not content.
+                        sha256_file(&planned.resource.target)?
+                    }
+                    ResourceUpdate::MetadataOnly => state
+                        .applied_resources
+                        .get(&planned.resource.id)
+                        .map(|applied| applied.sha256.clone())
+                        .unwrap_or_else(|| planned.digest.clone()),
+                }
+            } else {
+                planned.digest.clone()
+            };
+            state.applied_resources.insert(
+                planned.resource.id.clone(),
+                applied_resource_state(planned.resource, &recorded_digest),
+            );
+        }
+        Ok(())
+    })();
+    if let Err(err) = apply_result {
+        if app_service_prepared {
+            restore_app_service_after_resource_apply_failure(bootstrap);
+        }
+        return Err(err);
+    }
+
+    state.bootstrap_generation = bootstrap.generation;
     let readiness = ensure_runtime_ready(bootstrap, false);
     write_status(status_for(bootstrap, state, "resources-applied", readiness))?;
 
@@ -1313,10 +1405,12 @@ fn applied_resource_state(resource: &GuestResource, digest: &str) -> AppliedReso
         owner: resource.owner.clone(),
         group: resource.group.clone(),
         mode: resource.mode.clone(),
+        mutable: resource.mutable,
     }
 }
 
 fn resource_target_matches(resource: &GuestResource, expected_sha256: &str) -> Result<bool> {
+    validate_resource_target_path(&resource.target)?;
     if !resource.target.exists() {
         return Ok(false);
     }
@@ -1335,11 +1429,11 @@ fn resource_target_matches(resource: &GuestResource, expected_sha256: &str) -> R
     resource_metadata_matches(&resource.target, desired_mode, desired_uid, desired_gid)
 }
 
-fn apply_resource_once(
-    resource: &GuestResource,
-    source: &Path,
-    source_sha256: &str,
-) -> Result<ApplyOutcome> {
+fn resource_target_metadata_matches(resource: &GuestResource) -> Result<bool> {
+    validate_resource_target_path(&resource.target)?;
+    if !resource.target.exists() {
+        return Ok(false);
+    }
     let desired_mode = parse_mode(&resource.mode)?;
     let desired_uid = match resource.owner.as_deref() {
         Some(owner) => Some(resolve_user_id(owner)?),
@@ -1349,7 +1443,53 @@ fn apply_resource_once(
         Some(group) => Some(resolve_group_id(group)?),
         None => None,
     };
-    if resource.target.exists() && sha256_file(&resource.target)? == source_sha256 {
+    resource_metadata_matches(&resource.target, desired_mode, desired_uid, desired_gid)
+}
+
+fn apply_resource_metadata_for_resource(resource: &GuestResource) -> Result<()> {
+    validate_resource_target_path(&resource.target)?;
+    let desired_mode = parse_mode(&resource.mode)?;
+    let desired_uid = match resource.owner.as_deref() {
+        Some(owner) => Some(resolve_user_id(owner)?),
+        None => None,
+    };
+    let desired_gid = match resource.group.as_deref() {
+        Some(group) => Some(resolve_group_id(group)?),
+        None => None,
+    };
+    apply_resource_metadata(&resource.target, desired_mode, desired_uid, desired_gid)
+}
+
+fn apply_resource_once(
+    resource: &GuestResource,
+    source: &Path,
+    source_sha256: &str,
+) -> Result<ApplyOutcome> {
+    validate_resource_target_path(&resource.target)?;
+    let desired_mode = parse_mode(&resource.mode)?;
+    let desired_uid = match resource.owner.as_deref() {
+        Some(owner) => Some(resolve_user_id(owner)?),
+        None => None,
+    };
+    let desired_gid = match resource.group.as_deref() {
+        Some(group) => Some(resolve_group_id(group)?),
+        None => None,
+    };
+    let target_metadata = match fs::symlink_metadata(&resource.target) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to stat resource target '{}'",
+                    resource.target.display()
+                )
+            });
+        }
+    };
+    if matches!(target_metadata.as_ref(), Some(metadata) if metadata.is_file())
+        && sha256_file(&resource.target)? == source_sha256
+    {
         if !resource_metadata_matches(&resource.target, desired_mode, desired_uid, desired_gid)? {
             apply_resource_metadata(&resource.target, desired_mode, desired_uid, desired_gid)?;
             return Ok(ApplyOutcome::Updated);
@@ -1365,21 +1505,93 @@ fn apply_resource_once(
         .with_context(|| format!("failed to create '{}'", parent.display()))?;
 
     let tmp = resource.target.with_extension("confidential-agent.tmp");
-    if tmp.exists() {
-        fs::remove_file(&tmp)
-            .with_context(|| format!("failed to remove stale '{}'", tmp.display()))?;
+    reject_symlink_path_components(&tmp)
+        .with_context(|| format!("invalid resource temporary path '{}'", tmp.display()))?;
+    match fs::symlink_metadata(&tmp) {
+        Ok(_) => {
+            fs::remove_file(&tmp)
+                .with_context(|| format!("failed to remove stale '{}'", tmp.display()))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat '{}'", tmp.display()));
+        }
     }
-    fs::copy(source, &tmp).with_context(|| {
-        format!(
-            "failed to copy resource '{}' to '{}'",
-            source.display(),
-            resource.target.display()
-        )
-    })?;
+    if let Err(err) = copy_resource_to_new_file(source, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to copy resource '{}' to '{}'",
+                source.display(),
+                resource.target.display()
+            )
+        });
+    }
     apply_resource_metadata(&tmp, desired_mode, desired_uid, desired_gid)?;
     fs::rename(&tmp, &resource.target)
         .with_context(|| format!("failed to replace '{}'", resource.target.display()))?;
     Ok(ApplyOutcome::Updated)
+}
+
+fn copy_resource_to_new_file(source: &Path, target: &Path) -> Result<()> {
+    let mut source_file =
+        fs::File::open(source).with_context(|| format!("failed to open '{}'", source.display()))?;
+    let mut target_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(target)
+        .with_context(|| format!("failed to create '{}'", target.display()))?;
+    std::io::copy(&mut source_file, &mut target_file).with_context(|| {
+        format!(
+            "failed to copy '{}' into '{}'",
+            source.display(),
+            target.display()
+        )
+    })?;
+    target_file
+        .sync_all()
+        .with_context(|| format!("failed to sync '{}'", target.display()))?;
+    Ok(())
+}
+
+fn validate_resource_target_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!(
+            "resource target '{}' must be an absolute path",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!(
+            "resource target '{}' must not contain parent-directory components",
+            path.display()
+        );
+    }
+    reject_symlink_path_components(path)
+        .with_context(|| format!("invalid resource target '{}'", path.display()))
+}
+
+fn reject_symlink_path_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("path component '{}' is a symlink", current.display());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat '{}'", current.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resource_metadata_matches(
@@ -1388,7 +1600,10 @@ fn resource_metadata_matches(
     desired_uid: Option<u32>,
     desired_gid: Option<u32>,
 ) -> Result<bool> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
     if metadata.permissions().mode() & 0o777 != desired_mode {
         return Ok(false);
     }
@@ -1411,11 +1626,37 @@ fn apply_resource_metadata(
     desired_uid: Option<u32>,
     desired_gid: Option<u32>,
 ) -> Result<()> {
-    if desired_uid.is_some() || desired_gid.is_some() {
-        chown(path, desired_uid, desired_gid)
-            .with_context(|| format!("failed to chown '{}'", path.display()))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open '{}' for metadata update", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat '{}' for metadata update", path.display()))?;
+    if !metadata.is_file() {
+        bail!("resource target '{}' is not a regular file", path.display());
     }
-    set_mode(path, desired_mode)
+    let fd = file.as_raw_fd();
+    if desired_uid.is_some() || desired_gid.is_some() {
+        let uid = desired_uid
+            .map(|uid| uid as libc::uid_t)
+            .unwrap_or(!0 as libc::uid_t);
+        let gid = desired_gid
+            .map(|gid| gid as libc::gid_t)
+            .unwrap_or(!0 as libc::gid_t);
+        let rc = unsafe { libc::fchown(fd, uid, gid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to fchown '{}'", path.display()));
+        }
+    }
+    let rc = unsafe { libc::fchmod(fd, desired_mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to fchmod '{}'", path.display()));
+    }
+    Ok(())
 }
 
 fn resolve_user_id(owner: &str) -> Result<u32> {
@@ -2617,6 +2858,57 @@ fn start_service(service: &str) -> Result<()> {
         bail!("systemctl start '{}' failed with {}", service, status);
     }
     Ok(())
+}
+
+fn prepare_app_service_for_resource_apply(bootstrap: &BootstrapConfig) -> Result<bool> {
+    let Some(service) = bootstrap.app_service.as_deref() else {
+        return Ok(false);
+    };
+    if bootstrap.resources.is_empty() || std::env::var_os("CA_SKIP_SYSTEMCTL").is_some() {
+        return Ok(false);
+    }
+    let was_active = service_is_active(service)
+        .with_context(|| format!("failed to inspect service '{service}' before resource apply"))?;
+    let output = Command::new("systemctl")
+        .arg("stop")
+        .arg(service)
+        .output()
+        .with_context(|| format!("failed to stop service '{}' before resource apply", service))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if systemctl_reports_missing_unit(&output.status, &stderr) {
+            eprintln!(
+                "app service '{}' is not loaded; continuing resource apply before first start",
+                service
+            );
+            return Ok(false);
+        }
+        bail!("systemctl stop '{}' failed with {}", service, output.status);
+    }
+    let _ = Command::new("systemctl")
+        .arg("reset-failed")
+        .arg(service)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(was_active)
+}
+
+fn restore_app_service_after_resource_apply_failure(bootstrap: &BootstrapConfig) {
+    let Some(service) = bootstrap.app_service.as_deref() else {
+        return;
+    };
+    if let Err(err) = start_service(service) {
+        eprintln!("app service restart after resource apply failure failed: {err:#}");
+    }
+}
+
+fn systemctl_reports_missing_unit(status: &std::process::ExitStatus, stderr: &str) -> bool {
+    if status.code() == Some(5) {
+        return true;
+    }
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("not loaded") || stderr.contains("could not be found")
 }
 
 fn ensure_app_service_ready(bootstrap: &BootstrapConfig) -> bool {
