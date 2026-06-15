@@ -1,0 +1,36 @@
+schema: confidential-agent/v1
+
+service:
+  id: {{raw:MATRIX_REAL_SERVICE_ID}}
+  ports: [18080]
+  connect: []
+  app_service: cai-matrix.service
+
+build:
+  image_name: {{raw:MATRIX_REAL_SERVICE_ID}}
+  resize: 30G
+{{raw:MATRIX_REAL_BASE_IMAGE_LINE}}
+  with_network: true
+  packages: [ca-certificates, python3.11]
+  scripts: [{{json:MATRIX_REAL_INSTALL_SCRIPT}}]
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: false
+
+deploy:
+  provider: aliyun
+  image_variant: release
+  instance_type: {{json:MATRIX_REAL_INSTANCE_TYPE}}
+  region: {{json:MATRIX_REAL_REGION}}
+  zone_id: {{json:MATRIX_REAL_ZONE_ID}}
+  disk_gb: {{raw:MATRIX_REAL_DISK_GB}}
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: {{raw:MATRIX_REAL_REFERENCE_VALUES}}
+{{raw:MATRIX_REAL_REKOR_BLOCK}}
+
+resources: {}

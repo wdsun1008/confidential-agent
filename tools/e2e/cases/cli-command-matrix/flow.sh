@@ -429,8 +429,10 @@ matrix_wait_cloud_image_available() {
   local image_id="$1"
   local region="$2"
   local log_path="$WORK_DIR/publish-image-status.log"
+  local image_deadline
+  image_deadline=$((SECONDS + ${E2E_MATRIX_IMAGE_TIMEOUT_SEC:-1800}))
   : >"$log_path"
-  while true; do
+  while (( SECONDS < image_deadline )); do
     local status
     status="$(
       matrix_aliyun_json "$region" \
@@ -447,6 +449,11 @@ matrix_wait_cloud_image_available() {
       *) sleep 30 ;;
     esac
   done
+  if (( SECONDS >= image_deadline )); then
+    record_file_as_block "Published image status log at timeout:" "$log_path" text
+    echo "published image $image_id did not become available before timeout" >&2
+    return 1
+  fi
   record_file_as_block "Published image status log:" "$log_path" text
 }
 
@@ -467,6 +474,47 @@ if data.get("Images", {}).get("Image", []):
 PY
 }
 
+matrix_generate_real_cloud_fixture() {
+  local fixture_dir="$MATRIX_REAL_CASE_DIR/matrix"
+  local install_script="$fixture_dir/install-matrix-cloud.sh"
+  MATRIX_REAL_SPEC="$fixture_dir/matrix.yaml"
+
+  local cosign_key=""
+  if [[ "$MATRIX_REAL_REFERENCE_VALUES" == "rekor" ]]; then
+    [[ -x "$SLSA_GENERATOR" ]] || {
+      echo "SLSA generator is required for matrix real-cloud rekor mode: $SLSA_GENERATOR" >&2
+      return 1
+    }
+    cosign_key="$(resolve_cosign_key)"
+  fi
+
+  record_cmd "python3.11 tools/e2e/render_case.py --case cli-command-matrix --work-dir $(printf '%q' "$MATRIX_REAL_WORK_DIR")"
+  REFERENCE_VALUES="$MATRIX_REAL_REFERENCE_VALUES" \
+    COSIGN_KEY="$cosign_key" \
+    BUILD_BACKEND="$MATRIX_REAL_BUILD_BACKEND" \
+    BASE_IMAGE="$BASE_IMAGE" \
+    REGION="$MATRIX_REAL_REGION" \
+    ZONE_ID="$MATRIX_REAL_ZONE_ID" \
+    INSTANCE_TYPE="$MATRIX_REAL_INSTANCE_TYPE" \
+    DISK_GB="${E2E_MATRIX_DISK_GB:-80}" \
+    SLSA_GENERATOR="$SLSA_GENERATOR" \
+    MATRIX_REAL_SERVICE_ID="$MATRIX_REAL_SERVICE_ID" \
+    MATRIX_REAL_BUILD_BACKEND="$MATRIX_REAL_BUILD_BACKEND" \
+    MATRIX_REAL_BASE_IMAGE="$BASE_IMAGE" \
+    MATRIX_REAL_REFERENCE_VALUES="$MATRIX_REAL_REFERENCE_VALUES" \
+    MATRIX_REAL_COSIGN_KEY="$cosign_key" \
+    MATRIX_REAL_SLSA_GENERATOR="$SLSA_GENERATOR" \
+    MATRIX_REAL_REGION="$MATRIX_REAL_REGION" \
+    MATRIX_REAL_ZONE_ID="$MATRIX_REAL_ZONE_ID" \
+    MATRIX_REAL_INSTANCE_TYPE="$MATRIX_REAL_INSTANCE_TYPE" \
+    MATRIX_REAL_DISK_GB="${E2E_MATRIX_DISK_GB:-80}" \
+    MATRIX_REAL_INSTALL_SCRIPT="$install_script" \
+    python3.11 "$ROOT_DIR/tools/e2e/render_case.py" \
+      --case cli-command-matrix \
+      --work-dir "$MATRIX_REAL_WORK_DIR"
+  chmod 0755 "$install_script"
+}
+
 matrix_run_real_cloud_publish_flow() {
   MATRIX_REAL_REGION="${E2E_REGION:-cn-hongkong}"
   MATRIX_REAL_ZONE_ID="${E2E_ZONE_ID:-$(default_tdx_zone_id "$MATRIX_REAL_REGION")}"
@@ -474,7 +522,7 @@ matrix_run_real_cloud_publish_flow() {
   MATRIX_REAL_WORK_DIR="$WORK_DIR/real-cloud"
   MATRIX_REAL_STATE_DIR="$MATRIX_REAL_WORK_DIR/state"
   MATRIX_REAL_CASE_DIR="$MATRIX_REAL_WORK_DIR/rendered"
-  MATRIX_REAL_SERVICE_ID="${E2E_MATRIX_SERVICE_ID:-mcp-matrix-${E2E_RUN_ID//[^a-zA-Z0-9-]/-}}"
+  MATRIX_REAL_SERVICE_ID="${E2E_MATRIX_SERVICE_ID:-matrix-${E2E_RUN_ID//[^a-zA-Z0-9-]/-}}"
   MATRIX_REAL_REFERENCE_VALUES="${E2E_MATRIX_REFERENCE_VALUES:-sample}"
   MATRIX_REAL_BUILD_BACKEND="${E2E_BUILD_BACKEND:-mkosi}"
   mkdir -p "$MATRIX_REAL_WORK_DIR" "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_CASE_DIR"
@@ -486,24 +534,14 @@ matrix_run_real_cloud_publish_flow() {
   require_aliyun_credentials
   ensure_shelter
 
-  log "rendering real-cloud mcp fixture"
-  ROOT_DIR="$ROOT_DIR" \
-  WORK_DIR="$MATRIX_REAL_CASE_DIR" \
-  BUILD_BACKEND="$MATRIX_REAL_BUILD_BACKEND" \
-  BASE_IMAGE="$BASE_IMAGE" \
-  REFERENCE_VALUES="$MATRIX_REAL_REFERENCE_VALUES" \
-  SLSA_GENERATOR="$SLSA_GENERATOR" \
-  MCP_SERVICE_ID="$MATRIX_REAL_SERVICE_ID" \
-  REGION="$MATRIX_REAL_REGION" \
-  ZONE_ID="$MATRIX_REAL_ZONE_ID" \
-  INSTANCE_TYPE="$MATRIX_REAL_INSTANCE_TYPE" \
-  python3.11 "$ROOT_DIR/tools/e2e/render_case.py" --case cli-command-matrix --work-dir "$MATRIX_REAL_CASE_DIR"
+  log "generating real-cloud matrix fixture"
+  matrix_generate_real_cloud_fixture
 
-  validate_specs "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml"
-  ca_run "$MATRIX_REAL_STATE_DIR" build --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml"
+  validate_specs "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SPEC"
+  ca_run "$MATRIX_REAL_STATE_DIR" build --spec "$MATRIX_REAL_SPEC"
   record_manifest_variants "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID"
 
-  ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml" --region "$MATRIX_REAL_REGION" --no-wait
+  ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_SPEC" --region "$MATRIX_REAL_REGION" --no-wait
   matrix_published_summary "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID" "$WORK_DIR/published-after-no-wait.txt"
   record_file_as_block "Published state after no-wait:" "$WORK_DIR/published-after-no-wait.txt" text
   matrix_assert_contains "$WORK_DIR/published-after-no-wait.txt" "importing"
@@ -515,13 +553,13 @@ matrix_run_real_cloud_publish_flow() {
   }
 
   matrix_wait_cloud_image_available "$image_id" "$MATRIX_REAL_REGION"
-  ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml" --region "$MATRIX_REAL_REGION"
+  ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_SPEC" --region "$MATRIX_REAL_REGION"
   matrix_published_summary "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID" "$WORK_DIR/published-after-wait.txt"
   record_file_as_block "Published state after wait:" "$WORK_DIR/published-after-wait.txt" text
   matrix_assert_contains "$WORK_DIR/published-after-wait.txt" "available"
 
   ensure_operator_peering "$MATRIX_REAL_STATE_DIR" ops "$(resolve_allowed_cidr)"
-  ca_capture "$MATRIX_REAL_STATE_DIR" "$WORK_DIR/deploy-render.out" "$WORK_DIR/deploy-render.err" deploy --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml" --render-only --skip-peering-check
+  ca_capture "$MATRIX_REAL_STATE_DIR" "$WORK_DIR/deploy-render.out" "$WORK_DIR/deploy-render.err" deploy --spec "$MATRIX_REAL_SPEC" --render-only --skip-peering-check
   local rendered_config
   rendered_config="$(tail -n 1 "$WORK_DIR/deploy-render.out")"
   record_file_as_block "Deploy render stdout:" "$WORK_DIR/deploy-render.out" text
@@ -531,7 +569,7 @@ matrix_run_real_cloud_publish_flow() {
 
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID"
-  ca_run "$MATRIX_REAL_STATE_DIR" deploy --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml"
+  ca_run "$MATRIX_REAL_STATE_DIR" deploy --spec "$MATRIX_REAL_SPEC"
 
   local public_ip
   public_ip="$(state_value "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID" deploy.public_ip)"
@@ -539,7 +577,9 @@ matrix_run_real_cloud_publish_flow() {
     echo "deploy did not record public_ip" >&2
     return 1
   }
-  while true; do
+  local status_deadline
+  status_deadline=$((SECONDS + ${E2E_MATRIX_STATUS_TIMEOUT_SEC:-1200}))
+  while (( SECONDS < status_deadline )); do
     if ca_capture "$MATRIX_REAL_STATE_DIR" "$WORK_DIR/status-live-real.json" "$WORK_DIR/status-live-real.err" status --live --json; then
       if python3.11 - "$WORK_DIR/status-live-real.json" <<'PY'
 import json
@@ -557,6 +597,12 @@ PY
     fi
     sleep 30
   done
+  if (( SECONDS >= status_deadline )); then
+    record_file_as_block "Real live status stdout at timeout:" "$WORK_DIR/status-live-real.json" json
+    record_file_as_block "Real live status stderr at timeout:" "$WORK_DIR/status-live-real.err" text
+    echo "timed out waiting for matrix real-cloud live status readiness" >&2
+    return 1
+  fi
   record_file_as_block "Real live status:" "$WORK_DIR/status-live-real.json" json
   ca_capture "$MATRIX_REAL_STATE_DIR" "$WORK_DIR/report-real.json" "$WORK_DIR/report-real.err" report --service "$MATRIX_REAL_SERVICE_ID" --json
   matrix_assert_json "$WORK_DIR/report-real.json"
@@ -573,17 +619,19 @@ case_cleanup() {
   if [[ "$status" == "0" || "${E2E_MATRIX_REAL_CLOUD:-0}" != "1" ]]; then
     return 0
   fi
-  if [[ "$E2E_DEPLOY_ATTEMPTED" == "1" ]]; then
-    return 0
-  fi
   if [[ -n "${MATRIX_REAL_STATE_DIR:-}" && -n "${MATRIX_REAL_SERVICE_ID:-}" && -f "$MATRIX_REAL_STATE_DIR/services/$MATRIX_REAL_SERVICE_ID/state.json" ]]; then
     local image_id=""
     image_id="$(matrix_first_published_image_id "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID" 2>/dev/null || true)"
-    if [[ -n "$image_id" && -n "${MATRIX_REAL_CASE_DIR:-}" && -f "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml" ]]; then
-      log "waiting for published image $image_id to settle before failed-lane cleanup"
-      ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_CASE_DIR/mcp/mcp-demo.yaml" --region "$MATRIX_REAL_REGION" || true
+    if [[ "$E2E_DEPLOY_ATTEMPTED" == "1" ]]; then
+      log "destroying $MATRIX_REAL_SERVICE_ID before failed real-cloud lane image cleanup"
+      ca_run "$MATRIX_REAL_STATE_DIR" destroy "$MATRIX_REAL_SERVICE_ID" || true
+      E2E_DEPLOY_ATTEMPTED=0
     fi
-    log "unpublishing $MATRIX_REAL_SERVICE_ID after failed pre-deploy real-cloud lane"
+    if [[ -n "$image_id" && -n "${MATRIX_REAL_SPEC:-}" && -f "$MATRIX_REAL_SPEC" ]]; then
+      log "waiting for published image $image_id to settle before failed-lane cleanup"
+      ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_SPEC" --region "$MATRIX_REAL_REGION" || true
+    fi
+    log "unpublishing $MATRIX_REAL_SERVICE_ID after failed real-cloud lane"
     ca_run "$MATRIX_REAL_STATE_DIR" image unpublish "$MATRIX_REAL_SERVICE_ID" --force || true
   fi
 }

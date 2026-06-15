@@ -1,14 +1,14 @@
 {
   "assets": [
     {
-      "source": "examples/mcp/install-mcp.sh",
-      "target": "mcp/install-mcp.sh"
+      "source": "tools/e2e/cases/cli-command-matrix/assets/install-matrix-cloud.sh",
+      "target": "rendered/matrix/install-matrix-cloud.sh"
     }
   ],
   "templates": [
     {
-      "source": "templates/mcp-demo.yaml.tmpl",
-      "target": "mcp/mcp-demo.yaml"
+      "source": "templates/matrix-cloud.yaml.tmpl",
+      "target": "rendered/matrix/matrix.yaml"
     }
   ]
 }
