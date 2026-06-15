@@ -13,23 +13,27 @@ build:
   with_network: true
   container:
     image: {{yaml:HERMES_IMAGE}}
-    mode: {{yaml:HERMES_CONTAINER_MODE}}
+    mode: runtime
     runtime: {{yaml:HERMES_CONTAINER_RUNTIME}}
     name: hermes-agent
     pull: missing
+    command:
+      - gateway
+      - run
     env:
       API_SERVER_ENABLED: "true"
       API_SERVER_HOST: 0.0.0.0
       API_SERVER_PORT: "8642"
-      API_SERVER_KEY: {{yaml:HERMES_API_SERVER_KEY}}
-      DASHSCOPE_API_KEY: {{yaml:DASHSCOPE_KEY}}
       DASHSCOPE_BASE_URL: {{yaml:DASHSCOPE_BASE_URL}}
       HERMES_HOME: /opt/data
       HERMES_MODEL: {{yaml:HERMES_MODEL}}
-    working_dir: /opt/data
+    working_dir: /opt/hermes
     network: true
+    mounts:
+      - source: /var/lib/confidential-agent/hermes-agent/data
+        target: /opt/data
+        read_only: false
   packages: [ca-certificates, curl, jq]
-  scripts: [./prepare-hermes-data.sh]
   variants:
     release:
       enabled: false
@@ -50,4 +54,17 @@ attestation:
   reference_values: {{yaml:REFERENCE_VALUES}}
 {{raw:REKOR_BLOCK}}
 
-resources: {}
+resources:
+  hermes_env:
+    source: ./secrets/hermes.env
+    target: /var/lib/confidential-agent/hermes-agent/data/.env
+    owner: "10000"
+    group: "10000"
+    mode: "0600"
+  hermes_config:
+    source: ./secrets/config.yaml
+    target: /var/lib/confidential-agent/hermes-agent/data/config.yaml
+    owner: "10000"
+    group: "10000"
+    mode: "0600"
+    mutable: true

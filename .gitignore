@@ -4,3 +4,6 @@
 /.confidential-agent
 *.log
 /env.sh
+/examples/hermes-agent/secrets/
+__pycache__/
+*.py[cod]

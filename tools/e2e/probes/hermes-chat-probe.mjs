@@ -23,14 +23,15 @@ function normalizeBaseUrl(raw) {
   return url;
 }
 
-async function requestJson(baseUrl, pathname, token, options, timeoutMs) {
+async function requestJson(baseUrl, pathname, token, options, timeoutMs, perAttemptTimeoutMs = 30000) {
   const url = new URL(pathname, baseUrl);
   const deadline = Date.now() + timeoutMs;
   let lastError;
 
   while (Date.now() < deadline) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 30000));
+    const remainingMs = Math.max(1, deadline - Date.now());
+    const timer = setTimeout(() => controller.abort(), Math.min(remainingMs, perAttemptTimeoutMs));
     try {
       const headers = { ...(options.headers ?? {}) };
       if (token) headers.authorization = `Bearer ${token}`;
@@ -57,6 +58,39 @@ async function requestJson(baseUrl, pathname, token, options, timeoutMs) {
   throw lastError ?? new Error(`${pathname} timed out`);
 }
 
+async function requestExpectedChat(baseUrl, token, body, expected, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  let attempts = 0;
+
+  while (Date.now() < deadline) {
+    attempts += 1;
+    const remainingMs = Math.max(1, deadline - Date.now());
+    try {
+      const chat = await requestJson(
+        baseUrl,
+        "/v1/chat/completions",
+        token,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        Math.min(remainingMs, 120000),
+        Math.min(remainingMs, 120000),
+      );
+      const text = chatText(chat);
+      if (text.includes(expected)) return { chat, text, attempts };
+      lastError = new Error(`Hermes response does not include expected marker '${expected}': ${text}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+
+  throw lastError ?? new Error("/v1/chat/completions timed out");
+}
+
 function chatText(response) {
   const choice = response?.choices?.[0] ?? {};
   const content = choice?.message?.content ?? choice?.delta?.content ?? "";
@@ -80,35 +114,28 @@ const timeoutMs = Number(arg("timeout-ms", "180000"));
 async function main() {
   const health = await requestJson(baseUrl, "/health", "", { method: "GET" }, timeoutMs);
   const models = await requestJson(baseUrl, "/v1/models", token, { method: "GET" }, timeoutMs);
-  const chat = await requestJson(
+  const { text, attempts } = await requestExpectedChat(
     baseUrl,
-    "/v1/chat/completions",
     token,
     {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: "Return the requested marker exactly." },
-          { role: "user", content: message },
-        ],
-        max_tokens: 64,
-        stream: false,
-      }),
+      model,
+      messages: [
+        { role: "system", content: "Return the requested marker exactly." },
+        { role: "user", content: message },
+      ],
+      max_tokens: 64,
+      stream: false,
     },
+    expected,
     timeoutMs,
   );
-  const text = chatText(chat);
-  if (!text.includes(expected)) {
-    throw new Error(`Hermes response does not include expected marker '${expected}': ${text}`);
-  }
   console.log(
     JSON.stringify(
       {
         ok: true,
         health,
         modelCount: Array.isArray(models?.data) ? models.data.length : null,
+        attempts,
         text,
       },
       null,
