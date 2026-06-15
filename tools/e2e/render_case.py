@@ -42,6 +42,28 @@ def render_base_image_line(context):
     return ""
 
 
+def render_matrix_base_image_line(context):
+    if context["MATRIX_REAL_BUILD_BACKEND"] == "base-image":
+        return f"  base_image: {yaml_quote(context['MATRIX_REAL_BASE_IMAGE'])}"
+    return ""
+
+
+def render_matrix_rekor_block(context):
+    if context["MATRIX_REAL_REFERENCE_VALUES"] != "rekor":
+        return ""
+    cosign_key = context.get("MATRIX_REAL_COSIGN_KEY", "")
+    if not cosign_key:
+        raise SystemExit("MATRIX_REAL_COSIGN_KEY is required when MATRIX_REAL_REFERENCE_VALUES=rekor")
+    return "\n".join(
+        [
+            "  rekor:",
+            f"    cosign_key: {yaml_quote(cosign_key)}",
+            f"    slsa_generator: {yaml_quote(context['MATRIX_REAL_SLSA_GENERATOR'])}",
+            "    required: true",
+        ]
+    )
+
+
 def decode_jwt_payload(token: str) -> dict:
     parts = token.split(".")
     if len(parts) < 2:
@@ -127,16 +149,27 @@ def context_from_env(work_dir):
     default("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     default("DASHSCOPE_MODEL", "qwen3.7-max")
     default("HERMES_IMAGE", context.get("E2E_HERMES_IMAGE", "nousresearch/hermes-agent:v2026.6.5"))
-    default("HERMES_CONTAINER_MODE", context.get("E2E_HERMES_CONTAINER_MODE", "rootfs"))
-    default("HERMES_CONTAINER_RUNTIME", context.get("E2E_HERMES_CONTAINER_RUNTIME", "containerd"))
+    default("HERMES_CONTAINER_RUNTIME", context.get("E2E_HERMES_CONTAINER_RUNTIME", "podman"))
     default("HERMES_API_SERVER_KEY", context.get("E2E_HERMES_API_SERVER_KEY", ""))
     default("REGION", "cn-beijing")
     default("ZONE_ID", default_zone_id(context["REGION"]))
     default("INSTANCE_TYPE", default_instance_type(context["REGION"]))
-    default("MCP_SERVICE_ID", "mcp")
     default("DISK_GB", "200")
+    default("MATRIX_REAL_SERVICE_ID", "matrix")
+    default("MATRIX_REAL_BUILD_BACKEND", context["BUILD_BACKEND"])
+    default("MATRIX_REAL_BASE_IMAGE", context["BASE_IMAGE"])
+    default("MATRIX_REAL_REFERENCE_VALUES", context["REFERENCE_VALUES"])
+    default("MATRIX_REAL_COSIGN_KEY", context.get("COSIGN_KEY", ""))
+    default("MATRIX_REAL_SLSA_GENERATOR", context["SLSA_GENERATOR"])
+    default("MATRIX_REAL_REGION", context["REGION"])
+    default("MATRIX_REAL_ZONE_ID", context["ZONE_ID"])
+    default("MATRIX_REAL_INSTANCE_TYPE", context["INSTANCE_TYPE"])
+    default("MATRIX_REAL_DISK_GB", context["DISK_GB"])
+    default("MATRIX_REAL_INSTALL_SCRIPT", str(work_dir / "rendered" / "matrix" / "install-matrix-cloud.sh"))
     default("CAI_PEP", str(ROOT / "target" / "debug" / "cai-pep"))
     context["BASE_IMAGE_LINE"] = render_base_image_line(context)
+    context["MATRIX_REAL_BASE_IMAGE_LINE"] = render_matrix_base_image_line(context)
+    context["MATRIX_REAL_REKOR_BLOCK"] = render_matrix_rekor_block(context)
     context["REKOR_BLOCK"] = render_rekor_block(context)
     context["DASHSCOPE_KEY"] = (
         context.get("DASHSCOPE_KEY")

@@ -556,7 +556,9 @@ ssh_guest() {
   local host="$2"
   shift 2
   ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o ConnectTimeout=10 root@"$host" "$@"
+    -o ConnectTimeout=10 -o BatchMode=yes \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+    root@"$host" "$@"
 }
 
 guest_wait() {
@@ -650,6 +652,22 @@ cleanup_connect_ready() {
   local ready_json="$1"
   [[ -n "$ready_json" && -f "$ready_json" ]] || return 0
   "$CA_BIN" --tools-image "$TOOLS_IMAGE" connect stop --ready-json "$ready_json" >/dev/null 2>&1 || true
+  python3.11 - "$ready_json" <<'PY' | while IFS= read -r container; do
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        ready = json.load(f)
+except Exception:
+    raise SystemExit(0)
+for key in ("container_name", "container_id"):
+    value = str(ready.get(key) or "").strip()
+    if value:
+        print(value)
+PY
+    podman rm -f "$container" >/dev/null 2>&1 || docker rm -f "$container" >/dev/null 2>&1 || true
+  done
 }
 
 cleanup_connect_pid() {
