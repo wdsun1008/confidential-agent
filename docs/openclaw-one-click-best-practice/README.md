@@ -164,8 +164,6 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
   --disable-pep
 ```
 
-`--disable-pep` 与 `--run-tdx-skill-probe` 互斥，因为该 probe 依赖镜像内的 `tdx-remote-attestation` skill 和 `cai-pep attest` 命令。
-
 如需仅安装本机依赖、构建 Confidential Agent 组件和 tools 镜像，不创建云资源，执行以下命令：
 
 ```bash
@@ -210,7 +208,7 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 6.  将镜像参考值上传 Rekor 透明日志。
 7.  创建阿里云云资源并启动 TDX ECS。
 8.  远程证明通过后注入 OpenClaw 配置、百炼 API Key、钉钉凭据和 OpenClaw Gateway Token。启用钉钉时，镜像内会按 OpenClaw 上游实践安装并构建 `soimy/openclaw-channel-dingtalk`，再写入 `dingtalk` channel 配置。
-9.  启动本地 TNG connect 隧道，并执行 Web 可达性检查、Gateway WebSocket probe 和 chat probe。chat probe 会经过百炼 API 真实回包，作为端到端可用性确认。
+9.  启动本地 TNG connect 隧道并执行 Web 可达性检查。默认配置使用 OpenClaw Gateway Token 访问控制面，用户后续可按需使用 TUI、chat 和 TDX skill；E2E 会覆盖 token 鉴权、chat 请求和 TDX skill 调用。
 
 部署成功后，脚本会输出类似以下信息：
 
@@ -298,7 +296,7 @@ openclaw tui --url ws://127.0.0.1:18789 --token <YOUR_GATEWAY_TOKEN>
 
 > **注意**：
 >
-> 首次通过 TUI 连接时，如提示 `pairing required`，请先在浏览器中访问 `http://127.0.0.1:18789/openclaw`，在节点页面找到待授权设备并单击 Approve，再返回 TUI 使用。
+> 默认 one-click 配置禁用 device auth，TUI 使用 Gateway Token 连接即可。如果你手动启用了 device auth，首次通过 TUI 连接时如提示 `pairing required`，请先在浏览器中访问 `http://127.0.0.1:18789/openclaw`，在节点页面找到待授权设备并单击 Approve，再返回 TUI 使用。
 
 ### 步骤六（可选）：释放资源
 
@@ -502,11 +500,11 @@ Verification Successful!
 2.  检查 ECS 实例安全组是否放通 `ops` 和 `deployer` 两个 operator peering。
 3.  部署机公网出口 IP 发生变化时，重新运行一键脚本，或执行 `peering remove deployer` 后按新出口 IP 添加 `deployer` peering。
 
-#### Q4：Chat probe 失败
+#### Q4：OpenClaw chat 不可用
 
 **处理方式**：
 
-由于本方案的推理由百炼 API 完成，chat probe 失败通常与百炼配置有关：
+由于本方案的推理由百炼 API 完成，chat 请求失败通常与百炼配置、Gateway Token 或手动启用 device auth 后的 pairing 状态有关：
 
 1.  检查 `DASHSCOPE_API_KEY` 是否生效。可在部署机执行：
     ```bash
@@ -544,4 +542,4 @@ journalctl -u cai-pep.service -n 200 --no-pager
 
 ## 结果验证记录
 
-本文对应的 E2E 以 one-click OpenClaw + Bailian 为主路径，覆盖默认 PEP 和 `--disable-pep` 两个分支；验证项包括依赖安装、Shelter RPM 安装、源码构建、tools 镜像构建、可信镜像构建、Rekor 上传、阿里云 TDX ECS 创建、远程证明资源注入、mesh 同步、TNG connect、Web 可达性，以及通过百炼 API 完成的 OpenClaw chat probe。
+本文对应的 E2E 以 one-click OpenClaw + Bailian 为主路径，覆盖默认 PEP 和 `--disable-pep` 两个分支；验证项包括依赖安装、Shelter RPM 安装、源码构建、tools 镜像构建、可信镜像构建、Rekor 上传、阿里云 TDX ECS 创建、远程证明资源注入、mesh 同步、TNG connect、Web 可达性、Gateway Token 鉴权、通过百炼 API 完成的 OpenClaw chat probe，以及默认 PEP 分支的 TDX skill probe。

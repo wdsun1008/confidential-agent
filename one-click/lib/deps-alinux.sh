@@ -85,9 +85,15 @@ install_os_dependencies() {
     fi
   fi
 
+  if ! command -v podman >/dev/null 2>&1; then
+    if ! install_packages_best_effort "$pm" podman; then
+      warn "failed to install package 'podman'; Shelter container.image builds require host podman unless container.archive is used"
+    fi
+  fi
+
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
     if ! install_packages_best_effort "$pm" nodejs npm; then
-      warn "failed to install nodejs/npm; OpenClaw chat probe will be skipped unless Node.js is installed"
+      warn "failed to install nodejs/npm; install them manually before installing the host OpenClaw CLI"
     fi
   fi
 

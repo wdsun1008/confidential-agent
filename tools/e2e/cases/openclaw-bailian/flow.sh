@@ -14,6 +14,62 @@ case_cleanup() {
   record "- one-click local connect cleanup completed for status \`$status\`."
 }
 
+assert_openclaw_gateway_config() {
+  local config="$ONE_CLICK_WORK_DIR/openclaw/openclaw.json"
+  jq -e '
+    .gateway.auth.mode == "token" and
+    ((.gateway.auth.token // "") | length) >= 32 and
+    .gateway.http.endpoints.responses.enabled == true and
+    .gateway.controlUi.enabled == true and
+    .gateway.controlUi.dangerouslyDisableDeviceAuth == true
+  ' "$config" >/dev/null
+  record "- OpenClaw gateway config uses token auth with device auth disabled for the one-click control UI."
+}
+
+run_openclaw_gateway_token_probe() {
+  local connect_port="$1"
+  local token="$2"
+  require_cmd openclaw
+  install -d -m 0700 "$WORK_DIR/openclaw-state"
+  local openclaw_env=(
+    env
+    "OPENCLAW_CONFIG_PATH=$ONE_CLICK_WORK_DIR/openclaw/openclaw.json"
+    "OPENCLAW_STATE_DIR=$WORK_DIR/openclaw-state"
+  )
+  local url="ws://127.0.0.1:$connect_port"
+
+  record_cmd "OPENCLAW_STATE_DIR=$(printf '%q' "$WORK_DIR/openclaw-state") openclaw gateway probe --url $url --token '<redacted>' --json --timeout 10000"
+  "${openclaw_env[@]}" openclaw gateway probe \
+    --url "$url" \
+    --token "$token" \
+    --json \
+    --timeout 10000 \
+    >"$WORK_DIR/gateway-probe.json" 2>"$WORK_DIR/gateway-probe.err"
+  record_file_as_block "OpenClaw gateway token probe:" "$WORK_DIR/gateway-probe.json" json
+  record_file_as_block "OpenClaw gateway token probe stderr:" "$WORK_DIR/gateway-probe.err" text
+  jq -e '
+    .ok == true and
+    any(.targets[]?; .id == "explicit" and .connect.ok == true and (.connect.rpcOk == true or .connect.scopeLimited == true))
+  ' \
+    "$WORK_DIR/gateway-probe.json" >/dev/null
+
+  record_cmd "OPENCLAW_STATE_DIR=$(printf '%q' "$WORK_DIR/openclaw-state") openclaw gateway probe --url $url --token '<wrong-token>' --json --timeout 10000"
+  if "${openclaw_env[@]}" openclaw gateway probe \
+      --url "$url" \
+      --token "ca-e2e-wrong-token" \
+      --json \
+      --timeout 10000 \
+      >"$WORK_DIR/gateway-probe-wrong-token.json" 2>"$WORK_DIR/gateway-probe-wrong-token.err"; then
+    record_file_as_block "OpenClaw wrong-token probe:" "$WORK_DIR/gateway-probe-wrong-token.json" json
+    record_file_as_block "OpenClaw wrong-token probe stderr:" "$WORK_DIR/gateway-probe-wrong-token.err" text
+    echo "OpenClaw gateway probe unexpectedly accepted an invalid token" >&2
+    return 1
+  fi
+  record_file_as_block "OpenClaw wrong-token probe:" "$WORK_DIR/gateway-probe-wrong-token.json" json
+  record_file_as_block "OpenClaw wrong-token probe stderr:" "$WORK_DIR/gateway-probe-wrong-token.err" text
+  record "- OpenClaw gateway accepts the configured token and rejects an invalid token."
+}
+
 run_case() {
   INSTANCE_TYPE="$DEFAULT_INSTANCE_TYPE"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-bailian-$E2E_RUN_ID}"
@@ -61,7 +117,7 @@ run_case() {
     --non-interactive
     --yes
     --skip-deps
-    --skip-host-openclaw
+    --no-start-connect
     --state-dir "$STATE_DIR"
     --work-dir "$ONE_CLICK_WORK_DIR"
     --tools-image "$TOOLS_IMAGE"
@@ -90,8 +146,6 @@ run_case() {
   fi
   if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" == "1" ]]; then
     one_click_cmd+=(--disable-pep)
-  elif [[ "${E2E_RUN_TDX_SKILL_PROBE:-1}" == "1" ]]; then
-    one_click_cmd+=(--run-tdx-skill-probe)
   fi
 
   record_cmd "DASHSCOPE_API_KEY=<redacted> CA_GATEWAY_TOKEN=<redacted> $(cmd_string "${one_click_cmd[@]}")"
@@ -103,9 +157,6 @@ run_case() {
   ca_pep_bin="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
   if ! DASHSCOPE_API_KEY="$dashscope_key" \
       CA_GATEWAY_TOKEN="$token" \
-      CA_CHAT_MESSAGE="$CHAT_MESSAGE" \
-      CA_CHAT_EXPECT="$CHAT_EXPECT" \
-      CA_CHAT_TIMEOUT_MS="$CHAT_TIMEOUT_MS" \
       CA_BIN="$CA_BIN" \
       CA_AGENTD_BIN="$ca_agentd_bin" \
       CA_GATEWAY_BIN="$ca_gateway_bin" \
@@ -118,6 +169,25 @@ run_case() {
   fi
   record_file_as_block "one-click stdout:" "$WORK_DIR/one-click.out" text
   record_file_as_block "one-click stderr:" "$WORK_DIR/one-click.err" text
+  assert_openclaw_gateway_config
+
+  local connect_port=""
+  if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
+    connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw-bailian /openclaw 4 180 --service openclaw)"
+    record "- OpenClaw connect endpoint: \`ws://127.0.0.1:$connect_port\`."
+    run_openclaw_gateway_token_probe "$connect_port" "$token"
+    run_openclaw_chat_probe \
+      "ws://127.0.0.1:$connect_port" \
+      "$token" \
+      "$CHAT_MESSAGE" \
+      "$CHAT_EXPECT" \
+      "$WORK_DIR/chat-probe.json" \
+      --timeout-ms "$CHAT_TIMEOUT_MS"
+    if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" != "1" && "${E2E_RUN_TDX_SKILL_PROBE:-0}" == "1" ]]; then
+      echo "E2E_RUN_TDX_SKILL_PROBE=1 was requested, but the OpenClaw TDX skill probe is not wired in this e2e case" >&2
+      return 1
+    fi
+  fi
 
   validate_specs "$STATE_DIR" "$ONE_CLICK_WORK_DIR/openclaw/openclaw.yaml"
   if ! ca_capture "$STATE_DIR" "$WORK_DIR/status-live.txt" "$WORK_DIR/status-live.err" status --live; then

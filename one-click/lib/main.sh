@@ -59,9 +59,6 @@ Deploy options:
   --skip-build                   Skip confidential image build
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
-  --skip-chat-probe              Do not run the OpenClaw chat probe
-  --run-tdx-skill-probe          Also run the optional tdx-remote-attestation skill probe; requires PEP
-  --tdx-probe-timeout-ms MS      Default: 300000; only used with --run-tdx-skill-probe
 
 Shelter options:
   --shelter-bin PATH             Existing shelter binary
@@ -84,8 +81,6 @@ init_defaults() {
   CA_SKIP_CARGO_BUILD="${CA_SKIP_CARGO_BUILD:-0}"
   CA_SKIP_BUILD="${CA_SKIP_BUILD:-0}"
   CA_SKIP_DEPLOY="${CA_SKIP_DEPLOY:-0}"
-  CA_SKIP_CHAT_PROBE="${CA_SKIP_CHAT_PROBE:-0}"
-  CA_RUN_TDX_SKILL_PROBE="${CA_RUN_TDX_SKILL_PROBE:-0}"
   CA_SKIP_HOST_OPENCLAW="${CA_SKIP_HOST_OPENCLAW:-0}"
   CA_REBUILD_TOOLS_IMAGE="${CA_REBUILD_TOOLS_IMAGE:-0}"
   CA_ENABLE_DINGTALK="${CA_ENABLE_DINGTALK:-0}"
@@ -106,10 +101,6 @@ init_defaults() {
   CA_STATE_DIR="${CA_STATE_DIR:-${HOME:-/root}/.confidential-agent}"
   CA_WORK_DIR="${CA_WORK_DIR:-$CA_STATE_DIR/one-click}"
   CA_SLSA_GENERATOR="${CA_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
-  CA_CHAT_TIMEOUT_MS="${CA_CHAT_TIMEOUT_MS:-180000}"
-  CA_TDX_PROBE_TIMEOUT_MS="${CA_TDX_PROBE_TIMEOUT_MS:-300000}"
-  CA_CHAT_MESSAGE="${CA_CHAT_MESSAGE:-请只回复 CA_E2E_OK，不要输出其他内容。}"
-  CA_CHAT_EXPECT="${CA_CHAT_EXPECT:-CA_E2E_OK}"
   CA_STATUS_TIMEOUT_SEC="${CA_STATUS_TIMEOUT_SEC:-900}"
   CA_CONNECT_TIMEOUT_SEC="${CA_CONNECT_TIMEOUT_SEC:-240}"
   CA_BIN="${CA_BIN:-$ROOT_DIR/target/release/confidential-agent}"
@@ -162,9 +153,6 @@ parse_args() {
       --skip-build) CA_SKIP_BUILD=1; shift ;;
       --skip-deploy) CA_SKIP_DEPLOY=1; shift ;;
       --no-start-connect) CA_START_CONNECT=0; shift ;;
-      --skip-chat-probe) CA_SKIP_CHAT_PROBE=1; shift ;;
-      --run-tdx-skill-probe) CA_RUN_TDX_SKILL_PROBE=1; shift ;;
-      --tdx-probe-timeout-ms) CA_TDX_PROBE_TIMEOUT_MS="${2:?missing value for --tdx-probe-timeout-ms}"; shift 2 ;;
       --shelter-bin) CA_SHELTER_BIN="${2:?missing value for --shelter-bin}"; shift 2 ;;
       --shelter-rpm) CA_SHELTER_RPM="${2:?missing value for --shelter-rpm}"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
@@ -187,9 +175,6 @@ validate_options() {
   esac
   [[ "$CA_DISK_GB" =~ ^[0-9]+$ ]] || die "--disk-gb must be an integer"
   [[ -n "$CA_BAILIAN_MODEL" ]] || die "--bailian-model cannot be empty"
-  if [[ "$CA_DISABLE_PEP" == "1" && "$CA_RUN_TDX_SKILL_PROBE" == "1" ]]; then
-    die "--run-tdx-skill-probe requires PEP; remove --disable-pep or omit the TDX skill probe"
-  fi
 }
 
 print_startup_config() {

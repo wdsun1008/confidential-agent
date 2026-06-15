@@ -75,7 +75,9 @@ build_confidential_agent() {
 }
 
 install_confidential_agent_cli() {
-  [[ "${CA_INSTALL_CLI:-1}" == "1" ]] || return
+  if [[ "${CA_INSTALL_CLI:-1}" != "1" ]]; then
+    return 0
+  fi
   is_root || die "installing confidential-agent to /usr/local/bin requires root"
   [[ -x "$CA_BIN" ]] || die "confidential-agent binary is missing: $CA_BIN"
   [[ -x "$CA_AGENTD_BIN" ]] || die "confidential-agentd binary is missing: $CA_AGENTD_BIN"
@@ -386,80 +388,6 @@ run_web_smoke() {
   log "control UI content check passed"
 }
 
-run_chat_probe() {
-  if [[ -z "${CA_CONNECT_PORT:-}" || "$CA_SKIP_CHAT_PROBE" == "1" ]]; then
-    return
-  fi
-  if ! command -v node >/dev/null 2>&1; then
-    warn "node is not installed; skipping OpenClaw chat probe"
-    return
-  fi
-  log "running OpenClaw chat probe through connect"
-  if node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
-    --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
-    --token "$CA_GATEWAY_TOKEN" \
-    --message "$CA_CHAT_MESSAGE" \
-    --expect "$CA_CHAT_EXPECT" \
-    --timeout-ms "$CA_CHAT_TIMEOUT_MS" \
-    >"$CA_WORK_DIR/chat-probe.json" 2>"$CA_WORK_DIR/chat-probe.err"; then
-    log "chat probe passed"
-  else
-    warn "chat probe failed; see $CA_WORK_DIR/chat-probe.err"
-  fi
-}
-
-run_gateway_probe() {
-  if [[ -z "${CA_CONNECT_PORT:-}" ]]; then
-    return
-  fi
-  if ! command -v openclaw >/dev/null 2>&1; then
-    warn "openclaw CLI is not installed; skipping Gateway WebSocket probe"
-    return
-  fi
-  log "verifying OpenClaw Gateway WebSocket for TUI"
-  if openclaw gateway probe \
-    --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
-    --token "$CA_GATEWAY_TOKEN" \
-    --json \
-    --timeout 10000 \
-    >"$CA_WORK_DIR/gateway-probe.json" 2>"$CA_WORK_DIR/gateway-probe.err"; then
-    log "Gateway WebSocket probe passed"
-  else
-    die "Gateway WebSocket probe failed; TUI may not connect. See $CA_WORK_DIR/gateway-probe.err"
-  fi
-}
-
-run_tdx_attestation_probe() {
-  if [[ "${CA_DISABLE_PEP:-0}" == "1" ]]; then
-    return
-  fi
-  if [[ "${CA_RUN_TDX_SKILL_PROBE:-0}" != "1" || -z "${CA_CONNECT_PORT:-}" || "$CA_SKIP_CHAT_PROBE" == "1" ]]; then
-    return
-  fi
-  if ! command -v node >/dev/null 2>&1; then
-    warn "node is not installed; skipping tdx attestation probe"
-    return
-  fi
-  local out="$CA_WORK_DIR/tdx-skill-probe.json"
-  local err="$CA_WORK_DIR/tdx-skill-probe.err"
-  log "triggering OpenClaw tdx-remote-attestation skill"
-  if ! node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
-    --url "ws://127.0.0.1:$CA_CONNECT_PORT" \
-    --token "$CA_GATEWAY_TOKEN" \
-    --message "请使用 tdx-remote-attestation skill 验证当前 TDX 运行环境。必须执行 skill 文档中的 cai-pep attest collect-and-verify 命令；如果工具调用失败，请直接报告失败，不要改用 CPU flags、/dev/tdx_guest 或系统日志推断。" \
-    --expect "" \
-    --expect-tool "cai-pep" \
-    --expect-regex "([0-9a-fA-F]{96}|measurement\\.uki\\.SHA-384|ear\\.trustworthiness-vector)" \
-    --reject-regex "(tdx_guest|/dev/tdx_guest|/proc/cpuinfo|lscpu|直接读取|编写一个简单的程序)" \
-    --instructions "Use the requested OpenClaw skill and tool path. Do not invent attestation results. If the exact tool path fails, say it failed and include the error." \
-    --timeout-ms "$CA_TDX_PROBE_TIMEOUT_MS" \
-    >"$out" 2>"$err"; then
-    warn "tdx attestation probe failed; see $err"
-    return
-  fi
-  log "tdx attestation probe passed; full response saved to $out"
-}
-
 stop_connect() {
   local pid_path="$CA_WORK_DIR/connect.pid"
   [[ -f "$pid_path" ]] || return 0
@@ -552,9 +480,6 @@ run_deploy_openclaw() {
   wait_for_live_status
   start_connect
   run_web_smoke
-  run_gateway_probe
-  run_chat_probe
-  run_tdx_attestation_probe
   print_summary
 }
 
