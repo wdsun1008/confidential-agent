@@ -43,7 +43,7 @@ Deploy options:
   --zone-id ZONE                 Default: cn-beijing-i
   --instance-type TYPE           Default: ecs.g9i.xlarge
   --disk-gb GB                   Default: 200
-  --allowed-cidr CIDR            Operator access CIDR; deployment host egress is added automatically
+  --allowed-cidr CIDR[,CIDR...]  Operator access CIDR list; may be repeated
   --bailian-api-key KEY          Bailian/DashScope API key
   --bailian-model MODEL          Bailian model id; default: qwen3.7-max
   --gateway-token TOKEN          OpenClaw gateway token; generated if omitted
@@ -137,7 +137,14 @@ parse_args() {
       --zone-id) CA_ZONE_ID="${2:?missing value for --zone-id}"; shift 2 ;;
       --instance-type) CA_INSTANCE_TYPE="${2:?missing value for --instance-type}"; shift 2 ;;
       --disk-gb) CA_DISK_GB="${2:?missing value for --disk-gb}"; shift 2 ;;
-      --allowed-cidr) CA_ALLOWED_CIDR="${2:?missing value for --allowed-cidr}"; shift 2 ;;
+      --allowed-cidr)
+        if [[ -n "${CA_ALLOWED_CIDR:-}" ]]; then
+          CA_ALLOWED_CIDR="$CA_ALLOWED_CIDR,${2:?missing value for --allowed-cidr}"
+        else
+          CA_ALLOWED_CIDR="${2:?missing value for --allowed-cidr}"
+        fi
+        shift 2
+        ;;
       --bailian-api-key) CA_BAILIAN_API_KEY="${2:?missing value for --bailian-api-key}"; shift 2 ;;
       --bailian-model) CA_BAILIAN_MODEL="${2:?missing value for --bailian-model}"; shift 2 ;;
       --gateway-token) CA_GATEWAY_TOKEN="${2:?missing value for --gateway-token}"; shift 2 ;;

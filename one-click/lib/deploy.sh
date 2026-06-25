@@ -153,8 +153,21 @@ ensure_operator_peering_entry() {
 
 ensure_operator_peering() {
   install -d -m 0700 "$CA_WORK_DIR"
-  ensure_operator_peering_entry ops "$CA_ALLOWED_CIDR" "operator access CIDR selected by one-click installer"
-  if [[ -n "${CA_DEPLOYER_CIDR:-}" && "$CA_DEPLOYER_CIDR" != "$CA_ALLOWED_CIDR" && "$CA_ALLOWED_CIDR" != "0.0.0.0/0" ]]; then
+  local allowed_cidrs="${CA_ALLOWED_CIDRS:-${CA_ALLOWED_CIDR:-}}"
+  local cidr label idx=0
+  [[ -n "$allowed_cidrs" ]] || die "operator CIDR list is empty"
+  for cidr in $allowed_cidrs; do
+    idx=$((idx + 1))
+    if [[ "$idx" == "1" ]]; then
+      label="ops"
+    else
+      label="ops-$idx"
+    fi
+    ensure_operator_peering_entry "$label" "$cidr" "operator access CIDR selected by one-click installer"
+  done
+  if [[ -n "${CA_DEPLOYER_CIDR:-}" ]] \
+    && ! cidr_list_contains "$allowed_cidrs" "$CA_DEPLOYER_CIDR" \
+    && ! cidr_list_contains "$allowed_cidrs" "0.0.0.0/0"; then
     ensure_operator_peering_entry deployer "$CA_DEPLOYER_CIDR" "deployment host egress CIDR detected by one-click installer"
   fi
 }
@@ -414,7 +427,7 @@ Confidential Agent one-click summary
   region:    $CA_REGION
   zone_id:   $CA_ZONE_ID
   instance:  $CA_INSTANCE_TYPE
-  cidr:      $CA_ALLOWED_CIDR
+  cidrs:     ${CA_ALLOWED_CIDRS:-${CA_ALLOWED_CIDR:-not set}}
   deployer:  ${CA_DEPLOYER_CIDR:-not detected}
   dingtalk:  $CA_ENABLE_DINGTALK
   pep:       $([[ "${CA_DISABLE_PEP:-0}" == "1" ]] && printf disabled || printf enabled)

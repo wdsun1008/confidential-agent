@@ -121,6 +121,44 @@ validate_cidr() {
   done
 }
 
+normalize_cidr_list() {
+  local raw="$1"
+  local out_var="$2"
+  local invalid_var="${3:-}"
+  local cidr result=""
+  raw="${raw//,/ }"
+  raw="${raw//;/ }"
+  for cidr in $raw; do
+    if ! validate_cidr "$cidr"; then
+      if [[ -n "$invalid_var" ]]; then
+        printf -v "$invalid_var" '%s' "$cidr"
+      fi
+      return 1
+    fi
+    case " $result " in
+      *" $cidr "*) ;;
+      *) result="${result:+$result }$cidr" ;;
+    esac
+  done
+  if [[ -z "$result" ]]; then
+    if [[ -n "$invalid_var" ]]; then
+      printf -v "$invalid_var" '%s' ""
+    fi
+    return 1
+  fi
+  printf -v "$out_var" '%s' "$result"
+}
+
+cidr_list_contains() {
+  local list="$1"
+  local needle="$2"
+  local cidr
+  for cidr in $list; do
+    [[ "$cidr" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
 warn_if_open_cidr() {
   local cidr="$1"
   if [[ "$cidr" == "0.0.0.0/0" ]]; then
@@ -128,6 +166,23 @@ warn_if_open_cidr() {
     warn "Default OpenClaw config disables device auth and authenticates with a single gateway token; combined with 0.0.0.0/0 the token alone protects the control UI."
     warn "Only use this CIDR for temporary demos or controlled environments, and keep the gateway token secret."
   fi
+}
+
+set_allowed_cidrs() {
+  local raw="$1"
+  local source="$2"
+  local normalized invalid cidr
+  if ! normalize_cidr_list "$raw" normalized invalid; then
+    if [[ -n "$invalid" ]]; then
+      die "invalid $source CIDR: $invalid"
+    fi
+    die "$source CIDR list cannot be empty"
+  fi
+  CA_ALLOWED_CIDRS="$normalized"
+  CA_ALLOWED_CIDR="$normalized"
+  for cidr in $CA_ALLOWED_CIDRS; do
+    warn_if_open_cidr "$cidr"
+  done
 }
 
 resolve_deployer_cidr() {
@@ -159,6 +214,27 @@ resolve_deployer_cidr() {
   warn "could not detect deployment host public egress IP; deploy may fail unless the operator CIDR covers this host"
 }
 
+prompt_allowed_cidr_list() {
+  local cidrs normalized invalid
+  while true; do
+    prompt_value cidrs "Operator CIDR list, comma or space separated, for example 203.0.113.10/32 198.51.100.0/24"
+    if normalize_cidr_list "$cidrs" normalized invalid; then
+      if cidr_list_contains "$normalized" "0.0.0.0/0"; then
+        warn_if_open_cidr "0.0.0.0/0"
+        confirm "Use 0.0.0.0/0 anyway?" "n" || continue
+      fi
+      CA_ALLOWED_CIDRS="$normalized"
+      CA_ALLOWED_CIDR="$normalized"
+      return
+    fi
+    if [[ -n "$invalid" ]]; then
+      warn "invalid CIDR: $invalid"
+    else
+      warn "CIDR list cannot be empty"
+    fi
+  done
+}
+
 choose_operator_cidr() {
   local detected="$1"
   local answer
@@ -166,7 +242,8 @@ choose_operator_cidr() {
 
 Operator CIDR controls who can reach deployment/status/debug/connect ports.
   1) Current machine only: $detected
-  2) Allow all IPv4 sources: 0.0.0.0/0
+  2) Custom CIDR list
+  3) Allow all IPv4 sources: 0.0.0.0/0
 
 EOF
   while true; do
@@ -174,18 +251,23 @@ EOF
     answer="${answer:-1}"
     case "$answer" in
       1|local|host|current)
-        CA_ALLOWED_CIDR="$detected"
+        set_allowed_cidrs "$detected" "detected operator"
         return
         ;;
-      2|all|open|0.0.0.0|0.0.0.0/0)
+      2|custom|list|manual)
+        prompt_allowed_cidr_list
+        return
+        ;;
+      3|all|open|0.0.0.0|0.0.0.0/0)
         warn_if_open_cidr "0.0.0.0/0"
         if confirm "Use 0.0.0.0/0 anyway?" "n"; then
-          CA_ALLOWED_CIDR="0.0.0.0/0"
+          CA_ALLOWED_CIDRS="0.0.0.0/0"
+          CA_ALLOWED_CIDR="$CA_ALLOWED_CIDRS"
           return
         fi
         ;;
       *)
-        warn "enter 1 for current machine only, or 2 for 0.0.0.0/0"
+        warn "enter 1 for current machine only, 2 for a custom CIDR list, or 3 for 0.0.0.0/0"
         ;;
     esac
   done
@@ -193,8 +275,7 @@ EOF
 
 resolve_allowed_cidr() {
   if [[ -n "${CA_ALLOWED_CIDR:-}" ]]; then
-    validate_cidr "$CA_ALLOWED_CIDR" || die "invalid --allowed-cidr: $CA_ALLOWED_CIDR"
-    warn_if_open_cidr "$CA_ALLOWED_CIDR"
+    set_allowed_cidrs "$CA_ALLOWED_CIDR" "--allowed-cidr"
     resolve_deployer_cidr
     return
   fi
@@ -204,7 +285,7 @@ resolve_allowed_cidr() {
     CA_DEPLOYER_CIDR="${CA_DEPLOYER_CIDR:-$detected}"
     export CA_OPERATOR_EGRESS_IP="${CA_OPERATOR_EGRESS_IP:-$ip}"
     if [[ "$CA_NON_INTERACTIVE" == "1" ]]; then
-      CA_ALLOWED_CIDR="$detected"
+      set_allowed_cidrs "$detected" "detected operator"
       return
     fi
     choose_operator_cidr "$detected"
@@ -214,10 +295,6 @@ resolve_allowed_cidr() {
   if [[ "$CA_NON_INTERACTIVE" == "1" ]]; then
     die "could not detect public egress IP; pass --allowed-cidr"
   fi
-  local cidr
-  prompt_value cidr "Operator CIDR for peering, for example 203.0.113.10/32"
-  validate_cidr "$cidr" || die "invalid CIDR: $cidr"
-  warn_if_open_cidr "$cidr"
-  CA_ALLOWED_CIDR="$cidr"
+  prompt_allowed_cidr_list
   resolve_deployer_cidr
 }

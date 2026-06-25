@@ -177,11 +177,12 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 | 选项 | 含义 | 适用场景 |
 | --- | --- | --- |
 | 当前部署机公网 IP `/32` | 仅允许当前部署机访问控制面、状态接口、debug SSH 和 connect 端口。 | 默认推荐，适用于生产和测试。 |
+| 自定义 CIDR 列表 | 手动输入一个或多个 IPv4 CIDR，支持逗号或空格分隔。 | 浏览器出口、跳板机出口、企业 NAT 出口等需要同时放通的场景。 |
 | `0.0.0.0/0` | 允许所有 IPv4 来源访问 operator 暴露端口。 | 临时演示或受控网络环境。 |
 
 > **说明**：
 >
-> 当前一键脚本仅支持 IPv4 CIDR；底层 `peering` 命令也只接受 IPv4 地址。部署机如果只有 IPv6 出口，请手动指定一个可用的 IPv4 CIDR。非交互传入的 `--allowed-cidr` 表示用户或运维入口 CIDR；脚本仍会额外探测部署机公网出口 IP，并写入单独的 `deployer` peering，保证部署阶段的资源注入、状态检查和 connect 流程可达。
+> 当前一键脚本仅支持 IPv4 CIDR；底层 `peering` 命令也只接受 IPv4 地址。部署机如果只有 IPv6 出口，请手动指定一个可用的 IPv4 CIDR。非交互传入的 `--allowed-cidr` 表示用户或运维入口 CIDR，支持逗号分隔、加引号的空格分隔，也可以重复传入；脚本仍会额外探测部署机公网出口 IP，并写入单独的 `deployer` peering，保证部署阶段的资源注入、状态检查和 connect 流程可达。
 
 > **重要**：
 >
@@ -193,7 +194,7 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
   --non-interactive \
   --yes \
-  --allowed-cidr 203.0.113.10/32
+  --allowed-cidr 203.0.113.10/32,198.51.100.0/24
 ```
 
 ### 步骤四：等待部署完成
@@ -220,7 +221,7 @@ Confidential Agent one-click summary
   region:    cn-beijing
   zone_id:   cn-beijing-i
   instance:  ecs.g9i.xlarge
-  cidr:      203.0.113.10/32
+  cidrs:     203.0.113.10/32 198.51.100.0/24
   dingtalk:  1
   pep:       enabled
   token:     <generated-or-provided-token>
@@ -476,7 +477,7 @@ Verification Successful!
 
 该错误表示当前状态目录中已存在不同 CIDR 的 operator peering。请执行以下操作之一：
 
-*   重新传入与已存在 peering 一致的 `--allowed-cidr`。
+*   重新传入与已存在 peering 一致的 `--allowed-cidr`，多 CIDR 场景会使用 `ops`、`ops-2`、`ops-3` 等标签。
 *   在交互模式中确认替换。
 *   非交互模式下追加 `--yes`。
 
