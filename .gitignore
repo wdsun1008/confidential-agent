@@ -5,5 +5,11 @@
 *.log
 /env.sh
 /examples/hermes-agent/secrets/
+/examples/claude-code/secrets/
+/examples/claude-code/cosign.key
+/examples/claude-code/cosign.pub
+/examples/codex/secrets/
+/examples/codex/cosign.key
+/examples/codex/cosign.pub
 __pycache__/
 *.py[cod]

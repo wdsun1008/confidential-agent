@@ -1,0 +1,62 @@
+schema: confidential-agent/v1
+
+service:
+  id: codex
+  ports: [4500]
+  connect: [4500]
+  app_service: cai-codex-app-server.service
+
+build:
+  image_name: codex-agent
+  resize: 30G
+  with_network: true
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
+  files:
+    - source: ../../target/debug/cai-pep
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ../cli-agents/files/install-cli-agent-runtime.sh
+      target: /usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh
+      executable: true
+    - source: ../cli-agents/files/tdx-remote-attestation.SKILL.md
+      target: /root/.agents/skills/tdx-remote-attestation/SKILL.md
+  scripts: [./install-codex.sh]
+  variants:
+    release:
+      enabled: true
+    debug:
+      enabled: true
+
+deploy:
+  provider: aliyun
+  image_variant: debug
+  instance_type: ecs.g9i.xlarge
+  region: cn-beijing
+  zone_id: cn-beijing-i
+  disk_gb: 60
+
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: rekor
+  rekor:
+    cosign_key: ./cosign.key
+    slsa_generator: /usr/libexec/shelter/slsa/slsa-generator
+    required: true
+
+resources:
+  codex_config:
+    source: ./secrets/config.toml
+    target: /root/.codex/config.toml
+    mode: "0600"
+    required: true
+  codex_env:
+    source: ./secrets/codex.env
+    target: /root/.config/confidential-agent/codex/codex.env
+    mode: "0600"
+    required: true
+  codex_app_server_token:
+    source: ./secrets/app-server-token
+    target: /root/.codex/app-server-token
+    mode: "0600"
+    required: true
