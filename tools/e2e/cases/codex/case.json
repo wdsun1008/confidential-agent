@@ -1,0 +1,9 @@
+{
+  "assets": [
+    {"source": "examples/cli-agents/files", "target": "codex/files"}
+  ],
+  "templates": [
+    {"source": "templates/codex.yaml.tmpl", "target": "codex/codex.yaml"},
+    {"source": "templates/install-codex.sh.tmpl", "target": "codex/install-codex.sh", "mode": "0755"}
+  ]
+}

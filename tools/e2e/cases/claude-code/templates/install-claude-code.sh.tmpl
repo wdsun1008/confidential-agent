@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+export CLI_AGENT_NODE_VERSION={{yaml:CLI_AGENT_NODE_VERSION}}
+export NPM_REGISTRY={{yaml:CLI_AGENT_NPM_REGISTRY}}
+export CLAUDE_CODE_VERSION={{yaml:CLAUDE_CODE_VERSION}}
+
+/usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh claude-code

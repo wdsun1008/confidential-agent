@@ -147,7 +147,19 @@ def context_from_env(work_dir):
     default("REFERENCE_VALUES", "rekor")
     default("SLSA_GENERATOR", "/usr/libexec/shelter/slsa/slsa-generator")
     default("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    default("DASHSCOPE_ANTHROPIC_BASE_URL", "https://dashscope.aliyuncs.com/apps/anthropic")
     default("DASHSCOPE_MODEL", "qwen3.7-max")
+    default("CLI_AGENT_NODE_VERSION", context.get("E2E_CLI_AGENT_NODE_VERSION", "22.19.0"))
+    default(
+        "CLI_AGENT_NPM_REGISTRY",
+        context.get("E2E_CLI_AGENT_NPM_REGISTRY")
+        or context.get("E2E_NPM_REGISTRY")
+        or "https://registry.npmjs.org/",
+    )
+    default("NPM_REGISTRY", context.get("E2E_NPM_REGISTRY", "https://registry.npmmirror.com/"))
+    default("CLAUDE_CODE_VERSION", context.get("E2E_CLAUDE_CODE_VERSION", "latest"))
+    default("CODEX_VERSION", context.get("E2E_CODEX_VERSION", "latest"))
+    default("CODEX_REMOTE_PORT", context.get("E2E_CODEX_REMOTE_PORT", "4500"))
     default("HERMES_IMAGE", context.get("E2E_HERMES_IMAGE", "nousresearch/hermes-agent:v2026.6.5"))
     default("HERMES_CONTAINER_RUNTIME", context.get("E2E_HERMES_CONTAINER_RUNTIME", "podman"))
     default("HERMES_API_SERVER_KEY", context.get("E2E_HERMES_API_SERVER_KEY", ""))

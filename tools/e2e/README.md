@@ -5,7 +5,7 @@ Run full cloud E2E cases through the single case runner:
 ```bash
 export ALICLOUD_ACCESS_KEY='...'
 export ALICLOUD_SECRET_KEY='...'
-export DASHSCOPE_API_KEY='...'              # openclaw-bailian/openclaw-a2a/cmaas
+export DASHSCOPE_API_KEY='...'              # openclaw-bailian/openclaw-a2a/cmaas/claude-code/codex
 export DASHSCOPE_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 export DASHSCOPE_MODEL='qwen3.7-max'
 
@@ -24,6 +24,8 @@ Cases:
 | `openclaw-vllm` | GPU TEE OpenClaw + local vLLM readiness and chat. |
 | `cmaas` | CMaaS 是主 MCP E2E：自然语言 agent 经 gateway 调用 memory MCP tools，验证 MCP audit 链、虚拟 MCP audit tools、TEE evidence 绑定、非 TEE baseline rejection 和 snapshot confidentiality；不通过 host connect 直连 MCP `mcp_ports`。 |
 | `hermes-agent` | Hermes official OCI workload on Shelter `container.mode: runtime`, including runtime mount/resource checks, deploy, connect, health/model/chat probes, and guest diagnostics on failure. |
+| `claude-code` | Claude Code CLI on Bailian qwen3.7-max through the Anthropic-compatible endpoint, with SSH chat and TDX skill probes. |
+| `codex` | Codex CLI on Bailian qwen3.7-max through Responses API, with SSH chat, TDX skill, and TNG-protected app-server remote probes. |
 | `cli-command-matrix` | Local CLI branch matrix plus an optional real-cloud publish/deploy lane when `E2E_MATRIX_REAL_CLOUD=1`. |
 
 OpenClaw + Bailian 的主路径必须同时覆盖 PEP 和 no-PEP 两个分支。CMaaS 承担 MCP 端到端主覆盖，probe 通过 agent/gateway 入口触发 MCP 工具调用，不把 MCP 端口作为 host connect 的直接访问目标。
@@ -49,6 +51,7 @@ CMaaS is the exception to the host `connect start` probe pattern. Its MCP port i
 The scripts do not unset proxy variables internally. On the current development host, OpenAI-facing tools may need a proxy, but mkosi/DNF access to `yum.tbsite.net` and deploy should run without proxy. Use the outer `env -u ...` wrapper shown above for full E2E runs.
 
 Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, and `aliyun`. Rekor-mode `cosign`/`rekor-cli` calls run through `confidential-agent-tools`, so they are not host prerequisites.
+Interactive Codex remote use still requires a host `codex` CLI, but the E2E remote probe validates the protected WebSocket endpoint directly.
 
 Common environment:
 
@@ -66,7 +69,11 @@ Common environment:
 | `E2E_DESTROY_ON_FAILURE` | `1` |
 | `E2E_MATRIX_REAL_CLOUD` | `0`; set to `1` for the `cli-command-matrix` publish/deploy/unpublish cloud lane |
 | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `DASHSCOPE_ANTHROPIC_BASE_URL` | `https://dashscope.aliyuncs.com/apps/anthropic` |
 | `DASHSCOPE_MODEL` | `qwen3.7-max` |
+| `E2E_CLI_AGENT_NPM_REGISTRY` | `https://registry.npmjs.org/`; used by `claude-code` and `codex` CLI package installs |
+| `E2E_CLAUDE_CODE_VERSION` | `latest` |
+| `E2E_CODEX_VERSION` | `latest` |
 
 Provider credentials:
 
@@ -78,7 +85,7 @@ Provider credentials:
 Relative `E2E_WORK_DIR`, `E2E_STATE_DIR`, and `E2E_COSIGN_KEY` inputs are normalized to absolute paths before rendering AppSpecs, so validation behaves the same from any caller working directory.
 Empty environment values are treated as unset by the template renderer and fall back to defaults.
 
-Keep local secret files such as `env.sh` outside the runner. If you use one, source it in your shell or translate it into the `export ...` commands above before invoking `tools/e2e/run.sh`; the E2E scripts must not source secret files themselves.
+Keep local secret files outside the runner. Source or translate them into the `export ...` commands above before invoking `tools/e2e/run.sh`; the E2E scripts must not source secret files themselves.
 
 Artifacts:
 

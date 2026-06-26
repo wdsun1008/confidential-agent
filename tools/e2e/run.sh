@@ -16,6 +16,8 @@ cases:
   openclaw-vllm
   cmaas
   hermes-agent
+  claude-code
+  codex
 EOF
 }
 
@@ -27,7 +29,7 @@ fi
 shift
 
 case "$CASE_NAME" in
-  cli-command-matrix | openclaw-bailian | openclaw-bailian-no-pep | openclaw-a2a | a2a-data-collab | openclaw-vllm | cmaas | hermes-agent) ;;
+  cli-command-matrix | openclaw-bailian | openclaw-bailian-no-pep | openclaw-a2a | a2a-data-collab | openclaw-vllm | cmaas | hermes-agent | claude-code | codex) ;;
   *) usage; exit 2 ;;
 esac
 

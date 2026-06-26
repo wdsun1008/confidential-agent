@@ -78,6 +78,11 @@ record_file_as_block() {
     -e 's/^([[:space:]]*token:[[:space:]]*).+$/\1<redacted>/g' \
     -e 's/token: "[^"]+"/token: "<redacted>"/g' \
     -e 's/"apiKey": "[^"]+"/"apiKey": "<redacted>"/g' \
+    -e 's/"ANTHROPIC_AUTH_TOKEN": "[^"]+"/"ANTHROPIC_AUTH_TOKEN": "<redacted>"/g' \
+    -e 's/^(ANTHROPIC_AUTH_TOKEN=).+$/\1<redacted>/g' \
+    -e 's/^(OPENAI_API_KEY=).+$/\1<redacted>/g' \
+    -e 's/^(CODEX_REMOTE_TOKEN=).+$/\1<redacted>/g' \
+    -e 's/(CODEX_REMOTE_TOKEN=)[^[:space:]]+/\1<redacted>/g' \
     -e 's/"authorization": "Bearer [^"]+"/"authorization": "Bearer <redacted>"/Ig' \
     -e 's/(Authorization: Bearer )[[:graph:]]+/\1<redacted>/Ig' \
     -e 's/"clientSecret": "[^"]+"/"clientSecret": "<redacted>"/g' \
