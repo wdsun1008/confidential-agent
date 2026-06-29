@@ -123,6 +123,7 @@ pub(super) fn stage_tools_image_asset(
     mode: u32,
 ) -> Result<PathBuf> {
     ensure_docker_available()?;
+    ensure_docker_image_available(&cli.tools_image)?;
     let staged = guest_staging_dir.join(filename);
     let output = Command::new("docker")
         .arg("create")

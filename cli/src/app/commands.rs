@@ -54,6 +54,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
             PrepareOptions {
                 build_id: Some(build_id),
                 image_variant: Some(variant.clone()),
+                resolve_container_images: !args.render_only,
                 deploy_names: Some(DeployNames::new(&variant_spec)),
                 ..PrepareOptions::default()
             },
@@ -315,6 +316,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             build_id: Some(build_variant.shelter_build_id.clone()),
             image_variant: Some(deploy_variant.clone()),
             include_deploy: true,
+            resolve_container_images: false,
             deploy_names: Some(deploy_names.clone()),
             mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
             peerings,
@@ -964,6 +966,7 @@ fn cmd_connect_stop(args: &ConnectStopArgs) -> Result<()> {
 
 fn start_tools_container_detached(cli: &Cli, spec: ToolContainerSpec) -> Result<String> {
     ensure_docker_available()?;
+    ensure_docker_image_available(&cli.tools_image)?;
     let envs = spec.envs.clone();
     let mut args = tools_container_args(cli, spec);
     args.insert(2, OsString::from("-d"));

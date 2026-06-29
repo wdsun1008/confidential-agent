@@ -135,6 +135,7 @@ struct PrepareOptions {
     build_id: Option<String>,
     image_variant: Option<String>,
     include_deploy: bool,
+    resolve_container_images: bool,
     deploy_names: Option<DeployNames>,
     mesh_peer_cidrs: Vec<String>,
     peerings: PeeringsFile,
@@ -462,6 +463,13 @@ fn prepare(
     let mut spec = AgentSpec::from_path(spec_path)?;
     if let Some(variant) = options.image_variant.as_ref() {
         spec.deploy.image_variant = Some(variant.clone());
+    }
+    if options.resolve_container_images {
+        if let Some(container) = &mut spec.build.container {
+            if let Some(image) = container.image.as_mut() {
+                *image = resolve_build_container_image(image)?;
+            }
+        }
     }
     spec.ensure_mvp_supported()?;
 

@@ -103,6 +103,92 @@ require_cmd() {
   }
 }
 
+dockerhub_mirror_image() {
+  local image="$1"
+  local mirror="${CA_DOCKERHUB_MIRROR:-docker.1ms.run}"
+  local first rest path last
+  [[ -n "$image" && "$image" != "$mirror/"* ]] || return 1
+  if [[ "$image" == */* ]]; then
+      first="${image%%/*}"
+      rest="${image#*/}"
+      case "$first" in
+      docker.io|index.docker.io|registry-1.docker.io)
+        path="$rest"
+        [[ "$path" == */* ]] || path="library/$path"
+        ;;
+      *.*|*:*|localhost) return 1 ;;
+      *) path="$image" ;;
+    esac
+  else
+    path="library/$image"
+  fi
+  if [[ "$path" != *@* ]]; then
+    last="${path##*/}"
+    [[ "$last" == *:* ]] || path="$path:latest"
+  fi
+  printf '%s/%s\n' "${mirror%/}" "$path"
+}
+
+dockerhub_primary_image() {
+  local image="$1"
+  local first
+  [[ -n "$image" ]] || return 1
+  if [[ "$image" == */* ]]; then
+    first="${image%%/*}"
+    case "$first" in
+      docker.io|index.docker.io|registry-1.docker.io|*.*|*:*|localhost)
+        printf '%s\n' "$image"
+        ;;
+      *)
+        printf 'docker.io/%s\n' "$image"
+        ;;
+    esac
+  else
+    printf 'docker.io/library/%s\n' "$image"
+  fi
+}
+
+run_with_optional_timeout() {
+  local limit="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$limit" "$@"
+  else
+    "$@"
+  fi
+}
+
+container_pull_with_fallback() {
+  local runtime="$1"
+  local image="$2"
+  local stdout="$3"
+  local stderr="$4"
+  local primary
+  local mirror
+  local timeout_s="${CA_CONTAINER_PULL_TIMEOUT:-180s}"
+
+  primary="$(dockerhub_primary_image "$image")"
+  : >"$stdout"
+  : >"$stderr"
+  if [[ "$primary" != "$image" ]]; then
+    printf 'normalized DockerHub image %s to %s\n' "$image" "$primary" >>"$stderr"
+  fi
+  if run_with_optional_timeout "$timeout_s" "$runtime" pull "$primary" >>"$stdout" 2>>"$stderr"; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+  mirror="$(dockerhub_mirror_image "$primary" || true)"
+  [[ -n "$mirror" ]] || return 1
+  {
+    printf '\nprimary pull failed for %s; retrying via %s\n' "$primary" "$mirror"
+  } >>"$stderr"
+  if run_with_optional_timeout "$timeout_s" "$runtime" pull "$mirror" >>"$stdout" 2>>"$stderr"; then
+    printf '%s\n' "$mirror"
+    return 0
+  fi
+  return 1
+}
+
 validate_modes() {
   case "$BUILD_BACKEND" in
     mkosi | base-image) ;;

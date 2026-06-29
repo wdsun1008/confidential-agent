@@ -9,6 +9,45 @@ PEP_POLICY_DIR="/etc/cai/pep"
 PEP_SOCKET_DIR="/run/cai"
 PEP_IMAGE="alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest"
 
+dockerhub_mirror_image() {
+    local image="$1"
+    local mirror="${CA_DOCKERHUB_MIRROR:-docker.1ms.run}"
+    local first rest path last
+    [[ -n "$image" && "$image" != "$mirror/"* ]] || return 1
+    if [[ "$image" == */* ]]; then
+        first="${image%%/*}"
+        rest="${image#*/}"
+        case "$first" in
+            docker.io|index.docker.io|registry-1.docker.io)
+                path="$rest"
+                [[ "$path" == */* ]] || path="library/$path"
+                ;;
+            *.*|*:*|localhost) return 1 ;;
+            *) path="$image" ;;
+        esac
+    else
+        path="library/$image"
+    fi
+    if [[ "$path" != *@* ]]; then
+        last="${path##*/}"
+        [[ "$last" == *:* ]] || path="$path:latest"
+    fi
+    printf '%s/%s\n' "${mirror%/}" "$path"
+}
+
+container_pull_with_fallback() {
+    local runtime="$1"
+    local image="$2"
+    local mirror
+    if "$runtime" pull "$image"; then
+        return 0
+    fi
+    mirror="$(dockerhub_mirror_image "$image" || true)"
+    [[ -n "$mirror" ]] || return 1
+    echo "$runtime pull failed for $image; retrying via $mirror" >&2
+    "$runtime" pull "$mirror" && "$runtime" tag "$mirror" "$image"
+}
+
 ensure_container_runtime() {
     if command -v docker >/dev/null 2>&1; then
         return 0
@@ -27,7 +66,7 @@ prepull_pep_image() {
         return 0
     fi
     echo "pre-pulling CAI PEP sandbox image: $PEP_IMAGE"
-    docker pull "$PEP_IMAGE"
+    container_pull_with_fallback docker "$PEP_IMAGE"
 }
 
 setup_runtime() {

@@ -66,6 +66,38 @@ ensure_git() {
     fi
 }
 
+github_proxy_repo_url() {
+    case "$1" in
+        https://github.com/*)
+            proxy="${CA_GITHUB_PROXY_URL:-https://gh-proxy.org/}"
+            case "$proxy" in
+                */) printf '%s%s\n' "$proxy" "$1" ;;
+                *) printf '%s/%s\n' "$proxy" "$1" ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+git_fetch_with_fallback() {
+    dir="$1"
+    repo_url="$2"
+    ref_name="$3"
+    git -C "$dir" remote set-url origin "$repo_url"
+    if git -C "$dir" fetch --depth 1 origin "$ref_name"; then
+        return 0
+    fi
+    proxy_url="$(github_proxy_repo_url "$repo_url" || true)"
+    if [ -z "$proxy_url" ]; then
+        return 1
+    fi
+    echo "Direct GitHub fetch failed, retrying via $proxy_url" >&2
+    git -C "$dir" remote set-url origin "$proxy_url"
+    git -C "$dir" fetch --depth 1 origin "$ref_name"
+}
+
 # Wrap the imperative body so `sh` parses the entire script before executing
 # anything. Without this wrapper, `curl ... | sh` would hit `exec </dev/tty`
 # while the rest of the script bytes are still in the curl pipe, then sh would
@@ -135,15 +167,14 @@ main() {
     mkdir -p "$(dirname "$source_dir")"
 
     if [ -d "$source_dir/.git" ]; then
-        git -C "$source_dir" remote set-url origin "$repo"
-        git -C "$source_dir" fetch --depth 1 origin "$ref"
+        git_fetch_with_fallback "$source_dir" "$repo" "$ref"
         git -C "$source_dir" checkout --detach "FETCH_HEAD"
     else
         rm -rf "$source_dir"
         mkdir -p "$source_dir"
         git -C "$source_dir" init
         git -C "$source_dir" remote add origin "$repo"
-        git -C "$source_dir" fetch --depth 1 origin "$ref"
+        git_fetch_with_fallback "$source_dir" "$repo" "$ref"
         git -C "$source_dir" checkout --detach "FETCH_HEAD"
     fi
 

@@ -44,6 +44,7 @@ pub(super) fn run_tools_container(
     inherit_stdio: bool,
 ) -> Result<()> {
     ensure_docker_available()?;
+    ensure_docker_image_available(&cli.tools_image)?;
     let container_name = spec.container_name.clone();
     let envs = spec.envs.clone();
     let args = tools_container_args(cli, spec);
@@ -196,6 +197,186 @@ pub(super) fn summarize_command_bytes(bytes: &[u8]) -> String {
         format!("{summary}...<truncated>")
     } else {
         summary
+    }
+}
+
+pub(super) fn ensure_docker_image_available(image: &str) -> Result<()> {
+    #[cfg(test)]
+    if image.ends_with(":test") {
+        return Ok(());
+    }
+    if docker_image_inspect(image)? {
+        return Ok(());
+    }
+    let primary = Command::new("docker")
+        .arg("pull")
+        .arg(image)
+        .output()
+        .with_context(|| format!("failed to execute 'docker pull {image}'"))?;
+    if primary.status.success() {
+        return Ok(());
+    }
+    let Some(mirror) = dockerhub_mirror_ref(image) else {
+        bail!(
+            "docker image '{}' is not available and pull failed with {}; stderr: {}",
+            image,
+            primary.status,
+            summarize_command_bytes(&primary.stderr)
+        );
+    };
+    eprintln!("[ca] docker pull failed for {image}; retrying via {mirror}");
+    let fallback = Command::new("docker")
+        .arg("pull")
+        .arg(&mirror)
+        .output()
+        .with_context(|| format!("failed to execute 'docker pull {mirror}'"))?;
+    if !fallback.status.success() {
+        bail!(
+            "docker pull failed for '{}' and fallback '{}'; primary stderr: {}; fallback stderr: {}",
+            image,
+            mirror,
+            summarize_command_bytes(&primary.stderr),
+            summarize_command_bytes(&fallback.stderr)
+        );
+    }
+    let tag = Command::new("docker")
+        .args(["tag", &mirror, image])
+        .output()
+        .with_context(|| format!("failed to execute 'docker tag {mirror} {image}'"))?;
+    if !tag.status.success() {
+        bail!(
+            "docker tag '{}' as '{}' failed with {}; stderr: {}",
+            mirror,
+            image,
+            tag.status,
+            summarize_command_bytes(&tag.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn docker_image_inspect(image: &str) -> Result<bool> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to execute 'docker image inspect {image}'"))?;
+    Ok(output.success())
+}
+
+pub(super) fn dockerhub_mirror_ref(image: &str) -> Option<String> {
+    let image = image.trim();
+    if image.is_empty() || image.starts_with("docker.1ms.run/") {
+        return None;
+    }
+    let mut parts = image.splitn(2, '/');
+    let first = parts.next()?;
+    let rest = parts.next();
+    let dockerhub_path = match rest {
+        None => format!("library/{}", ensure_tag(first)),
+        Some(rest) if is_dockerhub_registry(first) => ensure_tag(&dockerhub_library_path(rest)),
+        Some(_) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            return None
+        }
+        Some(_) => ensure_tag(image),
+    };
+    Some(format!("docker.1ms.run/{dockerhub_path}"))
+}
+
+pub(super) fn resolve_build_container_image(image: &str) -> Result<String> {
+    let runtime = container_image_runtime().context(
+        "build.container.image requires docker or podman on the build host to preflight image fallback",
+    )?;
+    if container_image_exists(&runtime, image)? {
+        return Ok(image.to_string());
+    }
+    let primary = Command::new(&runtime)
+        .arg("pull")
+        .arg(image)
+        .output()
+        .with_context(|| format!("failed to execute '{} pull {image}'", runtime))?;
+    if primary.status.success() {
+        return Ok(image.to_string());
+    }
+    let Some(mirror) = dockerhub_mirror_ref(image) else {
+        bail!(
+            "{} pull '{}' failed with {}; stderr: {}",
+            runtime,
+            image,
+            primary.status,
+            summarize_command_bytes(&primary.stderr)
+        );
+    };
+    eprintln!("[ca] {runtime} pull failed for {image}; retrying via {mirror}");
+    let fallback = Command::new(&runtime)
+        .arg("pull")
+        .arg(&mirror)
+        .output()
+        .with_context(|| format!("failed to execute '{} pull {mirror}'", runtime))?;
+    if !fallback.status.success() {
+        bail!(
+            "{} pull failed for '{}' and fallback '{}'; primary stderr: {}; fallback stderr: {}",
+            runtime,
+            image,
+            mirror,
+            summarize_command_bytes(&primary.stderr),
+            summarize_command_bytes(&fallback.stderr)
+        );
+    }
+    Ok(mirror)
+}
+
+fn container_image_runtime() -> Option<String> {
+    for candidate in ["podman", "docker"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()
+            .is_some_and(|status| status.success())
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn container_image_exists(runtime: &str, image: &str) -> Result<bool> {
+    let status = Command::new(runtime)
+        .args(["image", "inspect", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to execute '{} image inspect {image}'", runtime))?;
+    Ok(status.success())
+}
+
+fn is_dockerhub_registry(value: &str) -> bool {
+    matches!(
+        value,
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
+    )
+}
+
+fn dockerhub_library_path(value: &str) -> String {
+    if value.contains('/') {
+        value.to_string()
+    } else {
+        format!("library/{value}")
+    }
+}
+
+fn ensure_tag(value: &str) -> String {
+    if value.contains('@') {
+        return value.to_string();
+    }
+    let last = value.rsplit('/').next().unwrap_or(value);
+    if last.contains(':') {
+        value.to_string()
+    } else {
+        format!("{value}:latest")
     }
 }
 
@@ -796,6 +977,39 @@ mod tests {
             .collect();
         let wd_idx = strs.iter().position(|s| s == "--workdir").unwrap();
         assert_eq!(strs[wd_idx + 1], "/work/project");
+    }
+
+    #[test]
+    fn dockerhub_mirror_ref_normalizes_common_forms() {
+        assert_eq!(
+            dockerhub_mirror_ref("busybox").as_deref(),
+            Some("docker.1ms.run/library/busybox:latest")
+        );
+        assert_eq!(
+            dockerhub_mirror_ref("library/busybox").as_deref(),
+            Some("docker.1ms.run/library/busybox:latest")
+        );
+        assert_eq!(
+            dockerhub_mirror_ref("docker.io/library/busybox:1.36").as_deref(),
+            Some("docker.1ms.run/library/busybox:1.36")
+        );
+        assert_eq!(
+            dockerhub_mirror_ref("docker.io/busybox").as_deref(),
+            Some("docker.1ms.run/library/busybox:latest")
+        );
+        assert_eq!(
+            dockerhub_mirror_ref("nousresearch/hermes-agent:v2026.6.5").as_deref(),
+            Some("docker.1ms.run/nousresearch/hermes-agent:v2026.6.5")
+        );
+    }
+
+    #[test]
+    fn dockerhub_mirror_ref_ignores_non_dockerhub_registries() {
+        assert_eq!(dockerhub_mirror_ref("ghcr.io/org/app:tag").as_deref(), None);
+        assert_eq!(
+            dockerhub_mirror_ref("docker.1ms.run/library/busybox:latest").as_deref(),
+            None
+        );
     }
 
     #[test]

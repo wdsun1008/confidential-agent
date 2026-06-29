@@ -6,6 +6,7 @@ OPENCLAW_USER_HOME="${2:?missing OpenClaw user home}"
 OPENCLAW_CONFIG_DIR="${OPENCLAW_USER_HOME%/}/.openclaw"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.5.7}"
 OPENCLAW_NODE_VERSION="${OPENCLAW_NODE_VERSION:-22.19.0}"
+OPENCLAW_GIT_TIMEOUT_SEC="${OPENCLAW_GIT_TIMEOUT_SEC:-120}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
 install -d -m 1777 /tmp
@@ -140,14 +141,28 @@ preinstall_openclaw_bundled_runtime_deps() {
     done < <(find "$extensions_dir" -mindepth 2 -maxdepth 2 -name package.json -print0 | sort -z)
 }
 
+git_with_timeout() {
+    local git_env=(
+        "GIT_TERMINAL_PROMPT=0"
+        "GIT_HTTP_LOW_SPEED_LIMIT=${GIT_HTTP_LOW_SPEED_LIMIT:-1024}"
+        "GIT_HTTP_LOW_SPEED_TIME=${GIT_HTTP_LOW_SPEED_TIME:-20}"
+    )
+    if command -v timeout >/dev/null 2>&1; then
+        env "${git_env[@]}" timeout "$OPENCLAW_GIT_TIMEOUT_SEC" git "$@"
+    else
+        env "${git_env[@]}" git "$@"
+    fi
+}
+
 clone_github_with_fallback() {
     local repo_path="$1"
     local dest_dir="$2"
     local primary_url="https://github.com/${repo_path}"
-    local fallback_url="https://gh-proxy.org/https://github.com/${repo_path}"
+    local proxy="${CA_GITHUB_PROXY_URL:-https://gh-proxy.org/}"
+    local fallback_url="${proxy%/}/https://github.com/${repo_path}"
 
     rm -rf "${dest_dir}.tmp-direct" "${dest_dir}.tmp-proxy"
-    if git clone --depth 1 "$primary_url" "${dest_dir}.tmp-direct"; then
+    if git_with_timeout clone --depth 1 "$primary_url" "${dest_dir}.tmp-direct"; then
         rm -rf "$dest_dir"
         mv "${dest_dir}.tmp-direct" "$dest_dir"
         return 0
@@ -155,7 +170,7 @@ clone_github_with_fallback() {
 
     echo "Direct GitHub clone failed, retrying via gh-proxy..."
     rm -rf "${dest_dir}.tmp-direct"
-    if git clone --depth 1 "$fallback_url" "${dest_dir}.tmp-proxy"; then
+    if git_with_timeout clone --depth 1 "$fallback_url" "${dest_dir}.tmp-proxy"; then
         rm -rf "$dest_dir"
         mv "${dest_dir}.tmp-proxy" "$dest_dir"
         return 0
