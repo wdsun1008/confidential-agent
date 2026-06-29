@@ -177,6 +177,24 @@ pub(crate) struct InitArgs {
     pub(crate) node_version: String,
     #[arg(long, default_value = "https://registry.npmmirror.com/")]
     pub(crate) npm_registry: String,
+    #[arg(long, default_value = "Qwen/Qwen3.6-35B-A3B")]
+    pub(crate) vllm_model_id: String,
+    #[arg(long, default_value = "/opt/models/Qwen3.6-35B-A3B")]
+    pub(crate) vllm_model_dir: String,
+    #[arg(long, default_value = "Qwen3.6-35B-A3B")]
+    pub(crate) vllm_served_model_name: String,
+    #[arg(long, default_value_t = 8090)]
+    pub(crate) vllm_port: u16,
+    #[arg(long, default_value = "0.19.1")]
+    pub(crate) vllm_version: String,
+    #[arg(long, default_value = "release")]
+    pub(crate) vllm_build_variants: String,
+    #[arg(long)]
+    pub(crate) enable_dingtalk: bool,
+    #[arg(long, env = "DINGTALK_BOT_CLIENT_ID")]
+    pub(crate) dingtalk_client_id: Option<String>,
+    #[arg(long, env = "DINGTALK_BOT_CLIENT_SECRET")]
+    pub(crate) dingtalk_client_secret: Option<String>,
     #[arg(long, default_value = "main")]
     pub(crate) hermes_branch: String,
     #[arg(long)]

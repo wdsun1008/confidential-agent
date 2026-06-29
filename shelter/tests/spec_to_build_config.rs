@@ -242,6 +242,23 @@ fn spec_to_build_config_mkosi_path_omits_from_and_variants_but_keeps_payload() {
 }
 
 #[test]
+fn spec_to_build_config_renders_cleanup_passthrough() {
+    let yaml = SPEC.replace(
+        "  packages:\n",
+        "  cleanup:\n    remove_static_libs: false\n  packages:\n",
+    );
+    let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+    let parsed = render_yaml(&spec, ShelterRenderOptions::default());
+    let root = parsed.as_mapping().unwrap();
+
+    let cleanup = mapping_get(root, "cleanup").as_mapping().unwrap();
+    assert_eq!(
+        mapping_get(cleanup, "remove_static_libs").as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
 fn spec_to_build_config_renders_container_passthrough() {
     let yaml = SPEC.replace(
         "  packages:\n",

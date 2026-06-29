@@ -7,8 +7,8 @@ DEFAULT_BRANCH="one-click"
 usage() {
     cat <<'EOF'
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh
-  sh one-click/install.sh [deploy|install-only|cleanup] [options]
+  curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install-openclaw-vllm.sh | sh
+  sh one-click/install-openclaw-vllm.sh [deploy|install-only|cleanup] [options]
 
 Bootstrap options:
   --repo URL             Git repository to clone when running through curl | sh
@@ -18,7 +18,7 @@ Bootstrap options:
   --source-dir PATH      Local source checkout directory
   --help                 Show this help
 
-All other options are handled by the one-click installer after checkout.
+All other options are handled by the OpenClaw vLLM one-click installer after checkout.
 EOF
 }
 
@@ -41,6 +41,7 @@ validate_commit_ref() {
 
 run_main() {
     main_script="$1"
+    export CA_ONE_CLICK_TARGET=openclaw-vllm
     if [ -s "$pass_args_file" ]; then
         xargs -0 -a "$pass_args_file" bash "$main_script"
         exit $?
@@ -98,10 +99,6 @@ git_fetch_with_fallback() {
     git -C "$dir" fetch --depth 1 origin "$ref_name"
 }
 
-# Wrap the imperative body so `sh` parses the entire script before executing
-# anything. Without this wrapper, `curl ... | sh` would hit `exec </dev/tty`
-# while the rest of the script bytes are still in the curl pipe, then sh would
-# try to read the remaining script from the terminal and silently hang.
 main() {
     repo="${CA_ONE_CLICK_REPO:-$DEFAULT_REPO}"
     ref="${CA_ONE_CLICK_REF:-${CA_ONE_CLICK_BRANCH:-$DEFAULT_BRANCH}}"

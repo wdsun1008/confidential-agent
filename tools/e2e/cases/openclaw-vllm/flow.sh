@@ -60,16 +60,28 @@ assert_openclaw_vllm_init_output() {
   grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
   grep -Fq "target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh" "$spec"
   grep -Fq "target: /home/openclaw/.openclaw/skills/tdx-remote-attestation/SKILL.md" "$spec"
+  grep -Fq "cleanup:" "$spec"
+  grep -Fq "remove_static_libs: false" "$spec"
   grep -Fq "scripts: [./install-openclaw-vllm.sh]" "$spec"
-  grep -Fq "image_variant: debug" "$spec"
+  if [[ "$VLLM_BUILD_VARIANTS" == *debug* ]]; then
+    grep -Fq "image_variant: debug" "$spec"
+    grep -Fq "debug:" "$spec"
+  else
+    grep -Fq "image_variant: release" "$spec"
+    ! grep -Fq "debug:" "$spec"
+  fi
   grep -Fq "target: /home/openclaw/.openclaw/openclaw.json" "$spec"
   grep -Fq "OPENCLAW_VERSION" "$install_script"
   grep -Fq "OPENCLAW_NODE_VERSION" "$install_script"
   grep -Fq "NPM_REGISTRY" "$install_script"
+  grep -Fq "OPENCLAW_VLLM_PORT" "$install_script"
+  grep -Fq "OPENCLAW_VLLM_VERSION" "$install_script"
   assert_init_script_extends_example \
     "$install_script" \
     "$ROOT_DIR/examples/openclaw-vllm/install-openclaw-vllm.sh" \
-    OPENCLAW_VERSION OPENCLAW_NODE_VERSION NPM_REGISTRY
+    OPENCLAW_VERSION OPENCLAW_NODE_VERSION NPM_REGISTRY \
+    OPENCLAW_VLLM_MODEL_ID OPENCLAW_VLLM_MODEL_DIR \
+    OPENCLAW_VLLM_SERVED_MODEL_NAME OPENCLAW_VLLM_PORT OPENCLAW_VLLM_VERSION
   jq -e '
     .models.providers["local-vllm"].baseUrl == "http://127.0.0.1:8090/v1" and
     .gateway.auth.mode == "token" and
@@ -95,6 +107,11 @@ run_case() {
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-}"
   CHAT_ATTEMPTS="${E2E_CHAT_ATTEMPTS:-3}"
   VLLM_PORT="${OPENCLAW_VLLM_PORT:-8090}"
+  if [[ "${E2E_OPENCLAW_VLLM_RUN_CLOUD:-0}" == "1" ]]; then
+    VLLM_BUILD_VARIANTS="${E2E_OPENCLAW_VLLM_BUILD_VARIANTS:-debug}"
+  else
+    VLLM_BUILD_VARIANTS="${E2E_OPENCLAW_VLLM_BUILD_VARIANTS:-release}"
+  fi
 
   validate_modes
   require_cmd cargo
@@ -131,6 +148,7 @@ run_case() {
     --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.5.7}"
     --node-version "${E2E_OPENCLAW_NODE_VERSION:-22.19.0}"
     --npm-registry "${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}"
+    --vllm-build-variants "$VLLM_BUILD_VARIANTS"
   )
   if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" openclaw-vllm "${init_args[@]}"; then
     record_file_as_block "init stdout:" "$WORK_DIR/init.out" text

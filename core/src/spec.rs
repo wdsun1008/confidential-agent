@@ -57,6 +57,21 @@ pub struct BuildSpec {
     pub scripts: Vec<PathBuf>,
     #[serde(default)]
     pub variants: BuildVariantsSpec,
+    #[serde(default, skip_serializing_if = "BuildCleanupSpec::is_empty")]
+    pub cleanup: BuildCleanupSpec,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BuildCleanupSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_static_libs: Option<bool>,
+}
+
+impl BuildCleanupSpec {
+    pub fn is_empty(&self) -> bool {
+        self.remove_static_libs.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1213,6 +1228,8 @@ service:
 build:
   image_name: openclaw-vllm
   kernel_cmdline_append: swiotlb=4194304,any
+  cleanup:
+    remove_static_libs: false
   variants:
     debug:
       enabled: true
@@ -1244,6 +1261,7 @@ resources:
             spec.build.kernel_cmdline_append.as_deref(),
             Some("swiotlb=4194304,any")
         );
+        assert_eq!(spec.build.cleanup.remove_static_libs, Some(false));
         let resource = &spec.resources["openclaw_config"];
         assert_eq!(resource.owner.as_deref(), Some("openclaw"));
         assert_eq!(resource.group.as_deref(), Some("openclaw"));

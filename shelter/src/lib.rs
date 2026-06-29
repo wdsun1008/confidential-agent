@@ -2,7 +2,8 @@ use anyhow::Result;
 use confidential_agent_core::peerings::{PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{confidential_ports, AGENT_CARD_PORT, DAEMON_STATUS_PORT};
 use confidential_agent_core::spec::{
-    AgentSpec, AttestationMode, AttestationTee, BuildContainerSpec, ReferenceValueMode, RekorSpec,
+    AgentSpec, AttestationMode, AttestationTee, BuildCleanupSpec, BuildContainerSpec,
+    ReferenceValueMode, RekorSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +62,7 @@ pub fn render_build_config(
         with_network: spec.build.with_network,
         container: spec.build.container.clone(),
         packages: shelter_packages(spec, assets),
+        cleanup: shelter_cleanup(&spec.build.cleanup),
         files: guest_files(assets),
         scripts: assets
             .guest_setup_script
@@ -102,6 +104,12 @@ fn shelter_packages(spec: &AgentSpec, _assets: &GuestAssets) -> Vec<String> {
         packages.push("openssh-server".to_string());
     }
     packages
+}
+
+fn shelter_cleanup(cleanup: &BuildCleanupSpec) -> Option<ShelterCleanupConfig> {
+    (!cleanup.is_empty()).then(|| ShelterCleanupConfig {
+        remove_static_libs: cleanup.remove_static_libs,
+    })
 }
 
 fn shelter_services(spec: &AgentSpec) -> Vec<ShelterServiceUnit> {
@@ -354,6 +362,8 @@ struct ShelterBuildConfig {
     container: Option<BuildContainerSpec>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     packages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleanup: Option<ShelterCleanupConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     files: Vec<ShelterFileMapping>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -372,6 +382,12 @@ struct ShelterBuildConfig {
 struct ShelterDiskConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterCleanupConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remove_static_libs: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

@@ -66,6 +66,8 @@ build:
   resize: 30G                                 # 可选，渲染为 Shelter disk.size
   with_network: true                          # 可选，允许构建阶段访问网络
   kernel_cmdline_append: "swiotlb=4194304,any" # 可选，UKI cmdline 追加项
+  cleanup:                                    # 可选，透传给 Shelter cleanup
+    remove_static_libs: false                 # 可选，保留 *.a 静态库
   container:                                  # 可选，Shelter OCI workload payload
     image: nousresearch/hermes-agent:v2026.6.5
     mode: rootfs                              # runtime | rootfs
@@ -99,6 +101,7 @@ build:
 | `resize` | string | ❌ | `None` | 例如 `30G`，渲染为 Shelter `disk.size` |
 | `with_network` | bool | ❌ | `false` | 透传给 Shelter/mkosi 的 with-network；需要在 build/post-install/finalize 阶段执行 npm/pip/model 下载等网络安装时设为 `true` |
 | `kernel_cmdline_append` | string | ❌ | `None` | 透传到 `security.disk.cryptpilot.uki_append_cmdline` |
+| `cleanup.remove_static_libs` | bool | ❌ | Shelter 默认值 | 透传给 Shelter 顶层 `cleanup.remove_static_libs`；vLLM 等需要在运行期编译 Python 扩展的镜像可设为 `false` 保留静态库 |
 | `container` | object | ❌ | `None` | 原样渲染为 Shelter 顶层 `container:`；用于 OCI workload，不是 `base_image` |
 | `packages` | `[string]` | ❌ | `[]` | 透传给 Shelter `packages` |
 | `files` | `[BuildFileSpec]` | ❌ | `[]` | 见下表 |
@@ -217,7 +220,7 @@ deploy:
     confidential-agent-image-variant: <variant>
 ```
 
-Build 输出也使用 Shelter master schema：`build.resize` 渲染为顶层 `disk.size`，cryptpilot 渲染为 `security.disk.engine: cryptpilot` 和 `security.disk.cryptpilot.*`，不再输出旧 `resize`、`variants`、`security.disk-crypt`、`deploy.cc`、`deploy.tdx`、`security_group_ports` 或 `security_group_allowed_cidr`。
+Build 输出也使用 Shelter master schema：`build.resize` 渲染为顶层 `disk.size`，`build.cleanup` 渲染为顶层 `cleanup`，cryptpilot 渲染为 `security.disk.engine: cryptpilot` 和 `security.disk.cryptpilot.*`，不再输出旧 `resize`、`variants`、`security.disk-crypt`、`deploy.cc`、`deploy.tdx`、`security_group_ports` 或 `security_group_allowed_cidr`。
 
 ---
 

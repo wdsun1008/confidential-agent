@@ -20,6 +20,40 @@ struct InitProject {
     model: String,
     gateway_token: Option<String>,
     disable_pep: bool,
+    enable_dingtalk: bool,
+    dingtalk_client_id: Option<String>,
+    dingtalk_client_secret: Option<String>,
+    vllm_model_id: String,
+    vllm_model_dir: String,
+    vllm_served_model_name: String,
+    vllm_port: u16,
+    vllm_version: String,
+    vllm_build_variants: VllmBuildVariants,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VllmBuildVariants {
+    release: bool,
+    debug: bool,
+}
+
+impl Default for VllmBuildVariants {
+    fn default() -> Self {
+        Self {
+            release: true,
+            debug: false,
+        }
+    }
+}
+
+impl VllmBuildVariants {
+    fn deploy_variant(self) -> &'static str {
+        if self.debug {
+            "debug"
+        } else {
+            "release"
+        }
+    }
 }
 
 pub(super) fn cmd_init(cli: &Cli, args: &InitArgs) -> Result<()> {
@@ -65,6 +99,9 @@ pub(super) fn cmd_init(cli: &Cli, args: &InitArgs) -> Result<()> {
 }
 
 fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
+    if target == InitTarget::OpenclawVllm && args.disable_pep {
+        bail!("init openclaw-vllm does not support --disable-pep because the TDX attestation skill uses cai-pep attest");
+    }
     let service_id = target.service_id();
     let dir = args.output_dir.join(service_id);
     let spec_path = dir.join(target.spec_name());
@@ -107,6 +144,17 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
             bail!("--gateway-token must be at least 32 characters");
         }
     }
+    let (enable_dingtalk, dingtalk_client_id, dingtalk_client_secret) =
+        if matches!(target, InitTarget::Openclaw | InitTarget::OpenclawVllm) {
+            resolve_dingtalk_credentials(args)?
+        } else {
+            (false, None, None)
+        };
+    let vllm_build_variants = if target == InitTarget::OpenclawVllm {
+        parse_vllm_build_variants(&args.vllm_build_variants)?
+    } else {
+        VllmBuildVariants::default()
+    };
 
     Ok(InitProject {
         target,
@@ -127,6 +175,15 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
         model,
         gateway_token,
         disable_pep: args.disable_pep,
+        enable_dingtalk,
+        dingtalk_client_id,
+        dingtalk_client_secret,
+        vllm_model_id: args.vllm_model_id.clone(),
+        vllm_model_dir: args.vllm_model_dir.clone(),
+        vllm_served_model_name: args.vllm_served_model_name.clone(),
+        vllm_port: args.vllm_port,
+        vllm_version: args.vllm_version.clone(),
+        vllm_build_variants,
     })
 }
 
@@ -175,6 +232,71 @@ fn resolve_dashscope_key(args: &InitArgs, target: InitTarget) -> Result<Option<S
         );
     }
     Ok(Some(prompt_secret("DashScope/Bailian API key")?))
+}
+
+fn resolve_dingtalk_credentials(args: &InitArgs) -> Result<(bool, Option<String>, Option<String>)> {
+    if !args.enable_dingtalk {
+        return Ok((false, None, None));
+    }
+    let client_id = resolve_dingtalk_value(
+        args.dingtalk_client_id.clone(),
+        args.non_interactive,
+        "DingTalk bot client ID",
+        "--dingtalk-client-id",
+    )?;
+    let client_secret = resolve_dingtalk_value(
+        args.dingtalk_client_secret.clone(),
+        args.non_interactive,
+        "DingTalk bot client secret",
+        "--dingtalk-client-secret",
+    )?;
+    Ok((true, Some(client_id), Some(client_secret)))
+}
+
+fn resolve_dingtalk_value(
+    value: Option<String>,
+    non_interactive: bool,
+    prompt: &str,
+    flag: &str,
+) -> Result<String> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        return Ok(value);
+    }
+    if non_interactive {
+        bail!(
+            "init --enable-dingtalk --non-interactive requires {flag} or its environment variable"
+        );
+    }
+    if prompt.ends_with("secret") {
+        prompt_secret(prompt)
+    } else {
+        prompt_value(prompt)
+    }
+}
+
+fn parse_vllm_build_variants(value: &str) -> Result<VllmBuildVariants> {
+    let mut variants = VllmBuildVariants {
+        release: false,
+        debug: false,
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("--vllm-build-variants cannot be empty");
+    }
+    for token in trimmed.split(',').map(str::trim) {
+        match token {
+            "release" => variants.release = true,
+            "debug" => variants.debug = true,
+            "" => bail!("--vllm-build-variants contains an empty entry"),
+            other => bail!(
+                "--vllm-build-variants only supports release, debug, or release,debug; got {other}"
+            ),
+        }
+    }
+    if !variants.release && !variants.debug {
+        bail!("--vllm-build-variants must enable at least one variant");
+    }
+    Ok(variants)
 }
 
 fn resolve_or_generate_cosign_key(
@@ -262,6 +384,16 @@ fn prompt_secret(prompt: &str) -> Result<String> {
     Ok(value)
 }
 
+fn prompt_value(prompt: &str) -> Result<String> {
+    print!("{prompt}: ");
+    std::io::stdout().flush().ok();
+    let value = read_stdin_line()?.trim().to_string();
+    if value.is_empty() {
+        bail!("{prompt} cannot be empty");
+    }
+    Ok(value)
+}
+
 fn read_stdin_line() -> Result<String> {
     let mut value = String::new();
     std::io::stdin()
@@ -314,6 +446,7 @@ fn write_openclaw_vllm_project(cli: &Cli, args: &InitArgs, project: &InitProject
         .with_context(|| format!("failed to copy OpenClaw vLLM support file '{file}'"))?;
     }
     set_mode(&project.dir.join("cai-nvidia-cc-stack-install.sh"), 0o755)?;
+    let vllm_port = project.vllm_port.to_string();
     write_install_script_with_exports(
         &repo.join("examples/openclaw-vllm/install-openclaw-vllm.sh"),
         &project.dir.join("install-openclaw-vllm.sh"),
@@ -321,6 +454,14 @@ fn write_openclaw_vllm_project(cli: &Cli, args: &InitArgs, project: &InitProject
             ("OPENCLAW_VERSION", &args.openclaw_version),
             ("OPENCLAW_NODE_VERSION", &args.node_version),
             ("NPM_REGISTRY", &args.npm_registry),
+            ("OPENCLAW_VLLM_MODEL_ID", &project.vllm_model_id),
+            ("OPENCLAW_VLLM_MODEL_DIR", &project.vllm_model_dir),
+            (
+                "OPENCLAW_VLLM_SERVED_MODEL_NAME",
+                &project.vllm_served_model_name,
+            ),
+            ("OPENCLAW_VLLM_PORT", &vllm_port),
+            ("OPENCLAW_VLLM_VERSION", &project.vllm_version),
         ],
     )?;
 
@@ -544,11 +685,12 @@ fn openclaw_json(project: &InitProject, local_vllm: bool) -> Result<serde_json::
         .as_deref()
         .context("OpenClaw gateway token was not resolved")?;
     let (provider_name, provider, primary_model) = if local_vllm {
-        let served = "Qwen3.6-35B-A3B";
+        let served = project.vllm_served_model_name.as_str();
+        let base_url = format!("http://127.0.0.1:{}/v1", project.vllm_port);
         (
             "local-vllm",
             serde_json::json!({
-                "baseUrl": "http://127.0.0.1:8090/v1",
+                "baseUrl": base_url,
                 "apiKey": "local-unused",
                 "api": "openai-completions",
                 "models": [{
@@ -617,6 +759,38 @@ fn openclaw_json(project: &InitProject, local_vllm: bool) -> Result<serde_json::
         "cai-a2a".to_string(),
         serde_json::json!({"enabled": true, "config": {"peers": {}}}),
     );
+    let mut channels = serde_json::Map::new();
+    if project.enable_dingtalk {
+        let client_id = project
+            .dingtalk_client_id
+            .as_deref()
+            .context("DingTalk client ID was not resolved")?;
+        let client_secret = project
+            .dingtalk_client_secret
+            .as_deref()
+            .context("DingTalk client secret was not resolved")?;
+        allow.insert(0, "dingtalk");
+        entries.insert(
+            "dingtalk".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "hooks": {"allowConversationAccess": true}
+            }),
+        );
+        channels.insert(
+            "dingtalk".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "clientId": client_id,
+                "clientSecret": client_secret,
+                "dmPolicy": "open",
+                "allowFrom": ["*"],
+                "groupPolicy": "open",
+                "debug": false,
+                "messageType": "markdown"
+            }),
+        );
+    }
 
     Ok(serde_json::json!({
         "models": {
@@ -632,7 +806,7 @@ fn openclaw_json(project: &InitProject, local_vllm: bool) -> Result<serde_json::
             "allow": allow,
             "entries": entries
         },
-        "channels": {},
+        "channels": channels,
         "gateway": {
             "mode": "local",
             "bind": "lan",
@@ -716,6 +890,8 @@ resources:
 
 fn openclaw_vllm_yaml(project: &InitProject, pep_bin: &Path) -> Result<String> {
     let files = openclaw_vllm_files_yaml(pep_bin)?;
+    let variants = openclaw_vllm_variants_yaml(project.vllm_build_variants);
+    let deploy_variant = project.vllm_build_variants.deploy_variant();
     Ok(format!(
         r#"schema: confidential-agent/v1
 
@@ -730,18 +906,17 @@ build:
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
   with_network: true
+  cleanup:
+    remove_static_libs: false
   packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
 {files}  scripts: [./install-openclaw-vllm.sh]
   variants:
-    release:
-      enabled: true
-    debug:
-      enabled: true
+{variants}
 
 deploy:
   provider: aliyun
-  image_variant: debug
+  image_variant: {deploy_variant}
   instance_type: {instance_type}
   region: {region}
   zone_id: {zone_id}
@@ -773,6 +948,8 @@ resources:
 "#,
         base_image = base_image_line(project)?,
         files = files,
+        variants = variants,
+        deploy_variant = deploy_variant,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
         zone_id = yaml_quote(&project.zone_id)?,
@@ -780,6 +957,14 @@ resources:
         reference_values = yaml_quote(reference_values_name(project.reference_values))?,
         rekor = rekor_block(project)?,
     ))
+}
+
+fn openclaw_vllm_variants_yaml(variants: VllmBuildVariants) -> String {
+    let mut out = format!("    release:\n      enabled: {}\n", variants.release);
+    if variants.debug {
+        out.push_str("    debug:\n      enabled: true\n");
+    }
+    out
 }
 
 fn hermes_yaml(project: &InitProject) -> Result<String> {
@@ -1328,6 +1513,179 @@ mod tests {
     fn yaml_quote_escapes_single_quotes() {
         assert_eq!(yaml_quote("a'b").unwrap(), "'a''b'");
         assert!(yaml_quote("a\nb").is_err());
+    }
+
+    #[test]
+    fn parses_vllm_build_variants() {
+        assert_eq!(
+            parse_vllm_build_variants("release").unwrap(),
+            VllmBuildVariants {
+                release: true,
+                debug: false,
+            }
+        );
+        assert_eq!(
+            parse_vllm_build_variants("debug").unwrap(),
+            VllmBuildVariants {
+                release: false,
+                debug: true,
+            }
+        );
+        assert_eq!(
+            parse_vllm_build_variants("release,debug").unwrap(),
+            VllmBuildVariants {
+                release: true,
+                debug: true,
+            }
+        );
+        assert!(parse_vllm_build_variants("").is_err());
+        assert!(parse_vllm_build_variants("release,fast").is_err());
+    }
+
+    #[test]
+    fn openclaw_vllm_init_defaults_to_release_and_preserves_static_libs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let pep = temp.path().join("cai-pep");
+        fs::write(&pep, "#!/bin/sh\nexit 0\n").unwrap();
+        set_mode(&pep, 0o755).unwrap();
+        let previous = std::env::var_os("CA_PEP_BIN");
+        std::env::set_var("CA_PEP_BIN", &pep);
+
+        let cli = Cli::parse_from([
+            "confidential-agent",
+            "--state-dir",
+            temp.path().join("state").to_str().unwrap(),
+            "init",
+            "openclaw-vllm",
+            "--non-interactive",
+            "--force",
+            "--output-dir",
+            temp.path().join("init").to_str().unwrap(),
+            "--reference-values",
+            "sample",
+            "--gateway-token",
+            "0123456789abcdef0123456789abcdef",
+            "--vllm-served-model-name",
+            "custom-model",
+            "--vllm-port",
+            "18090",
+            "--vllm-version",
+            "0.20.0",
+        ]);
+        let Commands::Init(args) = &cli.command else {
+            panic!("expected init command");
+        };
+        cmd_init(&cli, args).unwrap();
+
+        let dir = temp.path().join("init/openclaw-vllm");
+        let spec = fs::read_to_string(dir.join("openclaw-vllm.yaml")).unwrap();
+        assert!(spec.contains("cleanup:\n    remove_static_libs: false"));
+        assert!(spec.contains("image_variant: release"));
+        assert!(spec.contains("release:\n      enabled: true"));
+        assert!(!spec.contains("debug:\n      enabled: true"));
+        let install_script = fs::read_to_string(dir.join("install-openclaw-vllm.sh")).unwrap();
+        assert!(install_script.contains("export OPENCLAW_VLLM_PORT='18090'"));
+        assert!(install_script.contains("export OPENCLAW_VLLM_VERSION='0.20.0'"));
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("openclaw-vllm.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["models"]["providers"]["local-vllm"]["baseUrl"],
+            "http://127.0.0.1:18090/v1"
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "local-vllm/custom-model"
+        );
+
+        if let Some(value) = previous {
+            std::env::set_var("CA_PEP_BIN", value);
+        } else {
+            std::env::remove_var("CA_PEP_BIN");
+        }
+    }
+
+    #[test]
+    fn openclaw_vllm_init_can_generate_debug_variant() {
+        let project = InitProject {
+            target: InitTarget::OpenclawVllm,
+            service_id: "openclaw-vllm",
+            dir: PathBuf::from("/tmp/openclaw-vllm"),
+            spec_path: PathBuf::from("/tmp/openclaw-vllm/openclaw-vllm.yaml"),
+            region: "cn-beijing".to_string(),
+            zone_id: "cn-beijing-l".to_string(),
+            instance_type: "ecs.gn8v-tee.4xlarge".to_string(),
+            disk_gb: 512,
+            reference_values: InitReferenceValues::Sample,
+            cosign_key: None,
+            slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
+            base_image: None,
+            dashscope_key: None,
+            dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            dashscope_anthropic_base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
+                .to_string(),
+            model: "qwen3.7-max".to_string(),
+            gateway_token: Some("0123456789abcdef0123456789abcdef".to_string()),
+            disable_pep: false,
+            enable_dingtalk: false,
+            dingtalk_client_id: None,
+            dingtalk_client_secret: None,
+            vllm_model_id: "Qwen/Qwen3.6-35B-A3B".to_string(),
+            vllm_model_dir: "/opt/models/Qwen3.6-35B-A3B".to_string(),
+            vllm_served_model_name: "Qwen3.6-35B-A3B".to_string(),
+            vllm_port: 8090,
+            vllm_version: "0.19.1".to_string(),
+            vllm_build_variants: VllmBuildVariants {
+                release: false,
+                debug: true,
+            },
+        };
+        let yaml = openclaw_vllm_yaml(&project, Path::new("/usr/local/bin/cai-pep")).unwrap();
+        assert!(yaml.contains("release:\n      enabled: false"));
+        assert!(yaml.contains("debug:\n      enabled: true"));
+        assert!(yaml.contains("image_variant: debug"));
+    }
+
+    #[test]
+    fn openclaw_json_includes_dingtalk_when_enabled() {
+        let project = InitProject {
+            target: InitTarget::Openclaw,
+            service_id: "openclaw",
+            dir: PathBuf::from("/tmp/openclaw"),
+            spec_path: PathBuf::from("/tmp/openclaw/openclaw.yaml"),
+            region: "cn-beijing".to_string(),
+            zone_id: "cn-beijing-i".to_string(),
+            instance_type: "ecs.g9i.xlarge".to_string(),
+            disk_gb: 200,
+            reference_values: InitReferenceValues::Sample,
+            cosign_key: None,
+            slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
+            base_image: None,
+            dashscope_key: Some("sk-test".to_string()),
+            dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            dashscope_anthropic_base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
+                .to_string(),
+            model: "qwen3.7-max".to_string(),
+            gateway_token: Some("0123456789abcdef0123456789abcdef".to_string()),
+            disable_pep: false,
+            enable_dingtalk: true,
+            dingtalk_client_id: Some("ding-id".to_string()),
+            dingtalk_client_secret: Some("ding-secret".to_string()),
+            vllm_model_id: "Qwen/Qwen3.6-35B-A3B".to_string(),
+            vllm_model_dir: "/opt/models/Qwen3.6-35B-A3B".to_string(),
+            vllm_served_model_name: "Qwen3.6-35B-A3B".to_string(),
+            vllm_port: 8090,
+            vllm_version: "0.19.1".to_string(),
+            vllm_build_variants: VllmBuildVariants::default(),
+        };
+        let config = openclaw_json(&project, false).unwrap();
+        assert_eq!(config["plugins"]["entries"]["dingtalk"]["enabled"], true);
+        assert_eq!(config["channels"]["dingtalk"]["clientId"], "ding-id");
+        assert_eq!(
+            config["channels"]["dingtalk"]["clientSecret"],
+            "ding-secret"
+        );
     }
 
     #[test]

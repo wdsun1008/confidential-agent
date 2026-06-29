@@ -13,6 +13,8 @@ build:
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
   with_network: true
+  cleanup:
+    remove_static_libs: false
   packages:
     - binutils
     - ca-certificates
@@ -78,12 +80,10 @@ build:
   variants:
     release:
       enabled: true
-    debug:
-      enabled: true
 
 deploy:
   provider: aliyun
-  image_variant: debug
+  image_variant: release
   instance_type: ecs.gn8v-tee.4xlarge
   region: cn-beijing
   zone_id: cn-beijing-l

@@ -18,7 +18,7 @@ ensure_shelter() {
 
   "$CA_SHELTER_BIN" --version >/dev/null
   log "using Shelter: $CA_SHELTER_BIN"
-  if [[ "${CA_MODE:-}" != "cleanup" && "$CA_REFERENCE_VALUES" == "rekor" && ! -x "$CA_SLSA_GENERATOR" ]]; then
+  if [[ "${CA_MODE:-}" != "cleanup" && "${CA_MODE:-}" != "cleanup-openclaw-vllm" && "$CA_REFERENCE_VALUES" == "rekor" && ! -x "$CA_SLSA_GENERATOR" ]]; then
     die "SLSA generator is required for rekor mode: $CA_SLSA_GENERATOR"
   fi
 }
@@ -174,25 +174,26 @@ ensure_operator_peering() {
 
 build_openclaw_image() {
   if [[ "$CA_SKIP_BUILD" == "1" ]]; then
-    log "skipping OpenClaw image build"
+    log "skipping $CA_SERVICE_LABEL image build"
     return
   fi
-  log "building OpenClaw confidential image"
-  (cd "$CA_WORK_DIR/openclaw" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" build --spec "$CA_WORK_DIR/openclaw/openclaw.yaml")
+  log "building $CA_SERVICE_LABEL confidential image"
+  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" build --spec "$CA_SPEC_PATH")
 }
 
 openclaw_is_active() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3.11 - "$status_json" <<'PY' >/dev/null 2>&1
+  python3.11 - "$status_json" "$CA_SERVICE_ID" <<'PY' >/dev/null 2>&1
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
 items = data if isinstance(data, list) else data.get("services", [])
+service_id = sys.argv[2]
 for item in items:
-    if item.get("service_id") == "openclaw" and item.get("phase") == "active":
+    if item.get("service_id") == service_id and item.get("phase") == "active":
         cloud = item.get("cloud") if isinstance(item.get("cloud"), dict) else {}
         if cloud.get("present") is True:
             raise SystemExit(0)
@@ -203,15 +204,16 @@ PY
 openclaw_public_ip() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3.11 - "$status_json" <<'PY'
+  python3.11 - "$status_json" "$CA_SERVICE_ID" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
 items = data if isinstance(data, list) else data.get("services", [])
+service_id = sys.argv[2]
 for item in items:
-    if item.get("service_id") == "openclaw":
+    if item.get("service_id") == service_id:
         cloud = item.get("cloud") if isinstance(item.get("cloud"), dict) else {}
         public_ip = cloud.get("public_ip")
         if public_ip:
@@ -224,15 +226,16 @@ PY
 openclaw_debug_ssh_key() {
   local status_json="$CA_WORK_DIR/status-local.json"
   ca_cmd status --json >"$status_json" 2>/dev/null || return 1
-  python3.11 - "$status_json" <<'PY'
+  python3.11 - "$status_json" "$CA_SERVICE_ID" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
 items = data if isinstance(data, list) else data.get("services", [])
+service_id = sys.argv[2]
 for item in items:
-    if item.get("service_id") == "openclaw":
+    if item.get("service_id") == service_id:
         build = item.get("build") if isinstance(item.get("build"), dict) else {}
         debug_ssh = build.get("debug_ssh") if isinstance(build.get("debug_ssh"), dict) else {}
         private_key = debug_ssh.get("private_key")
@@ -245,16 +248,16 @@ PY
 
 deploy_openclaw_service() {
   if [[ "$CA_SKIP_DEPLOY" == "1" ]]; then
-    log "skipping OpenClaw deploy"
+    log "skipping $CA_SERVICE_LABEL deploy"
     return
   fi
   if openclaw_is_active; then
-    log "OpenClaw is already active; skipping cloud deploy"
+    log "$CA_SERVICE_LABEL is already active; skipping cloud deploy"
     CA_DEPLOY_SKIPPED_ACTIVE=1
     return
   fi
-  log "deploying OpenClaw to Aliyun"
-  (cd "$CA_WORK_DIR/openclaw" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" deploy --spec "$CA_WORK_DIR/openclaw/openclaw.yaml")
+  log "deploying $CA_SERVICE_LABEL to Aliyun"
+  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" deploy --spec "$CA_SPEC_PATH")
 }
 
 sync_active_openclaw_resources() {
@@ -263,11 +266,11 @@ sync_active_openclaw_resources() {
   fi
   local public_ip
   public_ip="$(openclaw_public_ip)" || {
-    warn "could not determine active OpenClaw public IP; skipping resource sync"
+    warn "could not determine active $CA_SERVICE_LABEL public IP; skipping resource sync"
     return
   }
-  log "syncing resources to active OpenClaw at $public_ip"
-  (cd "$CA_WORK_DIR/openclaw" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" inject --spec "$CA_WORK_DIR/openclaw/openclaw.yaml" --target-ip "$public_ip")
+  log "syncing resources to active $CA_SERVICE_LABEL at $public_ip"
+  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" inject --spec "$CA_SPEC_PATH" --target-ip "$public_ip")
   CA_ACTIVE_RESOURCES_SYNCED=1
 }
 
@@ -310,18 +313,19 @@ wait_for_live_status() {
   log "waiting for live guest status"
   while ((SECONDS < deadline)); do
     if ca_cmd status --live --json >"$status_json" 2>"$CA_WORK_DIR/status-live.err"; then
-      if python3.11 - "$status_json" <<'PY' >/dev/null 2>&1
+      if python3.11 - "$status_json" "$CA_SERVICE_ID" <<'PY' >/dev/null 2>&1
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
 items = data if isinstance(data, list) else data.get("services", [])
+service_id_filter = sys.argv[2]
 for item in items:
     local = item.get("local") if isinstance(item.get("local"), dict) else {}
     daemon = item.get("daemon") if isinstance(item.get("daemon"), dict) else {}
     service_id = item.get("service_id") or item.get("service") or local.get("service_id") or daemon.get("service_id")
-    if service_id == "openclaw":
+    if service_id == service_id_filter:
         if daemon.get("app_ready") is True:
             raise SystemExit(0)
         if daemon.get("phase") in ("running", "ready", "active"):
@@ -349,8 +353,8 @@ start_connect() {
     return
   fi
   require_cmd setsid
-  local log_path="$CA_WORK_DIR/connect.log"
-  local pid_path="$CA_WORK_DIR/connect.pid"
+  local log_path="$CA_WORK_DIR/${CA_CONNECT_NAME:-connect}.log"
+  local pid_path="$CA_WORK_DIR/${CA_CONNECT_NAME:-connect}.pid"
   log "starting local RATS-TLS connect tunnel"
   if [[ -f "$pid_path" ]]; then
     local old_pid
@@ -363,7 +367,7 @@ start_connect() {
     rm -f "$pid_path"
   fi
   rm -f "$log_path" "$pid_path"
-  setsid "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" connect >"$log_path" 2>&1 &
+  setsid "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" connect --service "$CA_SERVICE_ID" >"$log_path" 2>&1 &
   printf '%s\n' "$!" >"$pid_path"
 
   local deadline=$((SECONDS + CA_CONNECT_TIMEOUT_SEC))
@@ -402,7 +406,7 @@ run_web_smoke() {
 }
 
 stop_connect() {
-  local pid_path="$CA_WORK_DIR/connect.pid"
+  local pid_path="$CA_WORK_DIR/${CA_CONNECT_NAME:-connect}.pid"
   [[ -f "$pid_path" ]] || return 0
   local pid
   pid="$(cat "$pid_path" 2>/dev/null || true)"
@@ -416,14 +420,14 @@ stop_connect() {
 
 print_summary() {
   local connect_pid=""
-  [[ -f "$CA_WORK_DIR/connect.pid" ]] && connect_pid="$(cat "$CA_WORK_DIR/connect.pid")"
+  [[ -f "$CA_WORK_DIR/${CA_CONNECT_NAME:-connect}.pid" ]] && connect_pid="$(cat "$CA_WORK_DIR/${CA_CONNECT_NAME:-connect}.pid")"
   cat <<EOF
 
 Confidential Agent one-click summary
   state_dir: $CA_STATE_DIR
   work_dir:  $CA_WORK_DIR
-  spec:      $CA_WORK_DIR/openclaw/openclaw.yaml
-  service:   openclaw
+  spec:      $CA_SPEC_PATH
+  service:   $CA_SERVICE_ID
   region:    $CA_REGION
   zone_id:   $CA_ZONE_ID
   instance:  $CA_INSTANCE_TYPE
@@ -438,19 +442,19 @@ EOF
   web:       http://127.0.0.1:$CA_CONNECT_PORT/openclaw
   ws/api:    ws://127.0.0.1:$CA_CONNECT_PORT
   tui:       openclaw tui --url ws://127.0.0.1:$CA_CONNECT_PORT --token "$CA_GATEWAY_TOKEN"
-  connect:   running (pid $connect_pid, log $CA_WORK_DIR/connect.log)
+  connect:   running (pid $connect_pid, log $CA_WORK_DIR/${CA_CONNECT_NAME:-connect}.log)
 EOF
   else
     cat <<EOF
   connect:   run this when the service is active:
-             confidential-agent connect
+             confidential-agent connect --service $CA_SERVICE_ID
 EOF
   fi
   if [[ -n "$connect_pid" ]]; then
     cat <<EOF
 
 Cleanup:
-  confidential-agent destroy openclaw
+  confidential-agent destroy $CA_SERVICE_ID
   kill $connect_pid  # only if connect is still running and you want to stop the local tunnel
 
 EOF
@@ -458,7 +462,7 @@ EOF
     cat <<EOF
 
 Cleanup:
-  confidential-agent destroy openclaw
+  confidential-agent destroy $CA_SERVICE_ID
 
 EOF
   fi
@@ -496,7 +500,29 @@ run_deploy_openclaw() {
   print_summary
 }
 
-run_cleanup() {
+run_deploy_openclaw_vllm() {
+  install_os_dependencies
+  ensure_host_openclaw_runtime
+  ensure_aliyun_credentials
+  ensure_dingtalk_credentials
+  resolve_allowed_cidr
+  ensure_shelter
+  build_confidential_agent
+  install_confidential_agent_cli
+  build_tools_image
+  prepare_openclaw_vllm_specs
+  build_openclaw_image
+  ensure_operator_peering
+  deploy_openclaw_service
+  sync_active_openclaw_resources
+  restart_active_openclaw_app
+  wait_for_live_status
+  start_connect
+  run_web_smoke
+  print_summary
+}
+
+run_cleanup_service() {
   ensure_aliyun_credentials
   ensure_shelter
   build_confidential_agent
@@ -504,7 +530,15 @@ run_cleanup() {
     die "state dir does not exist: $CA_STATE_DIR"
   fi
   stop_connect
-  ca_cmd destroy openclaw
-  log "cloud resources for openclaw destroy requested"
+  ca_cmd destroy "$CA_SERVICE_ID"
+  log "cloud resources for $CA_SERVICE_ID destroy requested"
   log "local state remains at $CA_STATE_DIR; remove it manually only after confirming no resources are needed"
+}
+
+run_cleanup() {
+  run_cleanup_service
+}
+
+run_cleanup_openclaw_vllm() {
+  run_cleanup_service
 }
