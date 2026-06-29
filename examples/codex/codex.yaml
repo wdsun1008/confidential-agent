@@ -23,7 +23,7 @@ build:
   scripts: [./install-codex.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 

@@ -22,7 +22,7 @@ build:
   scripts: [./install-claude-code.sh]
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 

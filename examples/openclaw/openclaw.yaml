@@ -47,7 +47,7 @@ build:
     - ./install-openclaw.sh
   variants:
     release:
-      enabled: true
+      enabled: false
     debug:
       enabled: true
 
