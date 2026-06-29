@@ -2,7 +2,7 @@
 
 case_cleanup() {
   local status="$1"
-  local pid_path="${ONE_CLICK_WORK_DIR:-}/connect.pid"
+  local pid_path="${INIT_OUTPUT_DIR:-}/connect.pid"
   if [[ -n "$pid_path" && -f "$pid_path" ]]; then
     local pid
     pid="$(cat "$pid_path" 2>/dev/null || true)"
@@ -11,11 +11,11 @@ case_cleanup() {
     fi
     rm -f "$pid_path"
   fi
-  record "- one-click local connect cleanup completed for status \`$status\`."
+  record "- init local connect cleanup completed for status \`$status\`."
 }
 
 assert_openclaw_gateway_config() {
-  local config="$ONE_CLICK_WORK_DIR/openclaw/openclaw.json"
+  local config="$OPENCLAW_DIR/openclaw.json"
   jq -e '
     .gateway.auth.mode == "token" and
     ((.gateway.auth.token // "") | length) >= 32 and
@@ -23,7 +23,40 @@ assert_openclaw_gateway_config() {
     .gateway.controlUi.enabled == true and
     .gateway.controlUi.dangerouslyDisableDeviceAuth == true
   ' "$config" >/dev/null
-  record "- OpenClaw gateway config uses token auth with device auth disabled for the one-click control UI."
+  record "- OpenClaw gateway config uses token auth with device auth disabled for the init control UI."
+}
+
+assert_openclaw_init_output() {
+  local spec="$OPENCLAW_DIR/openclaw.yaml"
+  local install_script="$OPENCLAW_DIR/install-openclaw.sh"
+
+  grep -Fq "packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]" "$spec"
+  grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
+  grep -Fq "target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh" "$spec"
+  grep -Fq "source: ./files/cai-a2a-plugin" "$spec"
+  grep -Fq "scripts: [./install-openclaw.sh]" "$spec"
+  grep -Fq "image_variant: debug" "$spec"
+  grep -Fq "target: /root/.openclaw/openclaw.json" "$spec"
+  grep -Fq "OPENCLAW_VERSION" "$install_script"
+  grep -Fq "OPENCLAW_NODE_VERSION" "$install_script"
+  grep -Fq "NPM_REGISTRY" "$install_script"
+  grep -Fq "CA_DISABLE_PEP" "$install_script"
+  assert_init_script_extends_example \
+    "$install_script" \
+    "$ROOT_DIR/examples/openclaw/install-openclaw.sh" \
+    OPENCLAW_VERSION OPENCLAW_NODE_VERSION NPM_REGISTRY CA_DISABLE_PEP
+
+  if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" == "1" ]]; then
+    ! grep -Fq "target: /usr/local/bin/cai-pep" "$spec"
+    ! grep -Fq "patch-openclaw-cai-pep.js" "$spec"
+    ! grep -Fq "cai-pep-default-policy.json" "$spec"
+  else
+    grep -Fq "target: /usr/local/bin/cai-pep" "$spec"
+    grep -Fq "target: /root/.openclaw/skills/tdx-remote-attestation/SKILL.md" "$spec"
+    grep -Fq "source: ./files/cai-pep-plugin" "$spec"
+    grep -Fq "patch-openclaw-cai-pep.js" "$spec"
+  fi
+  record "- OpenClaw init output mirrors the example files and rendered PEP mode."
 }
 
 run_openclaw_gateway_token_probe() {
@@ -33,7 +66,7 @@ run_openclaw_gateway_token_probe() {
   install -d -m 0700 "$WORK_DIR/openclaw-state"
   local openclaw_env=(
     env
-    "OPENCLAW_CONFIG_PATH=$ONE_CLICK_WORK_DIR/openclaw/openclaw.json"
+    "OPENCLAW_CONFIG_PATH=$OPENCLAW_DIR/openclaw.json"
     "OPENCLAW_STATE_DIR=$WORK_DIR/openclaw-state"
   )
   local url="ws://127.0.0.1:$connect_port"
@@ -76,8 +109,9 @@ run_case() {
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
   STATE_DIR="$(absolute_dir "$STATE_DIR")"
-  ONE_CLICK_WORK_DIR="$WORK_DIR/one-click"
-  ONE_CLICK_WORK_DIR="$(absolute_dir "$ONE_CLICK_WORK_DIR")"
+  INIT_OUTPUT_DIR="$WORK_DIR/init"
+  INIT_OUTPUT_DIR="$(absolute_dir "$INIT_OUTPUT_DIR")"
+  OPENCLAW_DIR="$INIT_OUTPUT_DIR/openclaw"
   CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-180000}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请只回复 CA_E2E_OK，不要输出其他内容。}"
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-CA_E2E_OK}"
@@ -95,7 +129,7 @@ run_case() {
   require_aliyun_credentials
   require_bailian_credentials
 
-  init_step_log "Confidential Agent OpenClaw/Bailian one-click E2E"
+  init_step_log "Confidential Agent OpenClaw/Bailian init E2E"
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
@@ -106,73 +140,58 @@ run_case() {
   allowed_cidr="$(resolve_allowed_cidr)"
   token="$(resolve_token)"
   cosign_key="$(resolve_cosign_key)"
+  export COSIGN_KEY="$cosign_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
-  record "- one-click state_dir: \`$STATE_DIR\`"
-  record "- one-click work_dir: \`$ONE_CLICK_WORK_DIR\`"
+  record "- init state_dir: \`$STATE_DIR\`"
+  record "- init output_dir: \`$INIT_OUTPUT_DIR\`"
   record "- OpenClaw gateway token generated but not printed."
 
-  local one_click_cmd=(
-    "$ROOT_DIR/one-click/install.sh"
-    deploy-openclaw
-    --non-interactive
-    --yes
-    --skip-deps
-    --no-start-connect
-    --state-dir "$STATE_DIR"
-    --work-dir "$ONE_CLICK_WORK_DIR"
-    --tools-image "$TOOLS_IMAGE"
-    --region "$REGION"
-    --zone-id "$ZONE_ID"
-    --instance-type "$INSTANCE_TYPE"
-    --disk-gb "${E2E_OPENCLAW_DISK_GB:-200}"
-    --allowed-cidr "$allowed_cidr"
-    --reference-values "$REFERENCE_VALUES"
-    --cosign-key "$cosign_key"
-    --slsa-generator "$SLSA_GENERATOR"
-    --build-backend "$BUILD_BACKEND"
-    --bailian-model "${DASHSCOPE_MODEL:-qwen3.7-max}"
+  mapfile -d '' init_args < <(init_common_args "$INIT_OUTPUT_DIR" "${E2E_OPENCLAW_DISK_GB:-200}")
+  init_args+=(
+    --dashscope-api-key "$dashscope_key"
+    --gateway-token "$token"
+    --model "${DASHSCOPE_MODEL:-qwen3.7-max}"
+    --dashscope-base-url "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
+    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.5.7}"
+    --node-version "${E2E_OPENCLAW_NODE_VERSION:-22.19.0}"
+    --npm-registry "${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}"
   )
-  if [[ "$BUILD_BACKEND" == "base-image" ]]; then
-    one_click_cmd+=(--base-image "$BASE_IMAGE")
-  fi
-  if [[ "${E2E_SKIP_BUILD:-0}" == "1" ]]; then
-    one_click_cmd+=(--skip-build)
-  fi
-  if [[ "${E2E_SKIP_DEPLOY:-0}" == "1" ]]; then
-    one_click_cmd+=(--skip-deploy)
-  fi
-  if [[ "${E2E_SKIP_CARGO_BUILD:-0}" == "1" ]]; then
-    one_click_cmd+=(--skip-cargo-build)
-  fi
   if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" == "1" ]]; then
-    one_click_cmd+=(--disable-pep)
+    init_args+=(--disable-pep)
   fi
 
-  record_cmd "DASHSCOPE_API_KEY=<redacted> CA_GATEWAY_TOKEN=<redacted> $(cmd_string "${one_click_cmd[@]}")"
-  E2E_DEPLOY_ATTEMPTED=1
-  register_destroy_target "$STATE_DIR" openclaw
   local ca_agentd_bin ca_gateway_bin ca_pep_bin
   ca_agentd_bin="${CA_AGENTD_BIN:-$ROOT_DIR/target/debug/confidential-agentd}"
   ca_gateway_bin="${CA_GATEWAY_BIN:-$ROOT_DIR/target/debug/cai-gateway}"
   ca_pep_bin="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
-  if ! DASHSCOPE_API_KEY="$dashscope_key" \
-      CA_GATEWAY_TOKEN="$token" \
-      CA_BIN="$CA_BIN" \
-      CA_AGENTD_BIN="$ca_agentd_bin" \
-      CA_GATEWAY_BIN="$ca_gateway_bin" \
-      CA_PEP_BIN="$ca_pep_bin" \
-      "${one_click_cmd[@]}" \
-      >"$WORK_DIR/one-click.out" 2>"$WORK_DIR/one-click.err"; then
-    record_file_as_block "one-click stdout:" "$WORK_DIR/one-click.out" text
-    record_file_as_block "one-click stderr:" "$WORK_DIR/one-click.err" text
+  export CA_AGENTD_BIN="$ca_agentd_bin" CA_GATEWAY_BIN="$ca_gateway_bin" CA_PEP_BIN="$ca_pep_bin"
+  if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" openclaw "${init_args[@]}"; then
+    record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+    record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
     return 1
   fi
-  record_file_as_block "one-click stdout:" "$WORK_DIR/one-click.out" text
-  record_file_as_block "one-click stderr:" "$WORK_DIR/one-click.err" text
+  record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+  record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
   assert_openclaw_gateway_config
+  assert_openclaw_init_output
+
+  validate_specs "$STATE_DIR" "$OPENCLAW_DIR/openclaw.yaml"
+
+  if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
+    ca_run "$STATE_DIR" build --spec "$OPENCLAW_DIR/openclaw.yaml"
+  fi
+  record_manifest_variants "$STATE_DIR" openclaw
+  ensure_operator_peering "$STATE_DIR" ops "$allowed_cidr"
+
+  if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
+    E2E_DEPLOY_ATTEMPTED=1
+    register_destroy_target "$STATE_DIR" openclaw
+    ca_run "$STATE_DIR" deploy --spec "$OPENCLAW_DIR/openclaw.yaml"
+  fi
 
   local connect_port=""
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
+    wait_for_status_service_ready "$STATE_DIR" openclaw 1200
     connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw-bailian /openclaw 4 180 --service openclaw)"
     record "- OpenClaw connect endpoint: \`ws://127.0.0.1:$connect_port\`."
     run_openclaw_gateway_token_probe "$connect_port" "$token"
@@ -189,7 +208,6 @@ run_case() {
     fi
   fi
 
-  validate_specs "$STATE_DIR" "$ONE_CLICK_WORK_DIR/openclaw/openclaw.yaml"
   if ! ca_capture "$STATE_DIR" "$WORK_DIR/status-live.txt" "$WORK_DIR/status-live.err" status --live; then
     record_file_as_block "Live status stdout:" "$WORK_DIR/status-live.txt" text
     record_file_as_block "Live status stderr:" "$WORK_DIR/status-live.err" text
@@ -199,7 +217,7 @@ run_case() {
   run_report_probe "$STATE_DIR" "$WORK_DIR/attestation-report.json" openclaw
 
   if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" == "1" ]]; then
-    jq -e '.plugins.entries["cai-pep"]? == null' "$ONE_CLICK_WORK_DIR/openclaw/openclaw.json" >/dev/null
+    jq -e '.plugins.entries["cai-pep"]? == null' "$OPENCLAW_DIR/openclaw.json" >/dev/null
     if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
       local openclaw_ip openclaw_key
       openclaw_ip="$(state_value "$STATE_DIR" openclaw deploy.public_ip)"
@@ -208,10 +226,10 @@ run_case() {
       wait_for_ssh "$openclaw_ip" "$openclaw_key" 300
       ssh_guest "$openclaw_key" "$openclaw_ip" "systemctl list-unit-files cai-pep.service --no-legend | wc -l" >"$WORK_DIR/no-pep-unit-count.txt"
       grep -Fx '0' "$WORK_DIR/no-pep-unit-count.txt" >/dev/null
-      record "- no-PEP one-click guest does not install cai-pep.service."
+      record "- no-PEP init guest does not install cai-pep.service."
     fi
   else
-    jq -e '.plugins.entries["cai-pep"].config.pepRequired == true' "$ONE_CLICK_WORK_DIR/openclaw/openclaw.json" >/dev/null
-    record "- PEP-enabled one-click config includes cai-pep plugin with fail-closed policy."
+    jq -e '.plugins.entries["cai-pep"].config.pepRequired == true' "$OPENCLAW_DIR/openclaw.json" >/dev/null
+    record "- PEP-enabled init config includes cai-pep plugin with fail-closed policy."
   fi
 }

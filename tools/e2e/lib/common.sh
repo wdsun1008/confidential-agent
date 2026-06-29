@@ -80,6 +80,10 @@ record_file_as_block() {
     -e 's/"apiKey": "[^"]+"/"apiKey": "<redacted>"/g' \
     -e 's/"ANTHROPIC_AUTH_TOKEN": "[^"]+"/"ANTHROPIC_AUTH_TOKEN": "<redacted>"/g' \
     -e 's/^(ANTHROPIC_AUTH_TOKEN=).+$/\1<redacted>/g' \
+    -e 's/^(DASHSCOPE_API_KEY=).+$/\1<redacted>/g' \
+    -e 's/^(API_SERVER_KEY=).+$/\1<redacted>/g' \
+    -e 's/"DASHSCOPE_API_KEY": "[^"]+"/"DASHSCOPE_API_KEY": "<redacted>"/g' \
+    -e 's/"API_SERVER_KEY": "[^"]+"/"API_SERVER_KEY": "<redacted>"/g' \
     -e 's/^(OPENAI_API_KEY=).+$/\1<redacted>/g' \
     -e 's/^(CODEX_REMOTE_TOKEN=).+$/\1<redacted>/g' \
     -e 's/(CODEX_REMOTE_TOKEN=)[^[:space:]]+/\1<redacted>/g' \
@@ -239,6 +243,92 @@ ca_capture() {
   local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
   "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"
+}
+
+redacted_cmd_string() {
+  local out="" arg redact_next=0
+  for arg in "$@"; do
+    if [[ "$redact_next" == "1" ]]; then
+      printf -v out '%s%s ' "$out" "'<redacted>'"
+      redact_next=0
+      continue
+    fi
+    case "$arg" in
+      --dashscope-api-key|--gateway-token|--hermes-api-server-key|--codex-app-server-token)
+        printf -v out '%s%q ' "$out" "$arg"
+        redact_next=1
+        ;;
+      *)
+        printf -v out '%s%q ' "$out" "$arg"
+        ;;
+    esac
+  done
+  printf '%s' "${out% }"
+}
+
+ca_init_capture() {
+  local state_dir="$1"
+  local stdout_path="$2"
+  local stderr_path="$3"
+  shift 3
+  local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" init "$@")
+  record_cmd "$(redacted_cmd_string "${cmd[@]}")"
+  "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"
+}
+
+assert_init_script_extends_example() {
+  local generated="$1"
+  local example="$2"
+  shift 2
+  python3.11 - "$generated" "$example" "$@" <<'PY'
+from pathlib import Path
+import sys
+
+generated = Path(sys.argv[1])
+example = Path(sys.argv[2])
+export_keys = tuple(sys.argv[3:])
+
+def strip_injected_exports(text: str) -> str:
+    lines = []
+    prefixes = tuple(f"export {key}=" for key in export_keys)
+    for line in text.splitlines(keepends=True):
+        if prefixes and line.startswith(prefixes):
+            continue
+        lines.append(line)
+    return "".join(lines)
+
+actual = strip_injected_exports(generated.read_text(encoding="utf-8"))
+expected = strip_injected_exports(example.read_text(encoding="utf-8"))
+if actual != expected:
+    print(f"{generated} does not match example script {example} after removing injected exports", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  record "- Init install script \`$generated\` extends example script \`$example\`."
+}
+
+init_common_args() {
+  local output_dir="$1"
+  local disk_gb="$2"
+  local args=(
+    --non-interactive
+    --force
+    --output-dir "$output_dir"
+    --region "$REGION"
+    --zone-id "$ZONE_ID"
+    --instance-type "${INSTANCE_TYPE:-$DEFAULT_INSTANCE_TYPE}"
+    --disk-gb "$disk_gb"
+    --reference-values "$REFERENCE_VALUES"
+    --slsa-generator "$SLSA_GENERATOR"
+    --build-backend "$BUILD_BACKEND"
+  )
+  if [[ "$BUILD_BACKEND" == "base-image" ]]; then
+    args+=(--base-image "$BASE_IMAGE")
+  fi
+  if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
+    : "${COSIGN_KEY:?COSIGN_KEY must be set before init_common_args when E2E_REFERENCE_VALUES=rekor}"
+    args+=(--cosign-key "$COSIGN_KEY")
+  fi
+  printf '%s\0' "${args[@]}"
 }
 
 use_aliyun_cli_profile() {

@@ -1,9 +1,4 @@
 {
-  "assets": [
-    {"source": "examples/cli-agents/files", "target": "claude-code/files"}
-  ],
-  "templates": [
-    {"source": "templates/claude-code.yaml.tmpl", "target": "claude-code/claude-code.yaml"},
-    {"source": "templates/install-claude-code.sh.tmpl", "target": "claude-code/install-claude-code.sh", "mode": "0755"}
-  ]
+  "assets": [],
+  "templates": []
 }

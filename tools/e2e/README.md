@@ -17,20 +17,20 @@ Cases:
 
 | Case | What it covers |
 |---|---|
-| `openclaw-bailian` | One-click OpenClaw + Bailian 主路径，使用 `--skip-deps` 保持 e2e 与用户流程一致但不改本地开发机依赖；覆盖默认启用 PEP 的部署分支。 |
-| `openclaw-bailian-no-pep` | 同一条 one-click OpenClaw + Bailian 主路径，额外传入 `--disable-pep`，覆盖不安装、不启用 cai-pep 的部署分支。 |
+| `openclaw-bailian` | `confidential-agent init openclaw` + Bailian 主路径，覆盖默认启用 PEP 的部署分支。 |
+| `openclaw-bailian-no-pep` | 同一条 `init openclaw` 主路径，额外传入 `--disable-pep`，覆盖不安装、不启用 cai-pep 的部署分支。 |
 | `openclaw-a2a` | Legacy two-OpenClaw A2A bridge coverage. |
 | `a2a-data-collab` | Two real LLM-backed agents collaborate over A2A: Analyst delegates a natural-language aggregate data task to a Data Owner and verifies no raw private rows leak. |
-| `openclaw-vllm` | GPU TEE OpenClaw + local vLLM readiness and chat. |
+| `openclaw-vllm` | `init openclaw-vllm` 生成和 AppSpec 校验；当前默认跳过云端 GPU TEE 部署，因为没有可用实例库存。设置 `E2E_OPENCLAW_VLLM_RUN_CLOUD=1` 可在库存恢复后跑完整 readiness/chat。 |
 | `cmaas` | CMaaS 是主 MCP E2E：自然语言 agent 经 gateway 调用 memory MCP tools，验证 MCP audit 链、虚拟 MCP audit tools、TEE evidence 绑定、非 TEE baseline rejection 和 snapshot confidentiality；不通过 host connect 直连 MCP `mcp_ports`。 |
-| `hermes-agent` | Hermes official OCI workload on Shelter `container.mode: runtime`, including runtime mount/resource checks, deploy, connect, health/model/chat probes, and guest diagnostics on failure. |
+| `hermes-agent` | `init hermes` 生成的普通 mkosi 路径：构建期通过官方 installer 从 Hermes 源码安装，运行期通过 `cai-hermes-agent.service` 启动，并覆盖资源注入、deploy、connect、health/chat probe 和失败诊断。 |
 | `claude-code` | Claude Code CLI on Bailian qwen3.7-max through the Anthropic-compatible endpoint, with SSH chat and TDX skill probes. |
 | `codex` | Codex CLI on Bailian qwen3.7-max through Responses API, with SSH chat, TDX skill, and TNG-protected app-server remote probes. |
 | `cli-command-matrix` | Local CLI branch matrix plus an optional real-cloud publish/deploy lane when `E2E_MATRIX_REAL_CLOUD=1`. |
 
 OpenClaw + Bailian 的主路径必须同时覆盖 PEP 和 no-PEP 两个分支。CMaaS 承担 MCP 端到端主覆盖，probe 通过 agent/gateway 入口触发 MCP 工具调用，不把 MCP 端口作为 host connect 的直接访问目标。
 
-Most E2E cases intentionally mirror the user command flow:
+Most E2E cases intentionally mirror the user command flow. Init-covered cases first run `confidential-agent init <target> --non-interactive`, then use the generated AppSpec:
 
 ```bash
 confidential-agent spec validate --spec <case-spec>
@@ -82,13 +82,13 @@ Provider credentials:
 - Rekor mode: `E2E_COSIGN_KEY` or an auto-generated key under the work dir. Auto-generation uses `confidential-agent key generate-cosign` with the configured tools image.
 - `a2a-data-collab`: defaults to unsigned AgentCards. Set `E2E_A2A_SIGNING=1` to exercise Sigstore keyless AgentCard signing; signed mode needs `CA_A2A_SIGSTORE_IDENTITY_TOKEN` or CI OIDC token request envs. `A2A_SIGNER_ISSUER` / `A2A_SIGNER_SUBJECT` may be set explicitly; otherwise a JWT `CA_A2A_SIGSTORE_IDENTITY_TOKEN` is decoded for `iss` / `sub`.
 
-Relative `E2E_WORK_DIR`, `E2E_STATE_DIR`, and `E2E_COSIGN_KEY` inputs are normalized to absolute paths before rendering AppSpecs, so validation behaves the same from any caller working directory.
-Empty environment values are treated as unset by the template renderer and fall back to defaults.
+Relative `E2E_WORK_DIR`, `E2E_STATE_DIR`, and `E2E_COSIGN_KEY` inputs are normalized to absolute paths before init/rendering, so validation behaves the same from any caller working directory.
+Empty environment values are treated as unset and fall back to defaults.
 
 Keep local secret files outside the runner. Source or translate them into the `export ...` commands above before invoking `tools/e2e/run.sh`; the E2E scripts must not source secret files themselves.
 
 Artifacts:
 
 - `e2e-steps.md` records the exact user-like commands, redacted configs, status output, and probe results.
-- Per-case rendered AppSpecs and configs live under the work dir.
-- `tools/e2e/cases/<case>/templates/` contains checked-in case config templates; shell flow files only orchestrate commands.
+- Init-covered cases write the real `confidential-agent init` output under the work dir and run the generated AppSpec directly.
+- Legacy non-init cases may still keep checked-in templates under `tools/e2e/cases/<case>/templates/`.

@@ -1,37 +1,10 @@
 #!/usr/bin/env bash
 
-write_codex_runtime_resources() {
-  local dashscope_key="$1"
-  local remote_token="$2"
-  local secrets_dir="$WORK_DIR/codex/secrets"
-  install -d -m 0700 "$secrets_dir"
-
-  cat >"$secrets_dir/config.toml" <<EOF_CONFIG
-model_provider = "Model_Studio"
-model = "$DASHSCOPE_MODEL"
-
-[model_providers.Model_Studio]
-name = "Model_Studio"
-base_url = "$DASHSCOPE_BASE_URL"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-EOF_CONFIG
-
-  cat >"$secrets_dir/codex.env" <<EOF_ENV
-OPENAI_API_KEY=$dashscope_key
-CODEX_HOME=/root/.codex
-EOF_ENV
-
-  printf '%s\n' "$remote_token" >"$secrets_dir/app-server-token"
-  chmod 0600 "$secrets_dir/config.toml" "$secrets_dir/codex.env" "$secrets_dir/app-server-token"
-  record "- Codex runtime resources staged under \`$secrets_dir\` with secret contents redacted."
-}
-
 assert_codex_secret_rendering() {
   local dashscope_key="$1"
   local remote_token="$2"
-  local spec="$WORK_DIR/codex/codex.yaml"
-  local install_script="$WORK_DIR/codex/install-codex.sh"
+  local spec="$CODEX_DIR/codex.yaml"
+  local install_script="$CODEX_DIR/install-codex.sh"
   for secret in "$dashscope_key" "$remote_token"; do
     for path in "$spec" "$install_script"; do
       if [[ -n "$secret" ]] && grep -Fq "$secret" "$path"; then
@@ -40,14 +13,28 @@ assert_codex_secret_rendering() {
       fi
     done
   done
-  grep -Fq "wire_api = \"responses\"" "$WORK_DIR/codex/secrets/config.toml"
+  grep -Fq "wire_api = \"responses\"" "$CODEX_DIR/secrets/config.toml"
+  grep -Fq "packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]" "$spec"
+  grep -Fq "source: ./files/install-cli-agent-runtime.sh" "$spec"
+  grep -Fq "target: /usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh" "$spec"
   grep -Fq "target: /root/.codex/config.toml" "$spec"
   grep -Fq "target: /root/.agents/skills/tdx-remote-attestation/SKILL.md" "$spec"
   grep -Fq "app_service: cai-codex-app-server.service" "$spec"
+  grep -Fq "scripts: [./install-codex.sh]" "$spec"
+  grep -Fq "image_variant: debug" "$spec"
+  grep -Fq "target: /root/.codex/app-server-token" "$spec"
+  grep -Fq "source: ./secrets/app-server-token" "$spec"
   grep -Fq "CODEX_VERSION" "$install_script"
-  test -s "$WORK_DIR/codex/secrets/config.toml"
-  test -s "$WORK_DIR/codex/secrets/codex.env"
-  test -s "$WORK_DIR/codex/secrets/app-server-token"
+  grep -Fq "CLI_AGENT_NODE_VERSION" "$install_script"
+  grep -Fq "NPM_REGISTRY" "$install_script"
+  grep -Fq "/usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh codex" "$install_script"
+  assert_init_script_extends_example \
+    "$install_script" \
+    "$ROOT_DIR/examples/codex/install-codex.sh" \
+    CLI_AGENT_NODE_VERSION NPM_REGISTRY CODEX_VERSION
+  test -s "$CODEX_DIR/secrets/config.toml"
+  test -s "$CODEX_DIR/secrets/codex.env"
+  test -s "$CODEX_DIR/secrets/app-server-token"
   record "- Codex rendered spec keeps provider/API and remote tokens in remote-attested resources only."
 }
 
@@ -223,6 +210,9 @@ run_case() {
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
   STATE_DIR="$(absolute_dir "$STATE_DIR")"
+  INIT_OUTPUT_DIR="$WORK_DIR/init"
+  INIT_OUTPUT_DIR="$(absolute_dir "$INIT_OUTPUT_DIR")"
+  CODEX_DIR="$INIT_OUTPUT_DIR/codex"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
   DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
   CODEX_REMOTE_PORT="${E2E_CODEX_REMOTE_PORT:-4500}"
@@ -253,26 +243,42 @@ run_case() {
   allowed_cidr="$(resolve_allowed_cidr)"
   cosign_key="$(resolve_cosign_key)"
   dashscope_key="$(resolve_dashscope_key)"
-  if [[ "${E2E_SKIP_DEPLOY:-0}" == "1" && -s "$WORK_DIR/codex/secrets/app-server-token" ]]; then
-    remote_token="$(<"$WORK_DIR/codex/secrets/app-server-token")"
+  if [[ "${E2E_SKIP_DEPLOY:-0}" == "1" && -s "$CODEX_DIR/secrets/app-server-token" ]]; then
+    remote_token="$(<"$CODEX_DIR/secrets/app-server-token")"
   else
     remote_token="$(openssl rand -base64 32)"
   fi
   export COSIGN_KEY="$cosign_key"
   export COSIGN_KEY INSTANCE_TYPE DISK_GB DASHSCOPE_BASE_URL DASHSCOPE_MODEL CODEX_REMOTE_PORT
 
-  DASHSCOPE_KEY="$dashscope_key" render_case
-  write_codex_runtime_resources "$dashscope_key" "$remote_token"
+  mapfile -d '' init_args < <(init_common_args "$INIT_OUTPUT_DIR" "$DISK_GB")
+  init_args+=(
+    --dashscope-api-key "$dashscope_key"
+    --dashscope-base-url "$DASHSCOPE_BASE_URL"
+    --model "$DASHSCOPE_MODEL"
+    --codex-app-server-token "$remote_token"
+    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-22.19.0}"
+    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
+    --codex-version "${E2E_CODEX_VERSION:-latest}"
+  )
+  export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
+  if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" codex "${init_args[@]}"; then
+    record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+    record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
+    return 1
+  fi
+  record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+  record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
   assert_codex_secret_rendering "$dashscope_key" "$remote_token"
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- Codex npm version: \`${E2E_CODEX_VERSION:-latest}\`."
   record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}\`."
   record "- Codex app-server token generated but not printed."
 
-  validate_specs "$STATE_DIR" "$WORK_DIR/codex/codex.yaml"
+  validate_specs "$STATE_DIR" "$CODEX_DIR/codex.yaml"
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
-    ca_run "$STATE_DIR" build --spec "$WORK_DIR/codex/codex.yaml"
+    ca_run "$STATE_DIR" build --spec "$CODEX_DIR/codex.yaml"
   fi
   record_manifest_variants "$STATE_DIR" codex
   ensure_operator_peering "$STATE_DIR" ops "$allowed_cidr"
@@ -280,7 +286,7 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
     register_destroy_target "$STATE_DIR" codex
-    ca_run "$STATE_DIR" deploy --spec "$WORK_DIR/codex/codex.yaml"
+    ca_run "$STATE_DIR" deploy --spec "$CODEX_DIR/codex.yaml"
   fi
 
   wait_for_status_service_ready "$STATE_DIR" codex 1200

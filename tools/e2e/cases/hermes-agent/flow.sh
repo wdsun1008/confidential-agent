@@ -1,79 +1,39 @@
 #!/usr/bin/env bash
 
-HERMES_DATA_DIR=/var/lib/confidential-agent/hermes-agent/data
-
-hermes_image_metadata_audit() {
-  local image="$1"
-  local inspect_json="$WORK_DIR/hermes-image-inspect.json"
-  local summary="$WORK_DIR/hermes-image-metadata.txt"
-
-  if podman image exists "$image"; then
-    record_cmd "podman image exists $(printf '%q' "$image")"
-    printf 'using locally available image: %s\n' "$image" >"$WORK_DIR/hermes-image-pull.out"
-    : >"$WORK_DIR/hermes-image-pull.err"
-  else
-    record_cmd "podman pull $(printf '%q' "$image")"
-    podman pull "$image" >"$WORK_DIR/hermes-image-pull.out" 2>"$WORK_DIR/hermes-image-pull.err"
-  fi
-  record_file_as_block "Hermes image pull stdout:" "$WORK_DIR/hermes-image-pull.out" text
-  record_file_as_block "Hermes image pull stderr:" "$WORK_DIR/hermes-image-pull.err" text
-
-  record_cmd "podman image inspect $(printf '%q' "$image")"
-  podman image inspect "$image" >"$inspect_json"
-  record_file_as_block "Hermes image inspect:" "$inspect_json" json
-  python3.11 - "$inspect_json" >"$summary" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))[0]
-cfg = data.get("Config") or {}
-for key in ("Entrypoint", "Cmd", "Env", "WorkingDir", "User", "Volumes"):
-    value = cfg.get(key)
-    if isinstance(value, list):
-        print(f"{key}: {' '.join(value)}")
-    elif isinstance(value, dict):
-        print(f"{key}: {','.join(sorted(value))}")
-    else:
-        print(f"{key}: {value or ''}")
-PY
-  record_file_as_block "Hermes image runtime metadata:" "$summary" text
-}
+HERMES_HOME=/opt/data
+HERMES_INSTALL_DIR=/usr/local/lib/hermes-agent
 
 collect_hermes_guest_diagnostics() {
   local host="$1"
   local key="$2"
   local label="$3"
   local out="$WORK_DIR/hermes-guest-diagnostics-$label.txt"
-  record_cmd "ssh hermes '<runtime diagnostics>'"
+  record_cmd "ssh hermes '<mkosi runtime diagnostics>'"
   ssh_guest "$key" "$host" /bin/sh >"$out" 2>&1 <<'REMOTE' || true
 set +e
-SERVICE=shelter-container-hermes-agent.service
-DATA=/var/lib/confidential-agent/hermes-agent/data
-PODMAN_ROOT=/run/shelter-container/hermes-agent/storage
-PODMAN_RUNROOT=/run/shelter-container/hermes-agent/run
-echo "### shelter container service"
+SERVICE=cai-hermes-agent.service
+DATA=/opt/data
+echo "### Hermes service"
 systemctl status "$SERVICE" --no-pager -l
-echo "### shelter container journal"
+echo "### Hermes journal"
 journalctl -u "$SERVICE" -n 300 --no-pager
-echo "### generated launcher"
-sed -n '1,220p' /usr/local/libexec/shelter/shelter-container-hermes-agent 2>&1
-echo "### podman state"
-podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" ps --all 2>&1
-podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" inspect hermes-agent 2>&1
+echo "### Hermes launcher"
+sed -n '1,260p' /usr/local/bin/cai-hermes-agent 2>&1
+echo "### Hermes unit"
+sed -n '1,160p' /etc/systemd/system/cai-hermes-agent.service 2>&1
+echo "### Hermes install"
+cat /usr/local/share/confidential-agent/hermes-install.txt 2>&1
+ls -la /usr/local/lib/hermes-agent 2>&1 | head -80
+/usr/local/bin/hermes --version 2>&1
 echo "### injected data metadata"
 find "$DATA" -maxdepth 2 -printf "%p %m %u:%g %s bytes\n" 2>&1
-echo "### mounted data from container"
-podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" exec hermes-agent /bin/sh -lc '
-set +e
-id
-pwd
-printf "HERMES_HOME=%s\n" "${HERMES_HOME:-}"
-find /opt/data -maxdepth 2 -printf "%p %m %u:%g %s bytes\n" 2>&1
+echo "### resource keys"
 printf "env_keys="
-cut -d= -f1 /opt/data/.env 2>/dev/null | paste -sd, -
+cut -d= -f1 "$DATA/.env" 2>/dev/null | paste -sd, -
 printf "\nconfig_head:\n"
-sed -n "1,40p" /opt/data/config.yaml 2>&1
-' 2>&1
+sed -n "1,40p" "$DATA/config.yaml" 2>&1
+echo "### processes"
+ps -ef | grep -E '[h]ermes|[c]ai-hermes' 2>&1
 echo "### local HTTP"
 curl -fsS -D - --max-time 10 http://127.0.0.1:8642/health 2>&1
 REMOTE
@@ -85,14 +45,12 @@ assert_hermes_guest_runtime() {
   local key="$2"
   local out="$WORK_DIR/hermes-guest-runtime-assertions.txt"
   local err="$WORK_DIR/hermes-guest-runtime-assertions.err"
-  record_cmd "ssh hermes '<runtime mount assertions>'"
+  record_cmd "ssh hermes '<mkosi runtime assertions>'"
   if ssh_guest "$key" "$host" /bin/sh >"$out" 2>"$err" <<'REMOTE'
 set -eu
 
-SERVICE=shelter-container-hermes-agent.service
-DATA=/var/lib/confidential-agent/hermes-agent/data
-PODMAN_ROOT=/run/shelter-container/hermes-agent/storage
-PODMAN_RUNROOT=/run/shelter-container/hermes-agent/run
+SERVICE=cai-hermes-agent.service
+DATA=/opt/data
 
 check_eq() {
   actual="$1"
@@ -116,8 +74,17 @@ check_file() {
 systemctl is-active --quiet "$SERVICE"
 printf 'service=%s\n' "$(systemctl is-active "$SERVICE")"
 
+check_file /usr/local/bin/cai-hermes-agent
+check_file /usr/local/bin/hermes
+check_file /usr/local/share/confidential-agent/hermes-install.txt
+test -d /usr/local/lib/hermes-agent/.git
+test -x /usr/local/lib/hermes-agent/venv/bin/python
 check_file "$DATA/.env"
 check_file "$DATA/config.yaml"
+
+id -u hermes >/dev/null
+check_eq "$(id -u hermes)" "10000" "uid:hermes"
+check_eq "$(id -g hermes)" "10000" "gid:hermes"
 check_eq "$(stat -c %a "$DATA/.env")" "600" "mode:$DATA/.env"
 check_eq "$(stat -c %a "$DATA/config.yaml")" "600" "mode:$DATA/config.yaml"
 check_eq "$(stat -c %u:%g "$DATA/.env")" "10000:10000" "owner:$DATA/.env"
@@ -130,30 +97,22 @@ grep -Fqx 'HERMES_HOME=/opt/data' "$DATA/.env"
 grep -Fq 'model:' "$DATA/config.yaml"
 grep -Fq 'provider: alibaba' "$DATA/config.yaml"
 
-launcher=/usr/local/libexec/shelter/shelter-container-hermes-agent
-check_file "$launcher"
-grep -Fq "$DATA:/opt/data:rw,rbind" "$launcher"
-grep -Fq "podman --root" "$launcher"
-grep -Fq "gateway" "$launcher"
-grep -Fq "run" "$launcher"
-if grep -Fq 'container-rootfs' "$launcher"; then
-  printf 'runtime launcher unexpectedly references rootfs mode\n' >&2
+grep -Fq '/usr/local/bin/hermes gateway run' /usr/local/bin/cai-hermes-agent
+grep -Fq 'runuser -u "$HERMES_USER"' /usr/local/bin/cai-hermes-agent
+grep -Fq 'branch=' /usr/local/share/confidential-agent/hermes-install.txt
+grep -Fq 'commit=' /usr/local/share/confidential-agent/hermes-install.txt
+
+test ! -e /usr/local/libexec/confidential-agent/patch-hermes-launcher.sh
+test ! -e /usr/local/libexec/confidential-agent/hermes/install-hermes-rootfs.sh
+test ! -d /opt/confidential-agent/hermes/rootfs
+if systemctl list-unit-files 'shelter-container-hermes-agent.service' --no-legend 2>/dev/null | grep -q 'shelter-container-hermes-agent.service'; then
+  printf 'unexpected Shelter container Hermes unit is installed\n' >&2
   exit 1
 fi
-
-podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" inspect hermes-agent >/dev/null
-podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" exec hermes-agent /bin/sh -lc '
-set -eu
-test -s /opt/data/.env
-test -s /opt/data/config.yaml
-test ! -e /usr/local/bin/start-hermes-rootfs
-test ! -d /opt/cai/hermes-rootfs
-test "$(stat -c %a /opt/data/.env)" = 600
-test "$(stat -c %u:%g /opt/data/.env)" = 10000:10000
-grep -Fqx API_SERVER_ENABLED=true /opt/data/.env
-grep -Fq "provider: alibaba" /opt/data/config.yaml
-printf "container_data_mount=ok\n"
-'
+if command -v podman >/dev/null 2>&1 && podman ps --format '{{.Names}}' 2>/dev/null | grep -qx 'hermes-agent'; then
+  printf 'unexpected Hermes podman runtime container is running\n' >&2
+  exit 1
+fi
 
 http_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 http://127.0.0.1:8642/health)"
 check_eq "$http_code" "200" "gateway_health_http_code"
@@ -191,7 +150,7 @@ wait_for_hermes_http_ready() {
       root@"$host" /bin/sh >"$attempt_out" 2>"$attempt_err" <<'REMOTE' || status=$?
 set -eu
 
-SERVICE=shelter-container-hermes-agent.service
+SERVICE=cai-hermes-agent.service
 if curl -fsS --connect-timeout 3 --max-time 10 http://127.0.0.1:8642/health; then
   systemctl is-active --quiet "$SERVICE"
   exit 0
@@ -222,7 +181,7 @@ REMOTE
   done
 
   printf 'Timed out waiting for Hermes local HTTP readiness\n' >>"$err"
-  ssh_guest "$key" "$host" 'journalctl -b -u shelter-container-hermes-agent.service -n 200 --no-pager' >>"$err" 2>&1 || true
+  ssh_guest "$key" "$host" 'journalctl -b -u cai-hermes-agent.service -n 200 --no-pager' >>"$err" 2>&1 || true
   rm -f "$attempt_out" "$attempt_err"
   record_file_as_block "Hermes local HTTP readiness:" "$out" text
   record_file_as_block "Hermes local HTTP readiness stderr:" "$err" text
@@ -275,35 +234,8 @@ print(debug.get("private_key") or "")
 PY
 }
 
-write_hermes_runtime_resources() {
-  local dashscope_key="$1"
-  local secrets_dir="$WORK_DIR/hermes-agent/secrets"
-  install -d -m 0700 "$secrets_dir"
-
-  cat >"$secrets_dir/hermes.env" <<EOF_ENV
-API_SERVER_ENABLED=true
-API_SERVER_HOST=0.0.0.0
-API_SERVER_PORT=8642
-API_SERVER_KEY=$HERMES_API_SERVER_KEY
-DASHSCOPE_API_KEY=$dashscope_key
-DASHSCOPE_BASE_URL=$DASHSCOPE_BASE_URL
-HERMES_HOME=/opt/data
-HERMES_MODEL=$HERMES_MODEL
-EOF_ENV
-
-  cat >"$secrets_dir/config.yaml" <<EOF_CONFIG
-model:
-  provider: alibaba
-  default: $HERMES_MODEL
-  model: $HERMES_MODEL
-EOF_CONFIG
-
-  chmod 0600 "$secrets_dir/hermes.env" "$secrets_dir/config.yaml"
-  record "- Hermes runtime resources staged under \`$secrets_dir\` with secret contents redacted."
-}
-
 assert_hermes_secret_rendering() {
-  local spec="$WORK_DIR/hermes-agent/hermes-agent.yaml"
+  local spec="$HERMES_DIR/hermes-agent.yaml"
   local dashscope_key="$1"
   for secret in "$HERMES_API_SERVER_KEY" "$dashscope_key"; do
     if [[ -n "$secret" ]] && grep -Fq "$secret" "$spec"; then
@@ -311,23 +243,52 @@ assert_hermes_secret_rendering() {
       return 1
     fi
   done
-  grep -Fq "mode: runtime" "$spec"
-  grep -Eq "runtime: '?$HERMES_CONTAINER_RUNTIME'?" "$spec"
-  grep -Fq "source: $HERMES_DATA_DIR" "$spec"
-  grep -Fq "target: /opt/data" "$spec"
-  grep -Fq "target: $HERMES_DATA_DIR/.env" "$spec"
-  grep -Fq "target: $HERMES_DATA_DIR/config.yaml" "$spec"
+
+  grep -Fq "app_service: cai-hermes-agent.service" "$spec"
+  grep -Fq "packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]" "$spec"
+  grep -Fq "source: ./files/install-hermes-agent-runtime.sh" "$spec"
+  grep -Fq "target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh" "$spec"
+  grep -Fq "source: ./files/cai-hermes-agent" "$spec"
+  grep -Fq "target: /usr/local/bin/cai-hermes-agent" "$spec"
+  grep -Fq "target: /etc/systemd/system/cai-hermes-agent.service" "$spec"
+  grep -Fq "scripts: [./install-hermes-agent.sh]" "$spec"
+  grep -Fq "image_variant: debug" "$spec"
+  grep -Fq "target: $HERMES_HOME/.env" "$spec"
+  grep -Fq "target: $HERMES_HOME/config.yaml" "$spec"
   grep -Fq 'mutable: true' "$spec"
   grep -Fq 'owner: "10000"' "$spec"
   grep -Fq 'group: "10000"' "$spec"
   grep -Fq 'mode: "0600"' "$spec"
-  if grep -Eq 'container-rootfs|start-hermes-rootfs|sitecustomize|APIServerAdapter|HERMES_ROOTFS' "$spec"; then
-    echo "Hermes rendered spec contains rootfs compatibility logic" >&2
+
+  if grep -Eq 'container:|shelter-container-hermes-agent|patch-hermes-launcher|/var/lib/confidential-agent/hermes-agent/data|/opt/confidential-agent/hermes/rootfs|podman|oci-archive|HERMES_IMAGE' "$spec"; then
+    echo "Hermes rendered spec still contains container/rootfs wiring" >&2
     return 1
   fi
-  test -s "$WORK_DIR/hermes-agent/secrets/hermes.env"
-  test -s "$WORK_DIR/hermes-agent/secrets/config.yaml"
-  record "- Hermes rendered spec uses Shelter runtime mounts and does not contain provider/API tokens."
+
+  test -s "$HERMES_DIR/secrets/hermes.env"
+  test -s "$HERMES_DIR/secrets/config.yaml"
+  test -x "$HERMES_DIR/install-hermes-agent.sh"
+  test -x "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  test -x "$HERMES_DIR/files/cai-hermes-agent"
+  test -s "$HERMES_DIR/files/cai-hermes-agent.service"
+  grep -Fq 'export HERMES_BRANCH=' "$HERMES_DIR/install-hermes-agent.sh"
+  grep -Fq 'export HERMES_COMMIT=' "$HERMES_DIR/install-hermes-agent.sh"
+  assert_init_script_extends_example \
+    "$HERMES_DIR/install-hermes-agent.sh" \
+    "$ROOT_DIR/examples/hermes-agent/install-hermes-agent.sh" \
+    HERMES_BRANCH HERMES_COMMIT
+  grep -Fq 'CA_GITHUB_PROXY_URL:-https://gh-proxy.org/' "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  grep -Fq 'HERMES_PYPI_INDEX_URL' "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  grep -Fq 'HERMES_NPM_REGISTRY_URL' "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  grep -Fq 'https://github.com/NousResearch/hermes-agent.git' "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  grep -Fq -- '--skip-browser' "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  grep -Fq -- '--skip-setup' "$HERMES_DIR/files/install-hermes-agent-runtime.sh"
+  grep -Fq '/usr/local/bin/hermes gateway run' "$HERMES_DIR/files/cai-hermes-agent"
+  if grep -Eq 'podman|docker|oci-archive|chroot|HERMES_IMAGE|rootfs' "$HERMES_DIR/files/install-hermes-agent-runtime.sh" "$HERMES_DIR/files/cai-hermes-agent"; then
+    echo "Hermes init output still contains container/rootfs implementation details" >&2
+    return 1
+  fi
+  record "- Hermes init output matches the mkosi source-install example and does not contain provider/API tokens."
 }
 
 run_case() {
@@ -337,17 +298,11 @@ run_case() {
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
   STATE_DIR="$(absolute_dir "$STATE_DIR")"
-  HERMES_IMAGE="${E2E_HERMES_IMAGE:-nousresearch/hermes-agent:v2026.6.5}"
-  if [[ "${E2E_HERMES_CONTAINER_MODE:-runtime}" != "runtime" ]]; then
-    echo "hermes-agent e2e supports only Shelter container.mode=runtime" >&2
-    return 1
-  fi
-  HERMES_CONTAINER_MODE="runtime"
-  HERMES_CONTAINER_RUNTIME="${E2E_HERMES_CONTAINER_RUNTIME:-podman}"
-  if [[ "$HERMES_CONTAINER_RUNTIME" != "podman" ]]; then
-    echo "hermes-agent e2e supports only Shelter container.runtime=podman on Alinux3" >&2
-    return 1
-  fi
+  INIT_OUTPUT_DIR="$WORK_DIR/init"
+  INIT_OUTPUT_DIR="$(absolute_dir "$INIT_OUTPUT_DIR")"
+  HERMES_DIR="$INIT_OUTPUT_DIR/hermes-agent"
+  HERMES_BRANCH="${E2E_HERMES_BRANCH:-main}"
+  HERMES_COMMIT="${E2E_HERMES_COMMIT:-}"
   HERMES_API_SERVER_KEY="${E2E_HERMES_API_SERVER_KEY:-$(openssl rand -hex 32)}"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
   HERMES_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
@@ -362,7 +317,6 @@ run_case() {
   require_cmd jq
   require_cmd node
   require_cmd openssl
-  require_cmd podman
   require_cmd python3.11
   require_cmd ssh
   require_cmd timeout
@@ -370,7 +324,7 @@ run_case() {
   require_aliyun_credentials
   require_bailian_credentials
 
-  init_step_log "Confidential Agent Hermes runtime container E2E"
+  init_step_log "Confidential Agent Hermes mkosi E2E"
   install_exit_traps
   ensure_shelter
   verify_slsa_generator
@@ -381,22 +335,39 @@ run_case() {
   cosign_key="$(resolve_cosign_key)"
   dashscope_key="$(resolve_dashscope_key)"
   export COSIGN_KEY="$cosign_key"
-  export COSIGN_KEY INSTANCE_TYPE DISK_GB HERMES_IMAGE HERMES_CONTAINER_MODE HERMES_CONTAINER_RUNTIME HERMES_API_SERVER_KEY DASHSCOPE_BASE_URL HERMES_MODEL HERMES_DATA_DIR
+  export COSIGN_KEY INSTANCE_TYPE DISK_GB HERMES_BRANCH HERMES_COMMIT HERMES_API_SERVER_KEY DASHSCOPE_BASE_URL HERMES_MODEL HERMES_HOME
 
-  DASHSCOPE_KEY="$dashscope_key" render_case
-  write_hermes_runtime_resources "$dashscope_key"
+  mapfile -d '' init_args < <(init_common_args "$INIT_OUTPUT_DIR" "$DISK_GB")
+  init_args+=(
+    --dashscope-api-key "$dashscope_key"
+    --dashscope-base-url "$DASHSCOPE_BASE_URL"
+    --model "$HERMES_MODEL"
+    --hermes-branch "$HERMES_BRANCH"
+    --hermes-api-server-key "$HERMES_API_SERVER_KEY"
+  )
+  if [[ -n "$HERMES_COMMIT" ]]; then
+    init_args+=(--hermes-commit "$HERMES_COMMIT")
+  fi
+  if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" hermes "${init_args[@]}"; then
+    record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+    record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
+    return 1
+  fi
+  record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+  record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
   assert_hermes_secret_rendering "$dashscope_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
-  record "- Hermes image: \`$HERMES_IMAGE\`."
-  record "- Hermes container mode: \`$HERMES_CONTAINER_MODE\`."
-  record "- Hermes container runtime: \`$HERMES_CONTAINER_RUNTIME\`."
+  record "- Hermes source branch: \`$HERMES_BRANCH\`."
+  if [[ -n "$HERMES_COMMIT" ]]; then
+    record "- Hermes source commit: \`$HERMES_COMMIT\`."
+  fi
+  record "- Hermes home: \`$HERMES_HOME\`."
   record "- Hermes API server key generated but not printed."
 
-  validate_specs "$STATE_DIR" "$WORK_DIR/hermes-agent/hermes-agent.yaml"
-  hermes_image_metadata_audit "$HERMES_IMAGE"
+  validate_specs "$STATE_DIR" "$HERMES_DIR/hermes-agent.yaml"
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
-    ca_run "$STATE_DIR" build --spec "$WORK_DIR/hermes-agent/hermes-agent.yaml"
+    ca_run "$STATE_DIR" build --spec "$HERMES_DIR/hermes-agent.yaml"
   fi
   record_manifest_variants "$STATE_DIR" hermes-agent
 
@@ -405,7 +376,7 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
     register_destroy_target "$STATE_DIR" hermes-agent
-    ca_run "$STATE_DIR" deploy --spec "$WORK_DIR/hermes-agent/hermes-agent.yaml"
+    ca_run "$STATE_DIR" deploy --spec "$HERMES_DIR/hermes-agent.yaml"
   fi
 
   wait_for_status_service_ready "$STATE_DIR" hermes-agent 1200

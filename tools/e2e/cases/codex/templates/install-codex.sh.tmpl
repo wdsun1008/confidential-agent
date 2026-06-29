@@ -1,8 +1,0 @@
-#!/bin/bash
-set -euo pipefail
-
-export CLI_AGENT_NODE_VERSION={{yaml:CLI_AGENT_NODE_VERSION}}
-export NPM_REGISTRY={{yaml:CLI_AGENT_NPM_REGISTRY}}
-export CODEX_VERSION={{yaml:CODEX_VERSION}}
-
-/usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh codex

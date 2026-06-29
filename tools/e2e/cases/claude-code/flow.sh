@@ -1,50 +1,35 @@
 #!/usr/bin/env bash
 
-write_claude_code_runtime_resources() {
-  local dashscope_key="$1"
-  local secrets_dir="$WORK_DIR/claude-code/secrets"
-  install -d -m 0700 "$secrets_dir"
-
-  cat >"$secrets_dir/settings.json" <<EOF_SETTINGS
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "$dashscope_key",
-    "ANTHROPIC_BASE_URL": "$DASHSCOPE_ANTHROPIC_BASE_URL",
-    "ANTHROPIC_MODEL": "$DASHSCOPE_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.6-flash",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$DASHSCOPE_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$DASHSCOPE_MODEL",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "$DASHSCOPE_MODEL"
-  }
-}
-EOF_SETTINGS
-
-  cat >"$secrets_dir/claude.json" <<'EOF_ONBOARDING'
-{
-  "hasCompletedOnboarding": true
-}
-EOF_ONBOARDING
-
-  chmod 0600 "$secrets_dir/settings.json" "$secrets_dir/claude.json"
-  record "- Claude Code runtime resources staged under \`$secrets_dir\` with secret contents redacted."
-}
-
 assert_claude_code_secret_rendering() {
   local dashscope_key="$1"
-  local spec="$WORK_DIR/claude-code/claude-code.yaml"
-  local install_script="$WORK_DIR/claude-code/install-claude-code.sh"
+  local spec="$CLAUDE_CODE_DIR/claude-code.yaml"
+  local install_script="$CLAUDE_CODE_DIR/install-claude-code.sh"
   for path in "$spec" "$install_script"; do
     if [[ -n "$dashscope_key" ]] && grep -Fq "$dashscope_key" "$path"; then
       echo "Claude Code rendered file contains secret material: $path" >&2
       return 1
     fi
   done
+  grep -Fq "packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]" "$spec"
+  grep -Fq "source: ./files/install-cli-agent-runtime.sh" "$spec"
+  grep -Fq "target: /usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh" "$spec"
   grep -Fq "target: /root/.claude/settings.json" "$spec"
   grep -Fq "target: /root/.claude/skills/tdx-remote-attestation/SKILL.md" "$spec"
   grep -Fq "target: /usr/local/bin/cai-pep" "$spec"
+  grep -Fq "scripts: [./install-claude-code.sh]" "$spec"
+  grep -Fq "image_variant: debug" "$spec"
+  grep -Fq "source: ./secrets/claude.json" "$spec"
+  grep -Fq "target: /root/.claude.json" "$spec"
   grep -Fq "CLAUDE_CODE_VERSION" "$install_script"
-  test -s "$WORK_DIR/claude-code/secrets/settings.json"
-  test -s "$WORK_DIR/claude-code/secrets/claude.json"
+  grep -Fq "CLI_AGENT_NODE_VERSION" "$install_script"
+  grep -Fq "NPM_REGISTRY" "$install_script"
+  grep -Fq "/usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh claude-code" "$install_script"
+  assert_init_script_extends_example \
+    "$install_script" \
+    "$ROOT_DIR/examples/claude-code/install-claude-code.sh" \
+    CLI_AGENT_NODE_VERSION NPM_REGISTRY CLAUDE_CODE_VERSION
+  test -s "$CLAUDE_CODE_DIR/secrets/settings.json"
+  test -s "$CLAUDE_CODE_DIR/secrets/claude.json"
   record "- Claude Code rendered spec keeps provider/API tokens in remote-attested resources only."
 }
 
@@ -151,6 +136,9 @@ run_case() {
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
   STATE_DIR="$(absolute_dir "$STATE_DIR")"
+  INIT_OUTPUT_DIR="$WORK_DIR/init"
+  INIT_OUTPUT_DIR="$(absolute_dir "$INIT_OUTPUT_DIR")"
+  CLAUDE_CODE_DIR="$INIT_OUTPUT_DIR/claude-code"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
   DASHSCOPE_ANTHROPIC_BASE_URL="${DASHSCOPE_ANTHROPIC_BASE_URL:-https://dashscope.aliyuncs.com/apps/anthropic}"
   DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
@@ -183,17 +171,33 @@ run_case() {
   export COSIGN_KEY="$cosign_key"
   export COSIGN_KEY INSTANCE_TYPE DISK_GB DASHSCOPE_BASE_URL DASHSCOPE_ANTHROPIC_BASE_URL DASHSCOPE_MODEL
 
-  DASHSCOPE_KEY="$dashscope_key" render_case
-  write_claude_code_runtime_resources "$dashscope_key"
+  mapfile -d '' init_args < <(init_common_args "$INIT_OUTPUT_DIR" "$DISK_GB")
+  init_args+=(
+    --dashscope-api-key "$dashscope_key"
+    --dashscope-base-url "$DASHSCOPE_BASE_URL"
+    --dashscope-anthropic-base-url "$DASHSCOPE_ANTHROPIC_BASE_URL"
+    --model "$DASHSCOPE_MODEL"
+    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-22.19.0}"
+    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
+    --claude-code-version "${E2E_CLAUDE_CODE_VERSION:-latest}"
+  )
+  export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
+  if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" claudecode "${init_args[@]}"; then
+    record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+    record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
+    return 1
+  fi
+  record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+  record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
   assert_claude_code_secret_rendering "$dashscope_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- Claude Code npm version: \`${E2E_CLAUDE_CODE_VERSION:-latest}\`."
   record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}\`."
 
-  validate_specs "$STATE_DIR" "$WORK_DIR/claude-code/claude-code.yaml"
+  validate_specs "$STATE_DIR" "$CLAUDE_CODE_DIR/claude-code.yaml"
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
-    ca_run "$STATE_DIR" build --spec "$WORK_DIR/claude-code/claude-code.yaml"
+    ca_run "$STATE_DIR" build --spec "$CLAUDE_CODE_DIR/claude-code.yaml"
   fi
   record_manifest_variants "$STATE_DIR" claude-code
   ensure_operator_peering "$STATE_DIR" ops "$allowed_cidr"
@@ -201,7 +205,7 @@ run_case() {
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
     register_destroy_target "$STATE_DIR" claude-code
-    ca_run "$STATE_DIR" deploy --spec "$WORK_DIR/claude-code/claude-code.yaml"
+    ca_run "$STATE_DIR" deploy --spec "$CLAUDE_CODE_DIR/claude-code.yaml"
   fi
 
   wait_for_status_service_ready "$STATE_DIR" claude-code 1200

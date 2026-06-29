@@ -1,6 +1,4 @@
 {
   "assets": [],
-  "templates": [
-    {"source": "templates/hermes-agent.yaml.tmpl", "target": "hermes-agent/hermes-agent.yaml"}
-  ]
+  "templates": []
 }

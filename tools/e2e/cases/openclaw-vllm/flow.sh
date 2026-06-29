@@ -48,6 +48,37 @@ print(debug.get("private_key") or "")
 PY
 }
 
+assert_openclaw_vllm_init_output() {
+  local spec="$VLLM_SPEC"
+  local install_script="$VLLM_DIR/install-openclaw-vllm.sh"
+
+  grep -Fq "image_name: openclaw-vllm-agent" "$spec"
+  grep -Fq "kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0" "$spec"
+  grep -Fq "packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]" "$spec"
+  grep -Fq "source: ./nvidia-persistenced.service" "$spec"
+  grep -Fq "source: ./cai-nvidia-cc-stack-install.sh" "$spec"
+  grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
+  grep -Fq "target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh" "$spec"
+  grep -Fq "target: /home/openclaw/.openclaw/skills/tdx-remote-attestation/SKILL.md" "$spec"
+  grep -Fq "scripts: [./install-openclaw-vllm.sh]" "$spec"
+  grep -Fq "image_variant: debug" "$spec"
+  grep -Fq "target: /home/openclaw/.openclaw/openclaw.json" "$spec"
+  grep -Fq "OPENCLAW_VERSION" "$install_script"
+  grep -Fq "OPENCLAW_NODE_VERSION" "$install_script"
+  grep -Fq "NPM_REGISTRY" "$install_script"
+  assert_init_script_extends_example \
+    "$install_script" \
+    "$ROOT_DIR/examples/openclaw-vllm/install-openclaw-vllm.sh" \
+    OPENCLAW_VERSION OPENCLAW_NODE_VERSION NPM_REGISTRY
+  jq -e '
+    .models.providers["local-vllm"].baseUrl == "http://127.0.0.1:8090/v1" and
+    .gateway.auth.mode == "token" and
+    ((.gateway.auth.token // "") | length) >= 32 and
+    .plugins.entries["cai-pep"].config.pepRequired == true
+  ' "$VLLM_DIR/openclaw-vllm.json" >/dev/null
+  record "- OpenClaw vLLM init output mirrors the example files and local-vLLM config."
+}
+
 run_case() {
   INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.gn8v-tee.4xlarge}"
   DISK_GB="${E2E_DISK_GB:-512}"
@@ -55,6 +86,10 @@ run_case() {
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
   STATE_DIR="${E2E_STATE_DIR:-$WORK_DIR/state}"
   STATE_DIR="$(absolute_dir "$STATE_DIR")"
+  INIT_OUTPUT_DIR="$WORK_DIR/init"
+  INIT_OUTPUT_DIR="$(absolute_dir "$INIT_OUTPUT_DIR")"
+  VLLM_DIR="$INIT_OUTPUT_DIR/openclaw-vllm"
+  VLLM_SPEC="$VLLM_DIR/openclaw-vllm.yaml"
   CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-300000}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-请用一句简短中文回复，说明 OpenClaw vLLM 服务可用。}"
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-}"
@@ -85,19 +120,38 @@ run_case() {
   allowed_cidr="$(resolve_allowed_cidr)"
   token="$(resolve_token)"
   cosign_key="$(resolve_cosign_key)"
-  export OPENCLAW_GATEWAY_TOKEN="$token"
   export COSIGN_KEY="$cosign_key"
   export INSTANCE_TYPE
   export DISK_GB
+  export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
 
-  render_case
+  mapfile -d '' init_args < <(init_common_args "$INIT_OUTPUT_DIR" "$DISK_GB")
+  init_args+=(
+    --gateway-token "$token"
+    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.5.7}"
+    --node-version "${E2E_OPENCLAW_NODE_VERSION:-22.19.0}"
+    --npm-registry "${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}"
+  )
+  if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" openclaw-vllm "${init_args[@]}"; then
+    record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+    record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
+    return 1
+  fi
+  record_file_as_block "init stdout:" "$WORK_DIR/init.out" text
+  record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
+  assert_openclaw_vllm_init_output
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- OpenClaw gateway token generated but not printed."
 
-  validate_specs "$STATE_DIR" "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+  validate_specs "$STATE_DIR" "$VLLM_SPEC"
+
+  if [[ "${E2E_OPENCLAW_VLLM_RUN_CLOUD:-0}" != "1" ]]; then
+    record "- OpenClaw vLLM cloud build/deploy skipped: current GPU TEE instance inventory is unavailable. Set E2E_OPENCLAW_VLLM_RUN_CLOUD=1 when inventory is available."
+    return 0
+  fi
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
-    ca_run "$STATE_DIR" build --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+    ca_run "$STATE_DIR" build --spec "$VLLM_SPEC"
   fi
   record_manifest_variants "$STATE_DIR" openclaw-vllm
 
@@ -105,7 +159,7 @@ run_case() {
 
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$STATE_DIR" openclaw-vllm
-  ca_run "$STATE_DIR" deploy --spec "$WORK_DIR/openclaw-vllm/openclaw-vllm.yaml"
+  ca_run "$STATE_DIR" deploy --spec "$VLLM_SPEC"
 
   wait_status_json_ready 1 1800
   record_file_as_block "Live status after debug SSH readiness:" "$WORK_DIR/status-live.json" json
