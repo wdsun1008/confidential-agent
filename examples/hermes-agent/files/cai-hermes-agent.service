@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes Agent gateway for Confidential Agent
+After=network-online.target confidential-agentd.service
+Wants=network-online.target confidential-agentd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cai-hermes-agent
+Restart=always
+RestartSec=5
+TimeoutStartSec=600
+KillMode=mixed
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

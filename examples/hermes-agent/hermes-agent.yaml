@@ -4,44 +4,32 @@ service:
   id: hermes-agent
   ports: [8642]
   connect: [8642]
-  app_service: shelter-container-hermes-agent.service
+  app_service: cai-hermes-agent.service
 
 build:
   image_name: hermes-agent
   resize: 30G
   with_network: true
-  container:
-    image: nousresearch/hermes-agent:v2026.6.5
-    mode: runtime
-    runtime: podman
-    name: hermes-agent
-    pull: missing
-    command:
-      - gateway
-      - run
-    env:
-      API_SERVER_ENABLED: "true"
-      API_SERVER_HOST: 0.0.0.0
-      API_SERVER_PORT: "8642"
-      DASHSCOPE_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
-      HERMES_HOME: /opt/data
-      HERMES_MODEL: qwen3.7-max
-    working_dir: /opt/hermes
-    network: true
-    mounts:
-      - source: /var/lib/confidential-agent/hermes-agent/data
-        target: /opt/data
-        read_only: false
-  packages: [ca-certificates, curl, jq]
+  packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]
+  files:
+    - source: ./files/install-hermes-agent-runtime.sh
+      target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
+      executable: true
+    - source: ./files/cai-hermes-agent
+      target: /usr/local/bin/cai-hermes-agent
+      executable: true
+    - source: ./files/cai-hermes-agent.service
+      target: /etc/systemd/system/cai-hermes-agent.service
+  scripts: [./install-hermes-agent.sh]
   variants:
     release:
-      enabled: true
-    debug:
       enabled: false
+    debug:
+      enabled: true
 
 deploy:
   provider: aliyun
-  image_variant: release
+  image_variant: debug
   instance_type: ecs.g9i.xlarge
   region: cn-beijing
   zone_id: cn-beijing-i
@@ -55,13 +43,13 @@ attestation:
 resources:
   hermes_env:
     source: ./secrets/hermes.env
-    target: /var/lib/confidential-agent/hermes-agent/data/.env
+    target: /opt/data/.env
     owner: "10000"
     group: "10000"
     mode: "0600"
   hermes_config:
     source: ./secrets/config.yaml
-    target: /var/lib/confidential-agent/hermes-agent/data/config.yaml
+    target: /opt/data/config.yaml
     owner: "10000"
     group: "10000"
     mode: "0600"

@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euo pipefail
+
+DATA="${HERMES_HOME:-/opt/data}"
+TIMEOUT="${HERMES_RESOURCE_TIMEOUT:-300}"
+HERMES_USER="${HERMES_USER:-hermes}"
+
+wait_for_resources() {
+    local deadline
+    deadline=$(( $(date +%s) + TIMEOUT ))
+    while [[ ! -s "$DATA/.env" || ! -s "$DATA/config.yaml" ]]; do
+        if [[ "$(date +%s)" -ge "$deadline" ]]; then
+            echo "timed out waiting for Hermes attested resources under $DATA" >&2
+            exit 1
+        fi
+        sleep 2
+    done
+}
+
+prepare_hermes_home() {
+    local sub
+    install -d -m 0700 "$DATA"
+    for sub in cron sessions logs hooks memories skills skins plans workspace home pairing platforms/pairing; do
+        install -d -m 0700 "$DATA/$sub"
+    done
+    chown -R "$HERMES_USER:$HERMES_USER" "$DATA"
+    chmod 0600 "$DATA/.env" "$DATA/config.yaml"
+    printf 'mkosi\n' >"$DATA/.install_method"
+    chown "$HERMES_USER:$HERMES_USER" "$DATA/.install_method"
+    chmod 0644 "$DATA/.install_method"
+}
+
+test -x /usr/local/bin/hermes || {
+    echo "Hermes command is missing /usr/local/bin/hermes" >&2
+    exit 1
+}
+
+id -u "$HERMES_USER" >/dev/null 2>&1 || {
+    echo "Hermes runtime user is missing: $HERMES_USER" >&2
+    exit 1
+}
+
+wait_for_resources
+prepare_hermes_home
+
+exec runuser -u "$HERMES_USER" -- /bin/bash -lc '
+set -eu
+export PATH=/usr/local/bin:/usr/local/lib/hermes-agent/venv/bin:/opt/data/node/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/opt/data
+export HERMES_HOME=/opt/data
+export PYTHONUNBUFFERED=1
+set -a
+. /opt/data/.env
+set +a
+cd /opt/data
+exec /usr/local/bin/hermes gateway run
+'

@@ -1,13 +1,16 @@
 # Hermes Agent
 
-This example runs the official Hermes container as a Shelter `podman` runtime
-workload on port `8642`.
+This example builds a regular mkosi image for Hermes Agent on port `8642`.
+During the mkosi post-install step, it clones the official Hermes Agent source
+with GitHub fallback and runs the official installer with `--skip-browser`,
+`--skip-setup`, and `--non-interactive`. At runtime,
+`cai-hermes-agent.service` starts `/usr/local/bin/hermes gateway run` as the
+`hermes` user. The AppSpec does not use containers.
 
 Before using it directly, create `secrets/hermes.env` and
 `secrets/config.yaml` next to `hermes-agent.yaml`. They are injected as runtime
-resources into the guest at `/var/lib/confidential-agent/hermes-agent/data` and
-then bind-mounted into the container as `/opt/data`; they are not baked into the
-Shelter build config or image.
+resources into `/opt/data`; they are not baked into the Shelter build config or
+disk image.
 
 `secrets/hermes.env` should contain the API server and DashScope credentials:
 
@@ -32,10 +35,19 @@ model:
 ```
 
 `hermes_config` is marked `mutable: true` in the AppSpec because the Hermes
-container migrates and rewrites `config.yaml` on startup. The DashScope/API
+runtime may migrate and rewrite `config.yaml` on startup. The DashScope/API
 secret file remains a normal enforced resource.
 
-The container still starts through the image's normal `/init` entrypoint. The
-AppSpec only passes `gateway run` as the container command and uses Shelter
-runtime mounts to bridge Confidential Agent resource injection into the
-container.
+The root `install-hermes-agent.sh` script selects the Hermes source ref:
+
+```bash
+export HERMES_BRANCH='main'
+export HERMES_COMMIT=''
+```
+
+Set `CA_GITHUB_PROXY_URL` to override the GitHub fallback proxy. The default is
+`https://gh-proxy.org/`. Set `HERMES_PYPI_INDEX_URL` or `UV_DEFAULT_INDEX` to
+override the Python package index used by the official installer; the default is
+`https://mirrors.aliyun.com/pypi/simple/`. Set `HERMES_NPM_REGISTRY_URL` or
+`NPM_CONFIG_REGISTRY` to override the npm registry used by optional browser-tool
+dependencies; the default is `https://registry.npmmirror.com/`.
