@@ -82,6 +82,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    Init(InitArgs),
     Build(BuildArgs),
     Deploy(DeployArgs),
     Docs(DocsArgs),
@@ -101,6 +102,93 @@ pub(crate) enum Commands {
     Report(ReportArgs),
     Destroy(DestroyArgs),
     Version,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum InitTarget {
+    Openclaw,
+    #[value(name = "openclaw-vllm")]
+    OpenclawVllm,
+    Hermes,
+    Codex,
+    #[value(name = "claudecode", alias = "claude-code")]
+    Claudecode,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum InitBuildBackend {
+    Mkosi,
+    #[value(name = "base-image")]
+    BaseImage,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum InitReferenceValues {
+    Sample,
+    Rekor,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct InitArgs {
+    #[arg(value_enum)]
+    pub(crate) target: Option<InitTarget>,
+    #[arg(long, default_value = "./confidential-agent-init")]
+    pub(crate) output_dir: PathBuf,
+    #[arg(long)]
+    pub(crate) force: bool,
+    #[arg(long)]
+    pub(crate) non_interactive: bool,
+    #[arg(long)]
+    pub(crate) region: Option<String>,
+    #[arg(long)]
+    pub(crate) zone_id: Option<String>,
+    #[arg(long)]
+    pub(crate) instance_type: Option<String>,
+    #[arg(long)]
+    pub(crate) disk_gb: Option<u32>,
+    #[arg(long, value_enum, default_value = "mkosi")]
+    pub(crate) build_backend: InitBuildBackend,
+    #[arg(long)]
+    pub(crate) base_image: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub(crate) reference_values: Option<InitReferenceValues>,
+    #[arg(long)]
+    pub(crate) cosign_key: Option<PathBuf>,
+    #[arg(long, default_value = "/usr/libexec/shelter/slsa/slsa-generator")]
+    pub(crate) slsa_generator: PathBuf,
+    #[arg(long, env = "DASHSCOPE_API_KEY")]
+    pub(crate) dashscope_api_key: Option<String>,
+    #[arg(
+        long,
+        default_value = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )]
+    pub(crate) dashscope_base_url: String,
+    #[arg(long, default_value = "https://dashscope.aliyuncs.com/apps/anthropic")]
+    pub(crate) dashscope_anthropic_base_url: String,
+    #[arg(long, env = "DASHSCOPE_MODEL")]
+    pub(crate) model: Option<String>,
+    #[arg(long)]
+    pub(crate) gateway_token: Option<String>,
+    #[arg(long)]
+    pub(crate) disable_pep: bool,
+    #[arg(long, default_value = "2026.5.7")]
+    pub(crate) openclaw_version: String,
+    #[arg(long, default_value = "22.19.0")]
+    pub(crate) node_version: String,
+    #[arg(long, default_value = "https://registry.npmmirror.com/")]
+    pub(crate) npm_registry: String,
+    #[arg(long, default_value = "main")]
+    pub(crate) hermes_branch: String,
+    #[arg(long)]
+    pub(crate) hermes_commit: Option<String>,
+    #[arg(long)]
+    pub(crate) hermes_api_server_key: Option<String>,
+    #[arg(long)]
+    pub(crate) codex_app_server_token: Option<String>,
+    #[arg(long)]
+    pub(crate) codex_version: Option<String>,
+    #[arg(long)]
+    pub(crate) claude_code_version: Option<String>,
 }
 
 #[derive(Debug, Args)]

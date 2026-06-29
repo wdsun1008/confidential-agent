@@ -7,6 +7,7 @@ const DAEMON_STATUS_WAIT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
+        Commands::Init(args) => cmd_init(cli, args),
         Commands::Build(args) => cmd_build(cli, args),
         Commands::Deploy(args) => cmd_deploy(cli, args),
         Commands::Docs(args) => cmd_docs(args),

@@ -6,7 +6,7 @@ use super::commands::{
     validate_deploy_start, wait_for_daemon_status_from,
 };
 use super::*;
-use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, StatusArgs};
+use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, InitTarget, StatusArgs};
 use clap::Parser;
 use confidential_agent_core::agent_card_fetch::AgentCardFetchError;
 use confidential_agent_core::schema::DAEMON_STATUS_SCHEMA_VERSION;
@@ -70,6 +70,34 @@ fn common_commands_default_to_confidential_agent_yaml() {
             assert!(!force);
         }
         other => panic!("expected key generate-cosign command, got {other:?}"),
+    }
+}
+
+#[test]
+fn init_cli_accepts_targets_and_aliases() {
+    let openclaw = Cli::parse_from([
+        "confidential-agent",
+        "init",
+        "openclaw",
+        "--output-dir",
+        "/tmp/init",
+        "--force",
+        "--non-interactive",
+    ]);
+    match openclaw.command {
+        Commands::Init(args) => {
+            assert_eq!(args.target, Some(InitTarget::Openclaw));
+            assert_eq!(args.output_dir, PathBuf::from("/tmp/init"));
+            assert!(args.force);
+            assert!(args.non_interactive);
+        }
+        other => panic!("expected init command, got {other:?}"),
+    }
+
+    let claude = Cli::parse_from(["confidential-agent", "init", "claude-code"]);
+    match claude.command {
+        Commands::Init(args) => assert_eq!(args.target, Some(InitTarget::Claudecode)),
+        other => panic!("expected init command, got {other:?}"),
     }
 }
 

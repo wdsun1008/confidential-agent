@@ -1,9 +1,10 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
-    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InjectArgs, KeyArgs, KeyCommands,
-    MeshArgs, MeshCommands, MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs,
-    SpecArgs, SpecCommands, SshArgs, StatusArgs,
+    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitBuildBackend,
+    InitReferenceValues, InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands,
+    MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands,
+    SshArgs, StatusArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{
@@ -445,6 +446,9 @@ mod commands;
 use commands::deploy_shelter_args;
 use commands::fetch_daemon_status_from;
 pub(crate) use commands::run;
+
+mod init;
+use init::*;
 
 mod self_describe;
 use self_describe::*;
