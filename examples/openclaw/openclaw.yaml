@@ -15,8 +15,11 @@ build:
   packages:
     - ca-certificates
     - curl
+    - dracut
     - git
     - jq
+    - kernel
+    - kmod
     - nodejs
     - npm
     - podman

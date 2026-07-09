@@ -120,6 +120,12 @@ build_tools_image() {
   if [[ ${#build_args[@]} -gt 0 ]]; then
     build_cmd+=("${build_args[@]}")
   fi
+  build_cmd+=(--build-arg "GITHUB_PROXY_URL=${CA_GITHUB_PROXY_URL-https://gh-proxy.org/}")
+  build_cmd+=(--build-arg "GITHUB_PROXY_FIRST=${CA_GITHUB_PROXY_FIRST-1}")
+  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_CONNECT_TIMEOUT=${CA_GITHUB_DOWNLOAD_CONNECT_TIMEOUT-20}")
+  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_MAX_TIME=${CA_GITHUB_DOWNLOAD_MAX_TIME-120}")
+  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_SPEED_LIMIT=${CA_GITHUB_DOWNLOAD_SPEED_LIMIT-65536}")
+  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_SPEED_TIME=${CA_GITHUB_DOWNLOAD_SPEED_TIME-20}")
   build_cmd+=(-t "$CA_TOOLS_IMAGE" -f tools/Dockerfile .)
   (cd "$ROOT_DIR" && "${build_cmd[@]}")
 }

@@ -105,7 +105,7 @@ run_confidential_agent_init() {
   export CA_BIN CA_AGENTD_BIN CA_GATEWAY_BIN CA_PEP_BIN
   install -d -m 0700 "$CA_WORK_DIR"
   log "generating $CA_SERVICE_LABEL AppSpec with confidential-agent init $target"
-  "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" init "$target" "$@"
+  (cd "$ROOT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" init "$target" "$@")
   [[ -f "$CA_SPEC_PATH" ]] || die "init did not create expected AppSpec: $CA_SPEC_PATH"
 }
 

@@ -50,24 +50,29 @@ run_main() {
 }
 
 ensure_git() {
-    if command -v git >/dev/null 2>&1; then
+    if command -v git >/dev/null 2>&1 && command -v git-lfs >/dev/null 2>&1; then
+        git lfs install --system >/dev/null 2>&1 || git lfs install >/dev/null 2>&1 || true
         return 0
     fi
     if [ "$(id -u)" != "0" ]; then
-        echo "git is required. Re-run as root or install git first." >&2
+        echo "git and git-lfs are required. Re-run as root or install git/git-lfs first." >&2
         exit 2
     fi
     if command -v dnf >/dev/null 2>&1; then
-        dnf install -y git ca-certificates
+        dnf install -y git git-lfs ca-certificates
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y git ca-certificates
+        yum install -y git git-lfs ca-certificates
     else
-        echo "git is required and no yum/dnf package manager was found." >&2
+        echo "git and git-lfs are required and no yum/dnf package manager was found." >&2
         exit 2
     fi
+    command -v git >/dev/null 2>&1 || { echo "git installation failed" >&2; exit 2; }
+    command -v git-lfs >/dev/null 2>&1 || { echo "git-lfs installation failed" >&2; exit 2; }
+    git lfs install --system >/dev/null 2>&1 || git lfs install >/dev/null 2>&1 || true
 }
 
 github_proxy_repo_url() {
+    [ -n "${CA_GITHUB_PROXY_URL:-https://gh-proxy.org/}" ] || return 1
     case "$1" in
         https://github.com/*)
             proxy="${CA_GITHUB_PROXY_URL:-https://gh-proxy.org/}"
@@ -82,21 +87,98 @@ github_proxy_repo_url() {
     esac
 }
 
+run_git_with_timeout() {
+    timeout_sec="${CA_GIT_FETCH_TIMEOUT_SEC:-30}"
+    if command -v timeout >/dev/null 2>&1; then
+        GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}" \
+        GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}" \
+            timeout "$timeout_sec" git "$@"
+    else
+        GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}" \
+        GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}" \
+            git "$@"
+    fi
+}
+
+github_proxy_first() {
+    case "${CA_GITHUB_PROXY_FIRST:-1}" in
+        1|true|TRUE|yes|YES|proxy|proxy-first)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 git_fetch_with_fallback() {
     dir="$1"
     repo_url="$2"
     ref_name="$3"
+    proxy_url="$(github_proxy_repo_url "$repo_url" || true)"
+    if github_proxy_first && [ -n "$proxy_url" ]; then
+        git -C "$dir" remote set-url origin "$proxy_url"
+        if run_git_with_timeout -C "$dir" fetch --depth 1 origin "$ref_name"; then
+            return 0
+        fi
+        echo "GitHub proxy fetch failed, retrying original URL $repo_url" >&2
+    fi
     git -C "$dir" remote set-url origin "$repo_url"
-    if git -C "$dir" fetch --depth 1 origin "$ref_name"; then
+    if run_git_with_timeout -C "$dir" fetch --depth 1 origin "$ref_name"; then
         return 0
     fi
-    proxy_url="$(github_proxy_repo_url "$repo_url" || true)"
     if [ -z "$proxy_url" ]; then
         return 1
     fi
     echo "Direct GitHub fetch failed, retrying via $proxy_url" >&2
     git -C "$dir" remote set-url origin "$proxy_url"
-    git -C "$dir" fetch --depth 1 origin "$ref_name"
+    run_git_with_timeout -C "$dir" fetch --depth 1 origin "$ref_name"
+}
+
+git_lfs_pull_with_fallback() {
+    dir="$1"
+    repo_url="$2"
+    timeout_sec="${CA_GIT_LFS_TIMEOUT_SEC:-300}"
+    proxy_url="$(github_proxy_repo_url "$repo_url" || true)"
+    current_url="$(git -C "$dir" remote get-url origin 2>/dev/null || printf '%s' "$repo_url")"
+
+    git -C "$dir" remote set-url origin "$current_url"
+    if command -v timeout >/dev/null 2>&1; then
+        if GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}" \
+           GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}" \
+           timeout "$timeout_sec" git -C "$dir" lfs pull origin; then
+            return 0
+        fi
+    elif GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}" \
+         GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}" \
+         git -C "$dir" lfs pull origin; then
+        return 0
+    fi
+
+    if [ "$current_url" = "$proxy_url" ]; then
+        echo "Git LFS proxy pull failed, retrying original URL $repo_url" >&2
+        git -C "$dir" remote set-url origin "$repo_url"
+    elif [ "$current_url" = "$repo_url" ] && [ -n "$proxy_url" ]; then
+        echo "Git LFS pull failed, retrying via $proxy_url" >&2
+        git -C "$dir" remote set-url origin "$proxy_url"
+    elif github_proxy_first && [ -n "$proxy_url" ]; then
+        echo "Git LFS pull failed, retrying via $proxy_url" >&2
+        git -C "$dir" remote set-url origin "$proxy_url"
+    elif [ "$current_url" != "$repo_url" ]; then
+        echo "Git LFS pull failed, retrying original URL $repo_url" >&2
+        git -C "$dir" remote set-url origin "$repo_url"
+    else
+        return 1
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}" \
+        GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}" \
+            timeout "$timeout_sec" git -C "$dir" lfs pull origin
+    else
+        GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}" \
+        GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}" \
+            git -C "$dir" lfs pull origin
+    fi
 }
 
 main() {
@@ -165,14 +247,16 @@ main() {
 
     if [ -d "$source_dir/.git" ]; then
         git_fetch_with_fallback "$source_dir" "$repo" "$ref"
-        git -C "$source_dir" checkout --detach "FETCH_HEAD"
+        GIT_LFS_SKIP_SMUDGE=1 git -C "$source_dir" checkout --detach "FETCH_HEAD"
+        git_lfs_pull_with_fallback "$source_dir" "$repo"
     else
         rm -rf "$source_dir"
         mkdir -p "$source_dir"
         git -C "$source_dir" init
         git -C "$source_dir" remote add origin "$repo"
         git_fetch_with_fallback "$source_dir" "$repo" "$ref"
-        git -C "$source_dir" checkout --detach "FETCH_HEAD"
+        GIT_LFS_SKIP_SMUDGE=1 git -C "$source_dir" checkout --detach "FETCH_HEAD"
+        git_lfs_pull_with_fallback "$source_dir" "$repo"
     fi
 
     if [ ! -f "$source_dir/one-click/lib/main.sh" ]; then

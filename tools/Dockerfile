@@ -11,6 +11,12 @@ ARG COSIGN_SHA256=c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c
 ARG REKOR_CLI_SHA256=0b4964af85477892c37039fb80793b151864970d19838873eaa1a777ca2fb813
 ARG ALIYUN_CLI_SHA256=f6dca50b17e745881c5bb5d2e02ea7382bf1cf2a6d3ec76488b071a04a06c0e4
 ARG OSSUTIL_SHA256=c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697
+ARG GITHUB_PROXY_URL=https://gh-proxy.org/
+ARG GITHUB_PROXY_FIRST=0
+ARG GITHUB_DOWNLOAD_CONNECT_TIMEOUT=20
+ARG GITHUB_DOWNLOAD_MAX_TIME=120
+ARG GITHUB_DOWNLOAD_SPEED_LIMIT=65536
+ARG GITHUB_DOWNLOAD_SPEED_TIME=20
 # URLs may be overridden for local mirrors; the fixed SHA256 values still gate content.
 ARG COSIGN_URL=https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64
 ARG REKOR_CLI_URL=https://github.com/sigstore/rekor/releases/download/v${REKOR_VERSION}/rekor-cli-linux-amd64
@@ -28,13 +34,37 @@ COPY hack/tng-2.6.0 /usr/bin/tng
 RUN download() { \
         dest="$1"; \
         url="$2"; \
+        proxy_url=""; \
+        case "$url" in \
+            https://github.com/*) \
+                if [ -n "$GITHUB_PROXY_URL" ]; then \
+                    case "$GITHUB_PROXY_URL" in \
+                        */) proxy_url="${GITHUB_PROXY_URL}${url}" ;; \
+                        *) proxy_url="${GITHUB_PROXY_URL}/${url}" ;; \
+                    esac; \
+                fi; \
+                ;; \
+        esac; \
         for attempt in 1 2 3 4 5; do \
-            if curl -fsSL --connect-timeout 20 --max-time 300 -o "${dest}.tmp" "$url"; then \
-                mv "${dest}.tmp" "$dest"; \
-                return 0; \
+            if [ "$GITHUB_PROXY_FIRST" = "1" ]; then \
+                candidates="$proxy_url $url"; \
+            else \
+                candidates="$url $proxy_url"; \
             fi; \
-            rm -f "${dest}.tmp"; \
-            echo "download failed for ${url} (attempt ${attempt}/5)" >&2; \
+            for candidate in $candidates; do \
+                [ -n "$candidate" ] || continue; \
+                if curl -fsSL \
+                    --connect-timeout "$GITHUB_DOWNLOAD_CONNECT_TIMEOUT" \
+                    --max-time "$GITHUB_DOWNLOAD_MAX_TIME" \
+                    --speed-limit "$GITHUB_DOWNLOAD_SPEED_LIMIT" \
+                    --speed-time "$GITHUB_DOWNLOAD_SPEED_TIME" \
+                    -o "${dest}.tmp" "$candidate"; then \
+                    mv "${dest}.tmp" "$dest"; \
+                    return 0; \
+                fi; \
+                rm -f "${dest}.tmp"; \
+                echo "download failed for ${candidate} (attempt ${attempt}/5)" >&2; \
+            done; \
             [ "$attempt" = 5 ] || sleep "$((attempt * 5))"; \
         done; \
         return 1; \

@@ -838,7 +838,7 @@ build:
 {base_image}  image_name: openclaw-agent
   resize: 30G
   with_network: true
-  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, dracut, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
   files:
 {files}  scripts: [./install-openclaw.sh]
   variants:
@@ -908,7 +908,7 @@ build:
   with_network: true
   cleanup:
     remove_static_libs: false
-  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
 {files}  scripts: [./install-openclaw-vllm.sh]
   variants:

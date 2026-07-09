@@ -214,6 +214,43 @@ fn run_ossutil(
     )
 }
 
+fn run_ossutil_capture(
+    cli: &Cli,
+    args: Vec<String>,
+    file_mounts: Vec<PathBuf>,
+    region: &str,
+) -> Result<String> {
+    let config = ossutil_config(cli, region)?;
+    let mut tool_args = vec![
+        OsString::from("-c"),
+        config.path.as_os_str().to_os_string(),
+        OsString::from("-e"),
+        OsString::from(format!("https://oss-{region}.aliyuncs.com")),
+    ];
+    tool_args.extend(args.into_iter().map(OsString::from));
+
+    let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
+    let state_dir = absolute_path_for_state(&cli.state_dir);
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
+    let mut mounts = vec![workdir.clone(), state_dir, config.path.clone()];
+    for path in file_mounts {
+        mounts.extend(mounts_for_file(&path, &workdir));
+    }
+
+    run_tools_container_capture(
+        cli,
+        ToolContainerSpec {
+            tool: "ossutil64",
+            tool_args,
+            mounts,
+            envs: inherited_proxy_envs(None),
+            workdir: Some(workdir),
+            container_name: None,
+        },
+    )
+}
+
 fn validate_cloud_credentials(cli: &Cli, region: &str) -> Result<()> {
     println!("[ca] validating cloud credentials...");
     run_aliyun_cli(
@@ -230,7 +267,7 @@ fn validate_cloud_credentials(cli: &Cli, region: &str) -> Result<()> {
 }
 
 fn ensure_publish_bucket(cli: &Cli, bucket: &str, region: &str) -> Result<()> {
-    let check = run_ossutil(
+    let check = run_ossutil_capture(
         cli,
         vec!["stat".to_string(), format!("oss://{bucket}")],
         Vec::new(),
