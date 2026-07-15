@@ -305,6 +305,7 @@ sequenceDiagram
 | Shelter deploy 完了，但 `inject-resource` 一直 timeout | 安全组 8006 没放通；或 `peerings.yaml` 的 `control` scope 不包含 host | 检查 `confidential-agent peering list` 并运行 `peering apply` |
 | daemon phase 长期停在 `waiting-resources` | 某个 `required=true` 资源缺失或 sha256 不对 | `confidential-agent status --live --json` 看 `applied_resources` |
 | daemon phase 停在 `starting-mesh` | TNG 未启动；通常因为 attestation-agent.sock 还没 ready | `journalctl -u trusted-network-gateway` |
+| 需要持续观察 daemon、TEE policy、UKI/Rekor、服务地址和 Mesh/Connect 端口 | 一次性 `status --live` 不便对比状态变化 | 运行 `confidential-agent tui`；按 `v` 可立即重新校验所选 agent 的远程 evidence |
 | `connect` 报 `mesh bundle has no reference values` | 还没 deploy 过 / sample_rv 文件被手删 | 重新 `deploy` 或 `mesh sync` |
 | Rekor 注册失败 | 网络到不了 `rekor_url`、cosign 签名失败 | 重新构建 tools 镜像并检查 cosign 公私钥、SLSA generator 与 Rekor 可达性 |
 | initrd 阶段 Guest 直接关机 | initrd-fetch 在 `CA_SECRET_WAIT_TIMEOUT_SEC` 超时 | 这是设计的 fail-closed；扩大超时或先看 inject-resource 是不是一直没成功 |

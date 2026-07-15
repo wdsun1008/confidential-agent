@@ -119,8 +119,11 @@ confidential-agent \
   deploy --spec ./openclaw.yaml
 
 confidential-agent status --live
+confidential-agent tui
 confidential-agent report --include-a2a --json --out ./attestation-report.json
 ```
+
+`confidential-agent tui` 的远程认证面板展示默认 policy 判定、UKI 实测/期望值和 Rekor provenance；Agents 表与 Service Network 面板展示服务地址，并明确区分 Connect、Mesh 和 MCP 端口，不展示跨信任域 A2A 状态。
 
 如果存在匹配的 published image，`deploy` 会复用该自定义镜像创建云资源；否则会使用本地 build 产物并让 Shelter 执行上传和导入。远程证明通过后，CLI 会注入 `openclaw.json`、磁盘密钥和 mesh/A2A 配置。`report` 会汇总本地状态、Guest daemon 状态、EAR 证明和 Rekor 条目。
 

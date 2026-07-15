@@ -49,6 +49,48 @@ mod tests {
             std::env::set_var("HOME", value);
         }
     }
+
+    #[test]
+    fn tui_args_have_safe_refresh_defaults_and_validate_ranges() {
+        let cli = Cli::try_parse_from(["confidential-agent", "tui"]).unwrap();
+        match cli.command {
+            Commands::Tui(args) => {
+                assert_eq!(args.service, None);
+                assert_eq!(args.refresh, 2);
+                assert_eq!(args.attestation_refresh, 60);
+            }
+            other => panic!("expected tui command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "confidential-agent",
+            "tui",
+            "--service",
+            "agent-a",
+            "--refresh",
+            "5",
+            "--attestation-refresh",
+            "0",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Tui(args) => {
+                assert_eq!(args.service.as_deref(), Some("agent-a"));
+                assert_eq!(args.refresh, 5);
+                assert_eq!(args.attestation_refresh, 0);
+            }
+            other => panic!("expected tui command, got {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["confidential-agent", "tui", "--refresh", "0"]).is_err());
+        assert!(Cli::try_parse_from([
+            "confidential-agent",
+            "tui",
+            "--attestation-refresh",
+            "3601"
+        ])
+        .is_err());
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -98,6 +140,7 @@ pub(crate) enum Commands {
     Migrate(MigrateArgs),
     Image(ImageArgs),
     Ssh(SshArgs),
+    Tui(TuiArgs),
     Status(StatusArgs),
     Report(ReportArgs),
     Destroy(DestroyArgs),
@@ -496,6 +539,26 @@ pub(crate) struct StatusArgs {
     pub(crate) json: bool,
     #[arg(long, help = "Query read-only status from live guest daemons")]
     pub(crate) live: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TuiArgs {
+    #[arg(long, help = "Start with a single local service")]
+    pub(crate) service: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u64).range(1..=60),
+        help = "Guest daemon refresh interval in seconds"
+    )]
+    pub(crate) refresh: u64,
+    #[arg(
+        long,
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(0..=3600),
+        help = "Remote evidence verification interval in seconds; 0 disables automatic checks"
+    )]
+    pub(crate) attestation_refresh: u64,
 }
 
 #[derive(Debug, Args)]

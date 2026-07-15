@@ -144,6 +144,20 @@ token:  <generated-or-provided-token>
 
 生成的 gateway token 会保存在 `$HOME/.confidential-agent/one-click/secrets/gateway.token`，后续重跑会复用同一个 token。部署完成后可以直接运行 `confidential-agent status --live`、`confidential-agent connect` 和 `openclaw tui --url ws://127.0.0.1:<port> --token <token>`。
 
+### 实时状态 TUI
+
+Host 控制面的实时总览使用：
+
+```bash
+confidential-agent tui
+# 只看一个服务；daemon 每 5 秒刷新，TEE evidence 每 2 分钟重新校验
+confidential-agent tui --service openclaw --refresh 5 --attestation-refresh 120
+```
+
+TUI 持续刷新本地 service state 与 Guest `:8088/status`，并自动通过 `attestation-challenge-client` 收集新 evidence、校验 EAR。远程认证面板直接展示 TEE、默认 policy 的判定、BOOTX64.EFI 的 UKI SHA-384 实测值与期望值、匹配结果，以及 Rekor URL、artifact 和本地 upload entry；Agents 表展示首选地址、Mesh ports 和 Connect ports，Service Network 面板展示所选服务的公网/私网地址及全部 service、connect、mesh、MCP 端口。`--attestation-refresh 0` 可关闭自动校验，界面内仍可按 `v` 手动校验。常用键为 `j/k` 或方向键选择、`/` 过滤、`:` 命令模式、`r` 刷新、`?` 帮助、`q` 退出。
+
+界面刻意区分这些含义：`Evidence VERIFIED` 表示本次新证据通过默认 appraisal policy；`UKI MATCH` 表示 evidence 中的 UKI 度量与配置的参考值一致；Rekor entry 来自本地构建 upload provenance，不冒充一次新的在线查询；`Mesh/TNG READY` 只表示本信任域 TNG 配置已就绪，不表示已经建立过业务连接。
+
 清理云资源：
 
 ```bash

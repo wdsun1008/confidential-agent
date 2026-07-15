@@ -3889,7 +3889,7 @@ fn operator_peering_control_scope_accepts_direct_egress_match() {
 }
 
 #[test]
-fn proxied_challenge_envs_keep_guest_direct() {
+fn proxied_challenge_envs_allow_proxy_for_guest() {
     let envs = challenge_inject_envs(
         false,
         "39.105.64.44",
@@ -3904,10 +3904,10 @@ fn proxied_challenge_envs_keep_guest_direct() {
         "HTTP_PROXY".to_string(),
         "http://proxy.example:8080".to_string()
     )));
-    assert!(envs.contains(&(
-        "NO_PROXY".to_string(),
-        "localhost,127.0.0.1,39.105.64.44".to_string()
-    )));
+    assert!(envs.contains(&("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string())));
+    assert!(!envs.iter().any(|(key, value)| {
+        (key == "NO_PROXY" || key == "no_proxy") && value.contains("39.105.64.44")
+    }));
 }
 
 #[test]

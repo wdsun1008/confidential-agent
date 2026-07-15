@@ -21,8 +21,10 @@ anyhow = "=1.0.79"
 base64 = "=0.22.1"
 clap = { version = "=4.4.18", features = ["derive", "env"] }
 ctrlc = { version = "=3.4.4", features = ["termination"] }
+crossterm = "=0.27.0"
 curve25519-dalek = { version = "=4.1.3", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+ratatui = { version = "=0.26.3", default-features = false, features = ["crossterm"] }
 serde = { version = "=1.0.196", features = ["derive"] }
 serde_json = "=1.0.113"
 serde_yaml = "=0.9.31"
@@ -30,4 +32,6 @@ sha2 = "=0.10.8"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 tempfile = "=3.10.1"
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+# Keep ratatui's compatible transitive range on a release that supports workspace MSRV 1.75.
+unicode-segmentation = "=1.12.0"
 libc = "=0.2.186"

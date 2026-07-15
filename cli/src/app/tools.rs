@@ -598,6 +598,19 @@ pub(super) fn inherited_proxy_envs(no_proxy_target: Option<&str>) -> Vec<(String
     inherited_proxy_envs_from(std::env::vars(), no_proxy_target)
 }
 
+pub(super) fn outbound_proxy_configured() -> bool {
+    [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
 pub(super) fn inherited_proxy_envs_from<I, K, V>(
     source: I,
     no_proxy_target: Option<&str>,
@@ -651,7 +664,11 @@ where
     V: Into<String>,
 {
     if !direct {
-        return inherited_proxy_envs_from(source, Some(target));
+        // The direct attempt already bypasses proxies for the guest.  The
+        // fallback must leave the target out of NO_PROXY so environments
+        // that require an HTTP proxy for all outbound traffic can reach the
+        // attestation API as well.
+        return inherited_proxy_envs_from(source, None);
     }
 
     let mut current_no_proxy = String::new();
@@ -1093,6 +1110,21 @@ mod tests {
         let no_proxy = envs.iter().find(|(k, _)| k == "NO_PROXY");
         assert!(no_proxy.is_some());
         assert!(no_proxy.unwrap().1.contains("10.0.0.1"));
+    }
+
+    #[test]
+    fn challenge_inject_envs_proxy_mode_does_not_bypass_target() {
+        let source = vec![
+            ("http_proxy", "http://proxy:3128"),
+            ("no_proxy", "localhost"),
+        ];
+        let envs = challenge_inject_envs(false, "10.0.0.1", source);
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key == "http_proxy" && value == "http://proxy:3128"));
+        let no_proxy = envs.iter().find(|(key, _)| key == "NO_PROXY").unwrap();
+        assert_eq!(no_proxy.1, "localhost");
+        assert!(!no_proxy.1.contains("10.0.0.1"));
     }
 
     #[test]

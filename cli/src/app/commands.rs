@@ -21,6 +21,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Migrate(args) => cmd_migrate(cli, args),
         Commands::Image(args) => cmd_image(cli, args),
         Commands::Ssh(args) => cmd_ssh(cli, args),
+        Commands::Tui(args) => cmd_tui(cli, args),
         Commands::Status(args) => cmd_status(cli, args),
         Commands::Report(args) => cmd_report(cli, args),
         Commands::Destroy(args) => cmd_destroy(cli, args),
@@ -1885,6 +1886,31 @@ pub(super) fn fetch_daemon_status_from(
     timeout: Duration,
 ) -> Result<DaemonStatus> {
     let address = format!("{host}:{port}");
+    address
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid daemon status address '{address}'"))?;
+
+    match fetch_daemon_status_direct(host, port, timeout) {
+        Ok(status) => Ok(status),
+        Err(direct_error)
+            if outbound_proxy_configured() && daemon_status_proxy_retryable(&direct_error) =>
+        {
+            fetch_daemon_status_via_proxy(host, port, timeout).with_context(|| {
+                format!("direct daemon status request failed first: {direct_error:#}")
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn daemon_status_proxy_retryable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+}
+
+fn fetch_daemon_status_direct(host: &str, port: u16, timeout: Duration) -> Result<DaemonStatus> {
+    let address = format!("{host}:{port}");
     let mut stream = TcpStream::connect_timeout(
         &address
             .parse()
@@ -1918,6 +1944,23 @@ pub(super) fn fetch_daemon_status_from(
         );
     }
     serde_json::from_str(body).context("failed to parse daemon status JSON")
+}
+
+fn fetch_daemon_status_via_proxy(host: &str, port: u16, timeout: Duration) -> Result<DaemonStatus> {
+    let url = format!("http://{host}:{port}/status");
+    let response = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .timeout_read(timeout)
+        .redirects(0)
+        .try_proxy_from_env(true)
+        .build()
+        .get(&url)
+        .call()
+        .with_context(|| format!("failed to request daemon status through proxy at {url}"))?;
+    let body = response
+        .into_string()
+        .context("failed to read proxied daemon status response")?;
+    serde_json::from_str(&body).context("failed to parse proxied daemon status JSON")
 }
 
 fn join_ports(ports: &[u16]) -> String {
@@ -2566,6 +2609,8 @@ mod tests {
                 body
             )
             .unwrap();
+            stream.flush().unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
 
         let status = fetch_daemon_status_from("127.0.0.1", port, Duration::from_secs(1)).unwrap();
@@ -2581,6 +2626,19 @@ mod tests {
         let err = fetch_daemon_status_from("not a host", 8088, Duration::from_secs(1)).unwrap_err();
 
         assert!(err.to_string().contains("invalid daemon status address"));
+    }
+
+    #[test]
+    fn daemon_status_proxy_retry_only_handles_transport_failures() {
+        let transport = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ))
+        .context("failed to connect daemon status");
+        assert!(daemon_status_proxy_retryable(&transport));
+
+        let response = anyhow::anyhow!("daemon status returned HTTP/1.1 503 Service Unavailable");
+        assert!(!daemon_status_proxy_retryable(&response));
     }
 
     #[test]

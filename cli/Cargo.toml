@@ -16,12 +16,15 @@ clap.workspace = true
 confidential-agent-core = { path = "../core" }
 confidential-agent-shelter = { path = "../shelter" }
 ctrlc.workspace = true
+crossterm.workspace = true
 curve25519-dalek.workspace = true
 libc.workspace = true
 rand_core.workspace = true
+ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 ureq.workspace = true
+unicode-segmentation.workspace = true

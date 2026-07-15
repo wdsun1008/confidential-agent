@@ -4,7 +4,7 @@ use crate::cli::{
     ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitBuildBackend,
     InitReferenceValues, InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands,
     MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands,
-    SshArgs, StatusArgs,
+    SshArgs, StatusArgs, TuiArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{
@@ -23,11 +23,11 @@ use confidential_agent_core::agent_card_fetch::{
 };
 use confidential_agent_core::peerings::{PeeringEntry, PeeringRole, PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{
-    AgentCard, AppliedResourceState, BootstrapConfig, DaemonStatus, GatewayIdentity, GuestResource,
-    LocalBuildState, LocalDebugSshKey, LocalDeployState, LocalGatewayIdentity, LocalResourceState,
-    LocalServiceNetwork, LocalServiceState, LocalSpecState, MeshBundle, PublishedImage,
-    AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION, DAEMON_STATUS_PORT,
-    LOCAL_SERVICE_STATE_SCHEMA_VERSION,
+    confidential_ports, AgentCard, AppliedResourceState, BootstrapConfig, DaemonStatus,
+    GatewayIdentity, GuestResource, LocalBuildState, LocalDebugSshKey, LocalDeployState,
+    LocalGatewayIdentity, LocalResourceState, LocalServiceNetwork, LocalServiceState,
+    LocalSpecState, MeshBundle, PublishedImage, AGENT_CARD_PORT, BOOTSTRAP_SCHEMA_VERSION,
+    DAEMON_STATUS_PORT, LOCAL_SERVICE_STATE_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use confidential_agent_core::schema::{
@@ -711,6 +711,9 @@ mod publish;
 
 mod report;
 use report::*;
+
+mod tui;
+use tui::*;
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
