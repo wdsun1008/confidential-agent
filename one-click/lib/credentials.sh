@@ -9,11 +9,108 @@ normalize_aliyun_env() {
     export ALICLOUD_ACCESS_KEY="${ALICLOUD_ACCESS_KEY:-$ALIBABA_CLOUD_ACCESS_KEY_ID}"
     export ALICLOUD_SECRET_KEY="${ALICLOUD_SECRET_KEY:-$ALIBABA_CLOUD_ACCESS_KEY_SECRET}"
   fi
+  if [[ -n "${ALICLOUD_PROFILE:-}" ]]; then
+    export ALIBABA_CLOUD_PROFILE="${ALIBABA_CLOUD_PROFILE:-$ALICLOUD_PROFILE}"
+  fi
+  if [[ -n "${ALIBABA_CLOUD_PROFILE:-}" ]]; then
+    export ALICLOUD_PROFILE="${ALICLOUD_PROFILE:-$ALIBABA_CLOUD_PROFILE}"
+  fi
+  if [[ -n "${ALICLOUD_SHARED_CREDENTIALS_FILE:-}" ]]; then
+    export ALIBABA_CLOUD_CREDENTIALS_FILE="${ALIBABA_CLOUD_CREDENTIALS_FILE:-$ALICLOUD_SHARED_CREDENTIALS_FILE}"
+  fi
+  if [[ -n "${ALIBABA_CLOUD_CREDENTIALS_FILE:-}" ]]; then
+    export ALICLOUD_SHARED_CREDENTIALS_FILE="${ALICLOUD_SHARED_CREDENTIALS_FILE:-$ALIBABA_CLOUD_CREDENTIALS_FILE}"
+  fi
 }
 
 aliyun_cli_profile_works() {
   command -v aliyun >/dev/null 2>&1 || return 1
-  aliyun sts GetCallerIdentity >/dev/null 2>&1 || return 1
+  local profile="${1:-}"
+  local credentials_file="${2:-}"
+  local args=(sts GetCallerIdentity)
+  if [[ -n "$profile" ]]; then
+    args+=(--profile "$profile")
+  fi
+  if [[ -n "$credentials_file" ]]; then
+    args+=(--config-path "$credentials_file")
+  fi
+  aliyun "${args[@]}" >/dev/null 2>&1 || return 1
+}
+
+aliyun_cli_current_profile() {
+  local credentials_file="${1:-}"
+  local output profile
+  local args=(configure get profile)
+  if [[ -n "$credentials_file" ]]; then
+    args+=(--config-path "$credentials_file")
+  fi
+  output="$(aliyun "${args[@]}" 2>/dev/null)" || return 1
+  profile="${output#profile=}"
+  profile="${profile%%$'\n'*}"
+  profile="${profile%$'\r'}"
+  [[ -n "$profile" && "$profile" != "$output" ]] || return 1
+  printf '%s\n' "$profile"
+}
+
+export_aliyun_cli_ak_profile() {
+  local credentials_file="$1"
+  local profile="$2"
+  local credentials ak sk
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -r "$credentials_file" ]] || return 1
+
+  credentials="$(
+    jq -er --arg profile "$profile" '
+      first(
+        .profiles[]?
+        | select(.name == $profile and .mode == "AK")
+        | select(
+            (.access_key_id | type) == "string"
+            and (.access_key_id | length) > 0
+            and (.access_key_secret | type) == "string"
+            and (.access_key_secret | length) > 0
+          )
+        | [.access_key_id, .access_key_secret]
+        | @tsv
+      )
+    ' "$credentials_file" 2>/dev/null
+  )" || return 1
+  IFS=$'\t' read -r ak sk <<<"$credentials"
+  [[ -n "$ak" && -n "$sk" ]] || return 1
+
+  export ALICLOUD_ACCESS_KEY="$ak"
+  export ALICLOUD_SECRET_KEY="$sk"
+  export ALIBABA_CLOUD_ACCESS_KEY_ID="$ak"
+  export ALIBABA_CLOUD_ACCESS_KEY_SECRET="$sk"
+}
+
+configure_terraform_from_aliyun_cli() {
+  local profile credentials_file
+  credentials_file="${ALIBABA_CLOUD_CREDENTIALS_FILE:-${ALICLOUD_SHARED_CREDENTIALS_FILE:-}}"
+  if [[ -z "$credentials_file" && -n "${HOME:-}" && -r "$HOME/.aliyun/config.json" ]]; then
+    credentials_file="$HOME/.aliyun/config.json"
+  fi
+  [[ -n "$credentials_file" ]] || return 1
+
+  profile="${ALIBABA_CLOUD_PROFILE:-${ALICLOUD_PROFILE:-}}"
+  if [[ -n "$profile" ]]; then
+    aliyun_cli_profile_works "$profile" "$credentials_file" || return 1
+  else
+    aliyun_cli_profile_works "" "$credentials_file" || return 1
+    profile="$(aliyun_cli_current_profile "$credentials_file")" || return 1
+  fi
+
+  if ! export_aliyun_cli_ak_profile "$credentials_file" "$profile"; then
+    warn "Aliyun CLI profile '$profile' is valid but is not a readable AK profile; use environment credentials or enter an AccessKey interactively"
+    return 1
+  fi
+
+  export ALIBABA_CLOUD_PROFILE="$profile"
+  export ALICLOUD_PROFILE="$profile"
+  export ALIBABA_CLOUD_CREDENTIALS_FILE="$credentials_file"
+  export ALICLOUD_SHARED_CREDENTIALS_FILE="$credentials_file"
+
+  log "using Aliyun CLI AK profile '$profile' for one-click authentication"
 }
 
 ensure_aliyun_credentials() {
@@ -21,7 +118,7 @@ ensure_aliyun_credentials() {
   if [[ -n "${ALICLOUD_ACCESS_KEY:-}" && -n "${ALICLOUD_SECRET_KEY:-}" ]]; then
     return
   fi
-  if aliyun_cli_profile_works; then
+  if configure_terraform_from_aliyun_cli; then
     return
   fi
   if [[ "$CA_NON_INTERACTIVE" == "1" ]]; then
