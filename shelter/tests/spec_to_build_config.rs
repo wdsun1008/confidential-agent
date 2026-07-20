@@ -153,8 +153,8 @@ fn spec_to_build_config_renders_release_and_debug_variant_matrix() {
         assert!(!mapping_contains(root, "resize"));
         assert!(!mapping_contains(root, "variants"));
 
-        let disk = mapping_get(root, "disk").as_mapping().unwrap();
-        assert_eq!(mapping_get(disk, "size").as_str(), Some("30G"));
+        let output = mapping_get(root, "output").as_mapping().unwrap();
+        assert_eq!(mapping_get(output, "disk_size").as_str(), Some("30G"));
 
         let security = mapping_get(root, "security").as_mapping().unwrap();
         let harden = mapping_get(security, "harden").as_mapping().unwrap();
@@ -212,8 +212,8 @@ fn spec_to_build_config_mkosi_path_omits_from_and_variants_but_keeps_payload() {
     assert!(!mapping_contains(root, "variants"));
     assert!(!mapping_contains(root, "resize"));
 
-    let disk = mapping_get(root, "disk").as_mapping().unwrap();
-    assert_eq!(mapping_get(disk, "size").as_str(), Some("30G"));
+    let output = mapping_get(root, "output").as_mapping().unwrap();
+    assert_eq!(mapping_get(output, "disk_size").as_str(), Some("30G"));
 
     let packages = mapping_get(root, "packages").as_sequence().unwrap();
     assert!(sequence_contains_str(packages, "nodejs"));

@@ -56,8 +56,8 @@ pub fn render_build_config(
 
     let config = ShelterBuildConfig {
         base_image: spec.build.base_image.clone(),
-        disk: spec.build.resize.as_ref().map(|size| ShelterDiskConfig {
-            size: Some(size.clone()),
+        output: spec.build.resize.as_ref().map(|size| ShelterOutputConfig {
+            disk_size: Some(size.clone()),
         }),
         with_network: spec.build.with_network,
         container: spec.build.container.clone(),
@@ -355,7 +355,7 @@ struct ShelterBuildConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     base_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    disk: Option<ShelterDiskConfig>,
+    output: Option<ShelterOutputConfig>,
     #[serde(skip_serializing_if = "is_false")]
     with_network: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -379,9 +379,9 @@ struct ShelterBuildConfig {
 }
 
 #[derive(Debug, Serialize)]
-struct ShelterDiskConfig {
+struct ShelterOutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<String>,
+    disk_size: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
