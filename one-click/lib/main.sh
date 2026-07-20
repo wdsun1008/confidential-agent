@@ -317,6 +317,11 @@ validate_options() {
   [[ "$CA_DISK_GB" =~ ^[0-9]+$ ]] || die "--disk-gb must be an integer"
   [[ -n "$CA_BAILIAN_MODEL" ]] || die "--bailian-model cannot be empty"
   [[ "$CA_OPENCLAW_VLLM_PORT" =~ ^[0-9]+$ ]] || die "--vllm-port must be an integer"
+  # Both OpenClaw specs enable A2A, and A2A agent cards require Rekor
+  # metadata; fail here instead of after the image build at inject time.
+  if [[ "$CA_MODE" == deploy-openclaw* && "$CA_REFERENCE_VALUES" != "rekor" ]]; then
+    die "the OpenClaw flows enable A2A, which requires --reference-values rekor"
+  fi
   if [[ "$CA_MODE" == "deploy-openclaw-vllm" ]]; then
     validate_openclaw_vllm_build_variants
   fi
