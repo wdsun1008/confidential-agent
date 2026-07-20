@@ -969,7 +969,7 @@ fn start_tools_container_detached(cli: &Cli, spec: ToolContainerSpec) -> Result<
     ensure_docker_available()?;
     ensure_docker_image_available(&cli.tools_image)?;
     let envs = spec.envs.clone();
-    let mut args = tools_container_args(cli, spec);
+    let mut args = tools_container_args(&cli.tools_image, spec);
     args.insert(2, OsString::from("-d"));
     let mut command = Command::new("docker");
     command.args(args).stdin(Stdio::null());

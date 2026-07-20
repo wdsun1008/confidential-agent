@@ -147,7 +147,7 @@ fn current_nanos() -> u128 {
 fn run_tools_container_capture(cli: &Cli, spec: ToolContainerSpec) -> Result<String> {
     ensure_docker_available()?;
     let envs = spec.envs.clone();
-    let args = tools_container_args(cli, spec);
+    let args = tools_container_args(&cli.tools_image, spec);
     let mut command = Command::new("docker");
     command.args(args);
     for (key, value) in envs {

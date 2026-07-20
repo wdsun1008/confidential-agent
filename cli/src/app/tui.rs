@@ -193,6 +193,7 @@ struct TuiApp {
     attestation_refresh: Option<Duration>,
     service_scope: Option<String>,
     state_dir: PathBuf,
+    verifier: AttestationVerifier,
 }
 
 impl TuiApp {
@@ -202,6 +203,7 @@ impl TuiApp {
         agents: Vec<AgentSnapshot>,
         live_refresh: Duration,
         attestation_refresh: Option<Duration>,
+        verifier: AttestationVerifier,
     ) -> Self {
         Self {
             agents,
@@ -223,6 +225,7 @@ impl TuiApp {
             attestation_refresh,
             service_scope,
             state_dir,
+            verifier,
         }
     }
 
@@ -367,8 +370,10 @@ impl TuiApp {
         self.status_message = format!("Verifying remote evidence for {}…", target.service_id);
 
         let tx = tx.clone();
+        let verifier = self.verifier.clone();
         thread::spawn(move || {
-            let result = verify_remote_attestation_claims(&target.host, &target.tee)
+            let result = verifier
+                .verify_remote_attestation_claims(&target.host, &target.tee)
                 .map(|claims| evaluate_attestation_claims(claims.as_ref()))
                 .map_err(|err| format!("{err:#}"));
             let _ = tx.send(WorkerEvent::AttestationFinished {
@@ -671,6 +676,7 @@ pub(super) fn cmd_tui(cli: &Cli, args: &TuiArgs) -> Result<()> {
         initial,
         live_refresh,
         attestation_refresh,
+        AttestationVerifier::new(cli)?,
     );
     let (worker_tx, worker_rx) = mpsc::channel();
     let mut terminal = TerminalSession::enter()?;
@@ -2006,6 +2012,7 @@ mod tests {
             agents,
             Duration::from_secs(2),
             Some(Duration::from_secs(60)),
+            AttestationVerifier::for_tests("confidential-agent-tools:test", PathBuf::from("/tmp")),
         )
     }
 

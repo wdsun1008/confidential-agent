@@ -987,6 +987,10 @@ EOF
   rm)
     exit 0
     ;;
+  run)
+    echo "tng 2.6.0"
+    exit 0
+    ;;
 esac
 exit 1
 "#,
@@ -1018,7 +1022,7 @@ fn write_mesh_bundle(
 fn tools_container_wraps_challenge_client() {
     let cli = test_cli();
     let args = tools_container_args(
-        &cli,
+        &cli.tools_image,
         ToolContainerSpec {
             tool: "attestation-challenge-client",
             tool_args: vec![OsString::from("inject-resource")],
@@ -1053,7 +1057,7 @@ fn tools_container_wraps_challenge_client() {
 fn tools_container_wraps_tng_connect() {
     let cli = test_cli();
     let args = tools_container_args(
-        &cli,
+        &cli.tools_image,
         ToolContainerSpec {
             tool: "tng",
             tool_args: vec![

@@ -155,9 +155,10 @@ pub(super) fn cmd_report(cli: &Cli, args: &ReportArgs) -> Result<()> {
         }
     }
 
+    let verifier = AttestationVerifier::new(cli)?;
     let services: Vec<ServiceReport> = states
         .iter()
-        .map(|state| collect_service_report(&cli.state_dir, state))
+        .map(|state| collect_service_report(&cli.state_dir, state, &verifier))
         .collect();
 
     let a2a_peers = if args.include_a2a {
@@ -189,7 +190,11 @@ pub(super) fn cmd_report(cli: &Cli, args: &ReportArgs) -> Result<()> {
     Ok(())
 }
 
-fn collect_service_report(state_dir: &Path, state: &LocalServiceState) -> ServiceReport {
+fn collect_service_report(
+    state_dir: &Path,
+    state: &LocalServiceState,
+    verifier: &AttestationVerifier,
+) -> ServiceReport {
     if state.phase != "active" {
         return ServiceReport {
             service_id: state.service_id.clone(),
@@ -217,7 +222,7 @@ fn collect_service_report(state_dir: &Path, state: &LocalServiceState) -> Servic
     let tee_info = Some(tee_info_from_state(state));
 
     let attestation = match public_ip {
-        Some(ip) => match fetch_ear_token(ip, &state.deploy.tee) {
+        Some(ip) => match fetch_ear_token(verifier, ip, &state.deploy.tee) {
             Ok(ear) => Some(ear),
             Err(err) => {
                 errors.push(format!("attestation: {err:#}"));
@@ -360,32 +365,23 @@ fn tee_info_from_state(state: &LocalServiceState) -> TeeInfoReport {
     }
 }
 
-fn fetch_ear_token(host: &str, tee: &str) -> Result<AttestationEarReport> {
-    fetch_ear_token_with_bin(host, tee, Path::new("attestation-challenge-client"))
-}
-
-fn fetch_ear_token_with_bin(
-    host: &str,
-    tee: &str,
-    attestation_client: &Path,
-) -> Result<AttestationEarReport> {
-    let evidence = tempfile::NamedTempFile::new().context("failed to create evidence temp file")?;
+fn fetch_ear_token(verifier: &AttestationVerifier, host: &str, tee: &str) -> Result<AttestationEarReport> {
+    let evidence = tempfile::Builder::new()
+        .prefix("report-evidence-")
+        .suffix(".json")
+        .tempfile_in(&verifier.workdir)
+        .context("failed to create evidence file in attestation workdir")?;
     let aa_url = format!("http://{}:{}", host, TRUSTIFLUX_PORT);
 
-    fetch_evidence_with_proxy_fallback(attestation_client, &aa_url, evidence.path())
+    fetch_evidence_with_proxy_fallback(verifier, &aa_url, evidence.path())
         .with_context(|| format!("failed to fetch attestation evidence from {aa_url}"))?;
 
-    let mut verify = Command::new(attestation_client);
-    verify
-        .arg("verify")
-        .arg("--evidence")
-        .arg(evidence.path())
-        .arg("--tee")
-        .arg(tee.to_ascii_lowercase())
-        .arg("--policy")
-        .arg("default");
-    let output = run_attestation_challenge_client(&mut verify, "verify")
-        .context("failed to verify attestation evidence")?;
+    let output = verifier.run_client(
+        verify_tool_args(evidence.path(), tee),
+        Vec::new(),
+        "verify",
+        ATTESTATION_COMMAND_TIMEOUT,
+    )?;
 
     let jwt = String::from_utf8(output.stdout)
         .context("attestation verifier output was not UTF-8")?
@@ -403,45 +399,107 @@ fn fetch_ear_token_with_bin(
     })
 }
 
-fn get_evidence_command(attestation_client: &Path, aa_url: &str, output: &Path) -> Command {
-    let mut command = Command::new(attestation_client);
-    command
-        .arg("get-evidence")
-        .arg("--aa-url")
-        .arg(aa_url)
-        .arg("--output")
-        .arg(output);
-    command
+/// Runs `attestation-challenge-client` inside the tools container so the
+/// host only needs docker, matching the other host-side attestation flows.
+#[derive(Debug, Clone)]
+pub(super) struct AttestationVerifier {
+    tools_image: String,
+    workdir: PathBuf,
+}
+
+impl AttestationVerifier {
+    pub(super) fn new(cli: &Cli) -> Result<Self> {
+        Ok(Self {
+            tools_image: cli.tools_image.clone(),
+            workdir: ensure_attestation_workdir(&cli.state_dir)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_tests(tools_image: &str, workdir: PathBuf) -> Self {
+        Self {
+            tools_image: tools_image.to_string(),
+            workdir,
+        }
+    }
+
+    pub(super) fn verify_remote_attestation_claims(
+        &self,
+        host: &str,
+        tee: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(fetch_ear_token(self, host, tee)?.ear_claims)
+    }
+
+    fn run_client(
+        &self,
+        tool_args: Vec<OsString>,
+        mut envs: Vec<(String, String)>,
+        action: &str,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
+        envs.push((
+            "ATTESTATION_CHALLENGE_CLIENT_WORK_DIR".to_string(),
+            self.workdir.to_string_lossy().to_string(),
+        ));
+        let output = run_tools_container_output(
+            &self.tools_image,
+            ToolContainerSpec {
+                tool: "timeout",
+                tool_args: challenge_inject_tool_args(tool_args, timeout.as_secs()),
+                mounts: vec![self.workdir.clone()],
+                envs,
+                workdir: None,
+                container_name: None,
+            },
+        )
+        .with_context(|| format!("failed to run attestation-challenge-client {action}"))?;
+        interpret_attestation_output(output, action, timeout)
+    }
+}
+
+fn get_evidence_tool_args(aa_url: &str, output: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("get-evidence"),
+        OsString::from("--aa-url"),
+        OsString::from(aa_url),
+        OsString::from("--output"),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
+fn verify_tool_args(evidence: &Path, tee: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("verify"),
+        OsString::from("--evidence"),
+        evidence.as_os_str().to_os_string(),
+        OsString::from("--tee"),
+        OsString::from(tee.to_ascii_lowercase()),
+        OsString::from("--policy"),
+        OsString::from("default"),
+    ]
 }
 
 fn fetch_evidence_with_proxy_fallback(
-    attestation_client: &Path,
+    verifier: &AttestationVerifier,
     aa_url: &str,
     output: &Path,
 ) -> Result<()> {
-    fetch_evidence_with_proxy_mode(
-        attestation_client,
-        aa_url,
-        output,
-        outbound_proxy_configured(),
-    )
-}
-
-fn fetch_evidence_with_proxy_mode(
-    attestation_client: &Path,
-    aa_url: &str,
-    output: &Path,
-    proxy_configured: bool,
-) -> Result<()> {
-    let mut direct = get_evidence_command(attestation_client, aa_url, output);
-    configure_attestation_direct(&mut direct);
+    let proxy_configured = outbound_proxy_configured();
+    // The container starts with a clean environment, so the first attempt is
+    // always direct.  Keep it short when a proxy is configured because the
+    // guest may only be reachable through it.
     let direct_timeout = if proxy_configured {
         Duration::from_secs(3)
     } else {
         ATTESTATION_COMMAND_TIMEOUT
     };
-    let direct_result =
-        run_attestation_challenge_client_with_timeout(&mut direct, "get-evidence", direct_timeout);
+    let direct_result = verifier.run_client(
+        get_evidence_tool_args(aa_url, output),
+        Vec::new(),
+        "get-evidence",
+        direct_timeout,
+    );
     if direct_result.is_ok() {
         return Ok(());
     }
@@ -449,114 +507,35 @@ fn fetch_evidence_with_proxy_mode(
         return direct_result.map(|_| ());
     }
 
-    let mut proxied = get_evidence_command(attestation_client, aa_url, output);
-    proxied.env_remove("NO_PROXY").env_remove("no_proxy");
-    run_attestation_challenge_client_with_timeout(
-        &mut proxied,
-        "get-evidence through proxy",
-        ATTESTATION_COMMAND_TIMEOUT,
-    )
-    .map(|_| ())
-    .with_context(|| {
-        format!(
-            "direct get-evidence attempt failed first: {:#}",
-            direct_result.unwrap_err()
+    verifier
+        .run_client(
+            get_evidence_tool_args(aa_url, output),
+            inherited_proxy_envs(None),
+            "get-evidence through proxy",
+            ATTESTATION_COMMAND_TIMEOUT,
         )
-    })
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "direct get-evidence attempt failed first: {:#}",
+                direct_result.unwrap_err()
+            )
+        })
 }
 
-pub(super) fn verify_remote_attestation_claims(
-    host: &str,
-    tee: &str,
-) -> Result<Option<serde_json::Value>> {
-    Ok(fetch_ear_token(host, tee)?.ear_claims)
-}
+const TIMEOUT_COMMAND_EXIT_CODE: i32 = 124;
 
-fn run_attestation_challenge_client(
-    command: &mut Command,
-    action: &str,
-) -> Result<std::process::Output> {
-    configure_attestation_direct(command);
-    run_attestation_challenge_client_with_timeout(command, action, ATTESTATION_COMMAND_TIMEOUT)
-}
-
-fn configure_attestation_direct(command: &mut Command) {
-    command
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
-        .env_remove("ALL_PROXY")
-        .env_remove("all_proxy")
-        .env("NO_PROXY", "*");
-}
-
-fn run_attestation_challenge_client_with_timeout(
-    command: &mut Command,
+fn interpret_attestation_output(
+    output: std::process::Output,
     action: &str,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    use std::io::{Seek, SeekFrom};
-
-    let mut stdout = tempfile::tempfile().context("failed to create attestation stdout file")?;
-    let mut stderr = tempfile::tempfile().context("failed to create attestation stderr file")?;
-    command
-        .stdout(Stdio::from(
-            stdout
-                .try_clone()
-                .context("failed to clone attestation stdout file")?,
-        ))
-        .stderr(Stdio::from(
-            stderr
-                .try_clone()
-                .context("failed to clone attestation stderr file")?,
-        ));
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to run attestation-challenge-client {action}"))?;
-    let started = Instant::now();
-    let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed to wait for attestation {action}"))?
-        {
-            break (status, false);
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let status = child
-                .wait()
-                .with_context(|| format!("failed to reap timed out attestation {action}"))?;
-            break (status, true);
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-
-    stdout
-        .seek(SeekFrom::Start(0))
-        .context("failed to rewind attestation stdout")?;
-    stderr
-        .seek(SeekFrom::Start(0))
-        .context("failed to rewind attestation stderr")?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout
-        .read_to_end(&mut stdout_bytes)
-        .context("failed to read attestation stdout")?;
-    stderr
-        .read_to_end(&mut stderr_bytes)
-        .context("failed to read attestation stderr")?;
-    if timed_out {
+    if output.status.code() == Some(TIMEOUT_COMMAND_EXIT_CODE) {
         bail!(
             "attestation-challenge-client {action} timed out after {}s",
-            timeout.as_secs_f64()
+            timeout.as_secs()
         );
     }
-    let output = std::process::Output {
-        status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
-    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1163,7 +1142,6 @@ fn print_report_human(report: &AttestationReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn decode_jwt_claims_valid() {
@@ -1190,138 +1168,86 @@ mod tests {
     }
 
     #[test]
-    fn attestation_command_timeout_kills_and_reaps_child() {
-        let started = Instant::now();
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 2"]);
-        let error = run_attestation_challenge_client_with_timeout(
-            &mut command,
-            "test-timeout",
-            Duration::from_millis(50),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+    fn interpret_attestation_output_maps_timeout_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(TIMEOUT_COMMAND_EXIT_CODE << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let error =
+            interpret_attestation_output(output, "get-evidence", Duration::from_secs(20))
+                .unwrap_err();
+        assert!(error.to_string().contains("timed out after 20s"));
     }
 
     #[test]
-    fn attestation_command_timeout_helper_captures_output() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "printf result; printf warning >&2"]);
-        let output = run_attestation_challenge_client_with_timeout(
-            &mut command,
-            "test-output",
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(output.stdout, b"result");
-        assert_eq!(output.stderr, b"warning");
+    fn interpret_attestation_output_reports_failure_streams() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(7 << 8),
+            stdout: b"partial".to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        let error = interpret_attestation_output(output, "verify", Duration::from_secs(20))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("verify failed"));
+        assert!(error.contains("boom"));
+        assert!(error.contains("partial"));
     }
 
     #[test]
-    fn fetch_ear_token_runs_collect_and_verify_pipeline() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = dir.path().join("fake-attestation-client");
-        let claims = json!({
-            "submods": {
-                "cpu0": {
-                    "ear.trustworthiness-vector": {"hardware": 2}
-                }
-            }
-        });
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-case "$1" in
-  get-evidence)
-    shift
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--output" ]; then
-        shift
-        printf '{{}}' > "$1"
-        exit 0
-      fi
-      shift
-    done
-    exit 2
-    ;;
-  verify)
-    printf 'header.{payload}.signature\n'
-    ;;
-  *) exit 3 ;;
-esac
-"#
+    fn interpret_attestation_output_passes_success_through() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"jwt".to_vec(),
+            stderr: Vec::new(),
+        };
+        let output =
+            interpret_attestation_output(output, "verify", Duration::from_secs(20)).unwrap();
+        assert_eq!(output.stdout, b"jwt");
+    }
+
+    #[test]
+    fn verify_tool_args_lowercase_tee_and_default_policy() {
+        let args = verify_tool_args(Path::new("/work/evidence.json"), "TDX");
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strs,
+            vec![
+                "verify",
+                "--evidence",
+                "/work/evidence.json",
+                "--tee",
+                "tdx",
+                "--policy",
+                "default"
+            ]
         );
-        fs::write(&client, script).unwrap();
-        fs::set_permissions(&client, fs::Permissions::from_mode(0o700)).unwrap();
-
-        let report = fetch_ear_token_with_bin("127.0.0.1", "tdx", &client).unwrap();
-
-        assert_eq!(report.status, "ok");
-        assert_eq!(report.ear_claims, Some(claims));
-        assert!(report.ear_jwt.unwrap().starts_with("header."));
     }
 
     #[test]
-    fn fetch_evidence_retries_only_when_proxy_is_configured() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = dir.path().join("fake-attestation-client");
-        let script = r#"#!/bin/sh
-set -eu
-case "$1" in
-  get-evidence)
-    if [ "${NO_PROXY:-}" = "*" ]; then
-      echo 'direct route unavailable' >&2
-      exit 7
-    fi
-    shift
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--output" ]; then
-        shift
-        printf '{}' > "$1"
-        exit 0
-      fi
-      shift
-    done
-    exit 2
-    ;;
-  *) exit 3 ;;
-esac
-"#;
-        fs::write(&client, script).unwrap();
-        fs::set_permissions(&client, fs::Permissions::from_mode(0o700)).unwrap();
-        let evidence = tempfile::NamedTempFile::new().unwrap();
-
-        fetch_evidence_with_proxy_mode(&client, "http://127.0.0.1:8006", evidence.path(), true)
-            .unwrap();
-
-        assert_eq!(fs::read_to_string(evidence.path()).unwrap(), "{}");
-    }
-
-    #[test]
-    fn fetch_evidence_does_not_retry_without_a_proxy() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = dir.path().join("fake-attestation-client");
-        let attempts = dir.path().join("attempts");
-        let script = format!(
-            "#!/bin/sh\nprintf 'attempt\\n' >> '{}'\nexit 7\n",
-            attempts.display()
+    fn get_evidence_tool_args_target_aa_url_and_output() {
+        let args = get_evidence_tool_args("http://10.0.0.1:8006", Path::new("/work/e.json"));
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strs,
+            vec![
+                "get-evidence",
+                "--aa-url",
+                "http://10.0.0.1:8006",
+                "--output",
+                "/work/e.json"
+            ]
         );
-        fs::write(&client, script).unwrap();
-        fs::set_permissions(&client, fs::Permissions::from_mode(0o700)).unwrap();
-        let evidence = tempfile::NamedTempFile::new().unwrap();
-
-        let error = fetch_evidence_with_proxy_mode(
-            &client,
-            "http://127.0.0.1:8006",
-            evidence.path(),
-            false,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("status"));
-        assert_eq!(fs::read_to_string(attempts).unwrap(), "attempt\n");
     }
 
     #[test]
@@ -1373,7 +1299,11 @@ esac
             mesh_generation: 0,
             reference_values: "sample".to_string(),
         };
-        let report = collect_service_report(Path::new("/state"), &state);
+        let report = collect_service_report(
+            Path::new("/state"),
+            &state,
+            &AttestationVerifier::for_tests("confidential-agent-tools:test", PathBuf::from("/tmp")),
+        );
         assert_eq!(report.collect_status, "skipped");
         assert!(report.build.is_none());
         assert!(report.attestation.is_none());

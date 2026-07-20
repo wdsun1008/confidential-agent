@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn tools_container_args(cli: &Cli, spec: ToolContainerSpec) -> Vec<OsString> {
+pub(super) fn tools_container_args(tools_image: &str, spec: ToolContainerSpec) -> Vec<OsString> {
     let mut args = vec![OsString::from("run"), OsString::from("--rm")];
 
     if let Some(name) = spec.container_name {
@@ -32,7 +32,7 @@ pub(super) fn tools_container_args(cli: &Cli, spec: ToolContainerSpec) -> Vec<Os
         args.push(workdir.into_os_string());
     }
 
-    args.push(OsString::from(&cli.tools_image));
+    args.push(OsString::from(tools_image));
     args.push(OsString::from(spec.tool));
     args.extend(spec.tool_args);
     args
@@ -47,7 +47,7 @@ pub(super) fn run_tools_container(
     ensure_docker_image_available(&cli.tools_image)?;
     let container_name = spec.container_name.clone();
     let envs = spec.envs.clone();
-    let args = tools_container_args(cli, spec);
+    let args = tools_container_args(&cli.tools_image, spec);
     let mut command = Command::new("docker");
     command.args(args);
     for (key, value) in envs {
@@ -117,6 +117,22 @@ pub(super) fn run_tools_container(
     }
 
     result
+}
+
+pub(super) fn run_tools_container_output(
+    tools_image: &str,
+    spec: ToolContainerSpec,
+) -> Result<std::process::Output> {
+    ensure_docker_available()?;
+    ensure_docker_image_available(tools_image)?;
+    let envs = spec.envs.clone();
+    let args = tools_container_args(tools_image, spec);
+    let mut command = Command::new("docker");
+    command.args(args).stdin(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().context("failed to execute 'docker'")
 }
 
 static TOOL_CONTAINER_CLEANUP_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -876,7 +892,7 @@ mod tests {
             workdir: None,
             container_name: None,
         };
-        let args = tools_container_args(&cli, spec);
+        let args = tools_container_args(&cli.tools_image, spec);
         let strs: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().to_string())
@@ -902,7 +918,7 @@ mod tests {
             workdir: None,
             container_name: Some("my-container".to_string()),
         };
-        let args = tools_container_args(&cli, spec);
+        let args = tools_container_args(&cli.tools_image, spec);
         let strs: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().to_string())
@@ -926,7 +942,7 @@ mod tests {
             workdir: None,
             container_name: None,
         };
-        let args = tools_container_args(&cli, spec);
+        let args = tools_container_args(&cli.tools_image, spec);
         let strs: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().to_string())
@@ -946,7 +962,7 @@ mod tests {
             workdir: None,
             container_name: None,
         };
-        let args = tools_container_args(&cli, spec);
+        let args = tools_container_args(&cli.tools_image, spec);
         let strs: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().to_string())
@@ -966,7 +982,7 @@ mod tests {
             workdir: None,
             container_name: None,
         };
-        let args = tools_container_args(&cli, spec);
+        let args = tools_container_args(&cli.tools_image, spec);
         let strs: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().to_string())
@@ -987,7 +1003,7 @@ mod tests {
             workdir: Some(PathBuf::from("/work/project")),
             container_name: None,
         };
-        let args = tools_container_args(&cli, spec);
+        let args = tools_container_args(&cli.tools_image, spec);
         let strs: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().to_string())

@@ -68,7 +68,7 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         "tng-2.6.0",
         0o755,
     )?);
-    verify_guest_tng_binary(staged_guest_tng_bin.as_ref().unwrap())?;
+    verify_staged_guest_tng_binary(cli, staged_guest_tng_bin.as_ref().unwrap())?;
     let staged_attestation_client = stage_tools_image_asset(
         cli,
         guest_staging_dir,
@@ -229,6 +229,7 @@ pub(super) fn find_guest_tng_binary(candidates: &[PathBuf]) -> Result<PathBuf> {
     bail!("guest TNG 2.6.0 binary is required for builtin-AS mesh in test fixture ({checked})")
 }
 
+#[cfg(test)]
 pub(super) fn verify_guest_tng_binary(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!("guest TNG binary '{}' does not exist", path.display());
@@ -244,7 +245,45 @@ pub(super) fn verify_guest_tng_binary(path: &Path) -> Result<()> {
             output.status
         );
     }
-    let version_output = String::from_utf8_lossy(&output.stdout);
+    expect_tng_version(&output.stdout, path)
+}
+
+/// The staged binary links against guest-only libraries (e.g. libtdx-verify),
+/// so the version check must run inside the tools container, not on the host.
+fn verify_staged_guest_tng_binary(cli: &Cli, path: &Path) -> Result<()> {
+    let mount = absolute_path(
+        path.parent()
+            .with_context(|| format!("guest TNG path '{}' has no parent", path.display()))?,
+    )?;
+    let output = run_tools_container_output(
+        &cli.tools_image,
+        ToolContainerSpec {
+            tool: "sh",
+            tool_args: vec![
+                OsString::from("-c"),
+                OsString::from("exec \"$1\" --version"),
+                OsString::from("tng-version-check"),
+                absolute_path(path)?.into_os_string(),
+            ],
+            mounts: vec![mount],
+            envs: Vec::new(),
+            workdir: None,
+            container_name: None,
+        },
+    )?;
+    if !output.status.success() {
+        bail!(
+            "guest TNG binary '{}' failed version check with {}: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    expect_tng_version(&output.stdout, path)
+}
+
+fn expect_tng_version(stdout: &[u8], path: &Path) -> Result<()> {
+    let version_output = String::from_utf8_lossy(stdout);
     let version = version_output
         .lines()
         .next()
