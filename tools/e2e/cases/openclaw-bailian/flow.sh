@@ -30,7 +30,7 @@ assert_openclaw_init_output() {
   local spec="$OPENCLAW_DIR/openclaw.yaml"
   local install_script="$OPENCLAW_DIR/install-openclaw.sh"
 
-  grep -Fq "packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]" "$spec"
+  grep -Fq "packages: [ca-certificates, curl, dracut, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]" "$spec"
   grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
   grep -Fq "target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh" "$spec"
   grep -Fq "source: ./files/cai-a2a-plugin" "$spec"
