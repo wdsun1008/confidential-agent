@@ -440,7 +440,6 @@ impl DeployObservation {
 
 const DEFAULT_POLICY: &str = include_str!("../../tools/policies/trustee-opa-default.rego");
 const LOCAL_DEV_POLICY: &str = include_str!("../../tools/policies/trustee-opa-local-dev.rego");
-const TOOLS_DEFAULT_POLICY_PATH: &str = "/opt/confidential-agent/policies/trustee-opa-default.rego";
 const REQUIRED_GUEST_TNG_VERSION: &str = "tng 2.6.0";
 
 mod commands;

@@ -604,7 +604,7 @@ pub(super) fn render_connect_config(
                 },
                 "verify": {
                     "as_type": "builtin",
-                    "policy": connect_policy_config(),
+                    "policy": connect_policy_config(state_dir)?,
                     "policy_ids": ["default"],
                     "reference_values": reference_values,
                 }
@@ -618,15 +618,23 @@ pub(super) fn render_connect_config(
     }))
 }
 
-pub(super) fn render_agent_card_connect_config(card: &AgentCard) -> Result<serde_json::Value> {
-    render_agent_card_connect_config_with_port_checker(card, |port| !port_is_available(port))
+pub(super) fn render_agent_card_connect_config(
+    state_dir: &Path,
+    card: &AgentCard,
+) -> Result<serde_json::Value> {
+    render_agent_card_connect_config_with_port_checker(state_dir, card, |port| {
+        !port_is_available(port)
+    })
 }
 
 pub(super) fn render_agent_card_connect_config_with_port_checker(
+    state_dir: &Path,
     card: &AgentCard,
     is_occupied: impl Fn(u16) -> bool,
 ) -> Result<serde_json::Value> {
     let ext = confidential_extension(card)?;
+    let policy_path = host_default_policy_path(state_dir)?;
+    let policy_path = policy_path.to_string_lossy();
     let mut used_local_ports = BTreeSet::new();
     let mut client_endpoints = Vec::new();
     let control_port = allocate_local_port(50000, &is_occupied)?;
@@ -657,6 +665,7 @@ pub(super) fn render_agent_card_connect_config_with_port_checker(
             Ok(local_port)
         },
         control_port,
+        &policy_path,
     )?;
     if let serde_json::Value::Object(map) = &mut config {
         map.insert(
@@ -711,11 +720,11 @@ pub(super) fn connect_host(service: &LocalServiceState) -> Result<&str> {
         .with_context(|| format!("service '{}' has no public_ip", service.service_id))
 }
 
-pub(super) fn connect_policy_config() -> serde_json::Value {
-    serde_json::json!({
+pub(super) fn connect_policy_config(state_dir: &Path) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
         "type": "path",
-        "path": TOOLS_DEFAULT_POLICY_PATH,
-    })
+        "path": host_default_policy_path(state_dir)?,
+    }))
 }
 
 pub(super) fn connect_reference_values(
@@ -1239,9 +1248,12 @@ mod tests {
 
     #[test]
     fn connect_policy_config_structure() {
-        let config = connect_policy_config();
+        let config = connect_policy_config(Path::new("/state")).unwrap();
         assert_eq!(config["type"], "path");
-        assert!(config["path"].as_str().unwrap().contains("rego"));
+        assert_eq!(
+            config["path"],
+            "/state/attestation/token/ear/policies/opa/default.rego"
+        );
     }
 
     #[test]
@@ -1542,7 +1554,11 @@ resources: {}
             supports_authenticated_extended_card: None,
             signatures: vec![],
         };
-        let config = render_agent_card_connect_config_with_port_checker(&card, |_| false).unwrap();
+        let config =
+            render_agent_card_connect_config_with_port_checker(Path::new("/state"), &card, |_| {
+                false
+            })
+            .unwrap();
         assert!(config["add_ingress"].is_array());
         assert!(config["client_endpoints"].is_array());
         assert!(config["control_interface"].is_object());

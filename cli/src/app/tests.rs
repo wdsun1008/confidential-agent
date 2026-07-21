@@ -3716,10 +3716,11 @@ fn test_agent_card(ports: Vec<u16>) -> AgentCard {
 fn from_card_connect_allocates_available_local_ports() {
     let card = test_agent_card(vec![18789, 18790]);
 
-    let config = render_agent_card_connect_config_with_port_checker(&card, |port| {
-        port == 18789 || port == 50000
-    })
-    .unwrap();
+    let config =
+        render_agent_card_connect_config_with_port_checker(Path::new("/state"), &card, |port| {
+            port == 18789 || port == 50000
+        })
+        .unwrap();
 
     assert_eq!(config["control_interface"]["restful"]["port"], 50001);
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);

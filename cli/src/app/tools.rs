@@ -480,9 +480,17 @@ pub(super) fn run_attestation_tool(
     )
 }
 
+pub(super) fn attestation_workdir_path(state_dir: &Path) -> Result<PathBuf> {
+    Ok(absolute_path(state_dir)?.join("attestation"))
+}
+
+pub(super) fn host_default_policy_path(state_dir: &Path) -> Result<PathBuf> {
+    Ok(attestation_workdir_path(state_dir)?.join("token/ear/policies/opa/default.rego"))
+}
+
 pub(super) fn ensure_attestation_workdir(state_dir: &Path) -> Result<PathBuf> {
-    let root = absolute_path(state_dir)?.join("attestation");
-    let policy = root.join("token/ear/policies/opa/default.rego");
+    let root = attestation_workdir_path(state_dir)?;
+    let policy = host_default_policy_path(state_dir)?;
     let parent = policy
         .parent()
         .with_context(|| format!("policy path '{}' has no parent", policy.display()))?;

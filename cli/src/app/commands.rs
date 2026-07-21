@@ -810,7 +810,8 @@ pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
     let tng_config = tng_launch_config(&config);
     let config_content = serde_json::to_string(&tng_config)?;
     let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
-    let mounts = vec![workdir.clone()];
+    let attestation_workdir = ensure_attestation_workdir(&cli.state_dir)?;
+    let mounts = vec![workdir.clone(), attestation_workdir];
 
     run_tools_container(
         cli,
@@ -852,7 +853,7 @@ fn resolve_connect_config(
         let card = fetch_agent_card(url)
             .map_err(anyhow::Error::new)
             .with_context(|| format!("failed to fetch AgentCard from '{url}'"))?;
-        render_agent_card_connect_config(&card)
+        render_agent_card_connect_config(&cli.state_dir, &card)
     } else {
         render_connect_config(&cli.state_dir, service)
     }
@@ -880,7 +881,8 @@ fn cmd_connect_start(
     let tng_config = tng_launch_config(&config);
     let config_content = serde_json::to_string(&tng_config)?;
     let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
-    let mounts = vec![workdir.clone()];
+    let attestation_workdir = ensure_attestation_workdir(&cli.state_dir)?;
+    let mounts = vec![workdir.clone(), attestation_workdir];
     guard_existing_connect_ready(&args.ready_json)?;
     let container_name = connect_container_name();
     let container_id = start_tools_container_detached(

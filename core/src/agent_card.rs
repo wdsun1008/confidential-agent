@@ -124,14 +124,18 @@ pub fn agent_card_reference_values(card: &AgentCard) -> Result<Value> {
     }]))
 }
 
+pub const DEFAULT_TNG_POLICY_PATH: &str =
+    "/opt/confidential-agent/policies/trustee-opa-default.rego";
+
 pub fn derive_tng_client_config(card: &AgentCard) -> Result<Value> {
-    derive_tng_client_config_with_local_ports(card, Ok, 50000)
+    derive_tng_client_config_with_local_ports(card, Ok, 50000, DEFAULT_TNG_POLICY_PATH)
 }
 
 pub fn derive_tng_client_config_with_local_ports(
     card: &AgentCard,
     mut local_port_for: impl FnMut(u16) -> Result<u16>,
     control_port: u16,
+    policy_path: &str,
 ) -> Result<Value> {
     let ext = confidential_extension(card)?;
     let reference_values = agent_card_reference_values(card)?;
@@ -153,7 +157,7 @@ pub fn derive_tng_client_config_with_local_ports(
                 "as_type": "builtin",
                 "policy": {
                     "type": "path",
-                    "path": "/opt/confidential-agent/policies/trustee-opa-default.rego",
+                    "path": policy_path,
                 },
                 "policy_ids": ["default"],
                 "reference_values": reference_values,
@@ -553,7 +557,8 @@ mod tests {
     #[test]
     fn derive_tng_config_with_custom_port_mapping() {
         let card = test_card();
-        let config = derive_tng_client_config_with_local_ports(&card, |_| Ok(9999), 50000).unwrap();
+        let config = derive_tng_client_config_with_local_ports(&card, |_| Ok(9999), 50000, DEFAULT_TNG_POLICY_PATH)
+                .unwrap();
         let ingress = config["add_ingress"].as_array().unwrap();
         assert_eq!(ingress[0]["mapping"]["in"]["port"], 9999);
         assert_eq!(config["control_interface"]["restful"]["port"], 50000);
@@ -566,6 +571,7 @@ mod tests {
             &card,
             |_| anyhow::bail!("port conflict"),
             50000,
+            DEFAULT_TNG_POLICY_PATH,
         );
         assert!(result.is_err());
     }
