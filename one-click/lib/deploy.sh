@@ -183,8 +183,35 @@ build_openclaw_image() {
     log "skipping $CA_SERVICE_LABEL image build"
     return
   fi
+  local phase
+  phase="$(openclaw_phase || true)"
+  if [[ "$phase" == "deployed" || "$phase" == "active" ]]; then
+    log "$CA_SERVICE_LABEL is $phase; skipping image build (existing deployment detected)"
+    return
+  fi
   log "building $CA_SERVICE_LABEL confidential image"
   (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" build --spec "$CA_SPEC_PATH")
+}
+
+openclaw_phase() {
+  local status_json="$CA_WORK_DIR/status-local.json"
+  ca_cmd status --json >"$status_json" 2>/dev/null || return 1
+  python3.11 - "$status_json" "$CA_SERVICE_ID" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+items = data if isinstance(data, list) else data.get("services", [])
+service_id = sys.argv[2]
+for item in items:
+    if item.get("service_id") == service_id:
+        phase = item.get("phase")
+        if phase:
+            print(phase)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 openclaw_is_active() {
@@ -260,6 +287,15 @@ deploy_openclaw_service() {
   if openclaw_is_active; then
     log "$CA_SERVICE_LABEL is already active; skipping cloud deploy"
     CA_DEPLOY_SKIPPED_ACTIVE=1
+    return
+  fi
+  local phase
+  phase="$(openclaw_phase || true)"
+  if [[ "$phase" == "deployed" ]]; then
+    local public_ip
+    public_ip="$(openclaw_public_ip)" || die "$CA_SERVICE_LABEL is deployed but has no recorded public IP; run 'confidential-agent destroy $CA_SERVICE_ID' and redeploy"
+    log "$CA_SERVICE_LABEL is deployed but not active; resuming from resource injection to $public_ip"
+    (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" inject --spec "$CA_SPEC_PATH" --target-ip "$public_ip")
     return
   fi
   log "deploying $CA_SERVICE_LABEL to Aliyun"
