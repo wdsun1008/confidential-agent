@@ -13,6 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/cai/pep/policy.json";
 const DEFAULT_SOCKET_PATH: &str = "/run/cai/pep.sock";
+const GUEST_POLICY_SOURCE_PATH: &str = "/opt/confidential-agent/policies/trustee-opa-default.rego";
+const DEFAULT_ATTESTATION_WORK_DIR: &str = "/var/lib/attestation";
+const GUEST_REFERENCE_VALUE_LIST_PATH: &str = "/opt/confidential-agent/reference-value-list.json";
 
 fn main() {
     if let Err(err) = run_main() {
@@ -532,6 +535,33 @@ fn execute_attestation_request(
     stderr_max_bytes: usize,
     timeout_secs: u64,
 ) -> Result<ExecOutput, String> {
+    let mut prepare_warnings = String::new();
+    if let Err(err) = ensure_attestation_policy(
+        Path::new(GUEST_POLICY_SOURCE_PATH),
+        &attestation_work_dir(),
+    ) {
+        prepare_warnings.push_str(&format!("cai-pep attest: policy setup skipped: {err}\n"));
+    }
+    if let Some(mut load) =
+        reference_value_load_command(Path::new(GUEST_REFERENCE_VALUE_LIST_PATH))
+    {
+        load.stdout(Stdio::piped()).stderr(Stdio::piped());
+        match run_command_and_capture(&mut load, stdout_max_bytes, stderr_max_bytes, timeout_secs)
+        {
+            Ok(output) if output.exit_code != 0 => {
+                prepare_warnings.push_str(&format!(
+                    "cai-pep attest: reference value load failed: {}\n",
+                    output.stderr.trim_end()
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                prepare_warnings
+                    .push_str(&format!("cai-pep attest: reference value load failed: {err}\n"));
+            }
+        }
+    }
+
     let evidence_path = format!(
         "/tmp/cai-pep-attestation-{}-{}.json",
         now_ms(),
@@ -590,12 +620,49 @@ fn execute_attestation_request(
         (left, "") => format!("{left}\n"),
         (left, right) => format!("{left}\n{right}\n"),
     };
+    let stderr = format!("{prepare_warnings}{stderr}");
 
     Ok(ExecOutput {
         stdout: verify_output.stdout,
         stderr,
         exit_code: verify_output.exit_code,
     })
+}
+
+fn attestation_work_dir() -> PathBuf {
+    env::var_os("ATTESTATION_CHALLENGE_CLIENT_WORK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ATTESTATION_WORK_DIR))
+}
+
+fn ensure_attestation_policy(source: &Path, work_dir: &Path) -> Result<(), String> {
+    let policy = fs::read(source).map_err(|err| format!("read '{}': {err}", source.display()))?;
+    let target = work_dir.join("token/ear/policies/opa/default.rego");
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("policy path '{}' has no parent", target.display()))?;
+    fs::create_dir_all(parent).map_err(|err| format!("create '{}': {err}", parent.display()))?;
+    fs::write(&target, policy).map_err(|err| format!("write '{}': {err}", target.display()))
+}
+
+fn reference_value_load_command(rv_path: &Path) -> Option<Command> {
+    let content = fs::read_to_string(rv_path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    let mut command = Command::new("/usr/bin/attestation-challenge-client");
+    if value.get("rv_list").is_some() {
+        command
+            .arg("set-reference-value-list")
+            .arg("--rv-list")
+            .arg(rv_path);
+    } else {
+        command
+            .arg("set-reference-value")
+            .arg("--provenance-type")
+            .arg("sample")
+            .arg("--payload")
+            .arg(rv_path);
+    }
+    Some(command)
 }
 
 fn run_exec_in_docker(
@@ -1131,6 +1198,77 @@ mod tests {
             PepError::PolicyDeny { rule_id, .. } => rule_id,
             other => panic!("expected PolicyDeny, got {other:?}"),
         }
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn ensure_attestation_policy_writes_and_overwrites_workdir_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("policy.rego");
+        fs::write(&source, "package policy\n").unwrap();
+        let work_dir = dir.path().join("work");
+        let target = work_dir.join("token/ear/policies/opa/default.rego");
+
+        ensure_attestation_policy(&source, &work_dir).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "package policy\n");
+
+        fs::write(&target, "stale upstream policy").unwrap();
+        ensure_attestation_policy(&source, &work_dir).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "package policy\n");
+    }
+
+    #[test]
+    fn ensure_attestation_policy_fails_when_source_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            ensure_attestation_policy(&dir.path().join("missing.rego"), dir.path()).unwrap_err();
+        assert!(err.contains("missing.rego"));
+    }
+
+    #[test]
+    fn reference_value_load_command_uses_list_subcommand_for_rv_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rv.json");
+        fs::write(&path, r#"{"rv_list":[{"id":"x"}]}"#).unwrap();
+        let command = reference_value_load_command(&path).unwrap();
+        let args = command_args(&command);
+        assert_eq!(args[0], "set-reference-value-list");
+        assert_eq!(args[1], "--rv-list");
+        assert_eq!(args[2], path.display().to_string());
+    }
+
+    #[test]
+    fn reference_value_load_command_uses_sample_subcommand_for_sample_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rv.json");
+        fs::write(&path, r#"{"measurement.uki.SHA-384":["abc"]}"#).unwrap();
+        let command = reference_value_load_command(&path).unwrap();
+        let args = command_args(&command);
+        assert_eq!(
+            args,
+            vec![
+                "set-reference-value".to_string(),
+                "--provenance-type".to_string(),
+                "sample".to_string(),
+                "--payload".to_string(),
+                path.display().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_value_load_command_skips_missing_or_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(reference_value_load_command(&dir.path().join("absent.json")).is_none());
+        let invalid = dir.path().join("invalid.json");
+        fs::write(&invalid, "not json").unwrap();
+        assert!(reference_value_load_command(&invalid).is_none());
     }
 
     #[test]
