@@ -315,6 +315,16 @@ run_case() {
     grep -Eq "cai-pep|collect-and-verify|attest" "$WORK_DIR/codex-tdx-skill.out"
   fi
 
+  record "- Guest self-attestation vector matches host CLI verification (all-pass)."
+  record_cmd "ssh codex 'cai-pep attest collect-and-verify --claims'"
+  ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$host" \
+    "cai-pep attest collect-and-verify --aa-url http://localhost:8006 --tee tdx --policy default --claims" \
+    >"$WORK_DIR/guest-self-attest.out" 2>&1
+  grep -Eq '"hardware":[[:space:]]*2' "$WORK_DIR/guest-self-attest.out"
+  grep -Eq '"executables":[[:space:]]*3' "$WORK_DIR/guest-self-attest.out"
+  grep -Eq '"configuration":[[:space:]]*2' "$WORK_DIR/guest-self-attest.out"
+  grep -Eq '"file-system":[[:space:]]*2' "$WORK_DIR/guest-self-attest.out"
+
   local connect_port
   connect_port="$(start_connect_until_http_ready "$STATE_DIR" codex /readyz 4 180 --service codex)"
   record "Connect mapped Codex app-server to \`127.0.0.1:$connect_port\`."
