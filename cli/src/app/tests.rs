@@ -2970,6 +2970,29 @@ fn live_status_skips_deleted_services() {
 }
 
 #[test]
+fn guest_reference_value_source_resolves_mode_specific_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = context_paths(temp.path(), "svc");
+    fs::create_dir_all(&paths.service_dir).unwrap();
+
+    assert!(guest_reference_value_source(&paths, None, "rekor").is_none());
+    let rekor = paths.service_dir.join("rekor-rv-list.json");
+    fs::write(&rekor, r#"{"rv_list":[]}"#).unwrap();
+    assert_eq!(
+        guest_reference_value_source(&paths, None, "rekor"),
+        Some(rekor)
+    );
+
+    let sample = paths.service_dir.join("shelter-reference-values.json");
+    assert!(guest_reference_value_source(&paths, Some(&sample), "sample").is_none());
+    fs::write(&sample, r#"{"measurement.uki.SHA-384":["abc"]}"#).unwrap();
+    assert_eq!(
+        guest_reference_value_source(&paths, Some(&sample), "sample"),
+        Some(sample)
+    );
+}
+
+#[test]
 fn inject_requires_existing_managed_state() {
     let temp = tempfile::tempdir().unwrap();
     let spec = temp.path().join("confidential-agent.yaml");

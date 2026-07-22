@@ -28,6 +28,25 @@ pub(super) fn inject_resources(
 
     let mut bootstrap = render_bootstrap(&paths, spec)?;
 
+    let guest_rv_source = guest_reference_value_source(
+        &paths,
+        artifacts.sample_rv.as_ref(),
+        reference_value_mode_name(spec.attestation.reference_values),
+    );
+    if let Some(source) = &guest_rv_source {
+        bootstrap.resources.push(GuestResource {
+            id: REFERENCE_VALUE_LIST_RESOURCE_ID.to_string(),
+            resource_path: resource_path(REFERENCE_VALUE_LIST_RESOURCE_ID),
+            target: PathBuf::from(GUEST_REFERENCE_VALUE_LIST_PATH),
+            owner: None,
+            group: None,
+            mode: "0644".to_string(),
+            required: true,
+            mutable: true,
+            sha256: Some(sha256_file(source)?),
+        });
+    }
+
     if spec.a2a.as_ref().is_some_and(|a2a| a2a.enabled) {
         let rekor_path = artifacts.rekor_meta.as_ref().with_context(|| {
             format!(
@@ -65,6 +84,17 @@ pub(super) fn inject_resources(
         &paths.bootstrap_file,
         tee,
     )?;
+
+    if let Some(source) = &guest_rv_source {
+        challenge_inject(
+            cli,
+            state_dir,
+            target_ip,
+            &resource_path(REFERENCE_VALUE_LIST_RESOURCE_ID),
+            source,
+            tee,
+        )?;
+    }
 
     let disk_passphrase = match &spec.secrets.disk_passphrase {
         Some(path) => {
@@ -112,6 +142,20 @@ pub(super) fn inject_resources(
 
     println!("injected resources for service {}", spec.service.id);
     Ok(())
+}
+
+pub(super) fn guest_reference_value_source(
+    paths: &ContextPaths,
+    sample_rv: Option<&PathBuf>,
+    mode: &str,
+) -> Option<PathBuf> {
+    match mode {
+        "rekor" => {
+            let path = paths.service_dir.join("rekor-rv-list.json");
+            path.exists().then_some(path)
+        }
+        _ => sample_rv.filter(|path| path.exists()).cloned(),
+    }
 }
 
 pub(super) fn write_bootstrap_file(path: &Path, bootstrap: &BootstrapConfig) -> Result<()> {

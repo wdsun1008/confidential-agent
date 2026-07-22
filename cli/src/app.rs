@@ -423,6 +423,8 @@ struct ImageListEntry {
 const MAX_SHELTER_IMAGE_BUCKET_LEN: usize = 63;
 const SHELTER_IMAGE_BUCKET_SUFFIX: &str = "-images";
 const A2A_BUNDLE_RESOURCE: &str = "default/local-resources/cagent_a2a_bundle";
+const REFERENCE_VALUE_LIST_RESOURCE_ID: &str = "cagent_reference_value_list";
+const GUEST_REFERENCE_VALUE_LIST_PATH: &str = "/opt/confidential-agent/reference-value-list.json";
 
 impl DeployObservation {
     fn preferred_injection_ip(&self) -> Option<String> {
