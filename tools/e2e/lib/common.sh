@@ -249,13 +249,13 @@ register_destroy_target() {
 
 cleanup_connects() {
   local ready_file
-  for ready_file in "${E2E_CONNECT_READY_FILES[@]:-}"; do
+  for ready_file in "${E2E_CONNECT_READY_FILES[@]}"; do
     cleanup_connect_ready "$ready_file"
   done
   E2E_CONNECT_READY_FILES=()
 
   local pid
-  for pid in "${E2E_CONNECT_PIDS[@]:-}"; do
+  for pid in "${E2E_CONNECT_PIDS[@]}"; do
     [[ -n "$pid" ]] || continue
     kill -- "-$pid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
     wait "$pid" >/dev/null 2>&1 || true
@@ -266,12 +266,17 @@ cleanup_connects() {
 
 destroy_registered_resources() {
   local reason="$1"
-  local target state_dir service
-  for target in "${E2E_DESTROY_TARGETS[@]:-}"; do
+  local target state_dir service phase
+  for target in "${E2E_DESTROY_TARGETS[@]}"; do
     state_dir="${target%%|*}"
     service="${target#*|}"
     if [[ ! -f "$state_dir/services/$service/manifest.json" ]]; then
       record "- destroy $service: skipped; no manifest in $state_dir."
+      continue
+    fi
+    phase="$(state_value "$state_dir" "$service" phase 2>/dev/null || true)"
+    if [[ "$phase" == "deleted" ]]; then
+      record "- destroy $service: skipped; phase=deleted (formal destroy already completed)."
       continue
     fi
     log "destroying $service ($reason)"
@@ -295,6 +300,9 @@ finish_e2e() {
     elif [[ "$status" != "0" && "$DESTROY_ON_FAILURE" == "1" ]]; then
       destroy_registered_resources failure || true
     fi
+  fi
+  if declare -f case_post_destroy_cleanup >/dev/null 2>&1; then
+    case_post_destroy_cleanup "$status" || true
   fi
   record ""
   if [[ "$status" == "0" ]]; then
@@ -419,17 +427,17 @@ init_common_args() {
 
 use_aliyun_cli_profile() {
   command -v aliyun >/dev/null 2>&1 || return 1
-  aliyun sts GetCallerIdentity >/dev/null 2>&1 || return 1
-  if [[ -n "${ALICLOUD_PROFILE:-}" || -n "${ALIBABA_CLOUD_PROFILE:-}" ]]; then
-    return 0
+  local profile="${ALICLOUD_PROFILE:-${ALIBABA_CLOUD_PROFILE:-}}"
+  if [[ -z "$profile" ]]; then
+    local profile_line
+    profile_line="$(aliyun configure get profile 2>/dev/null || true)"
+    profile_line="${profile_line%%$'\n'*}"
+    [[ "$profile_line" == profile=* ]] || return 1
+    profile="${profile_line#profile=}"
+    profile="${profile%$'\r'}"
   fi
-  local profile_line profile
-  profile_line="$(aliyun configure get profile 2>/dev/null || true)"
-  profile_line="${profile_line%%$'\n'*}"
-  [[ "$profile_line" == profile=* ]] || return 1
-  profile="${profile_line#profile=}"
-  profile="${profile%$'\r'}"
   [[ -n "$profile" ]] || return 1
+  aliyun --profile "$profile" sts GetCallerIdentity >/dev/null 2>&1 || return 1
   export ALICLOUD_PROFILE="$profile"
 }
 
@@ -954,13 +962,19 @@ run_openclaw_chat_probe() {
   local output="$5"
   shift 5
   record_cmd "node tools/e2e/probes/openclaw-chat-probe.mjs --url $url --token '<redacted>' --message '<redacted>' --expect $expect"
-  node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
+  local probe_status=0
+  if node "$ROOT_DIR/tools/e2e/probes/openclaw-chat-probe.mjs" \
     --url "$url" \
     --token "$token" \
     --message "$message" \
     --expect "$expect" \
-    "$@" | tee "$output"
+    "$@" | tee "$output"; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
   record_file_as_block "OpenClaw chat probe:" "$output" json
+  return "$probe_status"
 }
 
 run_report_probe() {
