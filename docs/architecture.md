@@ -38,7 +38,7 @@ flowchart LR
     S[("AgentSpec<br/>confidential-agent/v1<br/>(用户写)")]
     S -->|render_build_config| SH["Shelter build YAML<br/>(host 内部)"]
     S -->|render_bootstrap| BS[("BootstrapConfig<br/>confidential-agent/bootstrap/v1")]
-    S -->|state.json| LS[("LocalServiceState<br/>confidential-agent/service-state/v1<br/>(host 持久化)")]
+    S -->|state.json| LS[("LocalServiceState<br/>confidential-agent/service-state/v1<br/>(host 持久化 + mode 快照)")]
     LS -->|render_mesh_bundle| MB[("MeshBundle<br/>confidential-agent/mesh-bundle/v1")]
 
     BS -.->|attested inject| GD["Guest daemon<br/>read_bootstrap"]
@@ -92,6 +92,8 @@ sequenceDiagram
 
 ## 4. `deploy` 端到端流程
 
+下图是 challenge 分支。Trustee 分支复用相同 build 产物，但在创建基础设施前先把 boot 资源同步到独立 KBS，并把 canonical Trustee runtime JSON 作为 ECS user-data；Guest 自己证明和拉取资源，不执行远程 `inject-resource`。完整时序见 [`trustee.md`](trustee.md)。
+
 ```mermaid
 sequenceDiagram
     participant U as User
@@ -124,7 +126,8 @@ sequenceDiagram
 
     rect rgb(245,255,245)
     note over CLI,G: 远程证明通道注入资源
-    CLI->>G: TDX boot, initrd 起 confidential-agentd initrd-fetch
+    CLI->>G: TDX boot, initrd 启动 CryptPilot
+    G->>G: NTP 校时后由 exec provider 调用 confidential-agentd initrd-fetch
     G->>G: 等 disk_passphrase 到位（fail-closed: 超时 poweroff）
     CLI->>ACC: inject-resource bootstrap.json (challenge over :8006)
     CLI->>ACC: inject-resource disk_passphrase
@@ -140,7 +143,7 @@ sequenceDiagram
     CLI-->>U: deploy completed: public_ip=… private_ip=… mesh_generation=…
 ```
 
-注入采用 `inject-resource` over `http://<ip>:8006`，对应代码 [`cli/src/app/tools.rs::challenge_inject`](../cli/src/app/tools.rs)。每个资源会先尝试 direct 网络，失败后 fallback 走 host 的代理环境变量。
+challenge 注入采用 `inject-resource` over `http://<ip>:8006`，对应代码 [`cli/src/app/tools.rs::challenge_inject`](../cli/src/app/tools.rs)。每个资源会先尝试 direct 网络，失败后 fallback 走 host 的代理环境变量。Trustee mode 不依赖 operator 到 Guest `:8006` 的入站连通性。
 
 `image publish` 会把 build 产物预先导入为阿里云自定义镜像，并把 provider、region、variant、build id、镜像 hash 与 image id 记录在本地 state。`deploy` 只在这些字段匹配且发布状态为 `available` 时复用该 image；`destroy` 负责运行资源，published image 的删除由 `image unpublish` 或 `image prune` 管理。
 
@@ -153,23 +156,25 @@ flowchart TB
     A["Aliyun TDX firmware"] --> B["UEFI"]
     B --> C["UKI (kernel + initrd + cmdline)"]
     C --> D["initrd:<br/>shelter-initrd-network<br/>+ confidential-computing-attestation"]
-    D --> E["confidential-agent-secret-fetch.service<br/>(=confidential-agentd initrd-fetch)"]
-    E --> F{"等到 bootstrap.json<br/>+ disk_passphrase ?"}
-    F -- No (timeout) --> X["systemctl poweroff<br/>(fail-closed)"]
-    F -- Yes --> G["写 /run/cai/secrets/disk_key"]
-    G --> H["cryptpilot-fde-before-sysroot.service<br/>(读 disk_key 解锁)"]
+    D --> E["cryptpilot-fde-before-sysroot.service<br/>先 best-effort 执行 Alibaba ECS NTP 校时"]
+    E --> F["CryptPilot exec provider<br/>调用 confidential-agentd initrd-fetch"]
+    F --> Q{"从 challenge 或 Trustee 取得<br/>bootstrap + disk_passphrase ?"}
+    Q -- No (timeout) --> X["systemctl poweroff<br/>(fail-closed)"]
+    Q -- Yes --> G["写 /run/cai/secrets/disk_key<br/>仅把 key 输出给 CryptPilot"]
+    G --> H["CryptPilot 解锁持久 delta"]
     H --> I["switch_root → rootfs"]
-    I --> J["multi-user.target"]
+    I --> J["switch_root 后 Trustee mode<br/>重新登记 runtime-config AAEL"]
+    J --> J0["multi-user.target"]
 
-    J --> K1["confidential-agentd.service<br/>run mode<br/>:8088 status"]
-    J --> K2["trustiflux-api-server<br/>:8006 inject API<br/>+ attestation-agent.sock"]
-    J --> K3["trusted-network-gateway.service<br/>(等 attestation-agent.sock)"]
+    J0 --> K1["confidential-agentd.service<br/>run mode<br/>:8088 status"]
+    J0 --> K2["trustiflux-api-server<br/>:8006 challenge API<br/>+ attestation-agent.sock"]
+    J0 --> K3["trusted-network-gateway.service<br/>(等 attestation-agent.sock)"]
     K1 --> M["持续 apply bootstrap → 写 /etc/tng/config.json → restart TNG"]
     K1 --> N["按 spec.service.app_service<br/>启动并检查应用 service + ports"]
 ```
 
 关键 systemd unit 与依赖关系来自三处：
-- daemon 嵌入的 unit 文本：[`agentd_service_unit`](../cli/src/app.rs)、[`secret_fetch_service_unit`](../cli/src/app.rs)。
+- daemon 嵌入的 rootfs unit 文本：[`agentd_service_unit`](../cli/src/app.rs)。initrd 不再创建独立 secret-fetch unit；[`cryptpilot_fde_config`](../cli/src/app.rs) 的 `exec` provider 在 CryptPilot 校时后直接调用 `confidential-agentd initrd-fetch`。
 - mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 把 `hack/tng-2.6.0` 覆盖安装到 `/usr/bin/tng`，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。`libtdx-verify` 由 Alinux3 软件源安装，不再作为仓库内 RPM 注入。
 - 每个示例自己的 `install-*.sh`，例如 [`examples/openclaw/install-openclaw.sh`](../examples/openclaw/install-openclaw.sh) 注册 `cai-openclaw-gateway.service`；spec 的 `service.app_service` 决定 daemon 是否把该 unit 纳入 `app_ready` 判定。
 
@@ -198,7 +203,7 @@ flowchart TB
 
 下发链路：
 1. CLI [`render_mesh_bundle`](../cli/src/app/workflows.rs) 生成 → host 持久化为 `<state-dir>/mesh-bundle.json`。
-2. 通过 `attestation-challenge-client inject-resource default/local-resources/cagent_mesh_bundle` 推到每台 Guest。
+2. 对每个 active service 按部署时写入的 mode 快照和 Trustee state membership 分流，不重新读取可变 AppSpec：challenge 使用 `attestation-challenge-client inject-resource`，Trustee 上传到该 service 的 KBS namespace；两份 durable state 不一致时 fail closed。
 3. Guest daemon [`sync_mesh`](../daemon/src/app.rs) 读到后：
    - 写 `/var/cache/confidential-agent/mesh-bundle.json`（持久化）；
    - 写 `/etc/cai/service-directory.json`（包含对端 `connect` 与 `mesh_ports`，每个端口标记 `mode=connect|mesh`，应用读这个文件做服务发现；无端口 peer 不会作为被调用目标出现）；
@@ -308,7 +313,7 @@ sequenceDiagram
 | 需要持续观察 daemon、TEE policy、UKI/Rekor、服务地址和 Mesh/Connect 端口 | 一次性 `status --live` 不便对比状态变化 | 运行 `confidential-agent tui`；按 `v` 可立即重新校验所选 agent 的远程 evidence |
 | `connect` 报 `mesh bundle has no reference values` | 还没 deploy 过 / sample_rv 文件被手删 | 重新 `deploy` 或 `mesh sync` |
 | Rekor 注册失败 | 网络到不了 `rekor_url`、cosign 签名失败 | 重新构建 tools 镜像并检查 cosign 公私钥、SLSA generator 与 Rekor 可达性 |
-| initrd 阶段 Guest 直接关机 | initrd-fetch 在 `CA_SECRET_WAIT_TIMEOUT_SEC` 超时 | 这是设计的 fail-closed；扩大超时或先看 inject-resource 是不是一直没成功 |
+| initrd 阶段 Guest 直接关机 | initrd-fetch 在 `CA_SECRET_WAIT_TIMEOUT_SEC` 超时 | 这是设计的 fail-closed；challenge 检查 inject-resource，Trustee 检查 IMDSv2 user-data、AAEL 和 KBS 可达性 |
 
 ---
 

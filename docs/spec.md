@@ -229,7 +229,7 @@ Build 输出也使用 Shelter master schema：`build.resize` 渲染为顶层 `di
 ```yaml
 attestation:
   tee: tdx                       # 当前仅 tdx
-  mode: challenge                # 当前仅 challenge（trustee 已预留但未实现）
+  mode: challenge                # challenge（默认工作流）| trustee
   reference_values: rekor        # sample（默认） | rekor
   rekor:                         # 仅 reference_values=rekor 时必需
     artifact_id: openclaw-agent-release   # 可选，默认 = build_id
@@ -245,7 +245,7 @@ attestation:
 | 字段 | 类型 | 必填 | 校验 |
 |---|---|:-:|---|
 | `tee` | enum | ✅ | `tdx` |
-| `mode` | enum | ✅ | `challenge`（`trustee` 解析能识别但执行会被 [`ensure_mvp_supported`](../core/src/spec.rs) 拒绝） |
+| `mode` | enum | ✅ | `challenge` 或 `trustee`；Trustee URL 是 CLI 全局运行时配置，不写入 AppSpec 或镜像 |
 | `reference_values` | enum | ❌ | 默认 `sample`；可选 `rekor`。若选 `rekor` 则 `attestation.rekor` 必填 |
 | `rekor` | object | 条件必填 | `artifact_type` 与 `rekor_url` 非空；`required=true` 时 `cosign_key` 必填 |
 
@@ -260,7 +260,10 @@ confidential-agent key generate-cosign --output-key-prefix ./cosign
 | 模式 | 来源 | 适用场景 | 失败行为 |
 |---|---|---|---|
 | `sample` | Shelter build 时本地生成的 sample reference value | 开发自验、QEMU 本地、policy=trustee-opa-local-dev | 验证不过，连接失败 |
-| `rekor` | Shelter 产出 in-toto SLSA provenance → tools 镜像内的 cosign/rekor-cli 签名并推 Rekor → 注入到 Trustee | 生产、对外可证明 | `required=true` 时整链失败；CLI 在 `set-reference-value-list` 阶段会做有限重试 |
+| `rekor` | Shelter 产出 in-toto SLSA provenance → tools 镜像内的 cosign/rekor-cli 签名并推 Rekor → 注册到验证服务 | 生产、对外可证明 | `required=true` 时整链失败；CLI 在 reference-value 阶段会做有限重试 |
+
+Trustee 的全局配置、接管、资源 namespace、重启与销毁语义见 [`docs/trustee.md`](trustee.md)。一个 CLI state directory 对应一个 Trustee，AppSpec 只通过 `mode` 选择 provider。
+部署时，CLI 会把该 mode 作为不可变快照写入本地 service state；后续 mesh/A2A 同步和销毁不重新读取可能被移动或修改的 AppSpec，并会在 Trustee 快照与 Trustee state entry 不一致时 fail closed。
 
 ---
 
@@ -271,7 +274,7 @@ secrets:
   disk_passphrase: ./secrets/disk_passphrase   # 可选；不写时 CLI 在 secrets_dir 下用 /dev/urandom 自动生成
 ```
 
-`disk_passphrase` 是 cryptpilot FDE 的可写层密钥。它不会出现在镜像里，每次 `deploy` / `inject` 都通过远程证明通道送入 Guest initrd，落到 `/run/cai/secrets/disk_key`（Guest tmpfs，断电即失），然后 cryptpilot 调用 `cat /run/cai/secrets/disk_key` 把 LUKS 解锁。详见 [`cli/src/app.rs::cryptpilot_fde_config`](../cli/src/app.rs)。
+`disk_passphrase` 是 cryptpilot FDE 的可写层密钥。它不会出现在镜像里：challenge 通过直接注入提供，Trustee 先同步到持久 KBS；每次启动时，CryptPilot 先在 Guest initrd 校时，再通过统一 `exec` provider 调用 `confidential-agentd initrd-fetch` 重新证明并取得密钥。密钥落到 `/run/cai/secrets/disk_key`（Guest tmpfs，断电即失），且只有文件原始字节会输出给 CryptPilot 来解锁持久 delta。详见 [`cli/src/app.rs::cryptpilot_fde_config`](../cli/src/app.rs) 与 [`docs/trustee.md`](trustee.md)。
 
 > 实践建议：如果你接 KMS / 自建 HSM，可以让外部脚本提前把密钥写到 `secrets.disk_passphrase` 指向的文件再调 CLI；CLI 不会再覆盖一次。
 
@@ -291,11 +294,11 @@ resources:
     mutable: false                              # 默认 false；true 表示首次写入后应用可改写内容
 ```
 
-工作过程（[`cli/src/app/workflows.rs::inject_resources`](../cli/src/app/workflows.rs)）：
+工作过程：
 
 1. CLI 把每个 resource 文件计算 sha256，作为 bootstrap.json 中 `GuestResource.sha256` 写下来。
-2. CLI 通过 `attestation-challenge-client inject-resource` 把内容写到 Guest CDH 的 `default/local-resources/<id>` 资源路径。
-3. Guest `confidential-agentd` 监测到 bootstrap 后，把 CDH 那份资源原子复制到 `target`，并强制校验 sha256 / mode / owner / group（[`daemon/src/app.rs::apply_resource_once`](../daemon/src/app.rs)）。
+2. challenge 通过 `attestation-challenge-client inject-resource` 写入 Guest CDH；Trustee 把同一逻辑路径映射为 `<service-id>/local-resources/<id>` 后同步到 KBS。
+3. Guest `confidential-agentd` 监测到 bootstrap 后，把 provider staging 中的资源原子复制到 `target`，并强制校验 sha256 / mode / owner / group（[`daemon/src/app.rs::apply_resource_once`](../daemon/src/app.rs)）。
 4. Daemon 校验失败会拒绝写文件并把状态停在 `waiting-resources`。
 
 `mutable: true` 用于应用会在启动后迁移或改写的初始化文件。daemon 仍会校验注入源文件的 sha256，并在首次缺失时写入 `target`；写入成功后只维护目标路径、mode、owner、group，不再因为目标内容被应用改写而覆盖文件或重启 `app_service`。如果应用删除了目标文件，daemon 会按原始注入内容重新 seed。不要把长期必须强一致的 secret 标成 mutable。

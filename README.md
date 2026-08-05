@@ -27,9 +27,10 @@ Confidential Agent 是一套面向"AI Agent + 机密计算"的端到端工程化
 
 | 能力 | 说明 |
 |---|---|
-| 🔐 **TDX 全盘加密** | Guest 可写层使用一次性磁盘密钥加密；密钥由 host 在远程证明通过后注入 initrd，**重启即丢失，且不落任何持久化存储**。 |
+| 🔐 **TDX 全盘加密** | Guest 可写层使用远程证明后取得的磁盘密钥加密；密钥只落 Guest tmpfs，每次启动都重新取得，不写入镜像或持久盘。 |
 | 📜 **声明式 AppSpec** | 一份 `confidential-agent/v1` YAML 描述服务、镜像、部署、证明、密钥、资源 6 个维度，CLI 自动驱动构建/部署/销毁。 |
 | 🛰 **远程证明模式** | `sample` 模式（开发自验）与 `rekor` 模式（基于 Sigstore Rekor + cosign 的供应链透明日志）。生产推荐 `rekor + required=true`。 |
+| 🗝 **Challenge / Trustee** | 同一度量镜像支持临时 challenge 注入或独立、持久的 Trustee KBS；Trustee URL 只在部署时注入，重启不要求本地 CLI 在线。 |
 | 🌐 **TNG RATS-TLS Mesh** | 多个 Confidential Agent 实例之间、以及主机 `connect` 子命令到 Guest 的连接，全部走带远程证明的 RATS-TLS（attest + TLS）。 |
 | 🛡 **运行时策略 PEP** | 内置 `cai-pep`（Policy Enforcement Point），把 Agent 的 `exec` 工具调用强制隔离到只读、无网、限资源的 Docker sandbox，并按 path/command 模式拒绝。 |
 | ☁️ **云资源全自动化** | 通过 [Shelter](https://github.com/inclavare-containers/shelter) + Terraform 自动完成 OSS 上传、自定义镜像、ECS 实例、安全组规则、镜像挂载等阿里云资源编排。 |
@@ -63,7 +64,7 @@ flowchart TB
     end
 
     L1 -- "policy 校验度量值" --> L2
-    L2 -- "RATS-TLS / challenge" --> L3
+    L2 -- "challenge / Trustee KBS" --> L3
 ```
 
 每一层都对应仓库中的具体组件：
@@ -206,5 +207,6 @@ confidential-agent/
 
 - [docs/architecture.md](docs/architecture.md) — 控制流与数据流详解（含序列图）
 - [docs/spec.md](docs/spec.md) — `confidential-agent/v1` AppSpec 完整字段参考
+- [docs/trustee.md](docs/trustee.md) — Trustee 全局配置、策略/资源同步、重启和销毁语义
 - [docs/openclaw-cli-step-by-step.md](docs/openclaw-cli-step-by-step.md) — 不走 one-click 的 OpenClaw CLI 分步部署场景
 - [docs/a2a.md](docs/a2a.md) — 跨组织/跨用户 A2A：背景、架构、信任模型、step-by-step 上手与排错
