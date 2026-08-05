@@ -557,8 +557,13 @@ mod tests {
     #[test]
     fn derive_tng_config_with_custom_port_mapping() {
         let card = test_card();
-        let config = derive_tng_client_config_with_local_ports(&card, |_| Ok(9999), 50000, DEFAULT_TNG_POLICY_PATH)
-                .unwrap();
+        let config = derive_tng_client_config_with_local_ports(
+            &card,
+            |_| Ok(9999),
+            50000,
+            DEFAULT_TNG_POLICY_PATH,
+        )
+        .unwrap();
         let ingress = config["add_ingress"].as_array().unwrap();
         assert_eq!(ingress[0]["mapping"]["in"]["port"], 9999);
         assert_eq!(config["control_interface"]["restful"]["port"], 50000);

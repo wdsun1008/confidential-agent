@@ -536,18 +536,15 @@ fn execute_attestation_request(
     timeout_secs: u64,
 ) -> Result<ExecOutput, String> {
     let mut prepare_warnings = String::new();
-    if let Err(err) = ensure_attestation_policy(
-        Path::new(GUEST_POLICY_SOURCE_PATH),
-        &attestation_work_dir(),
-    ) {
+    if let Err(err) =
+        ensure_attestation_policy(Path::new(GUEST_POLICY_SOURCE_PATH), &attestation_work_dir())
+    {
         prepare_warnings.push_str(&format!("cai-pep attest: policy setup skipped: {err}\n"));
     }
-    if let Some(mut load) =
-        reference_value_load_command(Path::new(GUEST_REFERENCE_VALUE_LIST_PATH))
+    if let Some(mut load) = reference_value_load_command(Path::new(GUEST_REFERENCE_VALUE_LIST_PATH))
     {
         load.stdout(Stdio::piped()).stderr(Stdio::piped());
-        match run_command_and_capture(&mut load, stdout_max_bytes, stderr_max_bytes, timeout_secs)
-        {
+        match run_command_and_capture(&mut load, stdout_max_bytes, stderr_max_bytes, timeout_secs) {
             Ok(output) if output.exit_code != 0 => {
                 prepare_warnings.push_str(&format!(
                     "cai-pep attest: reference value load failed: {}\n",
@@ -556,8 +553,9 @@ fn execute_attestation_request(
             }
             Ok(_) => {}
             Err(err) => {
-                prepare_warnings
-                    .push_str(&format!("cai-pep attest: reference value load failed: {err}\n"));
+                prepare_warnings.push_str(&format!(
+                    "cai-pep attest: reference value load failed: {err}\n"
+                ));
             }
         }
     }
