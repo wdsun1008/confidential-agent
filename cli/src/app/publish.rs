@@ -1960,6 +1960,7 @@ mod tests {
             service_id: service_id.to_string(),
             generation: 1,
             phase: "built".to_string(),
+            attestation_mode: "challenge".to_string(),
             spec: LocalSpecState {
                 path: PathBuf::from("/spec.yaml"),
                 sha256: "spec".to_string(),

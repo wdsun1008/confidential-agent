@@ -14,7 +14,7 @@ use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -29,6 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{Cli, Commands, InitrdFetchArgs, RunArgs};
+use crate::trustee::{self, RuntimeMode, TrusteeRuntime};
 
 const DEFAULT_AA_SOCK: &str =
     "unix:///run/confidential-containers/attestation-agent/attestation-agent.sock";
@@ -64,6 +65,60 @@ const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_MAX_CONCURRENT_REQUESTS: usize = 64;
 const HTTP_RATE_LIMIT_REQUESTS: usize = 120;
 const HTTP_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy)]
+struct InitrdDeadline {
+    started: Instant,
+    expires_at: Option<Instant>,
+}
+
+impl InitrdDeadline {
+    fn new(timeout_sec: u64) -> Result<Self> {
+        let started = Instant::now();
+        let expires_at = if timeout_sec == 0 {
+            None
+        } else {
+            Some(
+                started
+                    .checked_add(Duration::from_secs(timeout_sec))
+                    .context("initrd secret wait timeout is too large")?,
+            )
+        };
+        Ok(Self {
+            started,
+            expires_at,
+        })
+    }
+
+    fn remaining(&self, description: &str) -> Result<Option<Duration>> {
+        let Some(expires_at) = self.expires_at else {
+            return Ok(None);
+        };
+        let remaining = expires_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "timed out waiting for {description} after {}s",
+                self.started.elapsed().as_secs()
+            );
+        }
+        Ok(Some(remaining))
+    }
+
+    fn expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| Instant::now() >= expires_at)
+    }
+
+    fn capped_sleep(&self, requested: Duration) -> Duration {
+        self.expires_at
+            .map(|expires_at| requested.min(expires_at.saturating_duration_since(Instant::now())))
+            .unwrap_or(requested)
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
@@ -166,13 +221,40 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Run(args) => run_daemon(args),
         Commands::InitrdFetch(args) => initrd_fetch(args),
-        Commands::ApplyOnce(args) => {
-            let bootstrap = read_bootstrap(&args)?.with_context(|| {
+        Commands::ApplyOnce(mut args) => {
+            let trustee_runtime = trustee::load_rootfs_runtime()?;
+            let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
+                // The rootfs Attestation Agent is a different service
+                // instance from the one used in initrd. Re-register the same
+                // canonical runtime binding before any rootfs KBS request.
+                runtime.register_aael()?;
+                args.cdh_root = trustee::trusted_resource_root();
+                fs::create_dir_all(&args.cdh_root).with_context(|| {
+                    format!(
+                        "failed to create Trustee resource root '{}'",
+                        args.cdh_root.display()
+                    )
+                })?;
+                set_mode(&args.cdh_root, 0o700)?;
+                // initrd consumes bootstrap bytes directly and deliberately
+                // does not stage them into a rootfs provider tree. Make this
+                // one-shot command self-contained instead of assuming the
+                // long-running daemon already populated that tree.
+                runtime.fetch_to_trusted_root(&args.cdh_root, &args.bootstrap_resource)?;
+                RuntimeMode::Trustee
+            } else {
+                RuntimeMode::Challenge
+            };
+            let bootstrap = read_bootstrap(&args, runtime_mode)?.with_context(|| {
                 format!(
                     "bootstrap resource '{}' is not available",
                     args.bootstrap_resource
                 )
             })?;
+            if let Some(runtime) = trustee_runtime.as_ref() {
+                refresh_trustee_bootstrap_resources(runtime, &args, &bootstrap);
+                refresh_trustee_dynamic_resources(runtime, &args);
+            }
             let mut state = read_daemon_state().unwrap_or_default();
             if apply_bootstrap(&args, &bootstrap, &mut state, true)? {
                 sync_mesh(&args, &bootstrap, &mut state)?;
@@ -184,85 +266,156 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
 }
 
 fn initrd_fetch(args: InitrdFetchArgs) -> Result<()> {
+    match initrd_fetch_inner(args) {
+        Ok(()) => Ok(()),
+        Err(err) => initrd_fail_closed(format!("{err:#}")),
+    }
+}
+
+fn initrd_fetch_inner(args: InitrdFetchArgs) -> Result<()> {
+    let deadline = InitrdDeadline::new(args.wait_timeout_sec)?;
     println!("confidential-agentd initrd fetch starting");
     fs::create_dir_all(&args.stage_dir)
         .with_context(|| format!("failed to create '{}'", args.stage_dir.display()))?;
 
-    let bootstrap_path = args.cdh_root.join(&args.bootstrap_resource);
-    let bootstrap = wait_for_resource(
-        &bootstrap_path,
-        args.wait_timeout_sec,
-        args.retry_interval_sec,
-    )
-    .with_context(|| {
-        format!(
-            "bootstrap resource '{}' is not available",
-            args.bootstrap_resource
+    let (runtime_mode, trustee_runtime) = trustee::detect_initrd_runtime()?;
+    let (bootstrap_bytes, disk_key) = if let Some(runtime) = trustee_runtime.as_ref() {
+        // Trustee data never traverses the challenge/CDH injection tree.
+        // Consume the attested one-shot response directly in initrd so an
+        // untrusted writer cannot replace it between a write and a read.
+        retry_initrd_operation(
+            "Trustee runtime AAEL registration",
+            &deadline,
+            args.retry_interval_sec,
+            |_| runtime.register_aael(),
+        )?;
+        (
+            wait_for_trustee_resource(
+                runtime,
+                &args.bootstrap_resource,
+                &deadline,
+                args.retry_interval_sec,
+            )?,
+            wait_for_trustee_resource(
+                runtime,
+                &args.disk_key_resource,
+                &deadline,
+                args.retry_interval_sec,
+            )?,
         )
-    })?;
+    } else {
+        let bootstrap_path = args.cdh_root.join(&args.bootstrap_resource);
+        let bootstrap = wait_for_resource(&bootstrap_path, &deadline, args.retry_interval_sec)
+            .with_context(|| {
+                format!(
+                    "bootstrap resource '{}' is not available",
+                    args.bootstrap_resource
+                )
+            })?;
+        let disk_key_path = args.cdh_root.join(&args.disk_key_resource);
+        let disk_key = wait_for_resource(&disk_key_path, &deadline, args.retry_interval_sec)
+            .with_context(|| {
+                format!(
+                    "disk key resource '{}' is not available",
+                    args.disk_key_resource
+                )
+            })?;
+        (bootstrap, disk_key)
+    };
     let bootstrap: BootstrapConfig =
-        serde_json::from_slice(&bootstrap).context("failed to parse bootstrap config")?;
-    validate_bootstrap(&bootstrap)?;
+        serde_json::from_slice(&bootstrap_bytes).context("failed to parse bootstrap config")?;
+    validate_bootstrap(&bootstrap, runtime_mode)?;
 
-    let disk_key_path = args.cdh_root.join(&args.disk_key_resource);
-    let disk_key = wait_for_resource(
-        &disk_key_path,
-        args.wait_timeout_sec,
-        args.retry_interval_sec,
-    )
-    .with_context(|| {
-        format!(
-            "disk key resource '{}' is not available",
-            args.disk_key_resource
-        )
-    })?;
     let staged_key = args.stage_dir.join("disk_key");
     fs::write(&staged_key, disk_key)
         .with_context(|| format!("failed to write '{}'", staged_key.display()))?;
     set_mode(&staged_key, 0o600)?;
+    if let Some(runtime) = trustee_runtime.as_ref() {
+        runtime.persist_for_rootfs()?;
+    }
 
     println!(
-        "confidential-agentd initrd fetch complete for service {}",
-        bootstrap.service_id
+        "confidential-agentd initrd fetch complete for service {} mode={}",
+        bootstrap.service_id,
+        match runtime_mode {
+            RuntimeMode::Challenge => "challenge",
+            RuntimeMode::Trustee => "trustee",
+        }
     );
     Ok(())
 }
 
-fn wait_for_resource(path: &Path, timeout_sec: u64, interval_sec: u64) -> Result<Vec<u8>> {
-    let started = std::time::Instant::now();
-    let timeout = Duration::from_secs(timeout_sec);
-    let interval = Duration::from_secs(interval_sec);
-    let mut attempt = 1u64;
+fn wait_for_resource(path: &Path, deadline: &InitrdDeadline, interval_sec: u64) -> Result<Vec<u8>> {
+    retry_initrd_operation(
+        &format!("initrd resource '{}'", path.display()),
+        deadline,
+        interval_sec,
+        |_| match fs::read(path) {
+            Ok(bytes) if !bytes.is_empty() => Ok(bytes),
+            Ok(_) => bail!("resource is empty"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                bail!("resource does not exist")
+            }
+            Err(err) => Err(err).with_context(|| format!("failed to read '{}'", path.display())),
+        },
+    )
+}
 
+fn wait_for_trustee_resource(
+    runtime: &TrusteeRuntime,
+    logical_path: &str,
+    deadline: &InitrdDeadline,
+    interval_sec: u64,
+) -> Result<Vec<u8>> {
+    retry_initrd_operation(
+        &format!("Trustee resource '{logical_path}'"),
+        deadline,
+        interval_sec,
+        |remaining| runtime.fetch_resource_with_timeout(logical_path, remaining),
+    )
+}
+
+fn retry_initrd_operation<T, F>(
+    description: &str,
+    deadline: &InitrdDeadline,
+    interval_sec: u64,
+    mut operation: F,
+) -> Result<T>
+where
+    F: FnMut(Option<Duration>) -> Result<T>,
+{
+    let interval = Duration::from_secs(interval_sec);
+    let mut attempt = 0u64;
     loop {
-        match fs::read(path) {
-            Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        attempt += 1;
+        let remaining = deadline.remaining(description)?;
+        match operation(remaining) {
+            Ok(value) => return Ok(value),
             Err(err) => {
-                eprintln!("failed to read '{}': {err}", path.display());
+                if deadline.expired() {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "timed out waiting for {description} after {}s",
+                            deadline.elapsed().as_secs()
+                        )
+                    });
+                }
+                eprintln!(
+                    "waiting for {description} attempt={attempt} elapsed={}s: {err:#}",
+                    deadline.elapsed().as_secs()
+                );
+                thread::sleep(deadline.capped_sleep(interval));
             }
         }
-
-        if timeout_sec > 0 && started.elapsed() >= timeout {
-            initrd_fail_closed(format!("timed out waiting for '{}'", path.display()))?;
-        }
-
-        eprintln!(
-            "waiting for initrd resource '{}' attempt={} elapsed={}s",
-            path.display(),
-            attempt,
-            started.elapsed().as_secs()
-        );
-        thread::sleep(interval);
-        attempt += 1;
     }
 }
 
 fn initrd_fail_closed(reason: String) -> Result<()> {
     eprintln!("confidential-agentd initrd fetch failed: {reason}");
-    if std::env::var_os("CA_SKIP_INITRD_POWEROFF").is_none() {
-        let _ = Command::new("systemctl")
+    if initrd_poweroff_enabled() {
+        let systemctl =
+            std::env::var_os("CA_SYSTEMCTL_BIN").unwrap_or_else(|| OsString::from("systemctl"));
+        let _ = Command::new(systemctl)
             .arg("--no-block")
             .arg("poweroff")
             .status();
@@ -270,8 +423,34 @@ fn initrd_fail_closed(reason: String) -> Result<()> {
     bail!(reason)
 }
 
-fn run_daemon(args: RunArgs) -> Result<()> {
+fn initrd_poweroff_enabled() -> bool {
+    std::env::var_os("CA_SKIP_INITRD_POWEROFF").is_none()
+        && (Path::new("/etc/initrd-release").exists()
+            || std::env::var_os("CA_FORCE_INITRD_POWEROFF").is_some())
+}
+
+fn run_daemon(mut args: RunArgs) -> Result<()> {
     println!("confidential-agentd starting");
+    let trustee_runtime = trustee::load_rootfs_runtime()?;
+    let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
+        // Do not assume the initrd Attestation Agent's in-memory AAEL
+        // survived switch_root. Duplicate events with the same canonical
+        // digest are accepted by the resource policy.
+        runtime.register_aael()?;
+        // The challenge injection service can continue to exist in the
+        // mode-neutral image, but Trustee mode never consumes its file tree.
+        args.cdh_root = trustee::trusted_resource_root();
+        fs::create_dir_all(&args.cdh_root).with_context(|| {
+            format!(
+                "failed to create Trustee resource root '{}'",
+                args.cdh_root.display()
+            )
+        })?;
+        set_mode(&args.cdh_root, 0o700)?;
+        RuntimeMode::Trustee
+    } else {
+        RuntimeMode::Challenge
+    };
     let http_limits = Arc::new(HttpServerLimits::default());
     start_http_server(
         &args.status_listen,
@@ -294,8 +473,18 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     let mut state = read_daemon_state().unwrap_or_default();
     let mut active_bootstrap: Option<BootstrapConfig> = None;
     loop {
-        match read_bootstrap(&args)? {
+        if let Some(runtime) = trustee_runtime.as_ref() {
+            if let Err(err) =
+                runtime.fetch_to_trusted_root(&args.cdh_root, &args.bootstrap_resource)
+            {
+                eprintln!("Trustee bootstrap refresh failed: {err:#}");
+            }
+        }
+        match read_bootstrap(&args, runtime_mode)? {
             Some(bootstrap) => {
+                if let Some(runtime) = trustee_runtime.as_ref() {
+                    refresh_trustee_bootstrap_resources(runtime, &args, &bootstrap);
+                }
                 resource_watcher.add_resource_paths(
                     bootstrap
                         .resources
@@ -343,6 +532,9 @@ fn run_daemon(args: RunArgs) -> Result<()> {
         }
 
         if let Some(bootstrap) = active_bootstrap.as_ref() {
+            if let Some(runtime) = trustee_runtime.as_ref() {
+                refresh_trustee_dynamic_resources(runtime, &args);
+            }
             if let Err(err) = sync_mesh(&args, bootstrap, &mut state) {
                 eprintln!("mesh sync failed: {err:#}");
             }
@@ -351,16 +543,24 @@ fn run_daemon(args: RunArgs) -> Result<()> {
             eprintln!("daemon state write failed: {err:#}");
         }
 
-        let refresh_timeout = next_resource_refresh_timeout(&state, active_bootstrap.is_some());
+        let refresh_timeout = next_resource_refresh_timeout(
+            &state,
+            active_bootstrap.is_some(),
+            trustee_runtime.is_some(),
+        );
         match resource_watcher.wait(refresh_timeout)? {
             ResourceWatcherWait::Event | ResourceWatcherWait::Timeout => {}
         }
     }
 }
 
-fn next_resource_refresh_timeout(state: &DaemonState, bootstrap_active: bool) -> Option<Duration> {
+fn next_resource_refresh_timeout(
+    state: &DaemonState,
+    bootstrap_active: bool,
+    trustee_enabled: bool,
+) -> Option<Duration> {
     if !bootstrap_active {
-        return None;
+        return trustee_enabled.then(|| Duration::from_secs(5));
     }
     let idle_poll = Duration::from_secs(ACTIVE_BOOTSTRAP_IDLE_POLL_SEC);
     Some(
@@ -368,6 +568,40 @@ fn next_resource_refresh_timeout(state: &DaemonState, bootstrap_active: bool) ->
             .map(|timeout| timeout.min(idle_poll))
             .unwrap_or(idle_poll),
     )
+}
+
+fn refresh_trustee_bootstrap_resources(
+    runtime: &TrusteeRuntime,
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+) {
+    for resource in &bootstrap.resources {
+        let staged = args.cdh_root.join(&resource.resource_path);
+        if !resource.mutable
+            && resource.sha256.as_ref().is_some_and(|expected| {
+                staged.is_file()
+                    && sha256_file(&staged)
+                        .map(|actual| &actual == expected)
+                        .unwrap_or(false)
+            })
+        {
+            continue;
+        }
+        if let Err(err) = runtime.fetch_to_trusted_root(&args.cdh_root, &resource.resource_path) {
+            eprintln!(
+                "Trustee resource '{}' refresh failed: {err:#}",
+                resource.resource_path
+            );
+        }
+    }
+}
+
+fn refresh_trustee_dynamic_resources(runtime: &TrusteeRuntime, args: &RunArgs) {
+    for resource_path in [&args.mesh_resource, &args.a2a_bundle_resource] {
+        if let Err(err) = runtime.fetch_to_trusted_root(&args.cdh_root, resource_path) {
+            eprintln!("Trustee dynamic resource '{resource_path}' refresh failed: {err:#}");
+        }
+    }
 }
 
 fn next_a2a_refresh_timeout(state: &DaemonState, bootstrap_active: bool) -> Option<Duration> {
@@ -1150,7 +1384,7 @@ fn bootstrap_resources_ready(bootstrap: &BootstrapConfig, state: &DaemonState) -
     Ok(true)
 }
 
-fn read_bootstrap(args: &RunArgs) -> Result<Option<BootstrapConfig>> {
+fn read_bootstrap(args: &RunArgs, runtime_mode: RuntimeMode) -> Result<Option<BootstrapConfig>> {
     let path = args.cdh_root.join(&args.bootstrap_resource);
     if !path.exists() || path.metadata()?.len() == 0 {
         return Ok(None);
@@ -1160,11 +1394,11 @@ fn read_bootstrap(args: &RunArgs) -> Result<Option<BootstrapConfig>> {
         .with_context(|| format!("failed to read bootstrap '{}'", path.display()))?;
     let bootstrap: BootstrapConfig =
         serde_json::from_str(&content).context("failed to parse bootstrap config")?;
-    validate_bootstrap(&bootstrap)?;
+    validate_bootstrap(&bootstrap, runtime_mode)?;
     Ok(Some(bootstrap))
 }
 
-fn validate_bootstrap(bootstrap: &BootstrapConfig) -> Result<()> {
+fn validate_bootstrap(bootstrap: &BootstrapConfig, runtime_mode: RuntimeMode) -> Result<()> {
     if bootstrap.schema != BOOTSTRAP_SCHEMA_VERSION {
         bail!(
             "unsupported bootstrap schema '{}'; expected '{}'",
@@ -1175,10 +1409,15 @@ fn validate_bootstrap(bootstrap: &BootstrapConfig) -> Result<()> {
     if bootstrap.service_id.trim().is_empty() {
         bail!("bootstrap service_id must not be empty");
     }
-    if bootstrap.mode != "challenge" {
+    let expected_mode = match runtime_mode {
+        RuntimeMode::Challenge => "challenge",
+        RuntimeMode::Trustee => "trustee",
+    };
+    if bootstrap.mode != expected_mode {
         bail!(
-            "bootstrap mode '{}' is not supported by this daemon",
-            bootstrap.mode
+            "bootstrap mode '{}' does not match runtime mode '{}'",
+            bootstrap.mode,
+            expected_mode
         );
     }
     Ok(())

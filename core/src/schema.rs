@@ -17,6 +17,12 @@ pub struct LocalServiceState {
     pub service_id: String,
     pub generation: u64,
     pub phase: String,
+    /// Immutable snapshot of the attestation provider selected for the
+    /// deployed service. Older challenge-only state files deserialize as
+    /// `challenge`; new Trustee deployments use this marker to fail closed if
+    /// their dedicated Trustee state is lost.
+    #[serde(default = "default_bootstrap_mode")]
+    pub attestation_mode: String,
     pub spec: LocalSpecState,
     pub build: LocalBuildState,
     pub deploy: LocalDeployState,

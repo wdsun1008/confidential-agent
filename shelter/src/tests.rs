@@ -100,6 +100,50 @@ fn build_config_omits_deploy_by_default() {
 }
 
 #[test]
+fn build_config_is_identical_for_challenge_and_trustee_modes() {
+    let challenge = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    let trustee = AgentSpec::from_yaml(
+        &SPEC.replace("mode: challenge", "mode: trustee"),
+        Path::new("/project"),
+    )
+    .unwrap();
+
+    let challenge_rendered =
+        render_build_config(&challenge, &assets(), &ShelterRenderOptions::default()).unwrap();
+    let trustee_rendered =
+        render_build_config(&trustee, &assets(), &ShelterRenderOptions::default()).unwrap();
+
+    assert_eq!(challenge_rendered, trustee_rendered);
+    assert!(!challenge_rendered.contains("user_data"));
+}
+
+#[test]
+fn deploy_user_data_is_runtime_only_passthrough() {
+    let spec = AgentSpec::from_yaml(
+        &SPEC.replace("mode: challenge", "mode: trustee"),
+        Path::new("/project"),
+    )
+    .unwrap();
+    let runtime = r#"{"kbs_url":"https://trustee.example","schema":"confidential-agent/trustee-runtime/v1","service_id":"openclaw"}"#;
+
+    let build = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
+    let deploy = render_build_config(
+        &spec,
+        &assets(),
+        &ShelterRenderOptions {
+            include_deploy: true,
+            deploy_user_data: Some(runtime.to_string()),
+            ..ShelterRenderOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(!build.contains("user_data"));
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&deploy).unwrap();
+    assert_eq!(yaml["deploy"]["user_data"].as_str(), Some(runtime));
+}
+
+#[test]
 fn renders_release_shelter_deploy_without_ssh_key_name() {
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let rendered = render_build_config(

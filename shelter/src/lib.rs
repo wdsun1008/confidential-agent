@@ -43,6 +43,9 @@ pub struct ShelterRenderOptions {
     pub deploy_resource_name: Option<String>,
     pub local_image_import_name: Option<String>,
     pub cloud_image_id: Option<String>,
+    /// Runtime-only deployment data. This is never rendered into build-only
+    /// configs and is intentionally independent from Shelter's Trustee mode.
+    pub deploy_user_data: Option<String>,
     pub mesh_peer_cidrs: Vec<String>,
     pub peerings: PeeringsFile,
 }
@@ -247,6 +250,7 @@ fn render_deploy_config(
         vpc_id: deploy.vpc_id.clone(),
         vswitch_id: deploy.vswitch_id.clone(),
         security_group_id: deploy.security_group_id.clone(),
+        user_data: options.deploy_user_data.clone(),
         tags,
     })
 }
@@ -720,6 +724,8 @@ struct ShelterDeployConfig {
     vswitch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     security_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_data: Option<String>,
     tags: BTreeMap<String, String>,
 }
 

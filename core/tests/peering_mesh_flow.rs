@@ -45,6 +45,7 @@ fn service_state(
         service_id: id.to_string(),
         generation: 1,
         phase: phase.to_string(),
+        attestation_mode: "challenge".to_string(),
         spec: LocalSpecState {
             path: PathBuf::from("/project/agent.yaml"),
             sha256: "spec-hash".to_string(),

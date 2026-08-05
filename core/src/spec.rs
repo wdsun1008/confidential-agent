@@ -374,9 +374,6 @@ impl AgentSpec {
     }
 
     pub fn ensure_mvp_supported(&self) -> Result<()> {
-        if self.attestation.mode == AttestationMode::Trustee {
-            bail!("attestation.mode=trustee is planned but not implemented");
-        }
         Ok(())
     }
 
@@ -426,10 +423,10 @@ impl AgentSpec {
                 SCHEMA_VERSION
             );
         }
-        if self.attestation.mode != AttestationMode::Challenge {
-            bail!("attestation.mode=trustee is planned but not implemented");
-        }
         validate_id("service.id", &self.service.id)?;
+        if self.attestation.mode == AttestationMode::Trustee {
+            crate::trustee::validate_trustee_service_id(&self.service.id)?;
+        }
         if self
             .service
             .app_service
@@ -1382,14 +1379,14 @@ resources: {}
     }
 
     #[test]
-    fn rejects_trustee_mode_until_implemented() {
-        let err = AgentSpec::from_yaml(
+    fn accepts_trustee_mode_without_deployment_configuration() {
+        let spec = AgentSpec::from_yaml(
             &SPEC.replace("mode: challenge", "mode: trustee"),
             Path::new("/project"),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("planned but not implemented"));
+        assert_eq!(spec.attestation.mode, AttestationMode::Trustee);
     }
 
     #[test]

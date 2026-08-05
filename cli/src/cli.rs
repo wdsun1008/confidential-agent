@@ -91,6 +91,54 @@ mod tests {
         ])
         .is_err());
     }
+
+    #[test]
+    fn trustee_commands_parse_global_configuration_and_service_sync() {
+        let configured = Cli::try_parse_from([
+            "confidential-agent",
+            "trustee",
+            "configure",
+            "--url",
+            "https://trustee.example",
+            "--admin-key",
+            "/tmp/admin.key",
+        ])
+        .unwrap();
+        match configured.command {
+            Commands::Trustee(TrusteeArgs {
+                command:
+                    TrusteeCommands::Configure {
+                        url,
+                        management_url,
+                        admin_key,
+                        ca_cert,
+                        force,
+                    },
+            }) => {
+                assert_eq!(url, "https://trustee.example");
+                assert_eq!(management_url, None);
+                assert_eq!(admin_key, PathBuf::from("/tmp/admin.key"));
+                assert_eq!(ca_cert, None);
+                assert!(!force);
+            }
+            other => panic!("expected trustee configure command, got {other:?}"),
+        }
+
+        let sync = Cli::try_parse_from([
+            "confidential-agent",
+            "trustee",
+            "sync",
+            "--service",
+            "agent-a",
+        ])
+        .unwrap();
+        match sync.command {
+            Commands::Trustee(TrusteeArgs {
+                command: TrusteeCommands::Sync { service },
+            }) => assert_eq!(service.as_deref(), Some("agent-a")),
+            other => panic!("expected trustee sync command, got {other:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -130,6 +178,7 @@ pub(crate) enum Commands {
     Docs(DocsArgs),
     Spec(SpecArgs),
     Key(KeyArgs),
+    Trustee(TrusteeArgs),
     #[command(hide = true)]
     Inject(InjectArgs),
     #[command(hide = true)]
@@ -328,6 +377,57 @@ pub(crate) enum KeyCommands {
         output_key_prefix: PathBuf,
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TrusteeArgs {
+    #[command(subcommand)]
+    pub(crate) command: TrusteeCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum TrusteeCommands {
+    Configure {
+        #[arg(long, help = "Guest-visible KBS base URL (without /kbs/v0)")]
+        url: String,
+        #[arg(
+            long,
+            help = "CLI management base URL; defaults to --url (without /kbs/v0)"
+        )]
+        management_url: Option<String>,
+        #[arg(long, help = "Ed25519 PKCS#8 PEM management private key")]
+        admin_key: PathBuf,
+        #[arg(long, help = "Optional PEM CA certificate for HTTPS")]
+        ca_cert: Option<PathBuf>,
+        #[arg(long, help = "Replace an existing configuration")]
+        force: bool,
+    },
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Sync {
+        #[arg(long)]
+        service: Option<String>,
+    },
+    Adopt {
+        #[arg(long)]
+        attestation_policy_sha256: String,
+        #[arg(long)]
+        resource_policy_sha256: String,
+    },
+    Prune {
+        #[arg(long, help = "Delete stale resources; default is a dry run")]
+        apply: bool,
     },
 }
 

@@ -4,7 +4,7 @@ use crate::cli::{
     ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitBuildBackend,
     InitReferenceValues, InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands,
     MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands,
-    SshArgs, StatusArgs, TuiArgs,
+    SshArgs, StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{
@@ -35,7 +35,9 @@ use confidential_agent_core::schema::{
     MESH_SCHEMA_VERSION,
 };
 use confidential_agent_core::schema::{AgentCardPort, AgentCardRekor, DaemonA2aPeerStatus};
-use confidential_agent_core::spec::{AgentSpec, AttestationTee, ReferenceValueMode};
+use confidential_agent_core::spec::{
+    AgentSpec, AttestationMode, AttestationTee, ReferenceValueMode,
+};
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use confidential_agent_shelter::{
     render_build_config, shelter_build_id, GuestAssets, GuestFileAsset, ShelterRenderOptions,
@@ -140,6 +142,7 @@ struct PrepareOptions {
     mesh_peer_cidrs: Vec<String>,
     peerings: PeeringsFile,
     cloud_image_id: Option<String>,
+    deploy_user_data: Option<String>,
 }
 
 impl BuildManifest {
@@ -455,6 +458,8 @@ use init::*;
 mod self_describe;
 use self_describe::*;
 
+mod trustee;
+
 fn prepare(
     cli: &Cli,
     state_dir: &Path,
@@ -527,6 +532,7 @@ fn prepare(
             mesh_peer_cidrs: options.mesh_peer_cidrs.clone(),
             peerings: options.peerings.clone(),
             cloud_image_id: options.cloud_image_id.clone(),
+            deploy_user_data: options.deploy_user_data.clone(),
         },
     )?;
 
@@ -854,7 +860,7 @@ fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapC
         schema: BOOTSTRAP_SCHEMA_VERSION.to_string(),
         generation,
         service_id: spec.service.id.clone(),
-        mode: "challenge".to_string(),
+        mode: attestation_mode_name(spec.attestation.mode).to_string(),
         ports: spec.service.ports.clone(),
         connect: spec.service.connect.clone(),
         mcp_ports: spec.service.mcp_ports.clone(),
@@ -885,6 +891,13 @@ fn reference_value_mode_name(mode: ReferenceValueMode) -> &'static str {
     match mode {
         ReferenceValueMode::Sample => "sample",
         ReferenceValueMode::Rekor => "rekor",
+    }
+}
+
+fn attestation_mode_name(mode: AttestationMode) -> &'static str {
+    match mode {
+        AttestationMode::Challenge => "challenge",
+        AttestationMode::Trustee => "trustee",
     }
 }
 
@@ -1195,15 +1208,15 @@ systemctl reset-failed trusted-network-gateway.service || true
 
 fn cryptpilot_fde_config() -> &'static str {
     r#"[rootfs]
-delta_location = "disk"
+delta_location = "disk-persist"
 delta_backend = "dm-snapshot"
 
 [delta]
 integrity = false
 
 [delta.encrypt.exec]
-command = "cat"
-args = ["/run/cai/secrets/disk_key"]
+command = "/bin/bash"
+args = ["-c", "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /usr/bin/cat /run/cai/secrets/disk_key"]
 "#
 }
 
@@ -1226,42 +1239,15 @@ install() {
     fi
 
     inst_binary /usr/local/bin/confidential-agentd /usr/bin/confidential-agentd
-    inst_multiple mkdir sleep systemctl
+    inst_multiple bash cat mkdir sleep systemctl
     hostonly='' instmods tdx_guest || true
     mkdir -p "$initdir/usr/lib/modprobe.d"
     printf 'options tdx_guest tsm_api=1\n' > "$initdir/usr/lib/modprobe.d/confidential-agent-tdx.conf"
     mkdir -p "$initdir/usr/lib/modules-load.d"
     printf 'tdx_guest\n' > "$initdir/usr/lib/modules-load.d/confidential-agent-tdx.conf"
-    inst_simple "$moddir/confidential-agent-secret-fetch.service" /usr/lib/systemd/system/confidential-agent-secret-fetch.service
-    systemctl --root "$initdir" enable confidential-agent-secret-fetch.service
+    mkdir -p "$initdir/etc/cmdline.d"
+    printf '%s\n' 'rd.retry=300 rd.shell=0 rd.emergency=poweroff' > "$initdir/etc/cmdline.d/36-confidential-agent-fail-closed.conf"
 }
-"#
-}
-
-fn secret_fetch_service_unit() -> &'static str {
-    r#"[Unit]
-Description=Confidential Agent Secret Fetch (initrd)
-DefaultDependencies=no
-ConditionPathExists=/etc/initrd-release
-Requires=network-online.target
-After=network-online.target
-Wants=attestation-agent.service confidential-data-hub-daemon-initrd.service trustiflux-api-server-initrd.service
-After=attestation-agent.service confidential-data-hub-daemon-initrd.service trustiflux-api-server-initrd.service
-Before=initrd-root-device.target
-Before=cryptpilot-fde-before-sysroot.service
-Conflicts=shutdown.target
-Before=shutdown.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=true
-ExecStart=/usr/bin/confidential-agentd initrd-fetch
-StandardOutput=journal+console
-StandardError=journal+console
-
-[Install]
-RequiredBy=cryptpilot-fde-before-sysroot.service
-WantedBy=initrd.target
 "#
 }
 

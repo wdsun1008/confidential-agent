@@ -365,7 +365,11 @@ fn tee_info_from_state(state: &LocalServiceState) -> TeeInfoReport {
     }
 }
 
-fn fetch_ear_token(verifier: &AttestationVerifier, host: &str, tee: &str) -> Result<AttestationEarReport> {
+fn fetch_ear_token(
+    verifier: &AttestationVerifier,
+    host: &str,
+    tee: &str,
+) -> Result<AttestationEarReport> {
     let evidence = tempfile::Builder::new()
         .prefix("report-evidence-")
         .suffix(".json")
@@ -1175,9 +1179,8 @@ mod tests {
             stdout: Vec::new(),
             stderr: Vec::new(),
         };
-        let error =
-            interpret_attestation_output(output, "get-evidence", Duration::from_secs(20))
-                .unwrap_err();
+        let error = interpret_attestation_output(output, "get-evidence", Duration::from_secs(20))
+            .unwrap_err();
         assert!(error.to_string().contains("timed out after 20s"));
     }
 
@@ -1257,6 +1260,7 @@ mod tests {
             service_id: "test".to_string(),
             generation: 1,
             phase: "deleted".to_string(),
+            attestation_mode: "challenge".to_string(),
             spec: LocalSpecState {
                 path: PathBuf::from("/spec.yaml"),
                 sha256: "abc".to_string(),

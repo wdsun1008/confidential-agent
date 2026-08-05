@@ -13,6 +13,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Docs(args) => cmd_docs(args),
         Commands::Spec(args) => cmd_spec(args),
         Commands::Key(args) => cmd_key(cli, args),
+        Commands::Trustee(args) => trustee::cmd_trustee(cli, args),
         Commands::Inject(args) => cmd_inject(cli, args),
         Commands::Mesh(args) => cmd_mesh(cli, args),
         Commands::Connect(args) => cmd_connect(cli, args),
@@ -265,6 +266,16 @@ fn ensure_build_variant_present(
 
 pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
+    if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
+        bail!(
+            "service '{}' is still managed by Trustee; destroy or explicitly revoke that deployment before switching to challenge mode",
+            spec.service.id
+        );
+    }
+    if trustee_mode && args.skip_inject {
+        bail!("--skip-inject is not supported in Trustee mode because boot resources must be synchronized before deployment");
+    }
     if spec_requires_a2a_signing(&spec) {
         prepare_sigstore_tools_for_process(cli)?;
     }
@@ -302,13 +313,32 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         &spec.service.id,
         &spec.service.ports,
     )?;
-    if !args.render_only && !args.skip_inject {
+    if !trustee_mode && !args.render_only && !args.skip_inject {
         verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     }
 
     let existing_services = read_service_states(&cli.state_dir)?;
     let peerings = read_peerings_or_empty(&cli.state_dir)?;
     let deploy_names = DeployNames::new(&spec);
+    let deploy_user_data = if trustee_mode {
+        if !args.render_only {
+            println!("[ca] synchronizing Trustee boot resources before infrastructure launch...");
+            trustee::sync_service(
+                cli,
+                &cli.state_dir,
+                &spec,
+                &build_variant.build_result,
+                &build_variant.shelter_build_id,
+                None,
+            )?;
+        }
+        Some(trustee::runtime_user_data(
+            &cli.state_dir,
+            &spec.service.id,
+        )?)
+    } else {
+        None
+    };
     let prepared = prepare(
         cli,
         &cli.state_dir,
@@ -322,6 +352,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
             peerings,
             cloud_image_id: published_image_id.clone(),
+            deploy_user_data,
         },
     )?;
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
@@ -357,15 +388,27 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         let injection_ip = observation
             .preferred_injection_ip()
             .context("could not resolve deploy IP from Shelter outputs")?;
-        println!("[ca] injecting attested resources to {injection_ip}...");
-        inject_resources(
-            cli,
-            &cli.state_dir,
-            &spec,
-            &prepared.build_result,
-            &prepared.shelter_build_id,
-            &injection_ip,
-        )?;
+        if trustee_mode {
+            println!("[ca] refreshing Trustee bootstrap with resolved instance outputs...");
+            trustee::sync_service(
+                cli,
+                &cli.state_dir,
+                &spec,
+                &prepared.build_result,
+                &prepared.shelter_build_id,
+                Some(&injection_ip),
+            )?;
+        } else {
+            println!("[ca] injecting attested resources to {injection_ip}...");
+            inject_resources(
+                cli,
+                &cli.state_dir,
+                &spec,
+                &prepared.build_result,
+                &prepared.shelter_build_id,
+                &injection_ip,
+            )?;
+        }
         println!("[ca] waiting for guest daemon status at {injection_ip}:{DAEMON_STATUS_PORT}...");
         wait_for_daemon_status(&injection_ip).with_context(|| {
             format!(
@@ -404,10 +447,19 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
 
 pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
+    if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
+        bail!(
+            "service '{}' is still managed by Trustee; revoke it before using challenge injection",
+            spec.service.id
+        );
+    }
     if spec_requires_a2a_signing(&spec) {
         prepare_sigstore_tools_for_process(cli)?;
     }
-    verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
+    if !trustee_mode {
+        verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
+    }
     validate_mesh_port_conflicts(
         &read_service_states(&cli.state_dir)?,
         &spec.service.id,
@@ -434,14 +486,25 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     })?;
     let build_variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
 
-    inject_resources(
-        cli,
-        &cli.state_dir,
-        &spec,
-        &build_variant.build_result,
-        &build_variant.shelter_build_id,
-        &args.target_ip,
-    )?;
+    if trustee_mode {
+        trustee::sync_service(
+            cli,
+            &cli.state_dir,
+            &spec,
+            &build_variant.build_result,
+            &build_variant.shelter_build_id,
+            Some(&args.target_ip),
+        )?;
+    } else {
+        inject_resources(
+            cli,
+            &cli.state_dir,
+            &spec,
+            &build_variant.build_result,
+            &build_variant.shelter_build_id,
+            &args.target_ip,
+        )?;
+    }
     let mut active_state =
         activate_existing_service_state(&cli.state_dir, &args.spec, &spec, state)?;
     if active_state.deploy.public_ip.is_none() && active_state.deploy.private_ip.is_none() {
@@ -2002,8 +2065,22 @@ fn format_bytes(bytes: u64) -> String {
 pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
     let paths = context_paths(&cli.state_dir, &args.service);
     let existing_state = read_service_state_file(&paths.service_state)?;
+    // The AppSpec is mutable and may have been moved after deployment.
+    // Trustee membership is authoritative when present; the immutable mode
+    // snapshot prevents a lost Trustee state file from becoming an unsafe
+    // challenge fallback.
+    let trustee_mode = trustee::service_uses_trustee(
+        &cli.state_dir,
+        &args.service,
+        existing_state
+            .as_ref()
+            .map(|state| state.attestation_mode.as_str()),
+    )?;
     if let Some(state) = existing_state.as_ref() {
         if state.phase == "deleted" && !deploy_runtime_state_present(&state.deploy) {
+            if trustee_mode {
+                trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
+            }
             println!("service '{}' is already deleted", args.service);
             return Ok(());
         }
@@ -2032,7 +2109,20 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
     shelter_args.push(OsString::from("--config"));
     shelter_args.push(paths.rendered_config.as_os_str().to_os_string());
     shelter_args.push(OsString::from("--auto-approve"));
+    if trustee_mode {
+        println!("[ca] revoking Trustee resource access before infrastructure deletion...");
+        if !trustee::revoke_service(&cli.state_dir, &args.service)? {
+            bail!(
+                "Trustee service '{}' disappeared before access could be revoked; refusing infrastructure deletion",
+                args.service
+            );
+        }
+    }
     run_shelter(cli, &mut shelter_args)?;
+
+    if trustee_mode {
+        trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
+    }
 
     if let Some(mut state) = existing_state {
         state.phase = "deleted".to_string();
@@ -2249,7 +2339,7 @@ pub(super) fn a2a_cli_preview_error_kind(err: &AgentCardFetchError) -> &'static 
     }
 }
 
-fn sync_a2a_bundle(cli: &Cli, state_dir: &Path) -> Result<()> {
+pub(super) fn sync_a2a_bundle(cli: &Cli, state_dir: &Path) -> Result<()> {
     let state = read_a2a_state_or_empty(state_dir)?;
     let bundle = render_a2a_bundle(&state)?;
     let bundle_path = a2a_bundle_path(state_dir);
@@ -2258,20 +2348,33 @@ fn sync_a2a_bundle(cli: &Cli, state_dir: &Path) -> Result<()> {
     let services = read_service_states(state_dir)?;
     let mut delivered = Vec::new();
     for service in services.iter().filter(|service| service.phase == "active") {
-        let Some(target_ip) = service.deploy.preferred_injection_ip() else {
-            bail!(
-                "service '{}' has no IP for a2a bundle injection",
-                service.service_id
-            );
-        };
-        challenge_inject(
-            cli,
+        if trustee::service_uses_trustee(
             state_dir,
-            target_ip,
-            A2A_BUNDLE_RESOURCE,
-            &bundle_path,
-            &service.deploy.tee,
-        )?;
+            &service.service_id,
+            Some(&service.attestation_mode),
+        )? {
+            trustee::put_dynamic_resource(
+                state_dir,
+                &service.service_id,
+                A2A_BUNDLE_RESOURCE,
+                &bundle_path,
+            )?;
+        } else {
+            let Some(target_ip) = service.deploy.preferred_injection_ip() else {
+                bail!(
+                    "service '{}' has no IP for a2a bundle injection",
+                    service.service_id
+                );
+            };
+            challenge_inject(
+                cli,
+                state_dir,
+                target_ip,
+                A2A_BUNDLE_RESOURCE,
+                &bundle_path,
+                &service.deploy.tee,
+            )?;
+        }
         delivered.push(service.service_id.clone());
     }
     if delivered.is_empty() {

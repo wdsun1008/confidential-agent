@@ -6,6 +6,7 @@ pub mod mesh;
 pub mod peerings;
 pub mod schema;
 pub mod spec;
+pub mod trustee;
 pub mod util;
 
 #[cfg(test)]
@@ -26,6 +27,7 @@ mod schema_tests {
             service_id: "openclaw".to_string(),
             generation: 1,
             phase: "active".to_string(),
+            attestation_mode: "challenge".to_string(),
             spec: LocalSpecState {
                 path: PathBuf::from("/project/openclaw.yaml"),
                 sha256: "spec-hash".to_string(),
@@ -77,7 +79,12 @@ mod schema_tests {
 
         let encoded = serde_json::to_string(&state).unwrap();
         let decoded: LocalServiceState = serde_json::from_str(&encoded).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("attestation_mode");
+        let legacy: LocalServiceState = serde_json::from_value(legacy).unwrap();
 
+        assert_eq!(decoded.attestation_mode, "challenge");
+        assert_eq!(legacy.attestation_mode, "challenge");
         assert_eq!(decoded.service.ports, vec![18789, 18800]);
         assert_eq!(decoded.service.connect, vec![18789]);
         assert_eq!(decoded.service.mcp_ports, vec![18800]);

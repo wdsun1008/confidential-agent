@@ -308,18 +308,6 @@ pub(super) fn write_secret_fetch_module(module_dir: &Path) -> Result<()> {
         &module_dir.join("module-setup.sh"),
         secret_fetch_module_setup(),
     )?;
-    fs::write(
-        module_dir.join("confidential-agent-secret-fetch.service"),
-        secret_fetch_service_unit(),
-    )
-    .with_context(|| {
-        format!(
-            "failed to write '{}'",
-            module_dir
-                .join("confidential-agent-secret-fetch.service")
-                .display()
-        )
-    })?;
     Ok(())
 }
 
@@ -426,6 +414,10 @@ mod tests {
         assert!(
             config.contains("[cryptpilot]") || config.contains("name =") || config.contains('[')
         );
+        assert!(config.contains(
+            "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1"
+        ));
+        assert!(!config.contains("initrd-fetch 1>&2"));
     }
 
     #[test]
@@ -433,12 +425,7 @@ mod tests {
         let setup = secret_fetch_module_setup();
         assert!(setup.starts_with("#!/"));
         assert!(setup.contains("install"));
-    }
-
-    #[test]
-    fn secret_fetch_service_unit_is_systemd() {
-        let unit = secret_fetch_service_unit();
-        assert!(unit.contains("[Unit]") || unit.contains("[Service]"));
+        assert!(setup.contains("rd.retry=300 rd.shell=0 rd.emergency=poweroff"));
     }
 
     #[test]
@@ -447,7 +434,7 @@ mod tests {
         let module_dir = dir.path().join("99test-module");
         write_secret_fetch_module(&module_dir).unwrap();
         assert!(module_dir.join("module-setup.sh").exists());
-        assert!(module_dir
+        assert!(!module_dir
             .join("confidential-agent-secret-fetch.service")
             .exists());
     }

@@ -315,9 +315,9 @@ fn overdue_a2a_refresh_timeout_is_throttled() {
 fn active_bootstrap_polls_even_without_a2a_peers() {
     let state = DaemonState::default();
 
-    assert_eq!(next_resource_refresh_timeout(&state, false), None);
+    assert_eq!(next_resource_refresh_timeout(&state, false, false), None);
     assert_eq!(
-        next_resource_refresh_timeout(&state, true),
+        next_resource_refresh_timeout(&state, true, false),
         Some(Duration::from_secs(ACTIVE_BOOTSTRAP_IDLE_POLL_SEC))
     );
 }
@@ -343,7 +343,7 @@ fn active_bootstrap_uses_earlier_a2a_refresh_timeout() {
     );
 
     assert_eq!(
-        next_resource_refresh_timeout(&state, true),
+        next_resource_refresh_timeout(&state, true, false),
         Some(Duration::from_secs(A2A_OVERDUE_REFRESH_RETRY_SEC))
     );
 }
@@ -369,7 +369,7 @@ fn active_bootstrap_uses_future_a2a_refresh_before_idle_poll() {
     );
 
     assert_eq!(
-        next_resource_refresh_timeout(&state, true),
+        next_resource_refresh_timeout(&state, true, false),
         Some(Duration::from_secs(15))
     );
 }
@@ -395,7 +395,7 @@ fn active_bootstrap_caps_late_a2a_refresh_to_idle_poll() {
     );
 
     assert_eq!(
-        next_resource_refresh_timeout(&state, true),
+        next_resource_refresh_timeout(&state, true, false),
         Some(Duration::from_secs(ACTIVE_BOOTSTRAP_IDLE_POLL_SEC))
     );
 }
@@ -3374,6 +3374,47 @@ fn initrd_fetch_stages_disk_key_with_private_mode() {
 }
 
 #[test]
+fn initrd_retry_recovers_from_transient_trustee_failure() {
+    let mut attempts = 0u64;
+    let deadline = InitrdDeadline::new(1).unwrap();
+
+    let value = retry_initrd_operation("test Trustee resource", &deadline, 0, |_| {
+        attempts += 1;
+        if attempts < 3 {
+            bail!("transient KBS failure {attempts}");
+        }
+        Ok("resource")
+    })
+    .unwrap();
+
+    assert_eq!(value, "resource");
+    assert_eq!(attempts, 3);
+}
+
+#[test]
+fn initrd_retry_uses_one_global_deadline_across_operations() {
+    let started = Instant::now();
+    let deadline = InitrdDeadline {
+        started,
+        expires_at: Some(started + Duration::from_millis(300)),
+    };
+    let first_remaining = deadline.remaining("first resource").unwrap().unwrap();
+    thread::sleep(Duration::from_millis(120));
+    let mut second_remaining = None;
+
+    let error =
+        retry_initrd_operation("second resource", &deadline, 1, |remaining| -> Result<()> {
+            second_remaining = remaining;
+            bail!("resource is still unavailable")
+        })
+        .unwrap_err();
+
+    assert!(second_remaining.unwrap() < first_remaining);
+    assert!(format!("{error:#}").contains("timed out waiting for second resource"));
+    assert!(started.elapsed() < Duration::from_millis(700));
+}
+
+#[test]
 fn initrd_fail_closed_honors_poweroff_skip() {
     let env = EnvGuard::new(&["CA_SKIP_INITRD_POWEROFF"]);
     env.set("CA_SKIP_INITRD_POWEROFF", "1");
@@ -3384,21 +3425,60 @@ fn initrd_fail_closed_honors_poweroff_skip() {
 }
 
 #[test]
+fn initrd_fail_closed_uses_injected_systemctl_only_when_forced() {
+    let env = EnvGuard::new(&[
+        "CA_SKIP_INITRD_POWEROFF",
+        "CA_FORCE_INITRD_POWEROFF",
+        "CA_SYSTEMCTL_BIN",
+    ]);
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("systemctl.args");
+    let fake_systemctl = temp.path().join("systemctl-test-double");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+    env.remove("CA_SKIP_INITRD_POWEROFF");
+    env.set("CA_FORCE_INITRD_POWEROFF", "1");
+    env.set_path("CA_SYSTEMCTL_BIN", &fake_systemctl);
+
+    let err = initrd_fail_closed("forced test failure".to_string()).unwrap_err();
+
+    assert!(err.to_string().contains("forced test failure"));
+    assert_eq!(
+        fs::read_to_string(marker).unwrap().trim(),
+        "--no-block poweroff"
+    );
+}
+
+#[test]
 fn read_bootstrap_handles_absent_empty_and_invalid_resources() {
     let temp = tempfile::tempdir().unwrap();
     let cdh_root = temp.path().join("cdh");
     let args = test_run_args(cdh_root.clone());
 
-    assert!(read_bootstrap(&args).unwrap().is_none());
+    assert!(read_bootstrap(&args, RuntimeMode::Challenge)
+        .unwrap()
+        .is_none());
     write_test_file(&cdh_root.join(TEST_BOOTSTRAP_RESOURCE), b"");
-    assert!(read_bootstrap(&args).unwrap().is_none());
+    assert!(read_bootstrap(&args, RuntimeMode::Challenge)
+        .unwrap()
+        .is_none());
 
     let mut unsupported = test_bootstrap_config("openclaw");
     unsupported.mode = "trustee".to_string();
     write_json_fixture(&cdh_root.join(TEST_BOOTSTRAP_RESOURCE), &unsupported);
 
-    let err = read_bootstrap(&args).unwrap_err();
-    assert!(err.to_string().contains("not supported"));
+    let err = read_bootstrap(&args, RuntimeMode::Challenge).unwrap_err();
+    assert!(err.to_string().contains("does not match runtime mode"));
+    assert!(read_bootstrap(&args, RuntimeMode::Trustee)
+        .unwrap()
+        .is_some());
 }
 
 #[test]

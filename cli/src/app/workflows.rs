@@ -223,6 +223,7 @@ pub(super) fn build_service_state(
         service_id: spec.service.id.clone(),
         generation: old_generation + 1,
         phase: phase.to_string(),
+        attestation_mode: attestation_mode_name(spec.attestation.mode).to_string(),
         spec: LocalSpecState {
             path: absolute_path(spec_path)?,
             sha256: sha256_file(spec_path)?,
@@ -285,6 +286,7 @@ pub(super) fn activate_existing_service_state(
     state.schema = LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string();
     state.generation += 1;
     state.phase = "active".to_string();
+    state.attestation_mode = attestation_mode_name(spec.attestation.mode).to_string();
     state.spec = LocalSpecState {
         path: absolute_path(spec_path)?,
         sha256: sha256_file(spec_path)?,
@@ -434,12 +436,30 @@ pub(super) fn render_service_config_from_state(
     mesh_peer_cidrs: Vec<String>,
 ) -> Result<()> {
     let mut spec = AgentSpec::from_path(&state.spec.path)?;
+    // Re-rendering an existing deployment must preserve the provider that was
+    // committed to durable state. A later AppSpec edit may change desired
+    // settings for a future deployment, but it must not remove Trustee
+    // user-data from the currently managed instance.
+    spec.attestation.mode = if trustee::service_uses_trustee(
+        state_dir,
+        &state.service_id,
+        Some(&state.attestation_mode),
+    )? {
+        AttestationMode::Trustee
+    } else {
+        AttestationMode::Challenge
+    };
     let paths = context_paths(state_dir, &state.service_id);
     let manifest = read_build_manifest(&paths.manifest)?;
     let variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
     if let Some(debug_ssh) = variant.debug_ssh.as_ref() {
         apply_debug_ssh_public_key(&mut spec, &debug_ssh.public_key)?;
     }
+    let deploy_user_data = if spec.attestation.mode == AttestationMode::Trustee {
+        Some(trustee::runtime_user_data(state_dir, &state.service_id)?)
+    } else {
+        None
+    };
     spec.deploy.image_variant = Some(state.build.variant.clone());
     let images_dir = manifest.images_dir.clone();
     let cache_dir = manifest.cache_dir.clone();
@@ -470,6 +490,7 @@ pub(super) fn render_service_config_from_state(
             deploy_resource_name: Some(state.deploy.resource_name.clone()),
             local_image_import_name: state.deploy.image_import_name.clone(),
             cloud_image_id: state.deploy.published_image_id.clone(),
+            deploy_user_data,
             mesh_peer_cidrs,
             peerings: read_peerings_or_empty(state_dir)?,
         },
@@ -538,28 +559,43 @@ pub(super) fn sync_mesh_for_services(
                 .unwrap_or(true)
         })
     {
-        let Some(target_ip) = service.deploy.preferred_injection_ip() else {
-            bail!(
-                "service '{}' has no IP for mesh injection",
-                service.service_id
-            );
-        };
-        prepare_challenge_reference_values(
-            cli,
+        if trustee::service_uses_trustee(
             state_dir,
             &service.service_id,
-            service.build.sample_rv.as_ref(),
-            service.build.rekor_meta.as_ref(),
-            &service.reference_values,
-        )?;
-        challenge_inject(
-            cli,
-            state_dir,
-            target_ip,
-            "default/local-resources/cagent_mesh_bundle",
-            &bundle_path,
-            &service.deploy.tee,
-        )?;
+            Some(&service.attestation_mode),
+        )? {
+            // `sync_mesh` and `sync_mesh_with_candidate` hold the global
+            // state lock across bundle generation and delivery.
+            trustee::put_dynamic_resource_with_state_lock(
+                state_dir,
+                &service.service_id,
+                "default/local-resources/cagent_mesh_bundle",
+                &bundle_path,
+            )?;
+        } else {
+            let Some(target_ip) = service.deploy.preferred_injection_ip() else {
+                bail!(
+                    "service '{}' has no IP for mesh injection",
+                    service.service_id
+                );
+            };
+            prepare_challenge_reference_values(
+                cli,
+                state_dir,
+                &service.service_id,
+                service.build.sample_rv.as_ref(),
+                service.build.rekor_meta.as_ref(),
+                &service.reference_values,
+            )?;
+            challenge_inject(
+                cli,
+                state_dir,
+                target_ip,
+                "default/local-resources/cagent_mesh_bundle",
+                &bundle_path,
+                &service.deploy.tee,
+            )?;
+        }
         delivered.push(service.service_id.clone());
     }
 
@@ -1150,6 +1186,7 @@ mod tests {
             service_id: id.to_string(),
             generation: 1,
             phase: phase.to_string(),
+            attestation_mode: "challenge".to_string(),
             spec: LocalSpecState {
                 path: PathBuf::from("/project/agent.yaml"),
                 sha256: "spec-hash".to_string(),

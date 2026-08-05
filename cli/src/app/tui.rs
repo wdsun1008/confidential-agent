@@ -886,6 +886,7 @@ fn panic_fallback_state() -> LocalServiceState {
         service_id: String::new(),
         generation: 0,
         phase: "error".to_string(),
+        attestation_mode: "challenge".to_string(),
         spec: LocalSpecState {
             path: PathBuf::new(),
             sha256: String::new(),

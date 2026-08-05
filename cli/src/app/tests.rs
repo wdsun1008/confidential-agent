@@ -517,6 +517,7 @@ fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<u16>) -> LocalSer
             service_id: service_id.to_string(),
             generation: 1,
             phase: "active".to_string(),
+            attestation_mode: "challenge".to_string(),
             spec: LocalSpecState {
                 path: PathBuf::from("/spec.yaml"),
                 sha256: "spec".to_string(),
@@ -1139,12 +1140,16 @@ fn cryptpilot_fde_config_matches_current_schema() {
     let config = cryptpilot_fde_config();
 
     assert!(config.contains("[rootfs]"));
-    assert!(config.contains("delta_location = \"disk\""));
+    assert!(config.contains("delta_location = \"disk-persist\""));
     assert!(config.contains("delta_backend = \"dm-snapshot\""));
     assert!(config.contains("[delta]"));
     assert!(config.contains("integrity = false"));
     assert!(config.contains("[delta.encrypt.exec]"));
-    assert!(config.contains("args = [\"/run/cai/secrets/disk_key\"]"));
+    assert!(config.contains("command = \"/bin/bash\""));
+    assert!(config.contains(
+        "args = [\"-c\", \"CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /usr/bin/cat /run/cai/secrets/disk_key\"]"
+    ));
+    assert!(!config.contains("initrd-fetch 1>&2"));
     assert!(!config.contains("rw_overlay"));
     assert!(!config.contains("[data]"));
 }
@@ -4085,4 +4090,6 @@ fn secret_fetch_initrd_loads_tdx_guest_module() {
     assert!(setup.contains("usr/lib/modules-load.d"));
     assert!(setup.contains("confidential-agent-tdx.conf"));
     assert!(setup.contains("tdx_guest\\n"));
+    assert!(setup.contains("rd.retry=300 rd.shell=0 rd.emergency=poweroff"));
+    assert!(setup.contains("36-confidential-agent-fail-closed.conf"));
 }

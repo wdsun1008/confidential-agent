@@ -18,6 +18,7 @@ confidential-agent-shelter = { path = "../shelter" }
 ctrlc.workspace = true
 crossterm.workspace = true
 curve25519-dalek.workspace = true
+ed25519-dalek.workspace = true
 libc.workspace = true
 rand_core.workspace = true
 ratatui.workspace = true
@@ -28,3 +29,6 @@ sha2.workspace = true
 tempfile.workspace = true
 ureq.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+regorus.workspace = true
