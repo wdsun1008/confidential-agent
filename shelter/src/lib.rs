@@ -20,7 +20,6 @@ pub struct GuestAssets {
     pub fde_config_file: PathBuf,
     pub policy_default: PathBuf,
     pub policy_local_dev: PathBuf,
-    pub guest_tng_bin: Option<PathBuf>,
     pub guest_setup_script: Option<PathBuf>,
     pub extra_files: Vec<GuestFileAsset>,
 }
@@ -178,13 +177,6 @@ fn guest_files(assets: &GuestAssets) -> Vec<ShelterFileMapping> {
         },
     ];
 
-    if let Some(tng_bin) = &assets.guest_tng_bin {
-        files.push(ShelterFileMapping {
-            source: tng_bin.clone(),
-            destination: Some("/opt/confidential-agent/hack/tng-2.6.0".to_string()),
-            executable: true,
-        });
-    }
     files.extend(assets.extra_files.iter().map(|asset| ShelterFileMapping {
         source: asset.source.clone(),
         destination: Some(asset.destination.clone()),

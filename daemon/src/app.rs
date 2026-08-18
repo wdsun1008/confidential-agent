@@ -2009,6 +2009,9 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
             .enumerate()
             .map(|(idx, port)| {
                 let mut route = json!({
+                    "rats_tls": {
+                        "multiplex": true,
+                    },
                     "netfilter": {
                         "capture_dst": { "port": port },
                         "capture_local_traffic": false,
@@ -2288,11 +2291,10 @@ fn tng_attest_config() -> Value {
 fn tng_verify_config(reference_values: Value) -> Value {
     json!({
         "as_type": "builtin",
-        "policy": {
+        "attestation_policy": {
             "type": "path",
             "path": DEFAULT_POLICY_PATH,
         },
-        "policy_ids": ["default"],
         "reference_values": reference_values,
     })
 }
@@ -2335,6 +2337,9 @@ fn tng_config(bundle: &MeshBundle, self_id: &str, plan: &RuntimePortPlan) -> Res
     };
     for route_plan in &plan.self_routes {
         let mut route = json!({
+            "rats_tls": {
+                "multiplex": true,
+            },
             "netfilter": {
                 "capture_dst": {
                     "port": route_plan.port,
@@ -2360,6 +2365,9 @@ fn tng_config(bundle: &MeshBundle, self_id: &str, plan: &RuntimePortPlan) -> Res
     for route_plan in &plan.peer_routes {
         let reference_values = tng_reference_values(bundle, &route_plan.service_id)?;
         let mut entry = json!({
+            "rats_tls": {
+                "multiplex": true,
+            },
             "mapping": {
                 "in": {
                     "host": "127.0.0.1",
@@ -2645,6 +2653,9 @@ fn a2a_tng_ingress(
                 let mut dir_ports = Vec::new();
                 for port in &resolved.ports {
                     ingress.push(json!({
+                        "rats_tls": {
+                            "multiplex": true,
+                        },
                         "mapping": {
                             "in": {
                                 "host": "127.0.0.1",
@@ -2657,11 +2668,10 @@ fn a2a_tng_ingress(
                         },
                         "verify": {
                             "as_type": "builtin",
-                            "policy": {
+                            "attestation_policy": {
                                 "type": "path",
                                 "path": DEFAULT_POLICY_PATH,
                             },
-                            "policy_ids": ["default"],
                             "reference_values": resolved.reference_values,
                         },
                     }));

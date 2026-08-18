@@ -143,6 +143,9 @@ pub fn derive_tng_client_config_with_local_ports(
     for port in &ext.ports {
         let local_port = local_port_for(port.port)?;
         ingress.push(json!({
+            "rats_tls": {
+                "multiplex": true,
+            },
             "mapping": {
                 "in": {
                     "host": "127.0.0.1",
@@ -155,11 +158,10 @@ pub fn derive_tng_client_config_with_local_ports(
             },
             "verify": {
                 "as_type": "builtin",
-                "policy": {
+                "attestation_policy": {
                     "type": "path",
                     "path": policy_path,
                 },
-                "policy_ids": ["default"],
                 "reference_values": reference_values,
             },
         }));
@@ -552,6 +554,13 @@ mod tests {
         assert_eq!(ingress[0]["mapping"]["out"]["host"], "1.2.3.4");
         assert_eq!(ingress[0]["mapping"]["out"]["port"], 18789);
         assert_eq!(ingress[0]["mapping"]["in"]["host"], "127.0.0.1");
+        assert_eq!(ingress[0]["rats_tls"]["multiplex"], true);
+        assert_eq!(
+            ingress[0]["verify"]["attestation_policy"]["path"],
+            DEFAULT_TNG_POLICY_PATH
+        );
+        assert!(ingress[0]["verify"].get("policy").is_none());
+        assert!(ingress[0]["verify"].get("policy_ids").is_none());
     }
 
     #[test]

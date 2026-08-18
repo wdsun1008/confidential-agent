@@ -3,6 +3,7 @@ ARG BASE_IMAGE=alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux
 FROM ${BASE_IMAGE} AS tools
 
 ARG INSTALL_PACKAGES="binutils ca-certificates curl rpm tar"
+ARG TNG_RPM_VERSION=2.8.0-1.al8
 ARG COSIGN_VERSION=3.0.6
 ARG REKOR_VERSION=1.5.1
 ARG ALIYUN_CLI_VERSION=3.0.232
@@ -28,8 +29,6 @@ RUN yum install -y \
         ${INSTALL_PACKAGES} && \
     yum clean all && \
     rm -rf /var/cache/dnf /var/cache/yum
-
-COPY hack/tng-2.6.0 /usr/bin/tng
 
 RUN download() { \
         dest="$1"; \
@@ -116,7 +115,10 @@ RUN download() { \
 RUN yum install -y \
         --setopt=install_weak_deps=False \
         libtdx-verify \
-        attestation-challenge-client && \
+        attestation-challenge-client \
+        "trusted-network-gateway-${TNG_RPM_VERSION}" && \
+    rpm -q trusted-network-gateway | grep -qxF "trusted-network-gateway-${TNG_RPM_VERSION}.x86_64" && \
+    /usr/bin/tng --version | sed -n '1p' | grep -qxF 'tng 2.8.0' && \
     yum clean all && \
     rm -rf /var/cache/dnf /var/cache/yum && \
     ! rpm -q trustee && \
@@ -131,7 +133,6 @@ COPY --from=tools /usr/bin/rekor-cli /usr/bin/rekor-cli
 COPY --from=tools /usr/bin/aliyun /usr/bin/aliyun
 COPY --from=tools /usr/bin/ossutil64 /usr/bin/ossutil64
 COPY --from=tools /etc/sgx_default_qcnl.conf /etc/sgx_default_qcnl.conf
-COPY hack/tng-2.6.0 /opt/confidential-agent/hack/tng-2.6.0
 COPY --from=tools /usr/lib64/libsgx_dcap_quoteverify.so.1.22.100.3 /usr/lib64/libsgx_dcap_quoteverify.so.1.22.100.3
 COPY --from=tools /usr/lib64/libsgx_default_qcnl_wrapper.so.1.22.100.3 /usr/lib64/libsgx_default_qcnl_wrapper.so.1.22.100.3
 COPY --from=tools /usr/lib64/libdcap_quoteprov.so.1.13.109.3 /usr/lib64/libdcap_quoteprov.so.1.13.109.3
@@ -143,17 +144,14 @@ COPY tools/policies/trustee-opa-default.rego /var/lib/attestation/token/ear/poli
 RUN ln -sf libsgx_dcap_quoteverify.so.1.22.100.3 /usr/lib64/libsgx_dcap_quoteverify.so.1 && \
     ln -sf libsgx_default_qcnl_wrapper.so.1.22.100.3 /usr/lib64/libsgx_default_qcnl_wrapper.so.1 && \
     ln -sf libdcap_quoteprov.so.1.13.109.3 /usr/lib64/libdcap_quoteprov.so.1 && \
-    chmod 0755 /usr/bin/attestation-challenge-client /usr/bin/tng /usr/bin/cosign /usr/bin/rekor-cli /usr/bin/aliyun /usr/bin/ossutil64 /opt/confidential-agent/hack/tng-2.6.0 && \
+    chmod 0755 /usr/bin/attestation-challenge-client /usr/bin/tng /usr/bin/cosign /usr/bin/rekor-cli /usr/bin/aliyun /usr/bin/ossutil64 && \
     chmod 0644 /etc/sgx_default_qcnl.conf /usr/share/sgx/tee_appraisal_policy.wasm /var/lib/attestation/token/ear/policies/opa/default.rego /opt/confidential-agent/policies/*.rego && \
-    chmod 0755 /usr/share/sgx /var/lib/attestation /var/lib/attestation/token /var/lib/attestation/token/ear /var/lib/attestation/token/ear/policies /var/lib/attestation/token/ear/policies/opa /opt/confidential-agent /opt/confidential-agent/policies /opt/confidential-agent/hack
+    chmod 0755 /usr/share/sgx /var/lib/attestation /var/lib/attestation/token /var/lib/attestation/token/ear /var/lib/attestation/token/ear/policies /var/lib/attestation/token/ear/policies/opa /opt/confidential-agent /opt/confidential-agent/policies
 
-RUN /usr/bin/tng --version | grep -q '^tng 2\.6\.0' && \
-    tng_sum="$(sha256sum /usr/bin/tng)" && \
-    hack_tng_sum="$(sha256sum /opt/confidential-agent/hack/tng-2.6.0)" && \
-    test "${tng_sum%% *}" = "${hack_tng_sum%% *}" && \
+RUN /usr/bin/tng --version | sed -n '1p' | grep -qxF 'tng 2.8.0' && \
     /usr/bin/cosign version >/dev/null && \
     /usr/bin/rekor-cli version >/dev/null && \
     /usr/bin/aliyun version >/dev/null && \
     /usr/bin/ossutil64 --version >/dev/null && \
-    /opt/confidential-agent/hack/tng-2.6.0 --version | grep -q '^tng 2\.6\.0' && \
+    ! ldd /usr/bin/attestation-challenge-client | grep -q 'not found' && \
     /usr/bin/attestation-challenge-client --help >/dev/null

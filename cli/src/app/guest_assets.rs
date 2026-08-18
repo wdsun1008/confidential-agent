@@ -61,14 +61,6 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
     fs::write(&fde_config_file, cryptpilot_fde_config())
         .with_context(|| format!("failed to write '{}'", fde_config_file.display()))?;
 
-    let staged_guest_tng_bin = Some(stage_tools_image_asset(
-        cli,
-        guest_staging_dir,
-        "/opt/confidential-agent/hack/tng-2.6.0",
-        "tng-2.6.0",
-        0o755,
-    )?);
-    verify_staged_guest_tng_binary(cli, staged_guest_tng_bin.as_ref().unwrap())?;
     let staged_attestation_client = stage_tools_image_asset(
         cli,
         guest_staging_dir,
@@ -101,7 +93,6 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         fde_config_file,
         policy_default,
         policy_local_dev,
-        guest_tng_bin: staged_guest_tng_bin,
         guest_setup_script,
         extra_files,
     })
@@ -178,125 +169,6 @@ pub(super) fn ensure_docker_available() -> Result<()> {
         .context("docker command is required to run Confidential Agent tools image")?;
     if !status.success() {
         bail!("docker command is required to run Confidential Agent tools image");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn stage_guest_tng_binary(
-    guest_staging_dir: &Path,
-    explicit: Option<&PathBuf>,
-    candidates: &[PathBuf],
-) -> Result<PathBuf> {
-    let source = match explicit {
-        Some(path) => {
-            verify_guest_tng_binary(path)?;
-            path.clone()
-        }
-        None => find_guest_tng_binary(candidates)?,
-    };
-
-    let staged = guest_staging_dir.join("tng-2.6.0");
-    fs::copy(&source, &staged).with_context(|| {
-        format!(
-            "failed to copy guest TNG binary '{}' to '{}'",
-            source.display(),
-            staged.display()
-        )
-    })?;
-    set_mode(&staged, 0o755)?;
-    Ok(staged)
-}
-
-#[cfg(test)]
-pub(super) fn find_guest_tng_binary(candidates: &[PathBuf]) -> Result<PathBuf> {
-    let mut checked = Vec::new();
-    for candidate in candidates {
-        if !candidate.exists() {
-            continue;
-        }
-        checked.push(candidate.display().to_string());
-        if verify_guest_tng_binary(candidate).is_ok() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    let checked = if checked.is_empty() {
-        "no default candidates existed".to_string()
-    } else {
-        format!("checked: {}", checked.join(", "))
-    };
-    bail!("guest TNG 2.6.0 binary is required for builtin-AS mesh in test fixture ({checked})")
-}
-
-#[cfg(test)]
-pub(super) fn verify_guest_tng_binary(path: &Path) -> Result<()> {
-    if !path.exists() {
-        bail!("guest TNG binary '{}' does not exist", path.display());
-    }
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to execute guest TNG binary '{}'", path.display()))?;
-    if !output.status.success() {
-        bail!(
-            "guest TNG binary '{}' failed version check with {}",
-            path.display(),
-            output.status
-        );
-    }
-    expect_tng_version(&output.stdout, path)
-}
-
-/// The staged binary links against guest-only libraries (e.g. libtdx-verify),
-/// so the version check must run inside the tools container, not on the host.
-fn verify_staged_guest_tng_binary(cli: &Cli, path: &Path) -> Result<()> {
-    let mount = absolute_path(
-        path.parent()
-            .with_context(|| format!("guest TNG path '{}' has no parent", path.display()))?,
-    )?;
-    let output = run_tools_container_output(
-        &cli.tools_image,
-        ToolContainerSpec {
-            tool: "sh",
-            tool_args: vec![
-                OsString::from("-c"),
-                OsString::from("exec \"$1\" --version"),
-                OsString::from("tng-version-check"),
-                absolute_path(path)?.into_os_string(),
-            ],
-            mounts: vec![mount],
-            envs: Vec::new(),
-            workdir: None,
-            container_name: None,
-        },
-    )?;
-    if !output.status.success() {
-        bail!(
-            "guest TNG binary '{}' failed version check with {}: {}",
-            path.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    expect_tng_version(&output.stdout, path)
-}
-
-fn expect_tng_version(stdout: &[u8], path: &Path) -> Result<()> {
-    let version_output = String::from_utf8_lossy(stdout);
-    let version = version_output
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if version != REQUIRED_GUEST_TNG_VERSION {
-        bail!(
-            "guest TNG binary '{}' reported '{}', expected {}",
-            path.display(),
-            version,
-            REQUIRED_GUEST_TNG_VERSION
-        );
     }
     Ok(())
 }
@@ -384,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn tng_service_unit_launches_hack_replaced_tng_config() {
+    fn tng_service_unit_launches_packaged_tng_with_runtime_config() {
         let unit = tng_service_unit();
         assert!(unit.contains("ExecStart=/usr/bin/tng launch --config-file /etc/tng/config.json"));
         assert!(unit.contains("After=network-online.target attestation-agent.service"));
@@ -397,11 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn guest_setup_script_overwrites_tng_with_hack_binary() {
+    fn guest_setup_script_pins_packaged_tng_and_keeps_service_disabled() {
         let script = guest_setup_script();
-        assert!(
-            script.contains("install -m 0755 /opt/confidential-agent/hack/tng-2.6.0 /usr/bin/tng")
-        );
+        assert!(script.contains("trusted-network-gateway-2.8.0-1.al8.x86_64"));
+        assert!(script.contains("expected_tng_version='tng 2.8.0'"));
+        assert!(!script.contains("/opt/confidential-agent/hack/tng-"));
         assert!(script.contains("/etc/systemd/system-preset/00-confidential-agent-tng.preset"));
         assert!(script.contains("disable trusted-network-gateway.service"));
         assert!(script.contains("systemctl disable trusted-network-gateway.service"));

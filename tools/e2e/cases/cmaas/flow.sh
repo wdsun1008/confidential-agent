@@ -436,19 +436,28 @@ run_case() {
   wait_for_ssh "$cmaas_ip" "$cmaas_key" 300
   wait_for_ssh "$agent_ip" "$agent_key" 300
   local tng_runtime_check
-  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; a=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); b=\$(sha256sum /opt/confidential-agent/hack/tng-2.6.0 | cut -d' ' -f1); test \"\$a\" = \"\$b\"; echo tng_hash=\$a; enabled=\$(systemctl is-enabled trusted-network-gateway.service || true); echo tng_enabled=\$enabled; test \"\$enabled\" = disabled; systemctl is-active trusted-network-gateway.service"
+  # libtdx-verify remains intentional for attestation-challenge-client; TNG itself comes from the 2.8 RPM.
+  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; rpm_nevra=\$(rpm -q trusted-network-gateway); echo tng_rpm=\$rpm_nevra; test \"\$rpm_nevra\" = trusted-network-gateway-2.8.0-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); echo tng_version=\$tng_version; test \"\$tng_version\" = 'tng 2.8.0'; echo tng_hash=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; echo tng_config_schema=2.8; curl -fsS http://127.0.0.1:50000/status/ >/tmp/confidential-agent-tng-status.json; echo tng_status=ok; enabled=\$(systemctl is-enabled trusted-network-gateway.service || true); echo tng_enabled=\$enabled; test \"\$enabled\" = disabled; systemctl is-active trusted-network-gateway.service"
   record_cmd "ssh cmaas '<tng runtime check>'"
   ssh_guest "$cmaas_key" "$cmaas_ip" "$tng_runtime_check" >"$WORK_DIR/cmaas-tng-runtime.txt"
   record_file_as_block "CMaaS TNG runtime state:" "$WORK_DIR/cmaas-tng-runtime.txt" text
   grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_rpm=trusted-network-gateway-2.8.0-1.al8.x86_64' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_version=tng 2.8.0' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -E '^tng_hash=' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_config_schema=2.8' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_status=ok' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -Fx 'tng_enabled=disabled' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -Fx 'active' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   record_cmd "ssh agent '<tng runtime check>'"
   ssh_guest "$agent_key" "$agent_ip" "$tng_runtime_check" >"$WORK_DIR/agent-tng-runtime.txt"
   record_file_as_block "Agent TNG runtime state:" "$WORK_DIR/agent-tng-runtime.txt" text
   grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_rpm=trusted-network-gateway-2.8.0-1.al8.x86_64' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_version=tng 2.8.0' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -E '^tng_hash=' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_config_schema=2.8' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_status=ok' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -Fx 'tng_enabled=disabled' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -Fx 'active' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
 
@@ -502,6 +511,41 @@ run_case() {
   assert_file_contains "$WORK_DIR/agent-client-output.json" '"audit_verify"' "audit_verify tool call"
   assert_file_contains "$WORK_DIR/agent-client-output.json" '"tee_attest"' "tee_attest tool call"
   record "- natural-language CMaaS agent called memory, audit, and TEE attestation MCP tools."
+
+  # Prove that TNG 2.8 consumes verify.attestation_policy instead of silently
+  # falling back to hardware_only. Replacing the referenced policy with a
+  # valid always-deny appraisal must reject a fresh RA-TLS handshake.
+  local deny_policy_b64 deny_probe_succeeded
+  deny_policy_b64="$(printf '%s' $'package policy\n\nimport rego.v1\n\nexecutables := 33\nhardware := 97\nconfiguration := 36\nfile_system := 35\n' | base64 | tr -d '\n')"
+  record_cmd "ssh agent '<install deny-all TNG policy and restart>'"
+  ssh_guest "$agent_key" "$agent_ip" "set -euo pipefail; policy=/opt/confidential-agent/policies/trustee-opa-default.rego; backup=/run/confidential-agent-tng-policy.backup; cp -a \"\$policy\" \"\$backup\"; trap 'install -m 0644 \"\$backup\" \"\$policy\"; systemctl restart trusted-network-gateway.service' ERR; printf '%s' '$deny_policy_b64' | base64 -d >\"\$policy\"; systemctl restart trusted-network-gateway.service; systemctl is-active --quiet trusted-network-gateway.service; trap - ERR" >"$WORK_DIR/tng-deny-policy-install.txt"
+  deny_probe_succeeded=0
+  record_cmd "ssh agent 'cmaas-agent-client --action tools_list' # expected RA rejection"
+  if ssh_guest "$agent_key" "$agent_ip" "timeout 90 cmaas-agent-client --action tools_list" >"$WORK_DIR/tng-deny-policy-probe.out" 2>"$WORK_DIR/tng-deny-policy-probe.err"; then
+    deny_probe_succeeded=1
+  fi
+  record_file_as_block "TNG deny-policy probe stdout:" "$WORK_DIR/tng-deny-policy-probe.out" text
+  record_file_as_block "TNG deny-policy probe stderr:" "$WORK_DIR/tng-deny-policy-probe.err" text
+  record_cmd "ssh agent '<restore TNG policy and restart>'"
+  ssh_guest "$agent_key" "$agent_ip" "set -euo pipefail; policy=/opt/confidential-agent/policies/trustee-opa-default.rego; backup=/run/confidential-agent-tng-policy.backup; test -f \"\$backup\"; install -m 0644 \"\$backup\" \"\$policy\"; rm -f \"\$backup\"; systemctl restart trusted-network-gateway.service; systemctl is-active --quiet trusted-network-gateway.service"
+  if [[ "$deny_probe_succeeded" == "1" ]]; then
+    echo "TNG connection unexpectedly succeeded with an always-deny attestation_policy" >&2
+    return 1
+  fi
+  for attempt in 1 2 3 4 5 6; do
+    if ssh_guest "$agent_key" "$agent_ip" "timeout 90 cmaas-agent-client --action tools_list" >"$WORK_DIR/tng-policy-recovery.json" 2>"$WORK_DIR/tng-policy-recovery.err"; then
+      break
+    fi
+    [[ "$attempt" == "6" ]] && {
+      record_file_as_block "TNG policy recovery stderr:" "$WORK_DIR/tng-policy-recovery.err" text
+      return 1
+    }
+    sleep 10
+  done
+  record_file_as_block "TNG policy recovery output:" "$WORK_DIR/tng-policy-recovery.json" json
+  assert_file_contains "$WORK_DIR/tng-policy-recovery.json" '"tools"' "TNG policy recovery tools/list"
+  record "- TNG rejected a fresh connection under an always-deny builtin policy and recovered after restoring the policy."
+
   ssh_guest "$cmaas_key" "$cmaas_ip" "sync; grep -F '$observation' /var/lib/mcp-memory/memory.jsonl >/tmp/cmaas-marker.txt"
   record "- observation marker is present inside the running CMaaS guest memory file."
   record_cmd "ssh cmaas 'cai-gateway audit-verify --audit $audit_path'"

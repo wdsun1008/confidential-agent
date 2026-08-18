@@ -104,7 +104,10 @@ fn spec_parse_to_card_to_tng_config() {
     assert_eq!(ingress[0]["mapping"]["out"]["host"], "47.93.100.200");
     assert_eq!(ingress[0]["mapping"]["out"]["port"], 18789);
     assert!(ingress[0]["verify"]["reference_values"].is_array());
-    assert_eq!(ingress[0]["verify"]["policy_ids"][0], "default");
+    assert_eq!(ingress[0]["rats_tls"]["multiplex"], true);
+    assert_eq!(ingress[0]["verify"]["attestation_policy"]["type"], "path");
+    assert!(ingress[0]["verify"].get("policy").is_none());
+    assert!(ingress[0]["verify"].get("policy_ids").is_none());
 }
 
 #[test]

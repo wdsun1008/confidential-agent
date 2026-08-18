@@ -163,6 +163,21 @@ tail -n 200 /var/log/cai-a2a-data-collab.jsonl 2>/dev/null || true" >"$output" 2
   record_file_as_block "$label A2A data collaboration guest diagnostics:" "$output" text
 }
 
+assert_a2a_guest_tng_28_config() {
+  local label="$1"
+  local host="$2"
+  local key="$3"
+  local output="$WORK_DIR/a2a-tng-$label.txt"
+  local check
+
+  wait_for_ssh "$host" "$key" 300
+  check="set -euo pipefail; rpm_nevra=\$(rpm -q trusted-network-gateway); test \"\$rpm_nevra\" = trusted-network-gateway-2.8.0-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); test \"\$tng_version\" = 'tng 2.8.0'; jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; printf 'tng_rpm=%s\\ntng_version=%s\\ntng_config_schema=2.8\\n' \"\$rpm_nevra\" \"\$tng_version\""
+
+  record_cmd "ssh $label '<assert TNG 2.8 A2A config>'"
+  ssh_guest "$key" "$host" "$check" >"$output"
+  record_file_as_block "$label TNG 2.8 A2A config:" "$output" text
+}
+
 assert_a2a_connect_boundary() {
   local label="$1"
   local host="$2"
@@ -359,6 +374,8 @@ run_case() {
   wait_for_status_service_ready "$ANALYST_STATE_DIR" analyst-agent 900
   wait_for_a2a_peer_state "$analyst_ip" data-owner ok "" 300
   wait_for_a2a_peer_state "$data_owner_ip" analyst ok "" 300
+  assert_a2a_guest_tng_28_config analyst "$analyst_ip" "$analyst_key"
+  assert_a2a_guest_tng_28_config data-owner "$data_owner_ip" "$data_owner_key"
   assert_a2a_connect_boundary analyst "$analyst_ip" "$analyst_key" data-owner
   assert_a2a_connect_boundary data-owner "$data_owner_ip" "$data_owner_key" analyst
   ca_run "$ANALYST_STATE_DIR" status --live | tee "$WORK_DIR/status-live.txt"

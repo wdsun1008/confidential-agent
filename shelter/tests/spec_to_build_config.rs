@@ -55,7 +55,6 @@ fn assets() -> GuestAssets {
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/trustee-opa-default.rego"),
         policy_local_dev: PathBuf::from("/build/trustee-opa-local-dev.rego"),
-        guest_tng_bin: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     }

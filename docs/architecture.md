@@ -68,8 +68,7 @@ sequenceDiagram
     Core-->>CLI: spec (validated)
     CLI->>FS: lock state-dir + check phase != active/deployed
     CLI->>FS: prepare_guest_assets (staging confidential-agentd, cai-gateway, fde.toml, dracut module, OPA policy)
-    CLI->>Docker: docker create + cp tools-image:/opt/.../tng-2.6.0 → staging
-    CLI->>CLI: verify "tng --version == tng 2.6.0"
+    CLI->>Docker: docker create + cp attestation client/cosign → staging
     loop 每个 build.variants.*.enabled=true 的 variant
         CLI->>SH: render_build_config(spec with image_variant, assets, options)
         SH-->>CLI: Shelter YAML (string)
@@ -84,7 +83,7 @@ sequenceDiagram
 
 关键点：
 - **mkosi vs convert 模式**：取决于 `build.base_image` 是否提供。前者由 Shelter 从零构建，后者基于已有镜像增强。两条路径下都强制 UKI 启动 + cryptpilot FDE（[`ShelterDiskCrypt::writable_layer_defaults`](../shelter/src/lib.rs)）。
-- **TNG 严格 pin**：guest 用的 TNG 二进制版本必须等于 `REQUIRED_GUEST_TNG_VERSION = "tng 2.6.0"`（[`cli/src/app.rs`](../cli/src/app.rs)），否则 build 直接失败。
+- **TNG 严格 pin**：tools 镜像从 Alinux3 仓库安装 `trusted-network-gateway-2.8.0-1.al8`；Guest 由 Shelter 的 `security.tng: true` 自动安装官方 RPM，随后 [`guest_setup_script`](../cli/src/app.rs) 同时校验 RPM NEVRA 与 `tng --version`，版本不符时 build 直接失败。仓库不再携带或覆盖 TNG 二进制；从旧版升级时必须重新 build Guest 镜像，不能用 `E2E_SKIP_BUILD=1` 复用 2.6 产物验证升级。
 - **多 variant 构建**：一次 `build` 会构建所有 enabled variants；当前 state 的 `build_id` 指向 `deploy.image_variant`，完整结果保存在 manifest 的 `variants` map。
 - **build_id 时间戳化**：`<image_name>-<variant>-<run_id>`，run_id 精确到毫秒，防止重复 build 互相覆盖。
 
@@ -175,7 +174,7 @@ flowchart TB
 
 关键 systemd unit 与依赖关系来自三处：
 - daemon 嵌入的 rootfs unit 文本：[`agentd_service_unit`](../cli/src/app.rs)。initrd 不再创建独立 secret-fetch unit；[`cryptpilot_fde_config`](../cli/src/app.rs) 的 `exec` provider 在 CryptPilot 校时后直接调用 `confidential-agentd initrd-fetch`。
-- mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 把 `hack/tng-2.6.0` 覆盖安装到 `/usr/bin/tng`，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。`libtdx-verify` 由 Alinux3 软件源安装，不再作为仓库内 RPM 注入。
+- mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 校验 Shelter 安装的官方 TNG 2.8 RPM，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。Builtin AS 配置使用 TNG 2.8 的 `attestation_policy` 字段，并显式保持 `rats_tls.multiplex: true`，避免升级时发生隐含传输语义变化。`libtdx-verify` 仍由 Alinux3 软件源安装，供 `attestation-challenge-client` 使用。
 - 每个示例自己的 `install-*.sh`，例如 [`examples/openclaw/install-openclaw.sh`](../examples/openclaw/install-openclaw.sh) 注册 `cai-openclaw-gateway.service`；spec 的 `service.app_service` 决定 daemon 是否把该 unit 纳入 `app_ready` 判定。
 
 ---
@@ -306,7 +305,7 @@ sequenceDiagram
 
 | 现象 | 多半的原因 | 建议做法 |
 |---|---|---|
-| `confidential-agent build` 卡在 `tng --version` | tools 镜像里的 TNG 不是 2.6.0 | 用 `tools/Dockerfile` 重新构建工具镜像 |
+| `confidential-agent build` 报 TNG RPM/version 不匹配 | Alinux3 源解析到的 Guest TNG 不是 `2.8.0-1.al8`，或 tools 镜像不是 TNG 2.8.0 | 确认 `alinux3-plus` 中仍有目标 NEVRA，并用 `tools/Dockerfile` 重新构建工具镜像 |
 | Shelter deploy 完了，但 `inject-resource` 一直 timeout | 安全组 8006 没放通；或 `peerings.yaml` 的 `control` scope 不包含 host | 检查 `confidential-agent peering list` 并运行 `peering apply` |
 | daemon phase 长期停在 `waiting-resources` | 某个 `required=true` 资源缺失或 sha256 不对 | `confidential-agent status --live --json` 看 `applied_resources` |
 | daemon phase 停在 `starting-mesh` | TNG 未启动；通常因为 attestation-agent.sock 还没 ready | `journalctl -u trusted-network-gateway` |

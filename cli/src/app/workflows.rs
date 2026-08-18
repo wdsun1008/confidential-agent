@@ -473,7 +473,6 @@ pub(super) fn render_service_config_from_state(
         fde_config_file: manifest.fde_config_file,
         policy_default: manifest.policy_default,
         policy_local_dev: manifest.policy_local_dev,
-        guest_tng_bin: manifest.guest_tng_bin,
         guest_setup_script: manifest.guest_setup_script,
         extra_files: variant.extra_files,
     };
@@ -672,6 +671,9 @@ pub(super) fn render_connect_config(
                 http_base_url: format!("http://127.0.0.1:{local_port}"),
             });
             ingress.push(serde_json::json!({
+                "rats_tls": {
+                    "multiplex": true,
+                },
                 "mapping": {
                     "in": {
                         "host": "127.0.0.1",
@@ -684,8 +686,7 @@ pub(super) fn render_connect_config(
                 },
                 "verify": {
                     "as_type": "builtin",
-                    "policy": connect_policy_config(state_dir)?,
-                    "policy_ids": ["default"],
+                    "attestation_policy": connect_policy_config(state_dir)?,
                     "reference_values": reference_values,
                 }
             }));

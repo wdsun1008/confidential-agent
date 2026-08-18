@@ -771,6 +771,7 @@ fn tng_config_adds_egress_for_self_ports() {
     );
     assert_eq!(config["add_egress"][0]["netfilter"]["listen_port"], 39000);
     assert_eq!(config["add_egress"][0]["attest"]["aa_type"], "uds");
+    assert_eq!(config["add_egress"][0]["rats_tls"]["multiplex"], true);
     assert!(config["add_egress"][0].get("verify").is_none());
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 0);
 }
@@ -921,9 +922,15 @@ fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
     assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 3001);
     assert_eq!(config["add_ingress"][0]["verify"]["as_type"], "builtin");
     assert_eq!(
-        config["add_ingress"][0]["verify"]["policy"]["path"],
+        config["add_ingress"][0]["verify"]["attestation_policy"]["path"],
         DEFAULT_POLICY_PATH
     );
+    assert!(config["add_ingress"][0]["verify"].get("policy").is_none());
+    assert!(config["add_ingress"][0]["verify"]
+        .get("policy_ids")
+        .is_none());
+    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], true);
+    assert_eq!(config["add_egress"][0]["rats_tls"]["multiplex"], true);
     assert_eq!(
         config["add_ingress"][0]["verify"]["reference_values"][0]["type"],
         "sample"
@@ -2962,6 +2969,13 @@ fn a2a_tng_ingress_fetches_agent_card_and_generates_config() {
     assert_eq!(ingress[0]["mapping"]["in"]["host"], "127.0.0.1");
     assert_eq!(ingress[0]["mapping"]["in"]["port"], 3001);
     assert_eq!(ingress[1]["mapping"]["out"]["port"], 3002);
+    assert_eq!(ingress[0]["rats_tls"]["multiplex"], true);
+    assert_eq!(
+        ingress[0]["verify"]["attestation_policy"]["path"],
+        DEFAULT_POLICY_PATH
+    );
+    assert!(ingress[0]["verify"].get("policy").is_none());
+    assert!(ingress[0]["verify"].get("policy_ids").is_none());
 
     let rv = &ingress[0]["verify"]["reference_values"][0];
     assert_eq!(rv["type"], "slsa");

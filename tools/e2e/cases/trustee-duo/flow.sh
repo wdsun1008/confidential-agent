@@ -174,6 +174,25 @@ PY
   record_file_as_block "$service imported image:" "$image_out" json
 }
 
+assert_trustee_guest_tng_28() {
+  local service="$1"
+  local host key output check
+  host="$(state_value "$STATE_DIR" "$service" deploy.public_ip)"
+  key="$(state_value "$STATE_DIR" "$service" build.debug_ssh.private_key)"
+  output="$WORK_DIR/$service-tng-runtime.txt"
+  [[ -n "$host" && -f "$key" ]] || {
+    echo "missing debug connection details for $service TNG check" >&2
+    return 1
+  }
+  chmod 0600 "$key"
+  wait_for_ssh "$host" "$key" 300
+  check="set -euo pipefail; rpm_nevra=\$(rpm -q trusted-network-gateway); test \"\$rpm_nevra\" = trusted-network-gateway-2.8.0-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); test \"\$tng_version\" = 'tng 2.8.0'; jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; curl -fsS http://127.0.0.1:50000/status/ >/dev/null; printf 'tng_rpm=%s\\ntng_version=%s\\ntng_config_schema=2.8\\n' \"\$rpm_nevra\" \"\$tng_version\""
+
+  record_cmd "ssh $service '<assert Trustee guest TNG 2.8 config>'"
+  ssh_guest "$key" "$host" "$check" >"$output"
+  record_file_as_block "$service Trustee guest TNG runtime:" "$output" text
+}
+
 assert_oss_bucket_absent() {
   local bucket="$1"
   local output
@@ -497,6 +516,8 @@ run_case() {
   codex_generation_two="$(state_value "$STATE_DIR" codex mesh_generation)"
   ((openclaw_generation_two > openclaw_generation_one))
   [[ "$openclaw_generation_two" == "$codex_generation_two" ]]
+  assert_trustee_guest_tng_28 openclaw
+  assert_trustee_guest_tng_28 codex
 
   run_openclaw_conversation initial
   run_codex_conversation

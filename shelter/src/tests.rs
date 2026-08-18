@@ -54,7 +54,6 @@ fn assets() -> GuestAssets {
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/trustee-opa-default.rego"),
         policy_local_dev: PathBuf::from("/build/trustee-opa-local-dev.rego"),
-        guest_tng_bin: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     }
@@ -361,9 +360,8 @@ fn renders_public_mesh_peer_cidrs_and_stable_resource_names() {
 }
 
 #[test]
-fn renders_gateway_and_guest_tng_overwrite_setup() {
+fn renders_gateway_and_guest_setup_without_tng_binary_override() {
     let mut assets = assets();
-    assets.guest_tng_bin = Some(PathBuf::from("/build/tng-2.6.0"));
     assets.guest_setup_script = Some(PathBuf::from("/build/guest-setup.sh"));
 
     let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
@@ -372,7 +370,7 @@ fn renders_gateway_and_guest_tng_overwrite_setup() {
     assert!(rendered.contains("destination: /usr/local/bin/cai-gateway"));
     assert!(rendered.contains("destination: /etc/systemd/system/cai-gateway.service"));
     assert!(rendered.contains("destination: /etc/systemd/system/trusted-network-gateway.service"));
-    assert!(rendered.contains("destination: /opt/confidential-agent/hack/tng-2.6.0"));
+    assert!(!rendered.contains("destination: /opt/confidential-agent/hack/tng-"));
     assert!(rendered.contains("path: /build/guest-setup.sh"));
     assert!(!rendered.contains("destination: /usr/bin/tng"));
     assert!(!rendered.contains("/usr/local/bin/tng"));

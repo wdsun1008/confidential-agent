@@ -601,7 +601,6 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
         policy_local_dev: PathBuf::from("/build/local-dev.rego"),
         images_dir: service_dir.join("artifacts"),
         cache_dir: service_dir.join("cache"),
-        guest_tng_bin: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
         debug_ssh: None,
@@ -831,20 +830,6 @@ fn wait_for_daemon_status_retries_until_status_is_ready() {
     server.join().unwrap();
 }
 
-fn write_fake_tng(path: &Path, version: &str) {
-    let mut file = File::create(path).unwrap();
-    write!(
-            file,
-            "#!/bin/sh\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nprintf '%s\\n' '{}'\n",
-            version, version
-        )
-        .unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    set_mode(path, 0o755).unwrap();
-    std::thread::sleep(Duration::from_millis(10));
-}
-
 fn write_script(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
     set_mode(path, 0o755).unwrap();
@@ -967,29 +952,10 @@ case "${1:-}" in
     ;;
   cp)
     dest="$3"
-    case "$dest" in
-      *tng-2.6.0)
-        cat > "$dest" <<'EOF'
-#!/bin/sh
-if [ "${1:-}" = "--version" ]; then
-  echo "tng 2.6.0"
-else
-  echo "tng 2.6.0"
-fi
-EOF
-        chmod 755 "$dest"
-        ;;
-      *)
-        printf 'asset\n' > "$dest"
-        ;;
-    esac
+    printf 'asset\n' > "$dest"
     exit 0
     ;;
   rm)
-    exit 0
-    ;;
-  run)
-    echo "tng 2.6.0"
     exit 0
     ;;
 esac
@@ -1088,51 +1054,6 @@ fn tools_container_wraps_tng_connect() {
         &args[image_idx + 1..],
         ["tng", "launch", "--config-content={}"]
     );
-}
-
-#[test]
-fn stage_guest_tng_binary_uses_verified_candidate() {
-    let temp = tempfile::tempdir().unwrap();
-    let candidate = temp.path().join("source-tng");
-    write_fake_tng(&candidate, "tng 2.6.0");
-
-    let staged = stage_guest_tng_binary(temp.path(), None, &[candidate]).unwrap();
-
-    assert_eq!(staged.file_name().unwrap(), "tng-2.6.0");
-    assert!(staged.exists());
-}
-
-#[test]
-fn stage_guest_tng_binary_accepts_multiline_version_output() {
-    let temp = tempfile::tempdir().unwrap();
-    let candidate = temp.path().join("source-tng");
-    write_fake_tng(&candidate, "tng 2.6.0\ntag:v2.6.0");
-
-    let staged = stage_guest_tng_binary(temp.path(), Some(&candidate), &[]).unwrap();
-
-    assert!(staged.exists());
-}
-
-#[test]
-fn stage_guest_tng_binary_rejects_missing_candidate() {
-    let temp = tempfile::tempdir().unwrap();
-
-    let err = stage_guest_tng_binary(temp.path(), None, &[]).unwrap_err();
-
-    assert!(err
-        .to_string()
-        .contains("guest TNG 2.6.0 binary is required"));
-}
-
-#[test]
-fn stage_guest_tng_binary_rejects_wrong_version() {
-    let temp = tempfile::tempdir().unwrap();
-    let candidate = temp.path().join("source-tng");
-    write_fake_tng(&candidate, "tng 2.5.0");
-
-    let err = stage_guest_tng_binary(temp.path(), Some(&candidate), &[]).unwrap_err();
-
-    assert!(err.to_string().contains("expected tng 2.6.0"));
 }
 
 #[test]
@@ -2475,7 +2396,6 @@ fn mkosi_debug_deploy_stages_authorized_keys() {
         fde_config_file: paths.guest_staging_dir.join("fde.toml"),
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
-        guest_tng_bin: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     };
@@ -2523,7 +2443,6 @@ fn mkosi_debug_deploy_stages_configured_authorized_keys() {
         fde_config_file: paths.guest_staging_dir.join("fde.toml"),
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
-        guest_tng_bin: None,
         guest_setup_script: None,
         extra_files: Vec::new(),
     };
@@ -3588,6 +3507,15 @@ fn connect_renders_all_connect_services() {
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
     assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 49152);
     assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 49153);
+    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], true);
+    assert_eq!(
+        config["add_ingress"][0]["verify"]["attestation_policy"]["type"],
+        "path"
+    );
+    assert!(config["add_ingress"][0]["verify"].get("policy").is_none());
+    assert!(config["add_ingress"][0]["verify"]
+        .get("policy_ids")
+        .is_none());
     assert_eq!(config["client_endpoints"].as_array().unwrap().len(), 2);
     assert_eq!(config["client_endpoints"][0]["service"], "openclaw");
     assert_eq!(config["client_endpoints"][0]["guest_port"], 49152);
@@ -3754,6 +3682,15 @@ fn from_card_connect_allocates_available_local_ports() {
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
     assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 18790);
     assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 18789);
+    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], true);
+    assert_eq!(
+        config["add_ingress"][0]["verify"]["attestation_policy"]["type"],
+        "path"
+    );
+    assert!(config["add_ingress"][0]["verify"].get("policy").is_none());
+    assert!(config["add_ingress"][0]["verify"]
+        .get("policy_ids")
+        .is_none());
     assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 18791);
     assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 18790);
 }

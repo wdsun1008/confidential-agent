@@ -99,8 +99,6 @@ struct BuildManifest {
     images_dir: PathBuf,
     cache_dir: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
-    guest_tng_bin: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     guest_setup_script: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     extra_files: Vec<GuestFileAsset>,
@@ -445,7 +443,6 @@ impl DeployObservation {
 
 const DEFAULT_POLICY: &str = include_str!("../../tools/policies/trustee-opa-default.rego");
 const LOCAL_DEV_POLICY: &str = include_str!("../../tools/policies/trustee-opa-local-dev.rego");
-const REQUIRED_GUEST_TNG_VERSION: &str = "tng 2.6.0";
 
 mod commands;
 use commands::deploy_shelter_args;
@@ -565,7 +562,6 @@ fn prepare(
         policy_local_dev: assets.policy_local_dev,
         images_dir: paths.artifacts_dir.clone(),
         cache_dir: paths.cache_dir.clone(),
-        guest_tng_bin: assets.guest_tng_bin,
         guest_setup_script: assets.guest_setup_script,
         extra_files: assets.extra_files,
         debug_ssh: debug_ssh.clone(),
@@ -1168,8 +1164,17 @@ install_attestation_challenge_client() {
     fi
 }
 install_attestation_challenge_client
-if [ -f /opt/confidential-agent/hack/tng-2.6.0 ]; then
-    install -m 0755 /opt/confidential-agent/hack/tng-2.6.0 /usr/bin/tng
+expected_tng_nevra='trusted-network-gateway-2.8.0-1.al8.x86_64'
+installed_tng_nevra="$(rpm -q trusted-network-gateway 2>/dev/null || true)"
+if [ "$installed_tng_nevra" != "$expected_tng_nevra" ]; then
+    echo "unexpected TNG package: got '$installed_tng_nevra', expected '$expected_tng_nevra'" >&2
+    exit 1
+fi
+expected_tng_version='tng 2.8.0'
+installed_tng_version="$(/usr/bin/tng --version | sed -n '1p')"
+if [ "$installed_tng_version" != "$expected_tng_version" ]; then
+    echo "unexpected TNG binary: got '$installed_tng_version', expected '$expected_tng_version'" >&2
+    exit 1
 fi
 mkdir -p /etc/systemd/system-preset
 cat > /etc/systemd/system-preset/00-confidential-agent-tng.preset <<'EOF'
