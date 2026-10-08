@@ -308,6 +308,7 @@ struct DeployObservation {
 
 #[derive(Debug, Deserialize)]
 struct ShelterBuildResult {
+    #[serde(rename = "tag", alias = "id")]
     id: String,
     image_path: PathBuf,
     reference_value: Option<serde_json::Value>,
@@ -317,12 +318,16 @@ struct ShelterBuildResult {
 
 #[derive(Debug, Deserialize)]
 struct ShelterDeployResult {
+    #[serde(rename = "deployment_id", alias = "id")]
     id: String,
     deploy: ShelterDeployResultInfo,
 }
 
 #[derive(Debug, Deserialize)]
 struct ShelterDeployResultInfo {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "provider_instance_id", alias = "instance_id")]
     instance_id: Option<serde_json::Value>,
     public_ip: Option<serde_json::Value>,
     private_ip: Option<serde_json::Value>,
@@ -500,7 +505,8 @@ fn prepare(
             .and_then(|debug| debug.ssh_public_key.as_deref()),
     )?;
     let deploy_names = options.deploy_names.clone();
-    let terraform_dir = deploy_terraform_dir(&paths, None, deploy_names.as_ref());
+    // Managed runs allocate their own deployment ID and Terraform directory.
+    let terraform_dir = None;
     let build_id = options
         .build_id
         .clone()
@@ -536,10 +542,7 @@ fn prepare(
         .with_context(|| format!("failed to write '{}'", paths.rendered_config.display()))?;
 
     let build_result = shelter_build_result_path(&paths.shelter_work_dir, &build_id);
-    let deploy_result =
-        shelter_deploy_result_path(terraform_dir.as_deref().context(
-            "deploy terraform dir is required when preparing Shelter deploy result path",
-        )?);
+    let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
         service_id: spec.service.id.clone(),
@@ -684,19 +687,6 @@ fn current_utc_timestamp() -> String {
 
 mod debug_ssh;
 use debug_ssh::*;
-fn deploy_terraform_dir(
-    paths: &ContextPaths,
-    user_dir: Option<&PathBuf>,
-    deploy_names: Option<&DeployNames>,
-) -> Option<PathBuf> {
-    deploy_names
-        .map(|names| match user_dir {
-            Some(dir) => dir.join(&names.resource_name),
-            None => paths.service_dir.join("terraform").join(&names.run_id),
-        })
-        .or_else(|| user_dir.cloned())
-}
-
 mod guest_assets;
 use guest_assets::*;
 

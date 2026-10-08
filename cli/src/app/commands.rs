@@ -72,7 +72,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
                 OsString::from("build"),
                 OsString::from("--config"),
                 prepared.rendered_config.as_os_str().to_os_string(),
-                OsString::from("--image-id"),
+                OsString::from("--tag"),
                 OsString::from(prepared.shelter_build_id.clone()),
                 OsString::from("--image-type"),
                 OsString::from("disk"),
@@ -340,7 +340,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     } else {
         None
     };
-    let prepared = prepare(
+    let mut prepared = prepare(
         cli,
         &cli.state_dir,
         &args.spec,
@@ -367,8 +367,8 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
     }
-    // Apply can create resources before it fails. Save the attempt's directory
-    // first so destroy uses its recorded plan, including a redeploy from deleted.
+    // Apply can create resources before it fails. Save the attempt's name first
+    // so Shelter can resolve its recorded directory during destroy.
     write_service_state(
         &cli.state_dir,
         &args.spec,
@@ -380,6 +380,9 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     println!("[ca] deploying infrastructure with Shelter...");
     let mut shelter_args = deploy_shelter_args(&prepared);
     run_shelter(cli, &mut shelter_args)?;
+    bind_shelter_deployment(cli, &mut prepared)?;
+    deploy_manifest.deploy_result = prepared.deploy_result.clone();
+    write_json_atomic(&paths.manifest, &deploy_manifest)?;
 
     {
         println!("[ca] Shelter deploy completed; resolving instance outputs...");
@@ -2101,7 +2104,13 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
         OsString::from("--work-dir"),
         manifest.shelter_work_dir.as_os_str().to_os_string(),
         OsString::from("destroy"),
-        OsString::from(manifest.shelter_build_id.clone()),
+        OsString::from(
+            existing_state
+                .as_ref()
+                .filter(|state| !state.deploy.resource_name.is_empty())
+                .map(|state| &state.deploy.resource_name)
+                .unwrap_or(&manifest.shelter_build_id),
+        ),
     ];
     if let Some(terraform_dir) = existing_state
         .as_ref()
@@ -2175,22 +2184,26 @@ pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--work-dir"),
         prepared.shelter_work_dir.as_os_str().to_os_string(),
-        OsString::from("deploy"),
+        OsString::from("run"),
         OsString::from(prepared.shelter_build_id.clone()),
     ];
-    if let Some(terraform_dir) = prepared.terraform_dir.as_ref() {
-        args.push(OsString::from("--terraform-dir"));
-        args.push(terraform_dir.as_os_str().to_os_string());
-    }
+    // The explicit project carries deployment-only options such as Trustee
+    // bootstrap and peerings. Reuse requires its build inputs to match the image.
     args.extend([
+        OsString::from("--no-build"),
         OsString::from("--target"),
         OsString::from("deploy"),
-        OsString::from("--deployment-id"),
-        OsString::from(prepared.shelter_build_id.clone()),
+        OsString::from("--name"),
+        OsString::from(
+            prepared
+                .deploy_names
+                .as_ref()
+                .map(|names| &names.resource_name)
+                .unwrap_or(&prepared.shelter_build_id),
+        ),
     ]);
     args.push(OsString::from("--config"));
     args.push(prepared.rendered_config.as_os_str().to_os_string());
-    args.push(OsString::from("--auto-approve"));
     args
 }
 

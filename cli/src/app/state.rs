@@ -231,12 +231,57 @@ pub(super) fn effective_shelter_bin_from_candidates(cli: &Cli, candidates: &[Pat
         .unwrap_or_else(|| cli.shelter_bin.clone())
 }
 
+pub(super) fn bind_shelter_deployment(cli: &Cli, prepared: &mut PreparedConfig) -> Result<()> {
+    let expected_name = prepared
+        .deploy_names
+        .as_ref()
+        .map(|names| names.resource_name.as_str())
+        .unwrap_or(&prepared.shelter_build_id);
+    let output = Command::new(effective_shelter_bin(cli))
+        .arg("--work-dir")
+        .arg(&prepared.shelter_work_dir)
+        .args(["status", expected_name, "--format", "json"])
+        .output()
+        .context("failed to query Shelter deployment identity")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Shelter deployment status failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("failed to parse Shelter deployment status")?;
+    anyhow::ensure!(
+        status["schema_version"] == "io.shelter.instance-status/v1"
+            && status["name"].as_str() == Some(expected_name)
+            && status["location"] == "remote",
+        "Shelter status does not identify managed deployment '{expected_name}'"
+    );
+    let id = status["id"]
+        .as_str()
+        .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .context("Shelter status contains an invalid deployment ID")?;
+    let terraform_dir = prepared.shelter_work_dir.join("deploy").join(id);
+    let deploy_result = shelter_deploy_result_path(&terraform_dir);
+    let result = read_shelter_deploy_result(&deploy_result, expected_name)?;
+    anyhow::ensure!(
+        result.id == id,
+        "Shelter deploy result does not match deployment ID '{id}'"
+    );
+    prepared.terraform_dir = Some(terraform_dir);
+    prepared.deploy_result = deploy_result;
+    Ok(())
+}
+
 pub(super) fn resolve_deploy_observation(
     prepared: &PreparedConfig,
     spec: &AgentSpec,
 ) -> Result<DeployObservation> {
-    let deploy_result =
-        read_shelter_deploy_result(&prepared.deploy_result, &prepared.shelter_build_id)?;
+    let expected_name = prepared
+        .deploy_names
+        .as_ref()
+        .map(|names| names.resource_name.as_str())
+        .unwrap_or(&prepared.shelter_build_id);
+    let deploy_result = read_shelter_deploy_result(&prepared.deploy_result, expected_name)?;
     let public_ip = deploy_result_value_as_string(
         deploy_result
             .deploy
@@ -276,11 +321,14 @@ pub(super) fn read_shelter_deploy_result(
         .with_context(|| format!("failed to read Shelter deploy result '{}'", path.display()))?;
     let result: ShelterDeployResult = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse Shelter deploy result '{}'", path.display()))?;
-    if result.id != expected_id {
+    if result.deploy.name.as_deref() != Some(expected_id)
+        && !(result.deploy.name.is_none() && result.id == expected_id)
+    {
         bail!(
-            "Shelter deploy result '{}' contains id '{}', expected '{}'",
+            "Shelter deploy result '{}' contains deployment '{}' named {:?}, expected '{}'",
             path.display(),
             result.id,
+            result.deploy.name,
             expected_id
         );
     }

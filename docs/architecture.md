@@ -106,16 +106,17 @@ sequenceDiagram
     U->>CLI: deploy --spec foo.yaml
     CLI->>CLI: 检查 phase 必须是 built/deleted
     CLI->>CLI: 二次 render（含 mesh_peer_cidrs）
-    CLI->>FS: 保存本次 Terraform 目录，phase=deploying（失败后可 destroy）
+    CLI->>FS: 保存部署名称，phase=deploying（失败后可 destroy）
     alt 匹配的 published image 已 available
-        CLI->>SHB: shelter deploy (cloud_image_id)
+        CLI->>SHB: shelter run --no-build (cloud_image_id)
         SHB->>TF: 创建 ECS / 配置安全组
     else 使用本地 build 产物
-        CLI->>SHB: shelter deploy
+        CLI->>SHB: shelter run --no-build
         SHB->>TF: 上传 OSS / ImportImage / 创建 ECS / 配置安全组
     end
     TF-->>SHB: deploy-result.json (instance_id, public_ip, …)
     SHB-->>CLI: 完成
+    CLI->>SHB: status --format json（读取 instance ID / Terraform 目录）
     CLI->>CLI: write state.json (phase=deployed)
 
     rect rgb(245,245,255)
@@ -143,7 +144,7 @@ sequenceDiagram
     CLI-->>U: deploy completed: public_ip=… private_ip=… mesh_generation=…
 ```
 
-Shelter 部署使用 V1 `runtime.targets.deploy`，其 profile 为 `trust: verified`、`attestation: disabled`、`forbid_fallback: true`。这只关闭 Shelter 的重复证明流程；provider options 仍请求 TDX，证据验证与密钥释放由下面的 CA challenge/Trustee 流程负责。CLI 显式传入 `--target deploy --deployment-id <build_id>`，保持部署身份稳定。
+Shelter 部署使用 V1 `runtime.targets.deploy`，其 profile 为 `trust: verified`、`attestation: disabled`、`forbid_fallback: true`。这只关闭 Shelter 的重复证明流程；provider options 仍请求 TDX，证据验证与密钥释放由下面的 CA challenge/Trustee 流程负责。CLI 通过 `run <image-tag> --no-build --target deploy --name <resource_name> --config …` 复用已构建镜像，再通过 `status` 读取实际 instance ID 和 Terraform 目录；部署身份与 build ID 分开保存。
 
 challenge 注入采用 `inject-resource` over `http://<ip>:8006`，对应代码 [`cli/src/app/tools.rs::challenge_inject`](../cli/src/app/tools.rs)。每个资源会先尝试 direct 网络，失败后 fallback 走 host 的代理环境变量。Trustee mode 不依赖 operator 到 Guest `:8006` 的入站连通性。
 

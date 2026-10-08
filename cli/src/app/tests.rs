@@ -302,10 +302,15 @@ fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
         let pending: LocalServiceState =
             serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
         assert_eq!(pending.phase, "deploying");
-        let directory = pending.deploy.terraform_dir.as_ref().unwrap();
-        assert_ne!(Some(directory), state.deploy.terraform_dir.as_ref());
+        assert_eq!(pending.deploy.terraform_dir, None);
         let deploy_args = fs::read_to_string(&argv).unwrap();
-        assert!(deploy_args.contains(&format!("--terraform-dir\n{}\n", directory.display())));
+        assert!(deploy_args.contains("--no-build\n"));
+        let rendered: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&paths.rendered_config).unwrap()).unwrap();
+        assert_eq!(
+            rendered["runtime"]["targets"]["deploy"]["provider_options"]["terraform_dir"],
+            serde_yaml::Value::Null
+        );
         assert!(validate_deploy_start(Some(&pending)).is_err());
         assert!(validate_build_start(Some(&pending)).is_err());
         fs::remove_file(&paths.rendered_config).unwrap();
@@ -318,7 +323,8 @@ fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
         .unwrap();
         let destroy_args = fs::read_to_string(argv).unwrap();
         assert!(destroy_args.contains("destroy\n"));
-        assert!(destroy_args.contains(&format!("--terraform-dir\n{}\n", directory.display())));
+        assert!(destroy_args.contains(&format!("destroy\n{}\n", pending.deploy.resource_name)));
+        assert!(!destroy_args.contains("--terraform-dir\n"));
         assert!(!destroy_args.contains("--config\n"));
         assert_eq!(
             read_service_state_file(&paths.service_state)
@@ -919,6 +925,7 @@ fn write_fake_shelter(path: &Path, log: &Path) {
             r#"#!/usr/bin/env python3.11
 import json
 import os
+import re
 import sys
 
 args = sys.argv[1:]
@@ -936,7 +943,7 @@ def arg_after(flag):
 
 work_dir = arg_after("--work-dir")
 if "build" in args:
-    image_id = arg_after("--image-id")
+    image_id = arg_after("--tag")
     # Mainline publishes immutable records through images/<id> symlinks.
     image_dir = os.path.join(work_dir, "records", image_id)
     os.makedirs(image_dir, exist_ok=True)
@@ -949,22 +956,31 @@ if "build" in args:
         fh.write("image")
     with open(os.path.join(image_dir, "build-result.json"), "w", encoding="utf-8") as fh:
         json.dump({{
-            "id": image_id,
+            "tag": image_id,
             "image_path": image_path,
             "reference_value": {{"measurement.uki.SHA-384": ["a" * 96]}},
             "rekor_value": None,
         }}, fh)
     sys.exit(0)
 
-if "deploy" in args:
-    image_id = args[args.index("deploy") + 1]
-    terraform_dir = arg_after("--terraform-dir")
+if "status" in args:
+    with open(os.path.join(work_dir, "test-instance-status.json"), encoding="utf-8") as fh:
+        print(fh.read())
+    sys.exit(0)
+
+if "run" in args:
+    name = arg_after("--name")
+    terraform_dir = os.path.join(work_dir, "deploy", "a" * 64)
+    with open(os.path.join(work_dir, "test-instance-status.json"), "w", encoding="utf-8") as fh:
+        json.dump({{"schema_version": "io.shelter.instance-status/v1", "id": "a" * 64,
+                   "name": name, "location": "remote"}}, fh)
     os.makedirs(terraform_dir, exist_ok=True)
     with open(os.path.join(terraform_dir, "deploy-result.json"), "w", encoding="utf-8") as fh:
         json.dump({{
-            "id": image_id,
+            "deployment_id": "a" * 64,
             "deploy": {{
-                "instance_id": "i-test",
+                "name": name,
+                "provider_instance_id": "i-test",
                 "public_ip": "203.0.113.42",
                 "private_ip": "10.0.1.20",
                 "outputs": {{"security_group_id": "sg-test"}},
@@ -1182,20 +1198,19 @@ fn deploy_args_use_positional_build_id_without_cloud_image_override() {
 
     assert_eq!(args[0], OsStr::new("--work-dir"));
     assert_eq!(args[1], OsStr::new("/state/shelter-work"));
-    assert_eq!(args[2], OsStr::new("deploy"));
+    assert_eq!(args[2], OsStr::new("run"));
     assert_eq!(args[3], OsStr::new("cai-e2e-agent-release"));
     assert!(!args.iter().any(|arg| arg == OsStr::new("--image-id")));
     assert!(!args.iter().any(|arg| arg == OsStr::new("--cloud-image-id")));
-    assert!(args.iter().any(|arg| arg == OsStr::new("--auto-approve")));
+    assert!(args.iter().any(|arg| arg == OsStr::new("--no-build")));
     assert!(args.windows(2).any(|pair| pair == ["--target", "deploy"]));
     assert!(args
         .windows(2)
-        .any(|pair| pair[0] == "--deployment-id"
-            && pair[1] == OsStr::new(&prepared.shelter_build_id)));
+        .any(|pair| pair[0] == "--name" && pair[1] == OsStr::new(&prepared.shelter_build_id)));
 }
 
 #[test]
-fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
+fn deploy_args_use_the_project_without_overriding_managed_state() {
     let prepared = PreparedConfig {
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "cai-e2e-agent-debug".to_string(),
@@ -1216,16 +1231,10 @@ fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
 
     let args = deploy_shelter_args(&prepared);
 
-    let terraform_dir = args
+    assert!(args
         .windows(2)
-        .find(|window| window[0] == OsStr::new("--terraform-dir"))
-        .map(|window| window[1].as_os_str());
-    assert_eq!(
-        terraform_dir,
-        Some(OsStr::new(
-            "/state/services/openclaw/terraform/20260506130000"
-        ))
-    );
+        .any(|pair| pair == ["--config", "/state/shelter.yaml"]));
+    assert!(!args.iter().any(|arg| arg == "--terraform-dir"));
 }
 
 #[test]
@@ -1700,14 +1709,21 @@ resources: {}
     std::env::set_var("PATH", old_path);
 
     let invocations = fs::read_to_string(log).unwrap();
-    assert!(invocations.contains(&format!("\"deploy\", \"{debug_id}\"")));
-    assert!(!invocations.contains(&format!("\"deploy\", \"{release_id}\"")));
+    assert!(invocations.contains(&format!("\"run\", \"{debug_id}\"")));
+    assert!(!invocations.contains(&format!("\"run\", \"{release_id}\"")));
     let deployed = read_service_state_file(&service_dir.join("state.json"))
         .unwrap()
         .unwrap();
     assert_eq!(deployed.build.build_id, debug_id);
     assert_eq!(deployed.build.variant, "debug");
     assert_eq!(deployed.build.image_path, debug_image);
+    let terraform_dir = shelter_dir.join("deploy").join("a".repeat(64));
+    assert_eq!(deployed.deploy.terraform_dir.as_ref(), Some(&terraform_dir));
+    let manifest = read_build_manifest(&service_dir.join("manifest.json")).unwrap();
+    assert_eq!(
+        manifest.deploy_result,
+        shelter_deploy_result_path(&terraform_dir)
+    );
 }
 
 #[test]
@@ -2084,19 +2100,75 @@ fn materialize_build_artifacts_reads_manifest_result_path() {
 }
 
 #[test]
+fn bind_shelter_deployment_rejects_mismatched_or_unsafe_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "a".repeat(64);
+    let terraform_dir = temp.path().join("deploy").join(&id);
+    fs::create_dir_all(&terraform_dir).unwrap();
+    let result_path = shelter_deploy_result_path(&terraform_dir);
+    let valid_status = serde_json::json!({
+        "schema_version": "io.shelter.instance-status/v1",
+        "id": id,
+        "name": "openclaw",
+        "location": "remote"
+    });
+    let valid_result = serde_json::json!({
+        "deployment_id": id,
+        "deploy": {"name": "openclaw"}
+    });
+    let shelter = temp.path().join("fake-shelter");
+    let mut cli = test_cli();
+    cli.shelter_bin = shelter.clone();
+    for (status_key, status_value, result_key, result_value) in [
+        ("name", "other", "deployment_id", id.as_str()),
+        ("location", "local", "deployment_id", id.as_str()),
+        ("schema_version", "unknown", "deployment_id", id.as_str()),
+        ("id", "../other", "deployment_id", id.as_str()),
+        ("id", id.as_str(), "deployment_id", "wrong-id"),
+    ] {
+        let mut status = valid_status.clone();
+        status[status_key] = status_value.into();
+        let mut result = valid_result.clone();
+        result[result_key] = result_value.into();
+        fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        write_script(
+            &shelter,
+            &format!("#!/bin/sh\ncat <<'JSON'\n{status}\nJSON\n"),
+        );
+        let mut prepared = PreparedConfig {
+            rendered_config: temp.path().join("shelter.yaml"),
+            shelter_build_id: "openclaw".into(),
+            shelter_work_dir: temp.path().to_path_buf(),
+            build_result: temp.path().join("build-result.json"),
+            deploy_result: temp.path().join("unresolved-result.json"),
+            deploy_names: None,
+            terraform_dir: None,
+            debug_ssh: None,
+            cloud_image_id: None,
+        };
+        assert!(bind_shelter_deployment(&cli, &mut prepared).is_err());
+        assert_eq!(prepared.terraform_dir, None);
+        assert_eq!(
+            prepared.deploy_result,
+            temp.path().join("unresolved-result.json")
+        );
+    }
+}
+
+#[test]
 fn resolve_deploy_observation_reads_shelter_deploy_result_json() {
     let temp = tempfile::tempdir().unwrap();
     let deploy_result = temp.path().join("deploy-result.json");
     fs::write(
         &deploy_result,
         serde_json::to_string_pretty(&serde_json::json!({
-            "id": "openclaw-agent-release",
+            "deployment_id": "a".repeat(64),
             "image_path": "/image.qcow2",
             "reference_value": null,
             "rekor_value": null,
             "deploy": {
-                "name": "openclaw-20260429103011",
-                "instance_id": {"value": "i-test"},
+                "name": "openclaw-agent-release",
+                "provider_instance_id": {"value": "i-test"},
                 "public_ip": {"value": "39.0.0.1"},
                 "private_ip": {"value": "10.0.0.8"},
                 "components": null,
@@ -2335,50 +2407,6 @@ resources: {}
     let deploy_section = rendered.split("deploy:").nth(1).unwrap();
     assert!(deploy_section.contains("image_id: m-2ze123abc"));
     assert!(!deploy_section.contains("image:\n"));
-}
-
-#[test]
-fn deploy_terraform_dir_is_scoped_by_resource_name() {
-    let spec = AgentSpec::from_yaml(
-        r#"
-schema: confidential-agent/v1
-service:
-  id: openclaw
-  ports: [18789]
-  connect: [18789]
-build:
-  image_name: openclaw-agent
-deploy:
-  provider: aliyun
-  image_variant: release
-  instance_type: ecs.g8i.xlarge
-  region: cn-beijing
-  zone_id: cn-beijing-l
-attestation:
-  tee: tdx
-  mode: challenge
-  reference_values: sample
-resources: {}
-"#,
-        Path::new("/project"),
-    )
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let paths = context_paths(temp.path(), "openclaw");
-    let names = DeployNames::from_run_id(&spec, "20260429103011");
-
-    assert_eq!(
-        deploy_terraform_dir(&paths, Some(&PathBuf::from("/terraform")), Some(&names)).unwrap(),
-        PathBuf::from("/terraform/openclaw-20260429103011")
-    );
-    assert_eq!(
-        deploy_terraform_dir(&paths, None, Some(&names)).unwrap(),
-        paths.service_dir.join("terraform/20260429103011")
-    );
-    assert_eq!(
-        deploy_terraform_dir(&paths, Some(&PathBuf::from("/terraform")), None).unwrap(),
-        PathBuf::from("/terraform")
-    );
 }
 
 #[test]
@@ -2794,7 +2822,7 @@ fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
     assert!(err.to_string().contains("shelter exited with status"));
     let recorded = fs::read_to_string(argv).unwrap();
     assert!(recorded.contains("--work-dir\n"));
-    assert!(recorded.contains("destroy\nopenclaw-agent-release\n"));
+    assert!(recorded.contains(&format!("destroy\n{}\n", service.deploy.resource_name)));
     assert!(recorded.contains("--terraform-dir\n"));
     assert!(recorded.contains("services/openclaw/terraform/active\n"));
     let state = read_service_state_file(&service_dir.join("state.json"))
