@@ -1061,7 +1061,7 @@ fn cmd_image_unpublish_with_ops(
         );
         return Ok(());
     }
-    if !args.force && matches!(state.phase.as_str(), "active" | "deployed") {
+    if !args.force && matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
         if let Some(deployed_id) = state.deploy.published_image_id.as_deref() {
             if keys
                 .iter()
@@ -1129,7 +1129,7 @@ fn cmd_image_unpublish_with_ops(
 }
 
 fn published_entry_is_deployed(state: &LocalServiceState, entry: &PublishedImage) -> bool {
-    matches!(state.phase.as_str(), "active" | "deployed")
+    matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
         && entry.image_id.is_some()
         && state.deploy.published_image_id.as_deref() == entry.image_id.as_deref()
 }
@@ -1315,7 +1315,36 @@ mod tests {
         let mut entry = test_published_entry("old-build", STATUS_FAILED);
         entry.image_id = Some("m-2ze123abc".to_string());
 
-        assert!(!should_prune_published_entry(&state, &entry, true));
+        for phase in ["active", "deployed", "deploying"] {
+            state.phase = phase.to_string();
+            assert!(!should_prune_published_entry(&state, &entry, true));
+        }
+    }
+
+    #[test]
+    fn unpublish_rejects_image_used_by_pending_deploy() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut state = test_state("openclaw");
+        state.phase = "deploying".to_string();
+        let entry = test_published_entry(&state.build.build_id, STATUS_AVAILABLE);
+        state.deploy.published_image_id = entry.image_id.clone();
+        state.build.published.insert("pending".into(), entry);
+        write_local_service_state(temp.path(), &state).unwrap();
+        let ops = FakePublishCloudOps::default();
+        let result = cmd_image_unpublish_with_ops(
+            &cli,
+            &ops,
+            &ImageUnpublishArgs {
+                service: "openclaw".into(),
+                region: None,
+                variant: None,
+                image_id: None,
+                force: false,
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("is deploying"));
+        assert!(ops.calls().is_empty());
     }
 
     #[test]

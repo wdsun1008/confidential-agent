@@ -902,7 +902,7 @@ pub(super) fn validate_mesh_port_conflicts(
     incoming_ports: &[u16],
 ) -> Result<()> {
     for state in states {
-        if !matches!(state.phase.as_str(), "active" | "deployed") {
+        if !matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
             continue;
         }
         if state.service_id == incoming_service_id {

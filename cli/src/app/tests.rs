@@ -253,6 +253,84 @@ fn deploy_start_only_accepts_built_or_deleted_current_builds() {
 }
 
 #[test]
+fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    for initial_phase in ["built", "deleted"] {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_bin = write_fake_prepare_tools(temp.path());
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+        );
+        let spec = temp.path().join("openclaw.yaml");
+        fs::write(&spec, "schema: confidential-agent/v1\nservice:\n  id: openclaw\n  ports: [18789]\n  connect: [18789]\nbuild:\n  image_name: openclaw-agent\ndeploy:\n  provider: aliyun\n  image_variant: release\n  instance_type: ecs.g8i.xlarge\n  region: cn-beijing\n  zone_id: cn-beijing-l\nattestation:\n  tee: tdx\n  mode: challenge\n  reference_values: sample\nresources: {}\n").unwrap();
+        let mut state = local_state("openclaw", vec![18789], vec![18789]);
+        state.phase = initial_phase.to_string();
+        state.build.image_path = temp.path().join("image.qcow2");
+        fs::write(&state.build.image_path, "image").unwrap();
+        state.deploy.terraform_dir = Some(temp.path().join("old-terraform"));
+        write_state(temp.path(), &state);
+        write_manifest(temp.path(), "openclaw", &state.build.build_id);
+        let paths = context_paths(temp.path(), "openclaw");
+        write_build_result(
+            &shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id),
+            &state.build.build_id,
+            &state.build.image_path,
+        );
+        let shelter = temp.path().join("shelter");
+        let observed = temp.path().join("state-before-apply.json");
+        let argv = temp.path().join("argv");
+        write_script(&shelter, &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncase \" $* \" in *' deploy '*) cp '{}' '{}'; exit 42;; esac\n",
+            argv.display(), paths.service_state.display(), observed.display()
+        ));
+        let mut cli = test_cli();
+        cli.state_dir = temp.path().to_path_buf();
+        cli.shelter_bin = shelter;
+        let result = cmd_deploy(
+            &cli,
+            &DeployArgs {
+                spec,
+                skip_inject: true,
+                render_only: false,
+                skip_peering_check: true,
+            },
+        );
+        std::env::set_var("PATH", old_path);
+        assert!(result.unwrap_err().to_string().contains("shelter exited"));
+        let pending: LocalServiceState =
+            serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
+        assert_eq!(pending.phase, "deploying");
+        let directory = pending.deploy.terraform_dir.as_ref().unwrap();
+        assert_ne!(Some(directory), state.deploy.terraform_dir.as_ref());
+        let deploy_args = fs::read_to_string(&argv).unwrap();
+        assert!(deploy_args.contains(&format!("--terraform-dir\n{}\n", directory.display())));
+        assert!(validate_deploy_start(Some(&pending)).is_err());
+        assert!(validate_build_start(Some(&pending)).is_err());
+        fs::remove_file(&paths.rendered_config).unwrap();
+        cmd_destroy(
+            &cli,
+            &DestroyArgs {
+                service: "openclaw".into(),
+            },
+        )
+        .unwrap();
+        let destroy_args = fs::read_to_string(argv).unwrap();
+        assert!(destroy_args.contains("destroy\n"));
+        assert!(destroy_args.contains(&format!("--terraform-dir\n{}\n", directory.display())));
+        assert!(!destroy_args.contains("--config\n"));
+        assert_eq!(
+            read_service_state_file(&paths.service_state)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "deleted"
+        );
+    }
+}
+
+#[test]
 fn image_rm_removes_local_service_state_for_deleted_service() {
     let temp = tempfile::tempdir().unwrap();
     let mut service = local_state("openclaw", vec![18789], vec![18789]);

@@ -66,7 +66,7 @@ sequenceDiagram
     U->>CLI: build --spec foo.yaml
     CLI->>Core: AgentSpec::from_path
     Core-->>CLI: spec (validated)
-    CLI->>FS: lock state-dir + check phase != active/deployed
+    CLI->>FS: lock state-dir + check phase != active/deployed/deploying
     CLI->>FS: prepare_guest_assets (staging confidential-agentd, cai-gateway, fde.toml, OPA policy)
     CLI->>Docker: docker create + cp attestation client/cosign → staging
     loop 每个 build.variants.*.enabled=true 的 variant
@@ -106,6 +106,7 @@ sequenceDiagram
     U->>CLI: deploy --spec foo.yaml
     CLI->>CLI: 检查 phase 必须是 built/deleted
     CLI->>CLI: 二次 render（含 mesh_peer_cidrs）
+    CLI->>FS: 保存本次 Terraform 目录，phase=deploying（失败后可 destroy）
     alt 匹配的 published image 已 available
         CLI->>SHB: shelter deploy (cloud_image_id)
         SHB->>TF: 创建 ECS / 配置安全组

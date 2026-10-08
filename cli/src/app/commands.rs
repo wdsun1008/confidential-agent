@@ -134,7 +134,7 @@ pub(super) fn validate_build_start(existing: Option<&LocalServiceState>) -> Resu
     let Some(state) = existing else {
         return Ok(());
     };
-    if matches!(state.phase.as_str(), "active" | "deployed") {
+    if matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
         bail!(
             "service '{}' is {}; destroy it before building a new local image",
             state.service_id,
@@ -150,7 +150,7 @@ pub(super) fn validate_deploy_start(existing: Option<&LocalServiceState>) -> Res
     };
     match state.phase.as_str() {
         "built" | "deleted" => Ok(()),
-        "active" | "deployed" => bail!(
+        "active" | "deployed" | "deploying" => bail!(
             "service '{}' is {}; destroy it before deploying again",
             state.service_id,
             state.phase
@@ -367,6 +367,16 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
     }
+    // Apply can create resources before it fails. Save the attempt's directory
+    // first so destroy uses its recorded plan, including a redeploy from deleted.
+    write_service_state(
+        &cli.state_dir,
+        &args.spec,
+        &spec,
+        &DeployObservation::default(),
+        &prepared,
+        "deploying",
+    )?;
     println!("[ca] deploying infrastructure with Shelter...");
     let mut shelter_args = deploy_shelter_args(&prepared);
     run_shelter(cli, &mut shelter_args)?;
@@ -1198,7 +1208,7 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
             if let Some(state) = state.as_ref() {
                 match state.phase.as_str() {
                     "built" | "deleted" => {}
-                    "active" | "deployed" => bail!(
+                    "active" | "deployed" | "deploying" => bail!(
                         "service '{}' is {}; destroy it before removing local images",
                         state.service_id,
                         state.phase
@@ -2086,13 +2096,6 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
             return Ok(());
         }
     }
-    if !paths.rendered_config.exists() {
-        bail!(
-            "no local state or rendered Shelter config for service '{}'",
-            args.service
-        );
-    }
-
     let manifest = read_build_manifest(&paths.manifest)?;
     let mut shelter_args = vec![
         OsString::from("--work-dir"),
@@ -2107,8 +2110,9 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
         shelter_args.push(OsString::from("--terraform-dir"));
         shelter_args.push(terraform_dir.as_os_str().to_os_string());
     }
-    shelter_args.push(OsString::from("--config"));
-    shelter_args.push(paths.rendered_config.as_os_str().to_os_string());
+    // Destroy uses Shelter's saved deployment plan and Terraform directory.
+    // Re-reading the V2 project without its selected target fails when init
+    // stopped before a plan was saved, although no infrastructure was created.
     shelter_args.push(OsString::from("--auto-approve"));
     if trustee_mode {
         println!("[ca] revoking Trustee resource access before infrastructure deletion...");
