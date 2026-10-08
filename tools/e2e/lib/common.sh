@@ -5,9 +5,7 @@
 E2E_RUN_ID="${E2E_RUN_ID:-$(date +%Y%m%d%H%M%S)}"
 CA_BIN="${CA_BIN:-$ROOT_DIR/target/debug/confidential-agent}"
 TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
-BUILD_BACKEND="${E2E_BUILD_BACKEND:-mkosi}"
 REFERENCE_VALUES="${E2E_REFERENCE_VALUES:-rekor}"
-BASE_IMAGE="${E2E_BASE_IMAGE:-/root/images/alinux3.qcow2}"
 REGION="${E2E_REGION:-cn-beijing}"
 
 default_tdx_zone_id() {
@@ -190,10 +188,6 @@ container_pull_with_fallback() {
 }
 
 validate_modes() {
-  case "$BUILD_BACKEND" in
-    mkosi | base-image) ;;
-    *) echo "E2E_BUILD_BACKEND must be mkosi or base-image, got '$BUILD_BACKEND'" >&2; exit 2 ;;
-  esac
   case "$REFERENCE_VALUES" in
     sample | rekor) ;;
     *) echo "E2E_REFERENCE_VALUES must be sample or rekor, got '$REFERENCE_VALUES'" >&2; exit 2 ;;
@@ -226,7 +220,6 @@ init_step_log() {
     printf '%s\n' "- work_dir: \`$WORK_DIR\`"
     printf '%s\n' "- state_dir: \`${STATE_DIR:-multi-state}\`"
     printf '%s\n' "- tools_image: \`$TOOLS_IMAGE\`"
-    printf '%s\n' "- build_backend: \`$BUILD_BACKEND\`"
     printf '%s\n' "- reference_values: \`$REFERENCE_VALUES\`"
     printf '%s\n' "- region: \`$REGION\`"
     printf '%s\n' "- zone_id: \`$ZONE_ID\`"
@@ -413,11 +406,7 @@ init_common_args() {
     --disk-gb "$disk_gb"
     --reference-values "$REFERENCE_VALUES"
     --slsa-generator "$SLSA_GENERATOR"
-    --build-backend "$BUILD_BACKEND"
   )
-  if [[ "$BUILD_BACKEND" == "base-image" ]]; then
-    args+=(--base-image "$BASE_IMAGE")
-  fi
   if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
     : "${COSIGN_KEY:?COSIGN_KEY must be set before init_common_args when E2E_REFERENCE_VALUES=rekor}"
     args+=(--cosign-key "$COSIGN_KEY")
@@ -597,9 +586,9 @@ verify_cai_pep_binary() {
     (cd "$ROOT_DIR" && cargo clean -p cai-pep && cargo build -p cai-pep)
   fi
 
-  local bin="$ROOT_DIR/target/debug/cai-pep"
+  local bin="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
   [[ -x "$bin" ]] || {
-    echo "target/debug/cai-pep is not executable; build it or unset E2E_SKIP_CARGO_BUILD" >&2
+    echo "cai-pep '$bin' is not executable; set CA_PEP_BIN or build it" >&2
     exit 2
   }
 
@@ -649,15 +638,13 @@ render_case() {
   record_cmd "python3.11 tools/e2e/render_case.py --case $CASE_NAME --work-dir $(printf '%q' "$WORK_DIR")"
   ROOT_DIR="$ROOT_DIR" \
   WORK_DIR="$WORK_DIR" \
-  BUILD_BACKEND="$BUILD_BACKEND" \
-  BASE_IMAGE="$BASE_IMAGE" \
   REFERENCE_VALUES="$REFERENCE_VALUES" \
   SLSA_GENERATOR="$SLSA_GENERATOR" \
   REGION="$REGION" \
   ZONE_ID="$ZONE_ID" \
   INSTANCE_TYPE="${INSTANCE_TYPE:-}" \
   DISK_GB="${DISK_GB:-}" \
-  CAI_PEP="$ROOT_DIR/target/debug/cai-pep" \
+  CAI_PEP="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}" \
   DASHSCOPE_KEY="${DASHSCOPE_KEY:-}" \
   python3.11 "$ROOT_DIR/tools/e2e/render_case.py" --case "$CASE_NAME" --work-dir "$WORK_DIR"
 }

@@ -38,19 +38,17 @@ pub struct ServiceSpec {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildSpec {
-    #[serde(default)]
-    pub base_image: Option<String>,
     pub image_name: String,
     #[serde(default)]
     pub kernel_cmdline_append: Option<String>,
     #[serde(default)]
     pub resize: Option<String>,
     #[serde(default)]
-    pub with_network: bool,
-    #[serde(default)]
     pub container: Option<BuildContainerSpec>,
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<BuildRepositorySpec>,
     #[serde(default)]
     pub files: Vec<BuildFileSpec>,
     #[serde(default)]
@@ -59,6 +57,15 @@ pub struct BuildSpec {
     pub variants: BuildVariantsSpec,
     #[serde(default, skip_serializing_if = "BuildCleanupSpec::is_empty")]
     pub cleanup: BuildCleanupSpec,
+}
+
+/// Additional signed RPM repositories passed to Shelter's native build input.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildRepositorySpec {
+    pub name: String,
+    pub baseurl: String,
+    pub gpgkey: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -378,13 +385,6 @@ impl AgentSpec {
     }
 
     fn resolve_paths_against(&mut self, base_dir: &Path) {
-        if let Some(base_image) = &mut self.build.base_image {
-            if !looks_like_url(base_image) {
-                let mut path = PathBuf::from(base_image.as_str());
-                resolve_pathbuf(&mut path, base_dir);
-                *base_image = path.to_string_lossy().to_string();
-            }
-        }
         for path in &mut self.build.scripts {
             resolve_pathbuf(path, base_dir);
         }
@@ -443,15 +443,16 @@ impl AgentSpec {
             &self.service.connect,
             &self.service.mcp_ports,
         )?;
-        if self
-            .build
-            .base_image
-            .as_deref()
-            .is_some_and(|base_image| base_image.trim().is_empty())
-        {
-            bail!("build.base_image must not be empty when set");
-        }
         validate_build_packages(&self.build)?;
+        let mut repo_names = BTreeSet::new();
+        for repo in &self.build.repos {
+            validate_id("build.repos.name", &repo.name)?;
+            validate_https_url("build.repos.baseurl", &repo.baseurl)?;
+            validate_https_url("build.repos.gpgkey", &repo.gpgkey)?;
+            if !repo_names.insert(&repo.name) {
+                bail!("duplicate build.repos.name: {}", repo.name);
+            }
+        }
         if let Some(container) = &self.build.container {
             validate_build_container(container)?;
         }
@@ -639,9 +640,6 @@ fn validate_mcp_ports(ports: &[u16], connect: &[u16], mcp_ports: &[u16]) -> Resu
 }
 
 fn validate_build_packages(build: &BuildSpec) -> Result<()> {
-    if build.base_image.is_some() {
-        return Ok(());
-    }
     for (index, package) in build.packages.iter().enumerate() {
         let package = package.trim();
         if package.is_empty() {
@@ -776,7 +774,7 @@ fn alinux_package_substitution(package: &str) -> Option<&'static str> {
         "xz-utils" => Some("'xz'"),
         "docker-cli" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
         "docker.io" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
-        "ffmpeg" => Some("a custom base image or repository that provides ffmpeg; otherwise remove it from build.packages"),
+        "ffmpeg" => Some("a repository that provides ffmpeg; otherwise remove it from build.packages"),
         _ => None,
     }
 }
@@ -793,10 +791,6 @@ fn resolve_pathbuf(path: &mut PathBuf, base_dir: &Path) {
         *path = base_dir.join(&*path);
     }
     *path = normalize_path(path);
-}
-
-fn looks_like_url(value: &str) -> bool {
-    value.contains("://")
 }
 
 fn validate_https_url(field: &str, value: &str) -> Result<()> {
@@ -913,10 +907,8 @@ service:
   mcp_ports: [18800]
   app_service: cai-openclaw-gateway.service
 build:
-  base_image: ./base.qcow2
   image_name: openclaw-agent
   resize: 30G
-  with_network: true
   packages:
     - nodejs
   files:
@@ -966,11 +958,6 @@ resources:
         assert_eq!(spec.image_id(), "openclaw-agent");
         assert_eq!(spec.image_variant(), "release");
         assert_eq!(
-            spec.build.base_image.as_deref(),
-            Some("/project/base.qcow2")
-        );
-        assert!(spec.build.with_network);
-        assert_eq!(
             spec.build.scripts[0],
             PathBuf::from("/project/image/install-openclaw.sh")
         );
@@ -1015,22 +1002,19 @@ resources:
     }
 
     #[test]
-    fn accepts_mkosi_build_without_base_image() {
-        let spec = AgentSpec::from_yaml(
-            &SPEC.replace("  base_image: ./base.qcow2\n", ""),
-            Path::new("/project"),
-        )
-        .unwrap();
-
-        assert!(spec.build.base_image.is_none());
-        assert_eq!(spec.image_id(), "openclaw-agent");
+    fn rejects_removed_build_fields() {
+        for field in ["base_image: /images/base.qcow2", "with_network: true"] {
+            let yaml = SPEC.replace("build:\n", &format!("build:\n  {field}\n"));
+            let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+            assert!(format!("{err:#}").contains("unknown field"));
+        }
     }
 
     #[test]
     fn parses_and_resolves_build_container() {
         let yaml = SPEC.replace(
-            "  with_network: true\n",
-            r#"  with_network: true
+            "  image_name: openclaw-agent\n",
+            r#"  image_name: openclaw-agent
   container:
     archive: ./containers/hermes.oci.tar
     mode: runtime
@@ -1124,7 +1108,7 @@ resources:
                 "build.container.mounts is only supported with build.container.mode: runtime",
             ),
         ] {
-            let yaml = SPEC.replace("  with_network: true\n", &format!("  with_network: true\n{snippet}"));
+            let yaml = SPEC.replace("  image_name: openclaw-agent\n", &format!("  image_name: openclaw-agent\n{snippet}"));
             let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
             assert!(
                 err.to_string().contains(expected),
@@ -1135,9 +1119,7 @@ resources:
 
     #[test]
     fn rejects_debian_package_names_for_default_mkosi_builds() {
-        let yaml = SPEC
-            .replace("  base_image: ./base.qcow2\n", "")
-            .replace("    - nodejs", "    - build-essential");
+        let yaml = SPEC.replace("    - nodejs", "    - build-essential");
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
         assert!(err
@@ -1147,9 +1129,7 @@ resources:
 
     #[test]
     fn rejects_whitespace_padded_debian_package_names() {
-        let yaml = SPEC
-            .replace("  base_image: ./base.qcow2\n", "")
-            .replace("    - nodejs", "    - \" libffi-dev \"");
+        let yaml = SPEC.replace("    - nodejs", "    - \" libffi-dev \"");
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
         assert!(err.to_string().contains("use 'libffi-devel' instead"));
@@ -1163,9 +1143,7 @@ resources:
             "libc-dev",
             "docker.io",
         ] {
-            let yaml = SPEC
-                .replace("  base_image: ./base.qcow2\n", "")
-                .replace("    - nodejs", &format!("    - {package}"));
+            let yaml = SPEC.replace("    - nodejs", &format!("    - {package}"));
             let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
             assert!(err
@@ -1176,26 +1154,10 @@ resources:
 
     #[test]
     fn rejects_packages_unavailable_in_default_alinux_repos() {
-        let yaml = SPEC
-            .replace("  base_image: ./base.qcow2\n", "")
-            .replace("    - nodejs", "    - ffmpeg");
+        let yaml = SPEC.replace("    - nodejs", "    - ffmpeg");
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("custom base image or repository that provides ffmpeg"));
-    }
-
-    #[test]
-    fn allows_custom_base_images_to_choose_package_ecosystem() {
-        let yaml = SPEC.replace("    - nodejs", "    - build-essential");
-        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
-
-        assert_eq!(
-            spec.build.base_image.as_deref(),
-            Some("/project/base.qcow2")
-        );
-        assert_eq!(spec.build.packages, vec!["build-essential"]);
+        assert!(err.to_string().contains("repository that provides ffmpeg"));
     }
 
     #[test]

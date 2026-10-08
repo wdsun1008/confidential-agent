@@ -340,13 +340,35 @@ run_codex_conversation() {
 
 reboot_openclaw_without_cli_sync() {
   local instance_id="${SERVICE_INSTANCE_ID[openclaw]}"
+  local force_stop="${E2E_REBOOT_FORCE_STOP:-true}"
+  [[ "$force_stop" == true || "$force_stop" == false ]] || {
+    echo "E2E_REBOOT_FORCE_STOP must be true or false" >&2
+    return 1
+  }
   local public_ip
   public_ip="$(state_value "$STATE_DIR" openclaw deploy.public_ip)"
-  trustee_aliyun_cli ecs RebootInstance \
-    --RegionId "$REGION" \
-    --InstanceId "$instance_id" \
-    --ForceStop true >"$WORK_DIR/openclaw-reboot.json"
-  record_file_as_block "OpenClaw reboot request:" "$WORK_DIR/openclaw-reboot.json" json
+  local key sentinel before_boot after_boot guest_digest expected_digest
+  key="$(state_value "$STATE_DIR" openclaw build.debug_ssh.private_key)"
+  sentinel="$(openssl rand -hex 24)"
+  wait_for_ssh "$public_ip" "$key" 300
+  before_boot="$(ssh_guest "$key" "$public_ip" 'cat /proc/sys/kernel/random/boot_id')"
+  expected_digest="$(sha256sum /usr/libexec/shelter/cryptpilot-fde-guest | awk '{print $1}')"
+  guest_digest="$(ssh_guest "$key" "$public_ip" "sha256sum /usr/bin/cryptpilot-fde" | awk '{print $1}')"
+  [[ "$guest_digest" == "$expected_digest" ]] || { echo "guest Cryptpilot differs from fde-guest" >&2; return 1; }
+  ssh_guest "$key" "$public_ip" "install -d -m 0700 /var/lib/ca-e2e; printf '%s' '$sentinel' > /var/lib/ca-e2e/reboot-sentinel; sync"
+  record "- OpenClaw reboot ForceStop=$force_stop."
+  if [[ "$force_stop" == true ]]; then
+    trustee_aliyun_cli ecs RebootInstance \
+      --RegionId "$REGION" \
+      --InstanceId "$instance_id" \
+      --ForceStop true >"$WORK_DIR/openclaw-reboot.json"
+    record_file_as_block "OpenClaw reboot request:" "$WORK_DIR/openclaw-reboot.json" json
+  else
+    # Minimal images need not have a cloud agent to handle a soft reboot API.
+    # Prove shutdown/recovery independently through the OS and boot ID below.
+    record_cmd "ssh openclaw 'systemctl --no-block reboot'"
+    ssh_guest "$key" "$public_ip" 'systemctl --no-block reboot' || [[ "$?" == 255 ]]
+  fi
   local deadline=$((SECONDS + 180)) saw_down=0
   while (( SECONDS < deadline )); do
     if ! curl -fsS --max-time 3 "http://$public_ip:8088/status" >/dev/null 2>&1; then
@@ -366,6 +388,11 @@ reboot_openclaw_without_cli_sync() {
     echo "OpenClaw public IP changed across reboot: $public_ip -> $current_ip" >&2
     return 1
   }
+  wait_for_ssh "$public_ip" "$key" 300
+  after_boot="$(ssh_guest "$key" "$public_ip" 'cat /proc/sys/kernel/random/boot_id')"
+  [[ "$before_boot" != "$after_boot" ]] || { echo "boot ID did not change" >&2; return 1; }
+  [[ "$(ssh_guest "$key" "$public_ip" 'cat /var/lib/ca-e2e/reboot-sentinel')" == "$sentinel" ]] || { echo "encrypted persistent delta lost data across reboot" >&2; return 1; }
+  record "- Guest Cryptpilot matches fde-guest ($guest_digest); boot ID changed and encrypted delta sentinel survived reboot."
   record "- OpenClaw rebooted and recovered from Trustee without any CLI sync/inject."
 }
 
@@ -437,6 +464,7 @@ run_case() {
   require_cmd docker
   require_cmd jq
   require_cmd node
+  require_cmd openclaw
   require_cmd openssl
   require_cmd python3.11
   require_cmd scp

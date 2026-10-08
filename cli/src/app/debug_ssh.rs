@@ -200,7 +200,6 @@ service:
   id: test-svc
   ports: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: test-agent
   variants:
     release:
@@ -226,7 +225,6 @@ service:
   id: test-svc
   ports: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: test-agent
   variants:
     release:

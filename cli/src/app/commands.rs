@@ -64,6 +64,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
         let prepared_manifest = read_build_manifest(&paths.manifest)?;
         variants.insert(variant.clone(), manifest_variant_from(&prepared_manifest));
         if !args.render_only {
+            verify_shelter_initrd_support(cli, &prepared.rendered_config)?;
             println!("[ca] building {variant} image with Shelter...");
             let mut shelter_args = vec![
                 OsString::from("--work-dir"),
@@ -2177,6 +2178,12 @@ pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
         args.push(OsString::from("--terraform-dir"));
         args.push(terraform_dir.as_os_str().to_os_string());
     }
+    args.extend([
+        OsString::from("--target"),
+        OsString::from("deploy"),
+        OsString::from("--deployment-id"),
+        OsString::from(prepared.shelter_build_id.clone()),
+    ]);
     args.push(OsString::from("--config"));
     args.push(prepared.rendered_config.as_os_str().to_os_string());
     args.push(OsString::from("--auto-approve"));

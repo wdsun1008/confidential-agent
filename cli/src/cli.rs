@@ -208,13 +208,6 @@ pub(crate) enum InitTarget {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub(crate) enum InitBuildBackend {
-    Mkosi,
-    #[value(name = "base-image")]
-    BaseImage,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub(crate) enum InitReferenceValues {
     Sample,
     Rekor,
@@ -238,10 +231,6 @@ pub(crate) struct InitArgs {
     pub(crate) instance_type: Option<String>,
     #[arg(long)]
     pub(crate) disk_gb: Option<u32>,
-    #[arg(long, value_enum, default_value = "mkosi")]
-    pub(crate) build_backend: InitBuildBackend,
-    #[arg(long)]
-    pub(crate) base_image: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub(crate) reference_values: Option<InitReferenceValues>,
     #[arg(long)]

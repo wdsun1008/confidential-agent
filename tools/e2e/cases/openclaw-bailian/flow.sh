@@ -26,6 +26,7 @@ run_case() {
   require_cmd docker
   require_cmd jq
   require_cmd node
+  require_cmd openclaw
   require_cmd openssl
   require_cmd python3.11
   require_cmd ssh

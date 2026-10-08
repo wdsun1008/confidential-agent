@@ -457,7 +457,7 @@ fn kill_process_group(pid: u32) -> std::io::Result<()> {
 
 pub(crate) fn detect_initrd_runtime() -> Result<(RuntimeMode, Option<TrusteeRuntime>)> {
     // The subcommand is testable from a normal root filesystem, but runtime
-    // mode discovery is meaningful only inside dracut's initrd. Tests that
+    // mode discovery is meaningful only inside the boot initramfs. Tests that
     // exercise IMDS explicitly opt in with CA_FORCE_INITRD_RUNTIME_DETECTION.
     if !Path::new("/etc/initrd-release").exists()
         && std::env::var_os("CA_FORCE_INITRD_RUNTIME_DETECTION").is_none()

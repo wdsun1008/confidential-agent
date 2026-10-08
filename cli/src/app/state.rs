@@ -58,8 +58,13 @@ pub(super) fn materialize_shelter_build_artifacts(
     let result = read_shelter_build_result(result_path, build_id)?;
     fs::create_dir_all(&paths.service_dir)
         .with_context(|| format!("failed to create '{}'", paths.service_dir.display()))?;
+    let sample_values = result
+        .reference_value
+        .as_ref()
+        .map(rvps_sample_values)
+        .transpose()?;
     let sample_rv = write_json_artifact(
-        result.reference_value.as_ref(),
+        sample_values.as_ref(),
         &paths.service_dir.join("shelter-reference-values.json"),
     )?;
     let rekor_meta = write_json_artifact(
@@ -71,6 +76,26 @@ pub(super) fn materialize_shelter_build_artifacts(
         sample_rv,
         rekor_meta,
     })
+}
+
+/// RVPS sample input is a map of string arrays. Shelter also publishes
+/// namespaced boot metadata, which remains in the original build result.
+fn rvps_sample_values(value: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut object = value
+        .as_object()
+        .context("Shelter reference values must be an object")?
+        .clone();
+    object.remove("shelter.reference-values.v1");
+    let samples: BTreeMap<String, Vec<String>> =
+        serde_json::from_value(serde_json::Value::Object(object))
+            .context("Shelter external reference values must contain string arrays")?;
+    let uki = samples
+        .get("measurement.uki.SHA-384")
+        .context("Shelter reference values are missing the UKI SHA-384 bank required by CA")?;
+    if uki.len() != 1 || uki[0].len() != 96 || !uki[0].bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("Shelter UKI SHA-384 reference must contain exactly one 96-digit hex digest");
+    }
+    Ok(serde_json::to_value(samples)?)
 }
 
 pub(super) fn write_json_artifact(
@@ -101,6 +126,50 @@ pub(super) fn absolute_path_for_state(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+/// Check the compiled plan, since older Shelter accepts unknown initrd keys.
+pub(super) fn verify_shelter_initrd_support(cli: &Cli, config: &Path) -> Result<()> {
+    let binary = effective_shelter_bin(cli);
+    let output = Command::new(&binary)
+        .args(["plan", "--config"])
+        .arg(config)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run Shelter capability check: {}",
+                binary.display()
+            )
+        })?;
+    anyhow::ensure!(output.status.success(),
+        "Shelter plan failed for '{}'; install the bundled Shelter with initrd.binaries and split Cryptpilot support: {}",
+        binary.display(), String::from_utf8_lossy(&output.stderr));
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Shelter plan did not return a JSON build plan")?;
+    let config: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(config)?)?;
+    verify_initrd_binaries_in_plan(&config, &plan)
+}
+
+pub(super) fn verify_initrd_binaries_in_plan(
+    config: &serde_yaml::Value,
+    plan: &serde_json::Value,
+) -> Result<()> {
+    let required = config["initrd"]["binaries"]
+        .as_sequence()
+        .context("rendered Shelter config lacks initrd.binaries")?;
+    let planned = plan
+        .pointer("/plan/early_boot/binaries")
+        .and_then(|v| v.as_array())
+        .context(
+            "Shelter lacks initrd.binaries support; install the bundled Shelter before building",
+        )?;
+    for path in required {
+        let path = path.as_str().context("invalid initrd binary path")?;
+        anyhow::ensure!(planned.iter().any(|v| v.as_str() == Some(path)),
+            "Shelter plan omitted required initrd binary {path}; install the bundled Shelter before building");
+    }
+    Ok(())
 }
 
 pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
@@ -313,6 +382,27 @@ mod tests {
         fs::write(&path, serde_json::to_string(&data).unwrap()).unwrap();
         let err = read_shelter_build_result(&path, "wrong-id").unwrap_err();
         assert!(err.to_string().contains("wrong-id"));
+    }
+
+    #[test]
+    fn rvps_sample_keeps_uki_banks_and_excludes_shelter_metadata() {
+        let values = json!({
+            "measurement.uki.SHA-256": ["a".repeat(64)],
+            "measurement.uki.SHA-384": ["b".repeat(96)],
+            "shelter.reference-values.v1": {"measured_boot": {"tdx_rtmr2_sha384": "c".repeat(96)}}
+        });
+        let sample = rvps_sample_values(&values).unwrap();
+        assert_eq!(sample.as_object().unwrap().len(), 2);
+        assert_eq!(sample["measurement.uki.SHA-384"], json!(["b".repeat(96)]));
+        assert!(rvps_sample_values(
+            &json!({"shelter.reference-values.v1": values["shelter.reference-values.v1"]})
+        )
+        .is_err());
+        let mut bad = values.clone();
+        bad["measurement.uki.SHA-384"] = json!(["bad"]);
+        assert!(rvps_sample_values(&bad).is_err());
+        bad["measurement.uki.SHA-384"] = json!({"unexpected": "object"});
+        assert!(rvps_sample_values(&bad).is_err());
     }
 
     #[test]

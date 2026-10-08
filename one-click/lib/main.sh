@@ -58,15 +58,13 @@ Deploy options:
   --reference-values MODE        rekor or sample; default: rekor
   --cosign-key PATH              Existing cosign private key for rekor mode
   --slsa-generator PATH          Default: /usr/libexec/shelter/slsa/slsa-generator
-  --build-backend MODE           mkosi or base-image; default: mkosi
-  --base-image PATH              Required when --build-backend base-image is used
   --skip-build                   Skip confidential image build
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
 
 Shelter options:
   --shelter-bin PATH             Existing shelter binary
-  --shelter-rpm PATH             Shelter RPM to install when no binary exists
+  --shelter-rpm PATH             Shelter RPM to install when missing or incompatible
 
 Examples:
   one-click/install-openclaw-vllm.sh
@@ -114,15 +112,13 @@ Deploy options:
   --reference-values MODE        rekor or sample; default: rekor
   --cosign-key PATH              Existing cosign private key for rekor mode
   --slsa-generator PATH          Default: /usr/libexec/shelter/slsa/slsa-generator
-  --build-backend MODE           mkosi or base-image; default: mkosi
-  --base-image PATH              Required when --build-backend base-image is used
   --skip-build                   Skip confidential image build
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
 
 Shelter options:
   --shelter-bin PATH             Existing shelter binary
-  --shelter-rpm PATH             Shelter RPM to install when no binary exists
+  --shelter-rpm PATH             Shelter RPM to install when missing or incompatible
 
 Examples:
   one-click/install.sh
@@ -166,8 +162,6 @@ init_defaults() {
   CA_OPENCLAW_VLLM_PORT="${CA_OPENCLAW_VLLM_PORT:-${OPENCLAW_VLLM_PORT:-8090}}"
   CA_OPENCLAW_VLLM_VERSION="${CA_OPENCLAW_VLLM_VERSION:-${OPENCLAW_VLLM_VERSION:-0.19.1}}"
   CA_OPENCLAW_VLLM_BUILD_VARIANTS="${CA_OPENCLAW_VLLM_BUILD_VARIANTS:-${OPENCLAW_VLLM_BUILD_VARIANTS:-release}}"
-  CA_BUILD_BACKEND="${CA_BUILD_BACKEND:-mkosi}"
-  CA_BASE_IMAGE="${CA_BASE_IMAGE:-}"
   CA_TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
   CA_STATE_DIR="${CA_STATE_DIR:-${HOME:-/root}/.confidential-agent}"
   CA_WORK_DIR="${CA_WORK_DIR:-$CA_STATE_DIR/one-click}"
@@ -232,8 +226,6 @@ parse_args() {
       --reference-values) CA_REFERENCE_VALUES="${2:?missing value for --reference-values}"; shift 2 ;;
       --cosign-key) CA_COSIGN_KEY="${2:?missing value for --cosign-key}"; shift 2 ;;
       --slsa-generator) CA_SLSA_GENERATOR="${2:?missing value for --slsa-generator}"; shift 2 ;;
-      --build-backend) CA_BUILD_BACKEND="${2:?missing value for --build-backend}"; shift 2 ;;
-      --base-image) CA_BASE_IMAGE="${2:?missing value for --base-image}"; shift 2 ;;
       --skip-build) CA_SKIP_BUILD=1; shift ;;
       --skip-deploy) CA_SKIP_DEPLOY=1; shift ;;
       --no-start-connect) CA_START_CONNECT=0; shift ;;
@@ -306,13 +298,6 @@ validate_options() {
   case "$CA_REFERENCE_VALUES" in
     sample|rekor) ;;
     *) die "--reference-values must be sample or rekor" ;;
-  esac
-  case "$CA_BUILD_BACKEND" in
-    mkosi) ;;
-    base-image)
-      [[ -n "$CA_BASE_IMAGE" ]] || die "--base-image is required with --build-backend base-image"
-      ;;
-    *) die "--build-backend must be mkosi or base-image" ;;
   esac
   [[ "$CA_DISK_GB" =~ ^[0-9]+$ ]] || die "--disk-gb must be an integer"
   [[ -n "$CA_BAILIAN_MODEL" ]] || die "--bailian-model cannot be empty"

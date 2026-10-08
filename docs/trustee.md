@@ -241,7 +241,7 @@ default/local-resources/<resource-id>
 
 `confidential-agentd initrd-fetch` 的 `CA_SECRET_WAIT_TIMEOUT_SEC` 通用默认值是 600 秒（0 表示无限等待），但 CLI 生成的镜像会在 CryptPilot `exec` provider 中显式设置为 210 秒，因此 Guest 的有效截止时间是 210 秒。这是覆盖 AAEL 登记、bootstrap 和磁盘密钥全部取回操作的单一全局 deadline，不是按资源分别计时；每次 CDH one-shot 还受 `CA_CDH_ONESHOT_TIMEOUT_SEC`（默认 120 秒）与剩余 deadline 中较小值的限制。
 
-超时后 `initrd-fetch` 会通过 `systemctl --no-block poweroff` fail closed。该动作有双重门控：仅当未设置 `CA_SKIP_INITRD_POWEROFF`，且检测到 `/etc/initrd-release`（真实 initrd）或显式设置了 `CA_FORCE_INITRD_POWEROFF` 时才执行；`CA_SKIP_INITRD_POWEROFF` 优先级最高，设置后即使在真实 initrd 中也不触发 poweroff。因此普通 rootfs 手工运行默认不会关机，单测仍显式设置 `CA_SKIP_INITRD_POWEROFF=1` 作为双保险。无论是否触发 poweroff，失败原因都会先写入 stderr 并以错误退出。镜像的 dracut 命令行还固化了 `rd.retry=300 rd.shell=0 rd.emergency=poweroff` 作为独立的第二层 fail-closed；210 秒的取密 deadline 刻意早于该 300 秒上限，让失败先通过 `initrd-fetch` 的 console 日志暴露，而不是落入 dracut emergency。
+超时后 `initrd-fetch` 会通过 `systemctl --no-block poweroff` fail closed。该动作有双重门控：仅当未设置 `CA_SKIP_INITRD_POWEROFF`，且检测到 `/etc/initrd-release`（真实 initrd）或显式设置了 `CA_FORCE_INITRD_POWEROFF` 时才执行；`CA_SKIP_INITRD_POWEROFF` 优先级最高，设置后即使在真实 initrd 中也不触发 poweroff。因此普通 rootfs 手工运行默认不会关机，单测仍显式设置 `CA_SKIP_INITRD_POWEROFF=1` 作为双保险。无论是否触发 poweroff，失败原因都会先写入 stderr 并以错误退出。原生 initramfs 没有 systemctl；`initrd-fetch` 返回错误后，cryptpilot exec provider 失败，Shelter 的 PID 1 对根激活失败执行 `poweroff -f`，不进入可交互 emergency shell。取密 deadline 保持 210 秒，日志写入 console，只有成功时才通过 `/bin/cat` 把原始密钥交给 cryptpilot。
 
 challenge mode 在重启后仍会等待 challenge 注入方重新提供 initrd 资源；Trustee mode 因服务持久化，可以在 CLI 不在线时自行完成重启。
 

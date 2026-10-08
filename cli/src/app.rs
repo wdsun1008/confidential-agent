@@ -1,10 +1,10 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
-    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitBuildBackend,
-    InitReferenceValues, InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands,
-    MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands,
-    SshArgs, StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs,
+    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitReferenceValues,
+    InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands, MigrateArgs,
+    OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands, SshArgs,
+    StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs,
 };
 use anyhow::{bail, Context, Result};
 use base64::{
@@ -92,7 +92,6 @@ struct BuildManifest {
     gateway_bin: PathBuf,
     gateway_service: PathBuf,
     tng_service: PathBuf,
-    initrd_secret_fetch_module: PathBuf,
     fde_config_file: PathBuf,
     policy_default: PathBuf,
     policy_local_dev: PathBuf,
@@ -491,17 +490,15 @@ fn prepare(
             destination: file.target.clone(),
             executable: file.executable,
         }));
-    if spec.build.base_image.is_none() {
-        stage_mkosi_debug_ssh_authorized_keys(
-            &mut assets,
-            &paths,
-            spec.build
-                .variants
-                .debug
-                .as_ref()
-                .and_then(|debug| debug.ssh_public_key.as_deref()),
-        )?;
-    }
+    stage_mkosi_debug_ssh_authorized_keys(
+        &mut assets,
+        &paths,
+        spec.build
+            .variants
+            .debug
+            .as_ref()
+            .and_then(|debug| debug.ssh_public_key.as_deref()),
+    )?;
     let deploy_names = options.deploy_names.clone();
     let terraform_dir = deploy_terraform_dir(&paths, None, deploy_names.as_ref());
     let build_id = options
@@ -556,7 +553,6 @@ fn prepare(
         gateway_bin: assets.gateway_bin,
         gateway_service: assets.gateway_service,
         tng_service: assets.tng_service,
-        initrd_secret_fetch_module: assets.initrd_secret_fetch_module,
         fde_config_file: assets.fde_config_file,
         policy_default: assets.policy_default,
         policy_local_dev: assets.policy_local_dev,
@@ -1220,39 +1216,8 @@ delta_backend = "dm-snapshot"
 integrity = false
 
 [delta.encrypt.exec]
-command = "/bin/bash"
-args = ["-c", "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /usr/bin/cat /run/cai/secrets/disk_key"]
-"#
-}
-
-fn secret_fetch_module_setup() -> &'static str {
-    r#"#!/bin/bash
-
-check() { return 0; }
-
-depends() {
-    echo systemd
-    echo shelter-initrd-network
-    echo confidential-computing-attestation
-    echo cryptpilot
-}
-
-install() {
-    if [ ! -x /usr/local/bin/confidential-agentd ]; then
-        dfatal "confidential-agentd not found at /usr/local/bin/confidential-agentd"
-        return 1
-    fi
-
-    inst_binary /usr/local/bin/confidential-agentd /usr/bin/confidential-agentd
-    inst_multiple bash cat mkdir sleep systemctl
-    hostonly='' instmods tdx_guest || true
-    mkdir -p "$initdir/usr/lib/modprobe.d"
-    printf 'options tdx_guest tsm_api=1\n' > "$initdir/usr/lib/modprobe.d/confidential-agent-tdx.conf"
-    mkdir -p "$initdir/usr/lib/modules-load.d"
-    printf 'tdx_guest\n' > "$initdir/usr/lib/modules-load.d/confidential-agent-tdx.conf"
-    mkdir -p "$initdir/etc/cmdline.d"
-    printf '%s\n' 'rd.retry=300 rd.shell=0 rd.emergency=poweroff' > "$initdir/etc/cmdline.d/36-confidential-agent-fail-closed.conf"
-}
+command = "/bin/sh"
+args = ["-c", "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/local/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /bin/cat /run/cai/secrets/disk_key"]
 "#
 }
 

@@ -5,9 +5,8 @@ service:
   connect: [18789]
   app_service: cai-a2a-llm-agent.service
 build:
-{{raw:BASE_IMAGE_LINE}}
+
   image_name: a2a-analyst-agent
-  with_network: true
   packages: [ca-certificates, curl, jq, nodejs, npm, tar, xz]
   files:
     - source: ./files/agent-server.mjs

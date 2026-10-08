@@ -15,9 +15,11 @@ items = data if isinstance(data, list) else [data]
 required_debug = sys.argv[2] == "1"
 for item in items:
     daemon = item.get("daemon") or {}
-    if daemon.get("app_ready") is not True or daemon.get("mesh_ready") is not True:
+    if daemon.get("mesh_ready") is not True:
         raise SystemExit(1)
     if required_debug and daemon.get("debug_ssh_ready") is not True:
+        raise SystemExit(1)
+    if not required_debug and daemon.get("app_ready") is not True:
         raise SystemExit(1)
 raise SystemExit(0)
 PY
@@ -54,7 +56,7 @@ assert_openclaw_vllm_init_output() {
 
   grep -Fq "image_name: openclaw-vllm-agent" "$spec"
   grep -Fq "kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0" "$spec"
-  grep -Fq "packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]" "$spec"
+  grep -Fq "packages: [binutils, ca-certificates, curl, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]" "$spec"
   grep -Fq "source: ./nvidia-persistenced.service" "$spec"
   grep -Fq "source: ./cai-nvidia-cc-stack-install.sh" "$spec"
   grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
@@ -164,7 +166,7 @@ run_case() {
   validate_specs "$STATE_DIR" "$VLLM_SPEC"
 
   if [[ "${E2E_OPENCLAW_VLLM_RUN_CLOUD:-0}" != "1" ]]; then
-    record "- OpenClaw vLLM cloud build/deploy skipped: current GPU TEE instance inventory is unavailable. Set E2E_OPENCLAW_VLLM_RUN_CLOUD=1 when inventory is available."
+    record "- OpenClaw vLLM cloud build/deploy NOT VERIFIED: E2E_OPENCLAW_VLLM_RUN_CLOUD is not enabled. Check GPU TEE inventory and set it to 1 for cloud validation."
     return 0
   fi
 
@@ -185,6 +187,11 @@ run_case() {
   local host="${ssh_lines[0]}"
   local key="${ssh_lines[1]}"
   wait_for_ssh "$host" "$key"
+  local expected_guest_digest actual_guest_digest
+  expected_guest_digest="$(sha256sum /usr/libexec/shelter/cryptpilot-fde-guest | awk '{print $1}')"
+  actual_guest_digest="$(ssh_guest "$key" "$host" 'sha256sum /usr/bin/cryptpilot-fde' | awk '{print $1}')"
+  [[ "$actual_guest_digest" == "$expected_guest_digest" ]] || { echo "GPU guest Cryptpilot differs from fde-guest" >&2; return 1; }
+  record "- GPU guest Cryptpilot matches fde-guest ($actual_guest_digest)."
   guest_wait "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi" 1800
   guest_wait "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service" 1800
   guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 7200
@@ -192,6 +199,7 @@ run_case() {
   guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 7200
   wait_status_json_ready 0 900
   record_file_as_block "Live status:" "$WORK_DIR/status-live.json" json
+  run_report_probe "$STATE_DIR" "$WORK_DIR/attestation-report.json" openclaw-vllm
 
   local connect_port
   connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw-vllm /openclaw/ 4 180 --service openclaw-vllm)"

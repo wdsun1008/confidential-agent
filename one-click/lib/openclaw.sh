@@ -58,11 +58,7 @@ append_init_common_args() {
     --node-version "$CA_NODE_VERSION"
     --npm-registry "$CA_NPM_REGISTRY"
     --slsa-generator "$CA_SLSA_GENERATOR"
-    --build-backend "$CA_BUILD_BACKEND"
   )
-  if [[ "$CA_BUILD_BACKEND" == "base-image" ]]; then
-    args_ref+=(--base-image "$CA_BASE_IMAGE")
-  fi
   if [[ "$CA_REFERENCE_VALUES" == "rekor" ]]; then
     args_ref+=(--cosign-key "$CA_COSIGN_KEY")
   fi

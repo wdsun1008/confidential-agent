@@ -13,7 +13,6 @@ struct InitProject {
     reference_values: InitReferenceValues,
     cosign_key: Option<PathBuf>,
     slsa_generator: PathBuf,
-    base_image: Option<PathBuf>,
     dashscope_key: Option<String>,
     dashscope_base_url: String,
     dashscope_anthropic_base_url: String,
@@ -121,13 +120,6 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
     let reference_values = args
         .reference_values
         .unwrap_or_else(|| default_reference_values(target));
-    if args.build_backend == InitBuildBackend::BaseImage && args.base_image.is_none() {
-        bail!("init --build-backend base-image requires --base-image");
-    }
-    let base_image = match args.build_backend {
-        InitBuildBackend::Mkosi => None,
-        InitBuildBackend::BaseImage => args.base_image.clone(),
-    };
     let dashscope_key = resolve_dashscope_key(args, target)?;
     let model = args
         .model
@@ -168,7 +160,6 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
         reference_values,
         cosign_key: args.cosign_key.clone(),
         slsa_generator: args.slsa_generator.clone(),
-        base_image,
         dashscope_key,
         dashscope_base_url: args.dashscope_base_url.clone(),
         dashscope_anthropic_base_url: args.dashscope_anthropic_base_url.clone(),
@@ -835,10 +826,9 @@ service:
   app_service: cai-openclaw-gateway.service
 
 build:
-{base_image}  image_name: openclaw-agent
+  image_name: openclaw-agent
   resize: 30G
-  with_network: true
-  packages: [ca-certificates, curl, dracut, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
   files:
 {files}  scripts: [./install-openclaw.sh]
   variants:
@@ -877,7 +867,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         files = files,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
@@ -902,13 +891,16 @@ service:
   app_service: cai-openclaw-gateway.service
 
 build:
-{base_image}  image_name: openclaw-vllm-agent
+  image_name: openclaw-vllm-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
-  resize: 80G
-  with_network: true
+  resize: 160G
   cleanup:
     remove_static_libs: false
-  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  repos:
+    - name: epel
+      baseurl: https://mirrors.aliyun.com/epel/8/Everything/$basearch/
+      gpgkey: https://mirrors.aliyun.com/epel/RPM-GPG-KEY-EPEL-8
+  packages: [binutils, ca-certificates, curl, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
 {files}  scripts: [./install-openclaw-vllm.sh]
   variants:
@@ -946,7 +938,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         files = files,
         variants = variants,
         deploy_variant = deploy_variant,
@@ -978,9 +969,8 @@ service:
   app_service: cai-hermes-agent.service
 
 build:
-{base_image}  image_name: hermes-agent
+  image_name: hermes-agent
   resize: 30G
-  with_network: true
   packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]
   files:
     - source: ./files/install-hermes-agent-runtime.sh
@@ -1026,7 +1016,6 @@ resources:
     mode: "0600"
     mutable: true
 "#,
-        base_image = base_image_line(project)?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
         zone_id = yaml_quote(&project.zone_id)?,
@@ -1047,9 +1036,8 @@ service:
   app_service: cai-codex-app-server.service
 
 build:
-{base_image}  image_name: codex-agent
+  image_name: codex-agent
   resize: 30G
-  with_network: true
   packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
   files:
     - source: {pep}
@@ -1097,7 +1085,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         pep = yaml_quote(&pep_bin.to_string_lossy())?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
@@ -1118,9 +1105,8 @@ service:
   connect: []
 
 build:
-{base_image}  image_name: claude-code-agent
+  image_name: claude-code-agent
   resize: 30G
-  with_network: true
   packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
   files:
     - source: {pep}
@@ -1163,7 +1149,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         pep = yaml_quote(&pep_bin.to_string_lossy())?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
@@ -1215,17 +1200,6 @@ fn openclaw_vllm_files_yaml(pep_bin: &Path) -> Result<String> {
     out.push_str("    - source: ./files/cai-a2a-plugin\n      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin\n");
     out.push_str("    - source: ./files/patch-openclaw-cai-pep.js\n      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js\n      executable: true\n");
     Ok(out)
-}
-
-fn base_image_line(project: &InitProject) -> Result<String> {
-    if let Some(path) = &project.base_image {
-        Ok(format!(
-            "  base_image: {}\n",
-            yaml_quote(&path.to_string_lossy())?
-        ))
-    } else {
-        Ok(String::new())
-    }
 }
 
 fn rekor_block(project: &InitProject) -> Result<String> {
@@ -1620,7 +1594,6 @@ mod tests {
             reference_values: InitReferenceValues::Sample,
             cosign_key: None,
             slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
-            base_image: None,
             dashscope_key: None,
             dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             dashscope_anthropic_base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
@@ -1661,7 +1634,6 @@ mod tests {
             reference_values: InitReferenceValues::Sample,
             cosign_key: None,
             slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
-            base_image: None,
             dashscope_key: Some("sk-test".to_string()),
             dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             dashscope_anthropic_base_url: "https://dashscope.aliyuncs.com/apps/anthropic"

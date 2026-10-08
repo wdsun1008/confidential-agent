@@ -15,10 +15,8 @@ service:
   connect: [18789]
   app_service: cai-openclaw-gateway.service
 build:
-  base_image: ./base.qcow2
   image_name: openclaw-agent
   resize: 30G
-  with_network: true
   packages: [nodejs]
   scripts: [./install-openclaw.sh]
   files:

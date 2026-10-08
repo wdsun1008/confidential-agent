@@ -3,11 +3,11 @@ use confidential_agent_core::peerings::{PeeringScope, PeeringsFile};
 use confidential_agent_core::schema::{confidential_ports, AGENT_CARD_PORT, DAEMON_STATUS_PORT};
 use confidential_agent_core::spec::{
     AgentSpec, AttestationMode, AttestationTee, BuildCleanupSpec, BuildContainerSpec,
-    ReferenceValueMode, RekorSpec,
+    BuildRepositorySpec, ReferenceValueMode, RekorSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct GuestAssets {
@@ -16,7 +16,6 @@ pub struct GuestAssets {
     pub gateway_bin: PathBuf,
     pub gateway_service: PathBuf,
     pub tng_service: PathBuf,
-    pub initrd_secret_fetch_module: PathBuf,
     pub fde_config_file: PathBuf,
     pub policy_default: PathBuf,
     pub policy_local_dev: PathBuf,
@@ -57,13 +56,17 @@ pub fn render_build_config(
     spec.ensure_mvp_supported()?;
 
     let config = ShelterBuildConfig {
-        base_image: spec.build.base_image.clone(),
         output: spec.build.resize.as_ref().map(|size| ShelterOutputConfig {
             disk_size: Some(size.clone()),
         }),
-        with_network: spec.build.with_network,
         container: spec.build.container.clone(),
         packages: shelter_packages(spec, assets),
+        repos: spec.build.repos.clone(),
+        // CA's TNG transparent proxy and workload drivers require modules beyond
+        // Shelter's generic minimal-network keep-list.
+        kernel: ShelterKernel {
+            modules_policy: "full",
+        },
         cleanup: shelter_cleanup(&spec.build.cleanup),
         files: guest_files(assets),
         scripts: assets
@@ -80,18 +83,35 @@ pub fn render_build_config(
             .collect(),
         services: shelter_services(spec),
         rekor: render_rekor_config(spec, options.build_id.as_deref()),
-        tools: ShelterTools::host_defaults(),
+        sysconfig: ShelterSysconfig {
+            network: ShelterNetwork { enabled: true },
+        },
         security: ShelterSecurity::challenge_defaults(assets, spec),
         initrd: ShelterInitrd {
-            modules: vec![ShelterDracutModule {
-                path: assets.initrd_secret_fetch_module.clone(),
-            }],
+            network: true,
+            binaries: vec![
+                "/usr/local/bin/confidential-agentd".to_string(),
+                "/usr/bin/confidential-data-hub".to_string(),
+            ],
         },
-        deploy: if options.include_deploy {
-            render_deploy_config(spec, options)
-        } else {
-            None
-        },
+        runtime: options.include_deploy.then(|| ShelterRuntime {
+            profiles: BTreeMap::from([(
+                "ca-attestation",
+                ShelterRuntimeProfile {
+                    trust: "verified",
+                    attestation: "disabled",
+                    forbid_fallback: true,
+                },
+            )]),
+            targets: BTreeMap::from([(
+                "deploy",
+                ShelterRuntimeTarget {
+                    provider: "terraform-alicloud",
+                    profiles: vec!["ca-attestation"],
+                    provider_options: render_deploy_config(spec, options),
+                },
+            )]),
+        }),
     };
 
     serde_yaml::to_string(&config).map_err(Into::into)
@@ -115,10 +135,12 @@ fn shelter_packages(spec: &AgentSpec, _assets: &GuestAssets) -> Vec<String> {
     packages
 }
 
-fn shelter_cleanup(cleanup: &BuildCleanupSpec) -> Option<ShelterCleanupConfig> {
-    (!cleanup.is_empty()).then(|| ShelterCleanupConfig {
+fn shelter_cleanup(cleanup: &BuildCleanupSpec) -> ShelterCleanupConfig {
+    ShelterCleanupConfig {
         remove_static_libs: cleanup.remove_static_libs,
-    })
+        // Cloud soft reboot needs the input tags consumed by systemd-logind.
+        trim_udev_helpers: false,
+    }
 }
 
 fn shelter_services(spec: &AgentSpec) -> Vec<ShelterServiceUnit> {
@@ -193,10 +215,7 @@ fn guest_files(assets: &GuestAssets) -> Vec<ShelterFileMapping> {
     files
 }
 
-fn render_deploy_config(
-    spec: &AgentSpec,
-    options: &ShelterRenderOptions,
-) -> Option<ShelterDeployConfig> {
+fn render_deploy_config(spec: &AgentSpec, options: &ShelterRenderOptions) -> ShelterDeployConfig {
     let deploy = &spec.deploy;
     let mut tags = BTreeMap::new();
     tags.insert(
@@ -208,7 +227,7 @@ fn render_deploy_config(
         spec.image_variant().to_string(),
     );
 
-    Some(ShelterDeployConfig {
+    ShelterDeployConfig {
         name: options
             .deploy_resource_name
             .clone()
@@ -251,7 +270,7 @@ fn render_deploy_config(
         security_group_id: deploy.security_group_id.clone(),
         user_data: options.deploy_user_data.clone(),
         tags,
-    })
+    }
 }
 
 pub fn shelter_build_id(spec: &AgentSpec) -> String {
@@ -354,19 +373,16 @@ fn sanitize_rule_name_component(value: &str) -> String {
 
 #[derive(Debug, Serialize)]
 struct ShelterBuildConfig {
-    #[serde(rename = "from")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    base_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<ShelterOutputConfig>,
-    #[serde(skip_serializing_if = "is_false")]
-    with_network: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     container: Option<BuildContainerSpec>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     packages: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cleanup: Option<ShelterCleanupConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    repos: Vec<BuildRepositorySpec>,
+    kernel: ShelterKernel,
+    cleanup: ShelterCleanupConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     files: Vec<ShelterFileMapping>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -374,11 +390,17 @@ struct ShelterBuildConfig {
     services: Vec<ShelterServiceUnit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rekor: Option<ShelterRekorConfig>,
-    tools: ShelterTools,
+    sysconfig: ShelterSysconfig,
     security: ShelterSecurity,
     initrd: ShelterInitrd,
     #[serde(skip_serializing_if = "Option::is_none")]
-    deploy: Option<ShelterDeployConfig>,
+    runtime: Option<ShelterRuntime>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterKernel {
+    #[serde(rename = "modules-policy")]
+    modules_policy: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -391,6 +413,7 @@ struct ShelterOutputConfig {
 struct ShelterCleanupConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     remove_static_libs: Option<bool>,
+    trim_udev_helpers: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,7 +442,13 @@ impl ShelterRekorConfig {
             rekor_url: spec.rekor_url.clone(),
             cosign_key: spec.cosign_key.clone(),
             slsa_generator: spec.slsa_generator.clone(),
-            rv_name: spec.rv_name.clone(),
+            // CA's TDX appraisal uses the SHA-384 UKI bank. Shelter can emit
+            // multiple banks, so its first-key default is not sufficient.
+            rv_name: Some(
+                spec.rv_name
+                    .clone()
+                    .unwrap_or_else(|| "measurement.uki.SHA-384".to_string()),
+            ),
             required: spec.required,
         }
     }
@@ -443,62 +472,6 @@ struct ShelterScript {
 struct ShelterServiceUnit {
     name: String,
     enable: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ShelterTools {
-    #[serde(rename = "cryptpilot-enhance")]
-    cryptpilot_enhance: String,
-    #[serde(rename = "cryptpilot-convert")]
-    cryptpilot_convert: String,
-    #[serde(rename = "cryptpilot-fde-host")]
-    cryptpilot_fde_host: String,
-    #[serde(rename = "cryptpilot-fde-guest")]
-    cryptpilot_fde_guest: String,
-}
-
-impl ShelterTools {
-    fn host_defaults() -> Self {
-        Self {
-            cryptpilot_enhance: "cryptpilot-enhance".to_string(),
-            cryptpilot_convert: "cryptpilot-convert".to_string(),
-            cryptpilot_fde_host: preferred_cryptpilot_fde_host_tool(),
-            cryptpilot_fde_guest: preferred_cryptpilot_fde_guest_tool(),
-        }
-    }
-}
-
-fn preferred_cryptpilot_fde_host_tool() -> String {
-    preferred_existing_tool_path(
-        [
-            "/usr/bin/cryptpilot-fde-host",
-            "/usr/local/bin/cryptpilot-fde-host",
-        ],
-        "cryptpilot-fde-host",
-    )
-}
-
-fn preferred_cryptpilot_fde_guest_tool() -> String {
-    preferred_existing_tool_path(
-        [
-            "/usr/bin/cryptpilot-fde-guest",
-            "/usr/local/bin/cryptpilot-fde-guest",
-        ],
-        "cryptpilot-fde-guest",
-    )
-}
-
-fn preferred_existing_tool_path<I, P>(candidates: I, fallback: &str) -> String
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<Path>,
-{
-    candidates
-        .into_iter()
-        .map(|candidate| candidate.as_ref().to_path_buf())
-        .find(|candidate| candidate.is_file())
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -577,7 +550,13 @@ impl ShelterCryptpilotDisk {
             // Shelter drives reference-value extraction off
             // `security.disk.cryptpilot.rootfs.integrity`.
             rootfs: ShelterCryptpilotRootfs { integrity: true },
-            uki_append_cmdline: spec.build.kernel_cmdline_append.clone(),
+            // An explicit Shelter append string replaces its default console
+            // arguments. CA's append option must preserve those boot diagnostics.
+            uki_append_cmdline: spec
+                .build
+                .kernel_cmdline_append
+                .as_ref()
+                .map(|extra| format!("console=tty0 console=ttyS0,115200n8 {extra}")),
         }
     }
 }
@@ -589,12 +568,18 @@ struct ShelterCryptpilotRootfs {
 
 #[derive(Debug, Serialize)]
 struct ShelterInitrd {
-    modules: Vec<ShelterDracutModule>,
+    network: bool,
+    binaries: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct ShelterDracutModule {
-    path: PathBuf,
+struct ShelterSysconfig {
+    network: ShelterNetwork,
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterNetwork {
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -696,6 +681,29 @@ struct ShelterApiServer {
     enable_aa: bool,
     allow_remote_get_evidence: bool,
     allow_remote_resource_injection: bool,
+}
+
+// CA owns evidence verification and secret release for both challenge and Trustee.
+// This profile disables only Shelter's duplicate attestation workflow; provider
+// options still request TDX, and CA will not release keys before its own checks.
+#[derive(Debug, Serialize)]
+struct ShelterRuntime {
+    profiles: BTreeMap<&'static str, ShelterRuntimeProfile>,
+    targets: BTreeMap<&'static str, ShelterRuntimeTarget>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterRuntimeProfile {
+    trust: &'static str,
+    attestation: &'static str,
+    forbid_fallback: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ShelterRuntimeTarget {
+    provider: &'static str,
+    profiles: Vec<&'static str>,
+    provider_options: ShelterDeployConfig,
 }
 
 #[derive(Debug, Serialize)]

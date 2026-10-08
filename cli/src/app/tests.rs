@@ -595,7 +595,6 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
         gateway_bin: PathBuf::from("/bin/cai-gateway"),
         gateway_service: PathBuf::from("/etc/systemd/system/cai-gateway.service"),
         tng_service: PathBuf::from("/etc/systemd/system/trusted-network-gateway.service"),
-        initrd_secret_fetch_module: PathBuf::from("/build/99confidential-agent-secret-fetch"),
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/default.rego"),
         policy_local_dev: PathBuf::from("/build/local-dev.rego"),
@@ -845,6 +844,9 @@ import os
 import sys
 
 args = sys.argv[1:]
+if "plan" in args:
+    print(json.dumps({{"plan": {{"early_boot": {{"binaries": ["/usr/local/bin/confidential-agentd", "/usr/bin/confidential-data-hub"]}}}}}}))
+    sys.exit(0)
 with open("{log}", "a", encoding="utf-8") as fh:
     fh.write(json.dumps(args) + "\n")
 
@@ -857,8 +859,13 @@ def arg_after(flag):
 work_dir = arg_after("--work-dir")
 if "build" in args:
     image_id = arg_after("--image-id")
-    image_dir = os.path.join(work_dir, "images", image_id)
+    # Mainline publishes immutable records through images/<id> symlinks.
+    image_dir = os.path.join(work_dir, "records", image_id)
     os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "images"), exist_ok=True)
+    alias = os.path.join(work_dir, "images", image_id)
+    if not os.path.lexists(alias):
+        os.symlink(os.path.join("..", "records", image_id), alias)
     image_path = os.path.join(image_dir, f"image-{{image_id}}.qcow2")
     with open(image_path, "w", encoding="utf-8") as fh:
         fh.write("image")
@@ -866,7 +873,7 @@ if "build" in args:
         json.dump({{
             "id": image_id,
             "image_path": image_path,
-            "reference_value": {{"measurement.uki.SHA-384": [image_id]}},
+            "reference_value": {{"measurement.uki.SHA-384": ["a" * 96]}},
             "rekor_value": None,
         }}, fh)
     sys.exit(0)
@@ -1066,9 +1073,9 @@ fn cryptpilot_fde_config_matches_current_schema() {
     assert!(config.contains("[delta]"));
     assert!(config.contains("integrity = false"));
     assert!(config.contains("[delta.encrypt.exec]"));
-    assert!(config.contains("command = \"/bin/bash\""));
+    assert!(config.contains("command = \"/bin/sh\""));
     assert!(config.contains(
-        "args = [\"-c\", \"CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /usr/bin/cat /run/cai/secrets/disk_key\"]"
+        "args = [\"-c\", \"CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/local/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /bin/cat /run/cai/secrets/disk_key\"]"
     ));
     assert!(!config.contains("initrd-fetch 1>&2"));
     assert!(!config.contains("rw_overlay"));
@@ -1102,6 +1109,11 @@ fn deploy_args_use_positional_build_id_without_cloud_image_override() {
     assert!(!args.iter().any(|arg| arg == OsStr::new("--image-id")));
     assert!(!args.iter().any(|arg| arg == OsStr::new("--cloud-image-id")));
     assert!(args.iter().any(|arg| arg == OsStr::new("--auto-approve")));
+    assert!(args.windows(2).any(|pair| pair == ["--target", "deploy"]));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == "--deployment-id"
+            && pair[1] == OsStr::new(&prepared.shelter_build_id)));
 }
 
 #[test]
@@ -1158,7 +1170,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1232,7 +1243,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1543,7 +1553,7 @@ resources: {}
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": id,
                 "image_path": image,
-                "reference_value": {"measurement.uki.SHA-384": [id]},
+                "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
                 "rekor_value": null
             }))
             .unwrap(),
@@ -1571,7 +1581,6 @@ resources: {}
             "gateway_bin": "/bin/cai-gateway",
             "gateway_service": "/etc/systemd/system/cai-gateway.service",
             "tng_service": "/etc/systemd/system/trusted-network-gateway.service",
-            "initrd_secret_fetch_module": "/build/99confidential-agent-secret-fetch",
             "fde_config_file": "/build/fde.toml",
             "policy_default": "/build/default.rego",
             "policy_local_dev": "/build/local-dev.rego",
@@ -1634,7 +1643,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1660,7 +1668,7 @@ resources: {}
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": build_id,
                 "image_path": "/state/shelter/images/openclaw-agent-release/image-openclaw-agent-release.qcow2",
-                "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+                "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
                 "rekor_value": null
             }))
             .unwrap(),
@@ -1689,7 +1697,6 @@ service:
   connect: [18789]
   app_service: cai-openclaw-gateway.service
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1727,7 +1734,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1807,7 +1813,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1923,7 +1928,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1955,7 +1959,7 @@ resources: {}
         serde_json::to_string_pretty(&serde_json::json!({
             "id": build_id,
             "image_path": state.build.image_path,
-            "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+            "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
             "rekor_value": null
         }))
         .unwrap(),
@@ -1980,7 +1984,7 @@ fn materialize_build_artifacts_reads_manifest_result_path() {
         serde_json::to_string_pretty(&serde_json::json!({
             "id": "openclaw-agent-release",
             "image_path": "/shelter/images/openclaw-agent-release/image.qcow2",
-            "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+            "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
             "rekor_value": null
         }))
         .unwrap(),
@@ -2047,7 +2051,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2225,7 +2228,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2267,7 +2269,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2312,7 +2313,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -2390,9 +2390,6 @@ fn mkosi_debug_deploy_stages_authorized_keys() {
         tng_service: paths
             .guest_staging_dir
             .join("trusted-network-gateway.service"),
-        initrd_secret_fetch_module: paths
-            .guest_staging_dir
-            .join("99confidential-agent-secret-fetch"),
         fde_config_file: paths.guest_staging_dir.join("fde.toml"),
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
@@ -2437,9 +2434,6 @@ fn mkosi_debug_deploy_stages_configured_authorized_keys() {
         tng_service: paths
             .guest_staging_dir
             .join("trusted-network-gateway.service"),
-        initrd_secret_fetch_module: paths
-            .guest_staging_dir
-            .join("99confidential-agent-secret-fetch"),
         fde_config_file: paths.guest_staging_dir.join("fde.toml"),
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
@@ -2659,7 +2653,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2929,7 +2922,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2974,7 +2966,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3020,7 +3011,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3077,7 +3067,14 @@ resources: {}
 
 #[test]
 fn deploy_render_only_uses_published_image_without_local_qcow2() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
     let spec = temp.path().join("openclaw.yaml");
     fs::write(
         &spec,
@@ -3088,7 +3085,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3127,7 +3123,7 @@ resources: {}
     let mut cli = test_cli();
     cli.state_dir = temp.path().to_path_buf();
 
-    cmd_deploy(
+    let deploy_result = cmd_deploy(
         &cli,
         &DeployArgs {
             spec,
@@ -3135,8 +3131,9 @@ resources: {}
             render_only: true,
             skip_peering_check: true,
         },
-    )
-    .unwrap();
+    );
+    std::env::set_var("PATH", old_path);
+    deploy_result.unwrap();
 
     let rendered =
         fs::read_to_string(context_paths(temp.path(), "openclaw").rendered_config).unwrap();
@@ -3271,7 +3268,6 @@ service:
   ports: [18789, 18800]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3317,7 +3313,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3367,11 +3362,14 @@ fn ensure_gateway_identity_rejects_mismatched_public_key() {
 
 #[test]
 fn mesh_port_conflict_is_rejected() {
-    let states = vec![local_state("openclaw", vec![18789], vec![18789])];
-    let err = validate_mesh_port_conflicts(&states, "mcp", &[18789]).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("port 18789 is already used by service openclaw"));
+    let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    for phase in ["active", "deployed", "deploying"] {
+        state.phase = phase.to_string();
+        let err = validate_mesh_port_conflicts(&[state.clone()], "mcp", &[18789]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("port 18789 is already used by service openclaw"));
+    }
 }
 
 #[test]
@@ -4019,14 +4017,14 @@ fn no_proxy_with_target_trims_whitespace_in_existing_entries() {
 }
 
 #[test]
-fn secret_fetch_initrd_loads_tdx_guest_module() {
-    let setup = secret_fetch_module_setup();
-    assert!(setup.contains("instmods tdx_guest"));
-    assert!(setup.contains("usr/lib/modprobe.d"));
-    assert!(setup.contains("options tdx_guest tsm_api=1"));
-    assert!(setup.contains("usr/lib/modules-load.d"));
-    assert!(setup.contains("confidential-agent-tdx.conf"));
-    assert!(setup.contains("tdx_guest\\n"));
-    assert!(setup.contains("rd.retry=300 rd.shell=0 rd.emergency=poweroff"));
-    assert!(setup.contains("36-confidential-agent-fail-closed.conf"));
+fn build_preflight_rejects_silently_ignored_initrd_binaries() {
+    let config = serde_yaml::from_str("initrd:\n  binaries: [/usr/local/bin/confidential-agentd, /usr/bin/confidential-data-hub]\n").unwrap();
+    for plan in [
+        serde_json::json!({"plan": {"early_boot": {}}}),
+        serde_json::json!({"plan": {"early_boot": {"binaries": ["/usr/local/bin/confidential-agentd"]}}}),
+    ] {
+        assert!(verify_initrd_binaries_in_plan(&config, &plan).is_err());
+    }
+    let plan = serde_json::json!({"plan": {"early_boot": {"binaries": ["/usr/local/bin/confidential-agentd", "/usr/bin/confidential-data-hub"]}}});
+    verify_initrd_binaries_in_plan(&config, &plan).unwrap();
 }

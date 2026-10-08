@@ -21,7 +21,7 @@ Cases:
 | `openclaw-bailian-no-pep` | 同一条 `init openclaw` 主路径，额外传入 `--disable-pep`，覆盖不安装、不启用 cai-pep 的部署分支。 |
 | `openclaw-a2a` | Legacy two-OpenClaw A2A bridge coverage. |
 | `a2a-data-collab` | Two real LLM-backed agents collaborate over A2A: Analyst delegates a natural-language aggregate data task to a Data Owner, verifies no raw private rows leak, and asserts the A2A TNG routes use the pinned 2.8 RPM/config schema. |
-| `openclaw-vllm` | `init openclaw-vllm` 生成和 AppSpec 校验；当前默认跳过云端 GPU TEE 部署，因为没有可用实例库存。设置 `E2E_OPENCLAW_VLLM_RUN_CLOUD=1` 可在库存恢复后跑完整 readiness/chat。 |
+| `openclaw-vllm` | `init openclaw-vllm` 生成和 AppSpec 校验；设置 `E2E_OPENCLAW_VLLM_RUN_CLOUD=1` 并选择有库存的 GPU TEE zone，运行真实构建、部署、readiness/chat。未开启时不代表云端验证通过。 |
 | `cmaas` | CMaaS 是主 MCP E2E：自然语言 agent 经 gateway 调用 memory MCP tools，验证 MCP audit 链、虚拟 MCP audit tools、TEE evidence 绑定、TNG 2.8 builtin policy 的 deny/recovery 负例、非 TEE baseline rejection 和 snapshot confidentiality；不通过 host connect 直连 MCP `mcp_ports`。 |
 | `trustee-duo` | 同一 state/Trustee 下部署 OpenClaw Bailian 与 Codex Bailian，覆盖真实对话、同步/状态、无 CLI 重注入的 reboot 恢复、Trustee fail-closed、逐个销毁与最终清理。 |
 | `hermes-agent` | `init hermes` 生成的普通 mkosi 路径：构建期通过官方 installer 从 Hermes 源码安装，运行期通过 `cai-hermes-agent.service` 启动，并覆盖资源注入、deploy、connect、health/chat probe 和失败诊断。 |
@@ -45,13 +45,15 @@ confidential-agent connect stop --ready-json <ready-json>
 ```
 
 Business peers are added only after deployment, followed by `confidential-agent peering apply`.
-The build phase must not read `peerings.yaml` and must not render Shelter `deploy` or security group config.
+The build phase must not read `peerings.yaml` and must not render Shelter runtime deployment targets or security group config.
 
 CMaaS is the exception to the host `connect start` probe pattern. Its MCP port is `mcp_ports ⊆ mesh_ports`, so the E2E probe runs from the peer agent inside the confidential mesh and also asserts that `connect --render-only --service cmaas` fails. The test must not expose or probe MCP `mcp_ports` through host connect.
 
 The scripts do not unset proxy variables internally. On the current development host, OpenAI-facing tools may need a proxy, but mkosi/DNF access to `yum.tbsite.net` and deploy should run without proxy. Use the outer `env -u ...` wrapper shown above for full E2E runs.
 
-Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, and `aliyun`. Rekor-mode `cosign`/`rekor-cli` calls run through `confidential-agent-tools`, so they are not host prerequisites.
+Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, and `aliyun`. The OpenClaw Bailian (including no-PEP) and Trustee cases also require the host `openclaw` CLI for gateway token checks. Rekor-mode `cosign`/`rekor-cli` calls run through `confidential-agent-tools`, so they are not host prerequisites.
+
+Trustee reboot tests default to `E2E_REBOOT_FORCE_STOP=true`. Set it to `false` to test a graceful reboot separately from crash recovery; the selected mode is recorded in the test results.
 Interactive Codex remote use still requires a host `codex` CLI, but the E2E remote probe validates the protected WebSocket endpoint directly.
 
 Common environment:
@@ -60,7 +62,6 @@ Common environment:
 |---|---|
 | `E2E_WORK_DIR` | `.tmp/e2e/<case>-<timestamp>` |
 | `E2E_STATE_DIR` | `<work-dir>/state` for single-state cases |
-| `E2E_BUILD_BACKEND` | `mkosi` |
 | `E2E_REFERENCE_VALUES` | `rekor` |
 | `E2E_REGION` | `cn-beijing` |
 | `E2E_ZONE_ID` | `cn-beijing-i` for `cn-beijing`, `cn-hongkong-d` for `cn-hongkong` |
@@ -69,6 +70,7 @@ Common environment:
 | `E2E_DESTROY_ON_SUCCESS` | `1` |
 | `E2E_DESTROY_ON_FAILURE` | `1` |
 | `E2E_MATRIX_REAL_CLOUD` | `0`; set to `1` for the `cli-command-matrix` publish/deploy/unpublish cloud lane |
+| `E2E_MATRIX_REPO_MIRROR` | Optional HTTPS Alinux repository base, e.g. `https://mirrors-ssl.aliyuncs.com/alinux` on ECS; uses existing `build.repos` with GPG verification |
 | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `DASHSCOPE_ANTHROPIC_BASE_URL` | `https://dashscope.aliyuncs.com/apps/anthropic` |
 | `DASHSCOPE_MODEL` | `qwen3.7-max` |

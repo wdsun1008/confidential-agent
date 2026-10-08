@@ -67,7 +67,7 @@ sequenceDiagram
     CLI->>Core: AgentSpec::from_path
     Core-->>CLI: spec (validated)
     CLI->>FS: lock state-dir + check phase != active/deployed
-    CLI->>FS: prepare_guest_assets (staging confidential-agentd, cai-gateway, fde.toml, dracut module, OPA policy)
+    CLI->>FS: prepare_guest_assets (staging confidential-agentd, cai-gateway, fde.toml, OPA policy)
     CLI->>Docker: docker create + cp attestation client/cosign → staging
     loop 每个 build.variants.*.enabled=true 的 variant
         CLI->>SH: render_build_config(spec with image_variant, assets, options)
@@ -82,8 +82,8 @@ sequenceDiagram
 ```
 
 关键点：
-- **mkosi vs convert 模式**：取决于 `build.base_image` 是否提供。前者由 Shelter 从零构建，后者基于已有镜像增强。两条路径下都强制 UKI 启动 + cryptpilot FDE（[`ShelterDiskCrypt::writable_layer_defaults`](../shelter/src/lib.rs)）。
-- **TNG 严格 pin**：tools 镜像从 Alinux3 仓库安装 `trusted-network-gateway-2.8.0-1.al8`；Guest 由 Shelter 的 `security.tng: true` 自动安装官方 RPM，随后 [`guest_setup_script`](../cli/src/app.rs) 同时校验 RPM NEVRA 与 `tng --version`，版本不符时 build 直接失败。仓库不再携带或覆盖 TNG 二进制；从旧版升级时必须重新 build Guest 镜像，不能用 `E2E_SKIP_BUILD=1` 复用 2.6 产物验证升级。
+- **镜像构建**：CA 统一通过 Shelter mkosi 构建 rootfs，使用 UKI、cryptpilot FDE 和加密持久 delta。原生 initramfs 通过 `initrd.binaries` 从 rootfs 收集 `/usr/local/bin/confidential-agentd`、`/usr/bin/confidential-data-hub` 及其 ELF 依赖；不再生成 dracut module。构建前检查 `shelter plan` 确认这些程序进入 early-boot plan。
+- **TNG 严格 pin**：tools 镜像从 Alinux3 仓库安装 `trusted-network-gateway-2.8.0-1.al8`；Guest 显式安装相同版本的官方 RPM，并设置 `security.tng: false` 避免 Shelter 自动加入其他版本，随后 [`guest_setup_script`](../cli/src/app.rs) 同时校验 RPM NEVRA 与 `tng --version`，版本不符时 build 直接失败。仓库不再携带或覆盖 TNG 二进制；从旧版升级时必须重新 build Guest 镜像，不能用 `E2E_SKIP_BUILD=1` 复用 2.6 产物验证升级。
 - **多 variant 构建**：一次 `build` 会构建所有 enabled variants；当前 state 的 `build_id` 指向 `deploy.image_variant`，完整结果保存在 manifest 的 `variants` map。
 - **build_id 时间戳化**：`<image_name>-<variant>-<run_id>`，run_id 精确到毫秒，防止重复 build 互相覆盖。
 
@@ -142,6 +142,8 @@ sequenceDiagram
     CLI-->>U: deploy completed: public_ip=… private_ip=… mesh_generation=…
 ```
 
+Shelter 部署使用 V1 `runtime.targets.deploy`，其 profile 为 `trust: verified`、`attestation: disabled`、`forbid_fallback: true`。这只关闭 Shelter 的重复证明流程；provider options 仍请求 TDX，证据验证与密钥释放由下面的 CA challenge/Trustee 流程负责。CLI 显式传入 `--target deploy --deployment-id <build_id>`，保持部署身份稳定。
+
 challenge 注入采用 `inject-resource` over `http://<ip>:8006`，对应代码 [`cli/src/app/tools.rs::challenge_inject`](../cli/src/app/tools.rs)。每个资源会先尝试 direct 网络，失败后 fallback 走 host 的代理环境变量。Trustee mode 不依赖 operator 到 Guest `:8006` 的入站连通性。
 
 `image publish` 会把 build 产物预先导入为阿里云自定义镜像，并把 provider、region、variant、build id、镜像 hash 与 image id 记录在本地 state。`deploy` 只在这些字段匹配且发布状态为 `available` 时复用该 image；`destroy` 负责运行资源，published image 的删除由 `image unpublish` 或 `image prune` 管理。
@@ -154,11 +156,11 @@ challenge 注入采用 `inject-resource` over `http://<ip>:8006`，对应代码 
 flowchart TB
     A["Aliyun TDX firmware"] --> B["UEFI"]
     B --> C["UKI (kernel + initrd + cmdline)"]
-    C --> D["initrd:<br/>shelter-initrd-network<br/>+ confidential-computing-attestation"]
-    D --> E["cryptpilot-fde-before-sysroot.service<br/>先 best-effort 执行 Alibaba ECS NTP 校时"]
+    C --> D["原生 BusyBox initrd:<br/>加载模块、DHCP<br/>启动 AA / CDH / trustiflux API"]
+    D --> E["cryptpilot-fde boot-service<br/>before-sysroot"]
     E --> F["CryptPilot exec provider<br/>调用 confidential-agentd initrd-fetch"]
     F --> Q{"从 challenge 或 Trustee 取得<br/>bootstrap + disk_passphrase ?"}
-    Q -- No (timeout) --> X["systemctl poweroff<br/>(fail-closed)"]
+    Q -- No (timeout) --> X["PID 1: poweroff -f<br/>(fail-closed)"]
     Q -- Yes --> G["写 /run/cai/secrets/disk_key<br/>仅把 key 输出给 CryptPilot"]
     G --> H["CryptPilot 解锁持久 delta"]
     H --> I["switch_root → rootfs"]
@@ -174,7 +176,7 @@ flowchart TB
 
 关键 systemd unit 与依赖关系来自三处：
 - daemon 嵌入的 rootfs unit 文本：[`agentd_service_unit`](../cli/src/app.rs)。initrd 不再创建独立 secret-fetch unit；[`cryptpilot_fde_config`](../cli/src/app.rs) 的 `exec` provider 在 CryptPilot 校时后直接调用 `confidential-agentd initrd-fetch`。
-- mkosi 模式下额外的 setup script：[`guest_setup_script`](../cli/src/app.rs) 校验 Shelter 安装的官方 TNG 2.8 RPM，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。Builtin AS 配置使用 TNG 2.8 的 `attestation_policy` 字段，并显式保持 `rats_tls.multiplex: true`，避免升级时发生隐含传输语义变化。`libtdx-verify` 仍由 Alinux3 软件源安装，供 `attestation-challenge-client` 使用。
+- mkosi 构建中的 setup script：[`guest_setup_script`](../cli/src/app.rs) 校验 Shelter 安装的官方 TNG 2.8 RPM，并给 `trusted-network-gateway.service` 注入 `ExecStartPre` 等待 attestation-agent socket。Builtin AS 配置使用 TNG 2.8 的 `attestation_policy` 字段，并显式保持 `rats_tls.multiplex: true`，避免升级时发生隐含传输语义变化。`libtdx-verify` 仍由 Alinux3 软件源安装，供 `attestation-challenge-client` 使用。
 - 每个示例自己的 `install-*.sh`，例如 [`examples/openclaw/install-openclaw.sh`](../examples/openclaw/install-openclaw.sh) 注册 `cai-openclaw-gateway.service`；spec 的 `service.app_service` 决定 daemon 是否把该 unit 纳入 `app_ready` 判定。
 
 ---

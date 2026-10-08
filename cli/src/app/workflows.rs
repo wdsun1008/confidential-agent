@@ -469,7 +469,6 @@ pub(super) fn render_service_config_from_state(
         gateway_bin: manifest.gateway_bin,
         gateway_service: manifest.gateway_service,
         tng_service: manifest.tng_service,
-        initrd_secret_fetch_module: manifest.initrd_secret_fetch_module,
         fde_config_file: manifest.fde_config_file,
         policy_default: manifest.policy_default,
         policy_local_dev: manifest.policy_local_dev,
@@ -1451,7 +1450,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1503,7 +1501,6 @@ service:
   ports: [8080]
   connect: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: test
   variants:
     release:
@@ -1532,7 +1529,6 @@ service:
   id: test
   ports: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: test
   variants:
     release:
