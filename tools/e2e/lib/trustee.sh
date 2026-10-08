@@ -695,6 +695,20 @@ REMOTE
   trustee_scp "root@$TRUSTEE_PUBLIC_IP:/var/tmp/cai-trustee-e2e-journal.txt" "$journal_out"
   trustee_scp "root@$TRUSTEE_PUBLIC_IP:/var/tmp/cai-trustee-e2e-packets.txt" "$packets_out"
   trustee_scp "root@$TRUSTEE_PUBLIC_IP:/var/tmp/cai-trustee-e2e.pcap" "$pcap_out" || true
+  # Gateway debug logs include administrative bearer tokens. Keep diagnostics
+  # private and remove those headers before embedding the journal in reports.
+  python3.11 - "$journal_out" "$packets_out" "$pcap_out" <<'PY'
+import re
+import sys
+from pathlib import Path
+for name in sys.argv[1:]:
+    path = Path(name)
+    if path.exists():
+        path.chmod(0o600)
+journal = Path(sys.argv[1])
+text = journal.read_text()
+journal.write_text(re.sub(r"(Authorization: Bearer )[A-Za-z0-9_.-]+", r"\1<redacted>", text))
+PY
   TRUSTEE_DIAGNOSTICS_STARTED=0
   record_file_as_block "Trustee component journal ($label):" "$journal_out" text
   record_file_as_block "Trustee port 8081 packet trace ($label):" "$packets_out" text
@@ -976,12 +990,14 @@ PY
 
 stop_background_deploy() {
   local pid="$1"
-  kill "$pid" >/dev/null 2>&1 || true
+  # deploy runs in its own session; Terraform descendants must release locks
+  # before cleanup starts, even when the CLI parent exits on the first signal.
+  kill -- "-$pid" >/dev/null 2>&1 || true
   local deadline=$((SECONDS + 5))
-  while kill -0 "$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
+  while kill -0 -- "-$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
     sleep 1
   done
-  kill -9 "$pid" >/dev/null 2>&1 || true
+  kill -9 -- "-$pid" >/dev/null 2>&1 || true
   wait "$pid" >/dev/null 2>&1 || true
 }
 
@@ -1017,7 +1033,7 @@ deploy_with_trustee_access() {
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$state_dir" "$service"
   record_cmd "$CA_BIN --tools-image $TOOLS_IMAGE --state-dir $(printf '%q' "$state_dir") deploy --spec $(printf '%q' "$spec")"
-  "$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir" deploy --spec "$spec" \
+  setsid "$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir" deploy --spec "$spec" \
     >"$stdout" 2>"$stderr" &
   local pid=$!
   local deadline=$((SECONDS + timeout))
@@ -1187,33 +1203,34 @@ destroy_trustee_infra() {
   if [[ "$TRUSTEE_INFRA_CREATED" != "1" && ( -z "$TRUSTEE_IDS_FILE" || ! -f "$TRUSTEE_IDS_FILE" ) ]]; then
     return 0
   fi
-  trustee_recover_infra_ids
+  trustee_recover_infra_ids || return
+  local cleanup_status=0
 
   trustee_delete_until_absent instance "$TRUSTEE_INSTANCE_ID" 600 \
     ecs DeleteInstances \
     --RegionId "$REGION" \
     --InstanceId.1 "$TRUSTEE_INSTANCE_ID" \
     --Force true \
-    --ForceStop true \
-    --ClientToken "$(trustee_client_token delete-instance)"
+    --ClientToken "$(trustee_client_token delete-instance)" || cleanup_status=1
   trustee_delete_until_absent key_pair "$TRUSTEE_KEY_PAIR_NAME" 300 \
     ecs DeleteKeyPairs \
     --RegionId "$REGION" \
-    --KeyPairNames "[\"$TRUSTEE_KEY_PAIR_NAME\"]"
+    --KeyPairNames "[\"$TRUSTEE_KEY_PAIR_NAME\"]" || cleanup_status=1
   trustee_delete_until_absent security_group "$TRUSTEE_SECURITY_GROUP_ID" 300 \
     ecs DeleteSecurityGroup \
     --RegionId "$REGION" \
-    --SecurityGroupId "$TRUSTEE_SECURITY_GROUP_ID"
+    --SecurityGroupId "$TRUSTEE_SECURITY_GROUP_ID" || cleanup_status=1
   trustee_delete_until_absent vswitch "$TRUSTEE_VSWITCH_ID" 300 \
     vpc DeleteVSwitch \
     --RegionId "$REGION" \
-    --VSwitchId "$TRUSTEE_VSWITCH_ID"
+    --VSwitchId "$TRUSTEE_VSWITCH_ID" || cleanup_status=1
   trustee_delete_until_absent vpc "$TRUSTEE_VPC_ID" 300 \
     vpc DeleteVpc \
     --RegionId "$REGION" \
     --VpcId "$TRUSTEE_VPC_ID" \
-    --ClientToken "$(trustee_client_token delete-vpc)"
+    --ClientToken "$(trustee_client_token delete-vpc)" || cleanup_status=1
 
+  [[ "$cleanup_status" == "0" ]] || return "$cleanup_status"
   trustee_infra_record destroyed true
   TRUSTEE_INFRA_CREATED=0
 }

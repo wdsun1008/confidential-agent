@@ -330,6 +330,7 @@ assert_snapshot_lacks_marker() {
 case_cleanup() {
   local status="$1"
   local should_destroy=0
+  local cleanup_status=0
   if [[ "$status" == "0" && "$DESTROY_ON_SUCCESS" == "1" ]]; then
     should_destroy=1
   elif [[ "$status" != "0" && "$DESTROY_ON_FAILURE" == "1" ]]; then
@@ -337,22 +338,23 @@ case_cleanup() {
   fi
   [[ "$should_destroy" == "1" ]] || return 0
   if [[ "$SNAPSHOT_DISK_ATTACHED" == "1" && -n "$SNAPSHOT_DISK_ID" && -n "$BASELINE_ID" ]]; then
-    aliyun_cli ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
-    wait_disk_status "$SNAPSHOT_DISK_ID" Available 300 || true
+    aliyun_cli ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || cleanup_status=1
+    wait_disk_status "$SNAPSHOT_DISK_ID" Available 300 || cleanup_status=1
     SNAPSHOT_DISK_ATTACHED=0
   fi
   if [[ -n "$SNAPSHOT_DISK_ID" ]]; then
-    aliyun_cli ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || cleanup_status=1
   fi
   if [[ -n "$SNAPSHOT_ID" ]]; then
-    aliyun_cli ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || cleanup_status=1
   fi
   if [[ -n "$BASELINE_ID" ]]; then
-    aliyun_cli ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || cleanup_status=1
   fi
   if [[ -n "$BASELINE_KEY_NAME" ]]; then
-    aliyun_cli ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || cleanup_status=1
   fi
+  return "$cleanup_status"
 }
 
 run_case() {

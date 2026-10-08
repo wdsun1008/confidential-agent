@@ -37,7 +37,19 @@ case_post_destroy_cleanup() {
     should_destroy=1
   fi
   [[ "$should_destroy" == "1" ]] || return 0
-  destroy_trustee_infra || true
+  # Failed application deletion still needs Trustee to authorize a retry.
+  local service terraform_dir phase
+  for service in openclaw codex; do
+    [[ -f "$STATE_DIR/services/$service/state.json" ]] || continue
+    terraform_dir="$(state_value "$STATE_DIR" "$service" deploy.terraform_dir)" || return 1
+    phase="$(state_value "$STATE_DIR" "$service" phase)" || return 1
+    if [[ -n "$terraform_dir" && "$phase" != deleted ]]; then
+      log "keeping Trustee available while $service cleanup is incomplete"
+      return 1
+    fi
+  done
+  destroy_trustee_infra || return
+  assert_trustee_cloud_zero
 }
 
 assert_challenge_mode() {
@@ -166,6 +178,7 @@ PY
   SERVICE_SECURITY_GROUP_ID["$service"]="$(jq -er '.Instances.Instance[0].SecurityGroupIds.SecurityGroupId[0]' "$describe_out")"
   image_out="$WORK_DIR/$service-image.json"
   trustee_aliyun_cli ecs DescribeImages \
+    --Status ALL \
     --RegionId "$REGION" \
     --ImageOwnerAlias self \
     --ImageName "$image_name" >"$image_out"
@@ -228,7 +241,7 @@ assert_service_cloud_gone() {
     groups="$(trustee_aliyun_cli ecs DescribeSecurityGroups --RegionId "$REGION" --SecurityGroupIds "[\"${SERVICE_SECURITY_GROUP_ID[$service]}\"]" | jq -r '.TotalCount')"
     vpcs="$(trustee_aliyun_cli vpc DescribeVpcs --RegionId "$REGION" --VpcId "${SERVICE_VPC_ID[$service]}" | jq -r '.TotalCount')"
     switches="$(trustee_aliyun_cli vpc DescribeVSwitches --RegionId "$REGION" --VSwitchId "${SERVICE_VSWITCH_ID[$service]}" | jq -r '.TotalCount')"
-    images="$(trustee_aliyun_cli ecs DescribeImages --RegionId "$REGION" --ImageId "${SERVICE_IMAGE_ID[$service]}" | jq -r '.TotalCount')"
+    images="$(trustee_aliyun_cli ecs DescribeImages --Status ALL --RegionId "$REGION" --ImageId "${SERVICE_IMAGE_ID[$service]}" | jq -r '.TotalCount')"
     state_count="$(terraform -chdir="${SERVICE_TERRAFORM_DIR[$service]}" state list | wc -l)"
     if assert_oss_bucket_absent "${SERVICE_BUCKET[$service]}"; then
       bucket_present=0
@@ -468,6 +481,7 @@ run_case() {
   require_cmd openssl
   require_cmd python3.11
   require_cmd scp
+  require_cmd setsid
   require_cmd ssh
   require_cmd ssh-keygen
   require_cmd ssh-keyscan

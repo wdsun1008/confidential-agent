@@ -52,9 +52,12 @@ CMaaS is the exception to the host `connect start` probe pattern. Its MCP port i
 The scripts do not unset proxy variables internally. On the current development host, OpenAI-facing tools may need a proxy, but mkosi/DNF access to `yum.tbsite.net` and deploy should run without proxy. Use the outer `env -u ...` wrapper shown above for full E2E runs.
 
 Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, and `aliyun`. The OpenClaw Bailian (including no-PEP) and Trustee cases also require the host `openclaw` CLI for gateway token checks. Rekor-mode `cosign`/`rekor-cli` calls run through `confidential-agent-tools`, so they are not host prerequisites.
+The Trustee case also requires `setsid`; timed-out deployments are stopped as a process group so Shelter/Terraform descendants cannot hold deployment locks during cleanup.
 
 Trustee reboot tests default to `E2E_REBOOT_FORCE_STOP=true`. Set it to `false` to test a graceful reboot separately from crash recovery; the selected mode is recorded in the test results.
 Interactive Codex remote use still requires a host `codex` CLI, but the E2E remote probe validates the protected WebSocket endpoint directly.
+
+Before destroying a service, the runner saves resource identifiers and imported-image snapshot associations in `cloud-resource-ledger.json`. With automatic cleanup enabled, it removes an import snapshot only after verifying the recorded image is absent (`Status=ALL`), the snapshot belongs to that import, and its usage is `none`. This covers snapshots retained by the bundled Terraform provider; cleanup errors fail the case. Connect cleanup also discovers ready files created by helpers running in shell command substitutions. Only the shell that installed the exit traps performs resource cleanup; inherited error traps in command substitutions do not destroy the deployment.
 
 Common environment:
 

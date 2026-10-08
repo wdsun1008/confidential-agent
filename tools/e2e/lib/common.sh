@@ -229,6 +229,7 @@ init_step_log() {
 }
 
 install_exit_traps() {
+  E2E_TRAP_OWNER_BASHPID="$BASHPID"
   trap 'finish_e2e "$?"' EXIT ERR
   trap 'finish_e2e 130' INT
   trap 'finish_e2e 143' TERM
@@ -245,6 +246,13 @@ cleanup_connects() {
   for ready_file in "${E2E_CONNECT_READY_FILES[@]}"; do
     cleanup_connect_ready "$ready_file"
   done
+  # Connect helpers are commonly called through $(...), whose array updates
+  # do not reach the parent shell. Their per-attempt ready files survive.
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    for ready_file in "$WORK_DIR"/*-connect-attempt-*-ready.json; do
+      cleanup_connect_ready "$ready_file"
+    done
+  fi
   E2E_CONNECT_READY_FILES=()
 
   local pid
@@ -260,6 +268,7 @@ cleanup_connects() {
 destroy_registered_resources() {
   local reason="$1"
   local target state_dir service phase
+  local cleanup_status=0
   for target in "${E2E_DESTROY_TARGETS[@]}"; do
     state_dir="${target%%|*}"
     service="${target#*|}"
@@ -273,29 +282,43 @@ destroy_registered_resources() {
       continue
     fi
     log "destroying $service ($reason)"
-    ca_run "$state_dir" destroy "$service" || true
+    ca_run "$state_dir" destroy "$service" || cleanup_status=1
   done
+  return "$cleanup_status"
 }
 
 finish_e2e() {
   local status="$1"
+  # ERR traps are inherited by command substitutions under `set -E`.
+  # Only the shell that installed the traps owns the cloud resources.
+  if [[ -n "${E2E_TRAP_OWNER_BASHPID:-}" && "$BASHPID" != "$E2E_TRAP_OWNER_BASHPID" ]]; then
+    trap - EXIT ERR
+    exit "$status"
+  fi
+  local cleanup_snapshots=0
   if [[ "$E2E_EXIT_CLEANUP_STARTED" == "1" ]]; then
     exit "$status"
   fi
   E2E_EXIT_CLEANUP_STARTED=1
   cleanup_connects || true
   if declare -f case_cleanup >/dev/null 2>&1; then
-    case_cleanup "$status" || true
+    case_cleanup "$status" || status=1
   fi
   if [[ "$E2E_DEPLOY_ATTEMPTED" == "1" ]]; then
     if [[ "$status" == "0" && "$DESTROY_ON_SUCCESS" == "1" ]]; then
-      destroy_registered_resources success || true
+      cleanup_snapshots=1
+      destroy_registered_resources success || status=1
     elif [[ "$status" != "0" && "$DESTROY_ON_FAILURE" == "1" ]]; then
-      destroy_registered_resources failure || true
+      cleanup_snapshots=1
+      destroy_registered_resources failure || status=1
     fi
   fi
+  if [[ "$cleanup_snapshots" == "1" && -n "${WORK_DIR:-}" ]]; then
+    python3.11 "$ROOT_DIR/tools/e2e/cleanup_snapshots.py" cleanup \
+      "$WORK_DIR/cloud-resource-ledger.json" "$REGION" || status=1
+  fi
   if declare -f case_post_destroy_cleanup >/dev/null 2>&1; then
-    case_post_destroy_cleanup "$status" || true
+    case_post_destroy_cleanup "$status" || status=1
   fi
   record ""
   if [[ "$status" == "0" ]]; then
@@ -314,9 +337,49 @@ ca_args() {
   printf '%s\0' "$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@"
 }
 
+# Keep only resource identifiers, never the secret-bearing Terraform state.
+record_destroy_ledger() {
+  python3.11 - "$1/services/$2" "$WORK_DIR/cloud-resource-ledger.json" <<'PYLEDGER'
+import json
+import sys
+from pathlib import Path
+service, output = map(Path, sys.argv[1:])
+entries = json.loads(output.read_text()) if output.exists() else []
+for state in service.rglob("*.tfstate"):
+    data = json.loads(state.read_text())
+    for resource in data.get("resources", []):
+        kind = resource.get("type", "")
+        if resource.get("mode") != "managed" or not kind.startswith("alicloud_"):
+            continue
+        for instance in resource.get("instances", []):
+            attrs = instance.get("attributes", {})
+            item = {"type": kind, "id": attrs.get("id"), "service": service.name}
+            for key in ["region", "bucket", "key", "image_id", "system_disk_id", "vpc_id"]:
+                if attrs.get(key):
+                    item[key] = attrs[key]
+            if item not in entries:
+                entries.append(item)
+local_state = service / "state.json"
+if local_state.exists():
+    data = json.loads(local_state.read_text())
+    for published in data.get("build", {}).get("published", {}).values():
+        for kind, field in [("alicloud_image", "image_id"), ("alicloud_oss_bucket", "bucket")]:
+            if published.get(field):
+                item = {"type": kind, "id": published[field], "service": service.name}
+                if item not in entries:
+                    entries.append(item)
+output.write_text(json.dumps(entries, indent=2) + "\n")
+PYLEDGER
+  python3.11 "$ROOT_DIR/tools/e2e/cleanup_snapshots.py" record \
+    "$WORK_DIR/cloud-resource-ledger.json" "$REGION"
+}
+
 ca_run() {
   local state_dir="$1"
   shift
+  if [[ "${1:-}" == "destroy" && -n "${2:-}" ]]; then
+    record_destroy_ledger "$state_dir" "$2" || return
+  fi
   local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
   "${cmd[@]}"

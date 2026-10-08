@@ -437,6 +437,7 @@ matrix_wait_cloud_image_available() {
     status="$(
       matrix_aliyun_json "$region" \
         ecs DescribeImages \
+        --Status ALL \
         --RegionId "$region" \
         --ImageId "$image_id" \
         --ImageOwnerAlias self |
@@ -461,7 +462,7 @@ matrix_verify_cloud_image_deleted() {
   local image_id="$1"
   local region="$2"
   local out="$WORK_DIR/deleted-image-check.json"
-  matrix_aliyun_json "$region" ecs DescribeImages --RegionId "$region" --ImageId "$image_id" --ImageOwnerAlias self >"$out"
+  matrix_aliyun_json "$region" ecs DescribeImages --Status ALL --RegionId "$region" --ImageId "$image_id" --ImageOwnerAlias self >"$out"
   record_file_as_block "Deleted image verification:" "$out" json
   python3.11 - "$out" <<'PY'
 import json
@@ -619,7 +620,7 @@ case_cleanup() {
     image_id="$(matrix_first_published_image_id "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID" 2>/dev/null || true)"
     if [[ "$E2E_DEPLOY_ATTEMPTED" == "1" ]]; then
       log "destroying $MATRIX_REAL_SERVICE_ID before failed real-cloud lane image cleanup"
-      ca_run "$MATRIX_REAL_STATE_DIR" destroy "$MATRIX_REAL_SERVICE_ID" || true
+      ca_run "$MATRIX_REAL_STATE_DIR" destroy "$MATRIX_REAL_SERVICE_ID" || return
       E2E_DEPLOY_ATTEMPTED=0
     fi
     if [[ -n "$image_id" && -n "${MATRIX_REAL_SPEC:-}" && -f "$MATRIX_REAL_SPEC" ]]; then
@@ -627,8 +628,39 @@ case_cleanup() {
       ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_SPEC" --region "$MATRIX_REAL_REGION" || true
     fi
     log "unpublishing $MATRIX_REAL_SERVICE_ID after failed real-cloud lane"
-    ca_run "$MATRIX_REAL_STATE_DIR" image unpublish "$MATRIX_REAL_SERVICE_ID" --force || true
+    ca_run "$MATRIX_REAL_STATE_DIR" image unpublish "$MATRIX_REAL_SERVICE_ID" --force
   fi
+}
+
+case_post_destroy_cleanup() {
+  local status="$1"
+  [[ "${E2E_MATRIX_REAL_CLOUD:-0}" == "1" ]] || return 0
+  if [[ "$status" == "0" && "$DESTROY_ON_SUCCESS" != "1" ]] ||
+     [[ "$status" != "0" && "$DESTROY_ON_FAILURE" != "1" ]]; then
+    return 0
+  fi
+  local buckets=() bucket cleanup_status=0
+  mapfile -t buckets < <(python3.11 - "$WORK_DIR" <<'PYBUCKET'
+import re
+import sys
+from pathlib import Path
+buckets = set()
+for path in Path(sys.argv[1]).glob("published-after-*.txt"):
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and re.fullmatch(r"ca-images-[a-z0-9-]+", fields[3]):
+            buckets.add(fields[3])
+print("\n".join(sorted(buckets)))
+PYBUCKET
+  )
+  for bucket in "${buckets[@]}"; do
+    [[ -n "$bucket" ]] || continue
+    # CA retains publish buckets for reuse; this test owns a fresh state and
+    # removes only its empty bucket. Never recursively delete bucket contents.
+    ALIBABA_CLOUD_REGION_ID="$MATRIX_REAL_REGION" aliyun oss rm "oss://$bucket" -b -f \
+      -e "oss-$MATRIX_REAL_REGION.aliyuncs.com" || cleanup_status=1
+  done
+  return "$cleanup_status"
 }
 
 run_case() {
