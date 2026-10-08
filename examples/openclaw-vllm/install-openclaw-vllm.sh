@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 022
 
 MODEL_ID="${OPENCLAW_VLLM_MODEL_ID:-Qwen/Qwen3.6-35B-A3B}"
 MODEL_DIR="${OPENCLAW_VLLM_MODEL_DIR:-/opt/models/Qwen3.6-35B-A3B}"
