@@ -9,7 +9,7 @@ service:
 build:
   image_name: hermes-agent
   resize: 30G
-  packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]
+  packages: [ca-certificates, curl, findutils, git, libatomic, shadow-utils, tar, util-linux, xz]
   files:
     - source: ./files/install-hermes-agent-runtime.sh
       target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh

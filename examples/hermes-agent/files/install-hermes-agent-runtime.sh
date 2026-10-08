@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 022
 
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
 HERMES_COMMIT="${HERMES_COMMIT:-}"
@@ -8,7 +9,7 @@ HERMES_HOME="${HERMES_HOME:-/opt/data}"
 HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_UID="${HERMES_UID:-10000}"
 HERMES_GID="${HERMES_GID:-10000}"
-HERMES_GIT_TIMEOUT_SEC="${HERMES_GIT_TIMEOUT_SEC:-120}"
+HERMES_GIT_TIMEOUT_SEC="${HERMES_GIT_TIMEOUT_SEC:-600}"
 HERMES_PYPI_INDEX_URL="${HERMES_PYPI_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
 HERMES_UV_HTTP_TIMEOUT="${HERMES_UV_HTTP_TIMEOUT:-120}"
 HERMES_UV_HTTP_RETRIES="${HERMES_UV_HTTP_RETRIES:-5}"
@@ -40,7 +41,7 @@ github_proxy_prefix() {
 git_with_timeout() {
     local git_env=(
         "GIT_HTTP_LOW_SPEED_LIMIT=${GIT_HTTP_LOW_SPEED_LIMIT:-1024}"
-        "GIT_HTTP_LOW_SPEED_TIME=${GIT_HTTP_LOW_SPEED_TIME:-20}"
+        "GIT_HTTP_LOW_SPEED_TIME=${GIT_HTTP_LOW_SPEED_TIME:-120}"
     )
     if command -v timeout >/dev/null 2>&1; then
         env "${git_env[@]}" timeout "$HERMES_GIT_TIMEOUT_SEC" git "$@"
@@ -56,14 +57,14 @@ git_fetch_with_fallback() {
     local fallback
 
     git -C "$dir" remote set-url origin "$primary"
-    if git_with_timeout -C "$dir" fetch --depth 1 origin "$ref"; then
+    if git_with_timeout -C "$dir" fetch --filter=blob:none origin "$ref"; then
         return 0
     fi
 
     fallback="$(github_proxy_url "$primary")"
     echo "Direct GitHub fetch failed for ${REPO_PATH}; retrying via ${fallback}" >&2
     git -C "$dir" remote set-url origin "$fallback"
-    git_with_timeout -C "$dir" fetch --depth 1 origin "$ref"
+    git_with_timeout -C "$dir" fetch --filter=blob:none origin "$ref"
 }
 
 clone_hermes_source() {
@@ -73,14 +74,16 @@ clone_hermes_source() {
     rm -rf "$HERMES_INSTALL_DIR"
     install -d -m 0755 "$(dirname "$HERMES_INSTALL_DIR")"
 
-    if git_with_timeout clone --depth 1 --branch "$HERMES_BRANCH" "$primary" "$HERMES_INSTALL_DIR"; then
+    # The official installer verifies pinned commits against the branch history.
+    # Keep that history and its trees; fetch file contents only when needed.
+    if git_with_timeout clone --filter=blob:none --branch "$HERMES_BRANCH" "$primary" "$HERMES_INSTALL_DIR"; then
         return 0
     fi
 
     fallback="$(github_proxy_url "$primary")"
     echo "Direct GitHub clone failed for ${REPO_PATH}; retrying via ${fallback}" >&2
     rm -rf "$HERMES_INSTALL_DIR"
-    git_with_timeout clone --depth 1 --branch "$HERMES_BRANCH" "$fallback" "$HERMES_INSTALL_DIR"
+    git_with_timeout clone --filter=blob:none --branch "$HERMES_BRANCH" "$fallback" "$HERMES_INSTALL_DIR"
 }
 
 pin_hermes_commit() {
@@ -89,8 +92,19 @@ pin_hermes_commit() {
     git -C "$HERMES_INSTALL_DIR" checkout --detach "$HERMES_COMMIT"
 }
 
+hermes_entrypoint() {
+    local candidate
+    for candidate in "$HERMES_INSTALL_DIR/.hermes/bin/hermes" "$HERMES_INSTALL_DIR/venv/bin/hermes"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 hermes_payload_installed() {
-    test -d "$HERMES_INSTALL_DIR/.git" && test -x "$HERMES_INSTALL_DIR/venv/bin/hermes"
+    test -d "$HERMES_INSTALL_DIR/.git" && hermes_entrypoint >/dev/null
 }
 
 installed_ref_matches() {
@@ -119,7 +133,7 @@ run_official_installer_with_github_proxy() {
     export GIT_CONFIG_GLOBAL="$git_config"
     export GIT_TERMINAL_PROMPT=0
     export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}"
-    export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}"
+    export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-120}"
 
     set +e
     "$installer" "$@"
@@ -149,7 +163,6 @@ install_hermes() {
         --skip-browser
         --skip-setup
         --non-interactive
-        --no-skills
     )
 
     [[ -x "$installer" ]] || chmod +x "$installer"
@@ -171,10 +184,9 @@ install_hermes() {
 }
 
 install_hermes_shim() {
-    local hermes_bin="$HERMES_INSTALL_DIR/venv/bin/hermes"
-
-    test -x "$hermes_bin" || {
-        echo "Hermes entrypoint was not installed at $hermes_bin" >&2
+    local hermes_bin
+    hermes_bin="$(hermes_entrypoint)" || {
+        echo "Hermes entrypoint was not installed under $HERMES_INSTALL_DIR" >&2
         exit 1
     }
 

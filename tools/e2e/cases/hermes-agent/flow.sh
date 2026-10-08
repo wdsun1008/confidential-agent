@@ -78,7 +78,7 @@ check_file /usr/local/bin/cai-hermes-agent
 check_file /usr/local/bin/hermes
 check_file /usr/local/share/confidential-agent/hermes-install.txt
 test -d /usr/local/lib/hermes-agent/.git
-test -x /usr/local/lib/hermes-agent/venv/bin/python
+runuser -u hermes -- env HERMES_HOME="$DATA" /usr/local/bin/hermes --version
 check_file "$DATA/.env"
 check_file "$DATA/config.yaml"
 
@@ -245,7 +245,7 @@ assert_hermes_secret_rendering() {
   done
 
   grep -Fq "app_service: cai-hermes-agent.service" "$spec"
-  grep -Fq "packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]" "$spec"
+  grep -Fq "packages: [ca-certificates, curl, findutils, git, libatomic, shadow-utils, tar, util-linux, xz]" "$spec"
   grep -Fq "source: ./files/install-hermes-agent-runtime.sh" "$spec"
   grep -Fq "target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh" "$spec"
   grep -Fq "source: ./files/cai-hermes-agent" "$spec"
