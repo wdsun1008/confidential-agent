@@ -1018,6 +1018,18 @@ capture_service_console() {
   record_file_as_block "$service console ($label):" "$text_out" text
 }
 
+trustee_deploy_result_ip() {
+  local result="$1" expected_name="$2" deployment_id
+  deployment_id="$(jq -er '.deployment_id | strings | select(test("^[0-9a-f]{64}$"))' "$result")" || return 1
+  [[ "$(basename "$(dirname "$result")")" == "$deployment_id" ]] || return 1
+  jq -er --arg name "$expected_name" '
+    select(.deploy.name == $name)
+    | (.deploy.public_ip // .deploy.outputs.public_ip)
+    | if type == "object" then .value else . end
+    | select(type == "string" and length > 0)
+  ' "$result"
+}
+
 deploy_with_trustee_access() {
   local state_dir="$1"
   local service="$2"
@@ -1027,8 +1039,6 @@ deploy_with_trustee_access() {
   local stdout="$WORK_DIR/$service-deploy.out"
   local stderr="$WORK_DIR/$service-deploy.err"
   local manifest="$state_dir/services/$service/manifest.json"
-  local build_id
-  build_id="$(jq -er '.shelter_build_id' "$manifest")"
   touch "$marker"
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$state_dir" "$service"
@@ -1037,15 +1047,14 @@ deploy_with_trustee_access() {
     >"$stdout" 2>"$stderr" &
   local pid=$!
   local deadline=$((SECONDS + timeout))
-  local result_path="" result_id="" public_ip=""
+  local result_path="" expected_name="" public_ip=""
   while (( SECONDS < deadline )); do
-    result_id=""
     public_ip=""
+    expected_name="$(state_value "$state_dir" "$service" deploy.resource_name 2>/dev/null || true)"
     result_path="$(jq -r '.deploy_result // empty' "$manifest" 2>/dev/null || true)"
-    if [[ -n "$result_path" && -s "$result_path" && "$result_path" -nt "$marker" ]]; then
-      result_id="$(jq -r '.id // empty' "$result_path" 2>/dev/null || true)"
-      public_ip="$(jq -r '.deploy.public_ip // .deploy.outputs.public_ip // empty' "$result_path" 2>/dev/null || true)"
-      if [[ "$result_id" == "$build_id" && -n "$public_ip" ]]; then
+    if [[ -n "$expected_name" && -n "$result_path" && -s "$result_path" && "$result_path" -nt "$marker" ]]; then
+      public_ip="$(trustee_deploy_result_ip "$result_path" "$expected_name" 2>/dev/null || true)"
+      if [[ -n "$public_ip" ]]; then
         break
       fi
     fi
@@ -1058,7 +1067,7 @@ deploy_with_trustee_access() {
     fi
     sleep 3
   done
-  if [[ "$result_id" != "$build_id" || -z "$public_ip" ]]; then
+  if [[ -z "$public_ip" ]]; then
     stop_background_deploy "$pid"
     capture_service_console "$service" "$result_path" "deploy-result-timeout" || true
     record_file_as_block "$service deploy stdout:" "$stdout" text

@@ -916,6 +916,30 @@ cleanup_connect_pid() {
   wait "$pid" >/dev/null 2>&1 || true
 }
 
+capture_connect_diagnostics() {
+  local ready_json="$1" output="$2" container
+  container="$(python3.11 - "$ready_json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    ready = json.load(f)
+print(ready.get("container_name") or ready.get("container_id") or "")
+PY
+)"
+  [[ -n "$container" ]] || return 0
+  (umask 077; docker logs --tail 200 "$container" >"$output" 2>&1 ||
+    podman logs --tail 200 "$container" >"$output" 2>&1) || true
+  python3.11 - "$output" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(errors="replace")
+text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", text)
+text = re.sub(r"eyJ[A-Za-z0-9_.-]+", "[redacted JWT]", text)
+p.write_text(text)
+p.chmod(0o600)
+PY
+  record_file_as_block "Connect container diagnostics:" "$output" text
+}
+
 start_connect_until_http_ready() {
   local state_dir="$1"
   local path_prefix="$2"
@@ -949,15 +973,25 @@ start_connect_until_http_ready() {
     record_file_as_block "$path_prefix connect ready:" "$ready_json" json
     record_file_as_block "$path_prefix connect log:" "$log_path" text
 
-    local port
-    while IFS= read -r port; do
-      if [[ -n "$port" ]] && curl -fsS --max-time 5 "http://127.0.0.1:$port$http_path" >/dev/null 2>&1; then
-        printf '%s\n' "$port"
-        return 0
-      fi
-    done < <(connect_ready_ports "$ready_json")
+    local port remaining probe_started=$SECONDS deadline=$((SECONDS + wait_seconds))
+    local http_error="$WORK_DIR/$path_prefix-connect-attempt-$attempt-http.stderr"
+    # A bound local port does not mean the attested upstream is ready yet.
+    while ((SECONDS < deadline)); do
+      while IFS= read -r port; do
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then break; fi
+        if [[ -n "$port" ]] && curl -fsS --max-time "$remaining" "http://127.0.0.1:$port$http_path" >/dev/null 2>"$http_error"; then
+          record "- HTTP endpoint on local port $port became ready after $((SECONDS - probe_started)) seconds."
+          printf '%s\n' "$port"
+          return 0
+        fi
+      done < <(connect_ready_ports "$ready_json")
+      sleep 1
+    done
+    record_file_as_block "$path_prefix HTTP readiness stderr:" "$http_error" text
+    capture_connect_diagnostics "$ready_json" "$WORK_DIR/$path_prefix-connect-attempt-$attempt-container.log"
     cleanup_connect_ready "$ready_json"
-    sleep 10
+    if ((attempt < attempts)); then sleep 10; fi
   done
   echo "connect did not become HTTP-ready after $attempts attempts" >&2
   return 1
@@ -1033,6 +1067,13 @@ run_report_probe() {
   local expected_services="$3"
   local expected_a2a_peers="${4:-}"
   local reference_values="${5:-$REFERENCE_VALUES}"
+  # connect can refresh mesh resources; wait for that generation to settle.
+  local service
+  local -a report_services
+  IFS=',' read -r -a report_services <<<"$expected_services"
+  for service in "${report_services[@]}"; do
+    wait_for_status_service_ready "$state_dir" "$service" 600
+  done
   ca_run "$state_dir" report --include-a2a --json --out "$output"
   record_file_as_block "Attestation report:" "$output" json
   python3.11 - "$output" "$expected_services" "$expected_a2a_peers" "$reference_values" <<'PY'

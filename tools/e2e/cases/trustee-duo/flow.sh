@@ -370,18 +370,13 @@ reboot_openclaw_without_cli_sync() {
   [[ "$guest_digest" == "$expected_digest" ]] || { echo "guest Cryptpilot differs from fde-guest" >&2; return 1; }
   ssh_guest "$key" "$public_ip" "install -d -m 0700 /var/lib/ca-e2e; printf '%s' '$sentinel' > /var/lib/ca-e2e/reboot-sentinel; sync"
   record "- OpenClaw reboot ForceStop=$force_stop."
-  if [[ "$force_stop" == true ]]; then
-    trustee_aliyun_cli ecs RebootInstance \
-      --RegionId "$REGION" \
-      --InstanceId "$instance_id" \
-      --ForceStop true >"$WORK_DIR/openclaw-reboot.json"
-    record_file_as_block "OpenClaw reboot request:" "$WORK_DIR/openclaw-reboot.json" json
-  else
-    # Minimal images need not have a cloud agent to handle a soft reboot API.
-    # Prove shutdown/recovery independently through the OS and boot ID below.
-    record_cmd "ssh openclaw 'systemctl --no-block reboot'"
-    ssh_guest "$key" "$public_ip" 'systemctl --no-block reboot' || [[ "$?" == 255 ]]
-  fi
+  # Alibaba Cloud TDX instances do not support in-guest reboot. Both modes
+  # must use the cloud API; boot ID and persistent data are checked below.
+  trustee_aliyun_cli ecs RebootInstance \
+    --RegionId "$REGION" \
+    --InstanceId "$instance_id" \
+    --ForceStop "$force_stop" >"$WORK_DIR/openclaw-reboot.json"
+  record_file_as_block "OpenClaw reboot request:" "$WORK_DIR/openclaw-reboot.json" json
   local deadline=$((SECONDS + 180)) saw_down=0
   while (( SECONDS < deadline )); do
     if ! curl -fsS --max-time 3 "http://$public_ip:8088/status" >/dev/null 2>&1; then
@@ -584,6 +579,7 @@ run_case() {
   trustee_remove_service_access codex
   assert_service_cloud_gone codex 600
   assert_trustee_status "$STATE_DIR" "openclaw" "after-codex-destroy"
+  wait_for_status_service_ready "$STATE_DIR" openclaw 600
   assert_local_lifecycle_status "openclaw" "codex" "codex-deleted"
   local policy_after_codex_destroy openclaw_generation_after_codex
   policy_after_codex_destroy="$(jq -er '.resource_policy_sha256' "$WORK_DIR/trustee-status-after-codex-destroy.json")"
