@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ const DEFAULT_AAEL_URL: &str = "http://127.0.0.1:8006/aa/aael";
 const DEFAULT_RUNTIME_CONFIG_PATH: &str = "/run/cai/trustee-runtime.json";
 const DEFAULT_TRUSTEE_RESOURCE_ROOT: &str = "/run/cai/trustee-resources";
 const DEFAULT_CDH_ONESHOT_BIN: &str = "/usr/bin/confidential-data-hub";
+const DEFAULT_AA_TOKEN_BIN: &str = "/usr/bin/attestation-agent";
 const DEFAULT_CDH_SOCKET: &str = "unix:///run/confidential-containers/cdh.sock";
 const DEFAULT_CDH_ONESHOT_TIMEOUT_SEC: u64 = 120;
 const CDH_STDERR_TAIL_BYTES: usize = 64 * 1024;
@@ -156,6 +157,15 @@ impl TrusteeRuntime {
         physical_path: &str,
         remaining: Option<Duration>,
     ) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let configured_timeout = cdh_oneshot_timeout()?;
+        let timeout = remaining
+            .map(|remaining| remaining.min(configured_timeout))
+            .unwrap_or(configured_timeout);
+        // CDH's KBS URL does not configure the AA GetToken RPC: AA obtains
+        // tokens using its own startup configuration. Keep the shared AA (and
+        // its measured event log) intact and use a private token-only instance.
+        let token_agent = TrusteeTokenAgent::start(&self.config, timeout)?;
         let mut config_file = tempfile::Builder::new()
             .prefix("cai-trustee-cdh-")
             .suffix(".json")
@@ -171,6 +181,7 @@ impl TrusteeRuntime {
             "credentials": [],
             "kbc": kbc,
             "socket": DEFAULT_CDH_SOCKET,
+            "aa": { "aa_socket": token_agent.socket },
         });
         serde_json::to_writer(config_file.as_file_mut(), &cdh_config)
             .context("failed to write temporary CDH configuration")?;
@@ -184,15 +195,14 @@ impl TrusteeRuntime {
             .context("failed to protect temporary CDH configuration")?;
 
         let binary = env_or("CA_CDH_ONESHOT_BIN", DEFAULT_CDH_ONESHOT_BIN);
-        let configured_timeout = cdh_oneshot_timeout()?;
-        let timeout = remaining
-            .map(|remaining| remaining.min(configured_timeout))
-            .unwrap_or(configured_timeout);
+        let timeout = timeout.saturating_sub(started.elapsed());
         if timeout.is_zero() {
             bail!("Trustee resource '{physical_path}' fetch deadline expired");
         }
         let mut command = Command::new(&binary);
         command
+            .env("AA_SOCKET", &token_agent.socket)
+            .env("AA_KBC_PARAMS", format!("cc_kbc::{}", self.config.kbs_url))
             .arg("--config")
             .arg(config_file.path())
             .arg("--retry")
@@ -229,6 +239,85 @@ impl TrusteeRuntime {
         }
         Ok(resource)
     }
+}
+
+/// A token helper must not initialize/extend the shared AA event log. The native
+/// TDX attester still includes the existing CCEL/AAEL when obtaining evidence.
+struct TrusteeTokenAgent {
+    child: Child,
+    socket: String,
+    _directory: tempfile::TempDir,
+}
+
+impl TrusteeTokenAgent {
+    fn start(config: &TrusteeRuntimeConfig, timeout: Duration) -> Result<Self> {
+        Self::start_with_binary(
+            config,
+            timeout,
+            &env_or("CA_AA_TOKEN_BIN", DEFAULT_AA_TOKEN_BIN),
+        )
+    }
+
+    fn start_with_binary(
+        config: &TrusteeRuntimeConfig,
+        timeout: Duration,
+        binary: &str,
+    ) -> Result<Self> {
+        if timeout.is_zero() {
+            bail!("Trustee token helper deadline expired");
+        }
+        let directory = tempfile::Builder::new().prefix("cai-aa-").tempdir()?;
+        let config_path = directory.path().join("aa.json");
+        let socket_path = directory.path().join("aa.sock");
+        let socket = format!("unix://{}", socket_path.display());
+        write_private_atomic(
+            &config_path,
+            &serde_json::to_vec(&token_agent_config(config))?,
+        )?;
+        let child = Command::new(binary)
+            .args(["--config-file"])
+            .arg(&config_path)
+            .args(["--attestation_sock", &socket])
+            .env("TRUSTEE_URL", &config.kbs_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("failed to start Trustee token attestation-agent")?;
+        let mut agent = Self {
+            child,
+            socket,
+            _directory: directory,
+        };
+        let started = Instant::now();
+        loop {
+            if let Some(status) = agent.child.try_wait()? {
+                bail!("Trustee token attestation-agent exited before readiness: {status}");
+            }
+            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+                return Ok(agent);
+            }
+            if started.elapsed() >= timeout.min(Duration::from_secs(10)) {
+                bail!("timed out starting Trustee token attestation-agent");
+            }
+            thread::sleep(CHILD_POLL_INTERVAL);
+        }
+    }
+}
+
+impl Drop for TrusteeTokenAgent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn token_agent_config(config: &TrusteeRuntimeConfig) -> serde_json::Value {
+    json!({
+        "token_configs": { "kbs": { "url": config.kbs_url, "cert": config.kbs_ca_cert } },
+        "eventlog_config": { "init_pcr": 17, "enable_eventlog": false },
+        "aa_instance": { "heartbeat": { "enabled": false } },
+    })
 }
 
 fn cdh_oneshot_timeout() -> Result<Duration> {
@@ -678,6 +767,62 @@ mod tests {
     }
 
     #[test]
+    fn token_helper_uses_runtime_endpoint_and_preserves_shared_eventlog() {
+        let mut config = runtime().config;
+        config.kbs_ca_cert = Some("test-certificate".into());
+        let value = token_agent_config(&config);
+        assert_eq!(value["token_configs"]["kbs"]["url"], "http://trustee:8080");
+        assert_eq!(value["token_configs"]["kbs"]["cert"], "test-certificate");
+        assert_eq!(value["eventlog_config"]["enable_eventlog"], false);
+        assert_eq!(value["aa_instance"]["heartbeat"]["enabled"], false);
+    }
+
+    #[test]
+    fn token_helper_failure_is_bounded_and_child_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("aa");
+        let pid_file = dir.path().join("pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let start = Instant::now();
+        let result = TrusteeTokenAgent::start_with_binary(
+            runtime().config(),
+            Duration::from_millis(150),
+            script.to_str().unwrap(),
+        );
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let pid: i32 = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        let result = TrusteeTokenAgent::start_with_binary(
+            runtime().config(),
+            Duration::from_secs(5),
+            script.to_str().unwrap(),
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exited before readiness"));
+    }
+
+    #[test]
     fn persisted_runtime_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.json");
@@ -804,6 +949,8 @@ mod tests {
         };
         stat.rsplit_once(") ")
             .and_then(|(_, fields)| fields.as_bytes().first().copied())
-            .is_some_and(|state| state != b'Z')
+            // A reaped zombie can briefly report TASK_DEAD (X/x) before its
+            // proc entry disappears. Neither state can execute a descendant.
+            .is_some_and(|state| !matches!(state, b'Z' | b'X' | b'x'))
     }
 }

@@ -239,6 +239,8 @@ default/local-resources/<resource-id>
 6. switch_root 后，rootfs Attestation Agent 再登记一次相同 AAEL；重复事件安全且能覆盖 initrd event log 未被继承的情况。
 7. daemon 从 Trustee 刷新 bootstrap、应用资源、mesh 和 A2A bundle。
 
+CDH 的 KBS URL 不会传递给共享 AA 的 `GetToken` RPC。因此 CA 为每次 Trustee 取密启动私有 socket 的临时 AA，只负责向运行时指定的 KBS 地址取 token，并使用同一份 KBS CA 证书。该 helper 禁用 event-log 初始化和 heartbeat，TDX evidence 仍读取共享 CCEL/AAEL；不重启共享 AA，不重置度量日志。helper 启动与 CDH 调用共用 deadline，调用结束或失败均终止并回收子进程及临时文件。
+
 `confidential-agentd initrd-fetch` 的 `CA_SECRET_WAIT_TIMEOUT_SEC` 通用默认值是 600 秒（0 表示无限等待），但 CLI 生成的镜像会在 CryptPilot `exec` provider 中显式设置为 210 秒，因此 Guest 的有效截止时间是 210 秒。这是覆盖 AAEL 登记、bootstrap 和磁盘密钥全部取回操作的单一全局 deadline，不是按资源分别计时；每次 CDH one-shot 还受 `CA_CDH_ONESHOT_TIMEOUT_SEC`（默认 120 秒）与剩余 deadline 中较小值的限制。
 
 超时后 `initrd-fetch` 会通过 `systemctl --no-block poweroff` fail closed。该动作有双重门控：仅当未设置 `CA_SKIP_INITRD_POWEROFF`，且检测到 `/etc/initrd-release`（真实 initrd）或显式设置了 `CA_FORCE_INITRD_POWEROFF` 时才执行；`CA_SKIP_INITRD_POWEROFF` 优先级最高，设置后即使在真实 initrd 中也不触发 poweroff。因此普通 rootfs 手工运行默认不会关机，单测仍显式设置 `CA_SKIP_INITRD_POWEROFF=1` 作为双保险。无论是否触发 poweroff，失败原因都会先写入 stderr 并以错误退出。原生 initramfs 没有 systemctl；`initrd-fetch` 返回错误后，cryptpilot exec provider 失败，Shelter 的 PID 1 对根激活失败执行 `poweroff -f`，不进入可交互 emergency shell。取密 deadline 保持 210 秒，日志写入 console，只有成功时才通过 `/bin/cat` 把原始密钥交给 cryptpilot。
