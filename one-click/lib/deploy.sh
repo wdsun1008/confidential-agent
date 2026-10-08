@@ -4,7 +4,7 @@ ensure_shelter() {
   if [[ -n "${CA_SHELTER_BIN:-}" ]]; then
     [[ -x "$CA_SHELTER_BIN" ]] || die "CA_SHELTER_BIN is not executable: $CA_SHELTER_BIN"
     export CA_SHELTER_BIN
-  elif command -v shelter >/dev/null 2>&1; then
+  elif command -v shelter >/dev/null 2>&1 && "$ROOT_DIR/hack/check-shelter.sh" "$(command -v shelter)" >/dev/null 2>&1; then
     CA_SHELTER_BIN="$(command -v shelter)"
     export CA_SHELTER_BIN
   else
@@ -16,6 +16,7 @@ ensure_shelter() {
     export CA_SHELTER_BIN
   fi
 
+  "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" || die "Shelter is incompatible; install the bundled RPM or set CA_SHELTER_BIN to a compatible binary"
   "$CA_SHELTER_BIN" --version >/dev/null
   log "using Shelter: $CA_SHELTER_BIN"
   if [[ "${CA_MODE:-}" != "cleanup" && "${CA_MODE:-}" != "cleanup-openclaw-vllm" && "$CA_REFERENCE_VALUES" == "rekor" && ! -x "$CA_SLSA_GENERATOR" ]]; then

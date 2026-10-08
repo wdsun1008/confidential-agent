@@ -593,7 +593,7 @@ install_bundled_shelter_rpm() {
     echo "shelter is missing and neither dnf nor yum is available" >&2
     exit 2
   fi
-  record_cmd "$pm install -y $(printf '%q' "$rpm")"
+  record_cmd "$(cmd_string "$pm" install -y "$rpm")"
   "$pm" install -y "$rpm"
 }
 
@@ -607,13 +607,16 @@ ensure_shelter() {
     fi
   fi
   if [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "${E2E_USE_SOURCE_SHELTER:-0}" != "1" ]] &&
-     ! command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
+     ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1; then
     install_bundled_shelter_rpm
   fi
   command -v "$CA_SHELTER_BIN" >/dev/null 2>&1 || {
     echo "Shelter command '$CA_SHELTER_BIN' is not available" >&2
     exit 2
   }
+  "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN"
+  sha256sum "$(command -v "$CA_SHELTER_BIN")" > "$WORK_DIR/shelter-sha256.txt"
+  record_file_as_block "Shelter binary SHA256:" "$WORK_DIR/shelter-sha256.txt" text
   record_cmd "$CA_SHELTER_BIN --version"
   "$CA_SHELTER_BIN" --version | tee "$WORK_DIR/shelter-version.txt"
   record_file_as_block "Shelter version:" "$WORK_DIR/shelter-version.txt" text

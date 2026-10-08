@@ -98,3 +98,32 @@ Artifacts:
 - `e2e-steps.md` records the exact user-like commands, redacted configs, status output, and probe results.
 - Init-covered cases write the real `confidential-agent init` output under the work dir and run the generated AppSpec directly.
 - Legacy non-init cases may still keep checked-in templates under `tools/e2e/cases/<case>/templates/`.
+
+All CA image builds use mkosi. The runner verifies Shelter `initrd.binaries` support and records the selected binary SHA256. Cleanup failures make the case fail. Use fresh work/state directories when validating a Shelter upgrade; do not reuse old build artifacts.
+
+### Clean ECS build host
+
+Use a new Alibaba Cloud Linux 3 system image and copy only the CA source tree
+and the single Shelter RPM in `hack/`. Do not copy a workstation's Cargo cache,
+package cache, built CA binaries, container images, or prebuilt guest images.
+Run the normal installer, then repeat it to check idempotency:
+
+```bash
+one-click/install.sh install-only --non-interactive --yes --skip-host-openclaw
+rpm -V shelter cryptpilot-fde-host
+hack/check-shelter.sh /usr/bin/shelter
+```
+
+The Shelter RPM bundles the official Cryptpilot guest. Its host tool and
+convert/enhance scripts are installed from the system package repository through
+the `cryptpilot-fde-host` dependency.
+
+For the real cloud matrix, use the newly installed CA executables under
+`/usr/local/bin`, set `E2E_SKIP_CARGO_BUILD=1`, `E2E_SKIP_SHELTER_INSTALL=1`,
+`E2E_MATRIX_REAL_CLOUD=1`, and `E2E_MATRIX_REFERENCE_VALUES=rekor`. The harness
+also needs `aliyun` on `PATH`; it can be extracted from the tools image just
+built on the same host. Supply cloud credentials separately in a root-only file.
+On ECS, `E2E_MATRIX_REPO_MIRROR=https://mirrors-ssl.aliyuncs.com/alinux` selects
+the TLS-validated internal mirror through the existing signed repository
+configuration. Record the base image ID, RPM and executable digests, installed
+package inventory, tools image ID, and cleanup results before deleting the host.
