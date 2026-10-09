@@ -598,6 +598,11 @@ install_bundled_shelter_rpm() {
 }
 
 ensure_shelter() {
+  local bundled_rpm=""
+  if [[ -z "${CA_SHELTER_BIN:-}" && "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "${E2E_USE_SOURCE_SHELTER:-0}" != "1" ]]; then
+    bundled_rpm="$(resolve_shelter_rpm)"
+    [[ -n "$bundled_rpm" ]] || { echo "No bundled Shelter RPM was found" >&2; exit 2; }
+  fi
   export CA_SHELTER_BIN="${CA_SHELTER_BIN:-/usr/bin/shelter}"
   if [[ "${E2E_USE_SOURCE_SHELTER:-0}" == "1" ]]; then
     if [[ -x "$SHELTER_DIR/target/release/shelter" ]]; then
@@ -607,8 +612,12 @@ ensure_shelter() {
     fi
   fi
   if [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "${E2E_USE_SOURCE_SHELTER:-0}" != "1" ]] &&
-     ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1; then
+     { ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1 ||
+       { [[ -n "$bundled_rpm" ]] && ! "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$bundled_rpm" >/dev/null 2>&1; }; }; then
     install_bundled_shelter_rpm
+  fi
+  if [[ -n "$bundled_rpm" ]]; then
+    "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$bundled_rpm"
   fi
   command -v "$CA_SHELTER_BIN" >/dev/null 2>&1 || {
     echo "Shelter command '$CA_SHELTER_BIN' is not available" >&2

@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 
 ensure_shelter() {
+  local shelter_rpm=""
   if [[ -n "${CA_SHELTER_BIN:-}" ]]; then
     [[ -x "$CA_SHELTER_BIN" ]] || die "CA_SHELTER_BIN is not executable: $CA_SHELTER_BIN"
     export CA_SHELTER_BIN
-  elif command -v shelter >/dev/null 2>&1 && "$ROOT_DIR/hack/check-shelter.sh" "$(command -v shelter)" >/dev/null 2>&1; then
-    CA_SHELTER_BIN="$(command -v shelter)"
-    export CA_SHELTER_BIN
   else
-    local shelter_rpm
     shelter_rpm="$(resolve_shelter_rpm)"
-    install_shelter_rpm "$shelter_rpm"
     CA_SHELTER_BIN="$(command -v shelter || true)"
-    [[ -n "$CA_SHELTER_BIN" ]] || die "Shelter RPM installed but shelter is not on PATH"
+    if [[ -z "$CA_SHELTER_BIN" ]] ||
+       ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1 ||
+       ! "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$shelter_rpm" >/dev/null 2>&1; then
+      install_shelter_rpm "$shelter_rpm"
+      CA_SHELTER_BIN=/usr/bin/shelter
+    fi
     export CA_SHELTER_BIN
   fi
 
+  if [[ -n "$shelter_rpm" ]]; then
+    "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$shelter_rpm" || die "Shelter RPM does not satisfy the bundled package version"
+  fi
   "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" || die "Shelter is incompatible; install the bundled RPM or set CA_SHELTER_BIN to a compatible binary"
   "$CA_SHELTER_BIN" --version >/dev/null
   log "using Shelter: $CA_SHELTER_BIN"
