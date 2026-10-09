@@ -593,8 +593,8 @@ install_bundled_shelter_rpm() {
     echo "shelter is missing and neither dnf nor yum is available" >&2
     exit 2
   fi
-  record_cmd "$(cmd_string "$pm" install -y "$rpm")"
-  "$pm" install -y "$rpm"
+  record_cmd "$(cmd_string "$pm" install -y "$rpm" libguestfs-tools-c)"
+  "$pm" install -y "$rpm" libguestfs-tools-c
 }
 
 ensure_shelter() {
@@ -613,6 +613,7 @@ ensure_shelter() {
   fi
   if [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "${E2E_USE_SOURCE_SHELTER:-0}" != "1" ]] &&
      { ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1 ||
+       { [[ -n "$bundled_rpm" ]] && ! command -v virt-customize >/dev/null 2>&1; } ||
        { [[ -n "$bundled_rpm" ]] && ! "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$bundled_rpm" >/dev/null 2>&1; }; }; then
     install_bundled_shelter_rpm
   fi

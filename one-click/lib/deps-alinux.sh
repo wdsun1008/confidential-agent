@@ -68,6 +68,7 @@ install_os_dependencies() {
     git
     glibc-devel
     jq
+    libguestfs-tools-c
     make
     openssh-clients
     openssl

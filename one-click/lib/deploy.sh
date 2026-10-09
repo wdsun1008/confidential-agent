@@ -50,7 +50,7 @@ install_shelter_rpm() {
   is_root || die "Shelter is missing and installing the Shelter RPM requires root. Re-run as root, install Shelter first, or set CA_SHELTER_BIN."
   pm="$(package_manager)" || die "yum or dnf is required to install the Shelter RPM"
   log "installing Shelter RPM: $rpm"
-  "$pm" install -y "$rpm"
+  "$pm" install -y "$rpm" libguestfs-tools-c
 }
 
 build_confidential_agent() {

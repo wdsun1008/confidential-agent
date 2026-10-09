@@ -11,6 +11,13 @@ ROOT_DIR="$TEST_ROOT"
 WORK_DIR="$TEST_ROOT/work"
 mkdir -p "$WORK_DIR"
 export PATH="$TEST_ROOT/bin:$PATH"
+command() {
+  if [[ "$*" == '-v virt-customize' ]]; then
+    [[ "$TEST_HARDENING" == present || -f "$TEST_ROOT/hardening-installed" ]]
+    return
+  fi
+  builtin command "$@"
+}
 if [[ "$TEST_ENTRY" == one-click ]]; then
   source "$TEST_REPO/one-click/lib/deploy.sh"
 else
@@ -26,6 +33,7 @@ install_shelter_rpm() {
   printf '%s\n' "$1" >>"$TEST_ROOT/installs"
   if [[ "$TEST_INSTALL" == fail ]]; then return 7; fi
   if [[ "$TEST_INSTALL" != unchanged ]]; then printf current >"$TEST_ROOT/package"; fi
+  touch "$TEST_ROOT/hardening-installed"
 }
 install_bundled_shelter_rpm() { install_shelter_rpm "$(resolve_shelter_rpm)"; }
 CA_REFERENCE_VALUES=sample
@@ -42,7 +50,8 @@ RUNNER
 
 run_case() {
   local entry="$1" package="$2" override="$3" install="$4" expected_installs="$5" expected_success="$6"
-  local root="$work/$entry-$package-$override-$install"
+  local hardening="${7:-present}"
+  local root="$work/$entry-$package-$override-$install-$hardening"
   mkdir -p "$root/bin" "$root/hack" "$root/source/target/release"
   printf '%s' "$package" >"$root/package"
   touch "$root/hack/shelter-0.3.1-3.al8.x86_64.rpm"
@@ -67,6 +76,7 @@ CHECK
   local status=0
   env -u CA_SHELTER_BIN -u E2E_SKIP_SHELTER_INSTALL -u E2E_USE_SOURCE_SHELTER \
     TEST_REPO="$REPO_DIR" TEST_ROOT="$root" TEST_ENTRY="$entry" \
+    TEST_HARDENING="$hardening" \
     TEST_OVERRIDE="$override" TEST_INSTALL="$install" \
     bash "$work/runner.sh" >"$root/output" 2>&1 || status=$?
   if [[ "$expected_success" == yes ]]; then
@@ -94,4 +104,6 @@ for entry in one-click e2e; do
 done
 run_case e2e old source success 0 yes
 run_case e2e old skip success 0 yes
+run_case e2e current none success 1 yes missing
+run_case e2e current binary success 0 yes missing
 printf '%s\n' 'Shelter package upgrade and explicit overrides: PASS'
