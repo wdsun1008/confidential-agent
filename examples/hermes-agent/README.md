@@ -46,8 +46,13 @@ export HERMES_COMMIT=''
 ```
 
 Set `CA_GITHUB_PROXY_URL` to override the GitHub fallback proxy. The default is
-`https://gh-proxy.org/`. Set `HERMES_PYPI_INDEX_URL` or `UV_DEFAULT_INDEX` to
+`https://gh-proxy.org/`. Set `HERMES_PYPI_INDEX_URL` or `UV_INDEX_URL` to
 override the Python package index used by the official installer; the default is
 `https://mirrors.aliyun.com/pypi/simple/`. Set `HERMES_NPM_REGISTRY_URL` or
 `NPM_CONFIG_REGISTRY` to override the npm registry used by optional browser-tool
 dependencies; the default is `https://registry.npmmirror.com/`.
+`PLAYWRIGHT_DOWNLOAD_HOST` defaults to `https://npmmirror.com/mirrors/playwright`.
+
+The official installer's frozen lockfile can still download pinned packages from
+`files.pythonhosted.org`, and runtime assets can come from GitHub. The build
+environment also needs working access to these endpoints.
