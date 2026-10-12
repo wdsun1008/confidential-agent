@@ -323,8 +323,8 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             "--resume requires confirmed deployed infrastructure; service is '{}'. For an interrupted infrastructure operation, inspect its saved Shelter state and destroy it before a new deploy", state.phase);
         let manifest = read_build_manifest(&paths.manifest)?;
         let saved = committed_deployment(state, &manifest)?;
-        anyhow::ensure!(snapshot.source.sha256 == saved.source.sha256,
-            "--resume requires the original deployment configuration; restore it before resuming resource delivery");
+        validate_resume_inputs(&saved, &snapshot, &paths)?;
+        snapshot = saved;
     } else if current_state.is_some() || spec.deploy.image.is_none() {
         validate_deploy_start(current_state.as_ref())?;
     }
@@ -379,6 +379,10 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     } else {
         DeployNames::new(&spec)
     };
+    if !args.resume && !args.render_only {
+        freeze_deployment_inputs(&mut snapshot, &paths, &deploy_names.run_id)?;
+    }
+    let delivery_spec = deployment_delivery_spec(&snapshot)?;
     let deploy_user_data = if args.resume {
         committed_deployment(current_state.as_ref().unwrap(), &current_manifest)?.user_data
     } else if trustee_mode {
@@ -387,7 +391,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             trustee::sync_service(
                 cli,
                 &cli.state_dir,
-                &spec,
+                &delivery_spec,
                 &build_variant.build_result,
                 &build_variant.shelter_build_id,
                 None,
@@ -443,7 +447,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         write_service_state(
             &cli.state_dir,
             &args.spec,
-            &spec,
+            &delivery_spec,
             &DeployObservation::default(),
             &prepared,
             "deploying",
@@ -463,7 +467,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         write_service_state(
             &cli.state_dir,
             &args.spec,
-            &spec,
+            &delivery_spec,
             &observation,
             &prepared,
             "deployed",
@@ -480,7 +484,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             trustee::sync_service(
                 cli,
                 &cli.state_dir,
-                &spec,
+                &delivery_spec,
                 &prepared.build_result,
                 &prepared.shelter_build_id,
                 Some(&injection_ip),
@@ -490,7 +494,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             inject_resources(
                 cli,
                 &cli.state_dir,
-                &spec,
+                &delivery_spec,
                 &prepared.build_result,
                 &prepared.shelter_build_id,
                 &injection_ip,
@@ -507,7 +511,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         let mut active_state = build_service_state(
             &cli.state_dir,
             &args.spec,
-            &spec,
+            &delivery_spec,
             &observation,
             &prepared,
             "active",

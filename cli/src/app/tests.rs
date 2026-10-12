@@ -1308,6 +1308,7 @@ fn build_runs_all_enabled_variants_and_records_manifest_entries() {
 schema: confidential-agent/v1
 service:
   id: openclaw
+  ssh: true
   ports: [18789]
   connect: [18789]
 build:
@@ -1467,6 +1468,9 @@ resources: {}
         prepared.rendered_config,
         PathBuf::from(manifest["shelter_config"].as_str().unwrap())
     );
+    let deployed = read_build_manifest(&paths.manifest).unwrap();
+    let pinned = deployed.ssh.unwrap().command("192.0.2.1", &[]);
+    assert_eq!(pinned.private_key, paths.secrets_dir.join("ssh_client"));
     assert_eq!(
         fs::read(PathBuf::from(manifest["agentd_bin"].as_str().unwrap())).unwrap(),
         contents[3]

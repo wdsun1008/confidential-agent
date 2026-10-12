@@ -14,7 +14,8 @@ pub(super) fn link_committed_config(alias: &Path, target: &Path) -> Result<()> {
 }
 
 pub(super) fn deployment_snapshot(path: &Path) -> Result<DeploymentSnapshot> {
-    let path = absolute_path(path)?;
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve spec {}", path.display()))?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("failed to read spec '{}'", path.display()))?;
     Ok(DeploymentSnapshot {
@@ -24,7 +25,146 @@ pub(super) fn deployment_snapshot(path: &Path) -> Result<DeploymentSnapshot> {
         },
         spec: AgentSpec::from_yaml(&content, path.parent().context("spec has no parent")?)?,
         user_data: None,
+        inputs: None,
     })
+}
+
+fn deployment_input_paths(
+    paths: &ContextPaths,
+    spec: &AgentSpec,
+) -> Result<BTreeMap<String, PathBuf>> {
+    ensure_private_context_dirs(paths)?;
+    let mut inputs: BTreeMap<_, _> = instance_ssh::runtime_spec(paths, spec)?
+        .resources
+        .into_iter()
+        .map(|(id, resource)| (format!("resource:{id}"), resource.source))
+        .collect();
+    inputs.insert(
+        "secret:disk_passphrase".into(),
+        match &spec.secrets.disk_passphrase {
+            Some(path) => path.clone(),
+            None => ensure_disk_passphrase(paths)?,
+        },
+    );
+    let gateway = ensure_gateway_identity(paths)?;
+    inputs.insert("identity:gateway".into(), gateway.private_key_path);
+    if spec.service.ssh {
+        inputs.insert(
+            "identity:ssh_client".into(),
+            paths.secrets_dir.join("ssh_client"),
+        );
+    }
+    inputs
+        .into_iter()
+        .map(|(id, path)| {
+            fs::canonicalize(&path)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve deployment input {id}: {}",
+                        path.display()
+                    )
+                })
+                .map(|path| (id, path))
+        })
+        .collect()
+}
+
+pub(super) fn freeze_deployment_inputs(
+    snapshot: &mut DeploymentSnapshot,
+    paths: &ContextPaths,
+    run_id: &str,
+) -> Result<()> {
+    let directory = paths.service_dir.join("deployment-inputs").join(run_id);
+    ensure_private_dir(&directory)?;
+    let mut inputs = BTreeMap::new();
+    for (id, source) in deployment_input_paths(paths, &snapshot.spec)? {
+        let file =
+            File::open(&source).with_context(|| format!("failed to read deployment input {id}"))?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "deployment input {id} must be a regular file"
+        );
+        let mut content = Vec::new();
+        file.take(100 * 1024 * 1024 + 1).read_to_end(&mut content)?;
+        anyhow::ensure!(
+            content.len() <= 100 * 1024 * 1024,
+            "deployment input {id} exceeds 100 MiB"
+        );
+        let sha256 = hex_encode(&Sha256::digest(&content));
+        // Generated management credentials keep their existing identity paths;
+        // user resources and the disk secret are delivered from private copies.
+        let staged = if !matches!(
+            id.as_str(),
+            "resource:cai_ssh_authorized_keys" | "resource:cai_ssh_host_key"
+        ) && (snapshot
+            .spec
+            .resources
+            .keys()
+            .any(|key| id == format!("resource:{key}"))
+            || id == "secret:disk_passphrase")
+        {
+            let staged = directory.join(hex_encode(&Sha256::digest(id.as_bytes())));
+            write_private_file(&staged, &content, 0o600)?;
+            Some(staged)
+        } else {
+            None
+        };
+        inputs.insert(
+            id,
+            DeploymentInput {
+                source,
+                sha256,
+                snapshot: staged,
+            },
+        );
+    }
+    snapshot.inputs = Some(inputs);
+    Ok(())
+}
+
+pub(super) fn deployment_delivery_spec(snapshot: &DeploymentSnapshot) -> Result<AgentSpec> {
+    let mut spec = snapshot.spec.clone();
+    if let Some(inputs) = &snapshot.inputs {
+        for (id, input) in inputs {
+            if let Some(path) = &input.snapshot {
+                anyhow::ensure!(
+                    sha256_file(path)? == input.sha256,
+                    "saved deployment input {id} was modified"
+                );
+                if id == "secret:disk_passphrase" {
+                    spec.secrets.disk_passphrase = Some(path.clone());
+                } else if let Some(resource) = id
+                    .strip_prefix("resource:")
+                    .and_then(|id| spec.resources.get_mut(id))
+                {
+                    resource.source = path.clone();
+                }
+            }
+        }
+    }
+    Ok(spec)
+}
+
+pub(super) fn validate_resume_inputs(
+    saved: &DeploymentSnapshot,
+    current: &DeploymentSnapshot,
+    paths: &ContextPaths,
+) -> Result<()> {
+    anyhow::ensure!(current.source.path == saved.source.path && current.source.sha256 == saved.source.sha256,
+        "--resume requires the original deployment configuration and canonical path; restore them before resuming resource delivery");
+    let expected = saved.inputs.as_ref().context("this deployment has no frozen resource inputs; use an explicit inject to apply current resources instead of --resume")?;
+    let actual = deployment_input_paths(paths, &current.spec)?;
+    anyhow::ensure!(
+        actual.keys().eq(expected.keys()),
+        "--resume deployment input set changed"
+    );
+    for (id, path) in actual {
+        let input = &expected[&id];
+        anyhow::ensure!(path == input.source && sha256_file(&path)? == input.sha256,
+            "--resume deployment input {id} changed (source path or contents); restore the original input, or use an explicit inject to apply current resources");
+    }
+    deployment_delivery_spec(saved)?;
+    Ok(())
 }
 
 pub(super) fn committed_deployment(

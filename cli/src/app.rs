@@ -122,6 +122,16 @@ struct DeploymentSnapshot {
     source: LocalSpecState,
     spec: AgentSpec,
     user_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<BTreeMap<String, DeploymentInput>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeploymentInput {
+    source: PathBuf,
+    sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,7 +695,7 @@ fn prepare(
         runtime_contract,
         deployment: None,
         ssh: if options.include_deploy {
-            instance_ssh::identity(&paths, &spec)?
+            instance_ssh::identity(&context_paths(state_dir, &spec.service.id), &spec)?
         } else {
             None
         },

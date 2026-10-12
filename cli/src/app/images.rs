@@ -541,4 +541,87 @@ mod tests {
             original_key
         );
     }
+
+    #[test]
+    fn resume_binds_canonical_resource_paths_contents_and_instance_identities() {
+        let (root, cli, _) = fixture();
+        let path = instance_spec(root.path(), "agent-a");
+        let source = root.path().join("runtime.json");
+        fs::write(&source, "original runtime").unwrap();
+        let alias = root.path().join("runtime-link.json");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let raw = fs::read_to_string(&path).unwrap().replace("resources: {}", "resources:\n  runtime:\n    source: ./runtime-link.json\n    target: /opt/data/allinone/runtime.json");
+        fs::write(&path, &raw).unwrap();
+        let paths = context_paths(&cli.state_dir, "agent-a");
+        let mut saved = deployment_snapshot(&path).unwrap();
+        freeze_deployment_inputs(&mut saved, &paths, "attempt-1").unwrap();
+        // Persist and reload the exact contract used by a later process.
+        let file = root.path().join("snapshot.json");
+        write_json_atomic(&file, &saved).unwrap();
+        let saved: DeploymentSnapshot = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        let current = || deployment_snapshot(&path).unwrap();
+        validate_resume_inputs(&saved, &current(), &paths).unwrap();
+        let delivery = deployment_delivery_spec(&saved).unwrap();
+        let frozen = &delivery.resources["runtime"].source;
+        assert_ne!(frozen, &source);
+        assert_eq!(
+            fs::metadata(frozen).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::write(&source, "modified runtime").unwrap();
+        assert!(validate_resume_inputs(&saved, &current(), &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("resource:runtime"));
+        assert_eq!(fs::read(frozen).unwrap(), b"original runtime");
+        fs::write(&source, "original runtime").unwrap();
+        let other = root.path().join("other-runtime.json");
+        fs::write(&other, "original runtime").unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        assert!(validate_resume_inputs(&saved, &current(), &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("source path or contents"));
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let moved = root.path().join("moved");
+        fs::create_dir(&moved).unwrap();
+        let moved_spec = moved.join("agent-a.yaml");
+        fs::write(&moved_spec, &raw).unwrap();
+        assert!(
+            validate_resume_inputs(&saved, &deployment_snapshot(&moved_spec).unwrap(), &paths)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical path")
+        );
+        let disk = paths.secrets_dir.join("disk_passphrase");
+        let original_disk = fs::read(&disk).unwrap();
+        fs::write(&disk, "replacement disk secret").unwrap();
+        assert!(validate_resume_inputs(&saved, &current(), &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("secret:disk_passphrase"));
+        fs::write(&disk, original_disk).unwrap();
+        let client = paths.secrets_dir.join("ssh_client");
+        let original_client = fs::read(&client).unwrap();
+        fs::write(&client, "replacement client identity").unwrap();
+        assert!(validate_resume_inputs(&saved, &current(), &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("identity:ssh_client"));
+        fs::write(&client, original_client).unwrap();
+        validate_resume_inputs(&saved, &current(), &paths).unwrap();
+        fs::write(frozen, "tampered snapshot").unwrap();
+        assert!(validate_resume_inputs(&saved, &current(), &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("saved deployment input"));
+        let mut legacy = saved.clone();
+        legacy.inputs = None;
+        assert!(validate_resume_inputs(&legacy, &current(), &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("no frozen resource inputs"));
+    }
 }

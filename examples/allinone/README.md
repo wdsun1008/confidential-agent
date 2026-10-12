@@ -82,6 +82,18 @@ with `ca ssh SERVICE -- journalctl -u cai-allinone.service --no-pager`.
 OpenClaw and Hermes run only the selected gateway. All per-harness units from
 individual installers remain disabled.
 
+Resource `mutable` selects content ownership. The default `false` is
+operator-managed: the daemon restores guest edits to the delivered content.
+`true` is guest-managed after initialization: re-injecting an updated source
+does not replace an existing target. Keep `runtime.json` operator-managed;
+choose guest-managed native configuration only when an in-guest wizard owns it.
+
+Local `deployed` confirms infrastructure; `active` records delivery and mesh
+synchronization after the daemon becomes reachable. Inspect `ca report --json`
+for instance attestation and daemon resource state, and `ca status --live` for
+application readiness. A model request is a separate explicit check. No local
+phase or readiness flag implies that a paid model request succeeded.
+
 To expose the Hermes API through `service.connect`, set `API_SERVER_ENABLED=true`,
 `API_SERVER_HOST=0.0.0.0`, and `API_SERVER_PORT=8642` in its resource configuration.
 This lets the API accept TNG forwarding; keep its API key configured as in the
@@ -130,6 +142,10 @@ Background mesh and peering maintenance uses the saved deployment snapshot;
 editing or moving the original AppSpec does not update an existing instance.
 For resource delivery interrupted after infrastructure deployment completed,
 restore the original input and run `ca deploy --resume --spec instance.yaml`.
+Resume checks the original canonical AppSpec/resource paths, resource contents,
+disk secret and instance identities, and delivers the recorded private resource
+copies. Changing a referenced file while keeping the YAML unchanged is rejected.
+Use explicit `ca inject` to apply current resources to an existing instance.
 This keeps the recorded instance and identities. An interrupted infrastructure
 operation has unknown results and is not replayed by `--resume`; inspect its
 saved Shelter status before cleanup. `ca destroy` removes instance resources.

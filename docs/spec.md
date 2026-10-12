@@ -326,6 +326,8 @@ resources:
 
 `mutable: true` 用于应用会在启动后迁移或改写的初始化文件。daemon 仍会校验注入源文件的 sha256，并在首次缺失时写入 `target`；写入成功后只维护目标路径、mode、owner、group，不再因为目标内容被应用改写而覆盖文件或重启 `app_service`。如果应用删除了目标文件，daemon 会按原始注入内容重新 seed。不要把长期必须强一致的 secret 标成 mutable。
 
+这是内容所有权，不是更新开关：默认 `mutable: false` 为“操作者托管”，guest 中的改写会被校正回已交付的内容；`mutable: true` 为“guest 自主管理”，操作者修改 source 并再次注入也不会覆盖已经存在的目标内容。`runtime.json` 通常应由操作者托管；使用原生配置向导维护的文件按需要选择 guest 自主管理。
+
 约束：
 - `target` 必须绝对路径。
 - 单文件最大 100 MiB（`MAX_RESOURCE_BYTES`）。
@@ -547,7 +549,12 @@ Older image exports without this contract require rebuilding before using the
 published-image entry point; ordinary local artifact deployment remains available.
 
 `ca deploy --resume` resumes resource delivery only for confirmed `deployed`
-infrastructure with the original configuration. It does not apply Terraform or
+infrastructure with the original configuration at its canonical path. Deployment
+records canonical resource paths and digests and delivers private snapshots of
+user resources and the disk secret. Resume rejects changed resource contents,
+retargeted paths, or changed instance credentials; restore the original inputs
+before resuming. Legacy attempts without frozen inputs require an explicit
+`inject` to apply current resources. It does not apply Terraform or
 replay an interrupted infrastructure operation. Same-service build/deploy/inject/
 destroy operations are mutually exclusive; independent services may proceed in
 parallel. `ca ssh --tty SERVICE -- COMMAND` explicitly allocates a terminal;
