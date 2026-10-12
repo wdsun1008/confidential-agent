@@ -1,7 +1,10 @@
 """Check the image configuration and selected process without installing agents."""
 import json
+import os
 from pathlib import Path
 import runpy
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,6 +14,31 @@ RUNTIME = ROOT / "examples/allinone/files/cai-agent"
 
 
 class AllinoneRuntimeTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "requires the native systemd unit verifier")
+    def test_management_path_does_not_order_after_a_normal_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unit = root / "cai-ssh.path"
+            source = (ROOT / "examples/allinone/files/cai-ssh.path").read_text()
+            unit.write_text(source)
+            # Normal services start after basic.target; path units start before
+            # paths.target, which basic.target waits for. No programs are run.
+            for name in ["confidential-agentd.service", "cai-ssh.service"]:
+                (root / name).write_text("[Service]\nExecStart=/usr/bin/true\n")
+            target = root / "multi-user.target"
+            target.write_text("[Unit]\nRequires=basic.target\nAfter=basic.target\nWants=cai-ssh.path confidential-agentd.service\n")
+            env = dict(os.environ, SYSTEMD_UNIT_PATH=str(root) + ":/usr/lib/systemd/system:/lib/systemd/system")
+            args = ["systemd-analyze", "verify", str(target)]
+            verified = subprocess.run(args, env=env, capture_output=True, text=True)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            self.assertNotIn("ordering cycle", verified.stderr.lower())
+            # The verifier must actually detect the original ordering defect.
+            unit.write_text(source.replace("[Unit]", "[Unit]\nAfter=confidential-agentd.service", 1))
+            rejected = subprocess.run(args, env=env, capture_output=True, text=True)
+            # systemd 239 reports a broken transaction but still returns zero.
+            self.assertIn("ordering cycle", rejected.stderr.lower())
+            self.assertIn("deleted to break ordering cycle", rejected.stderr.lower())
+
     def test_configuration_rejects_unknown_harness_and_process_overrides(self):
         load = runpy.run_path(str(RUNTIME))["load_configuration"]
         with tempfile.TemporaryDirectory() as directory:
