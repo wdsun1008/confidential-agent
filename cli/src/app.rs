@@ -82,6 +82,8 @@ struct ContextPaths {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuildManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<DeploymentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     ssh: Option<instance_ssh::InstanceSsh>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<images::ImageDeployment>,
@@ -109,6 +111,13 @@ struct BuildManifest {
     debug_ssh: Option<LocalDebugSshKey>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     variants: BTreeMap<String, BuildManifestVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeploymentSnapshot {
+    source: LocalSpecState,
+    spec: AgentSpec,
+    user_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +559,7 @@ fn prepare(
     let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
+        deployment: None,
         ssh: if options.include_deploy {
             instance_ssh::identity(&paths, &spec)?
         } else {

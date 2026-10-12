@@ -270,7 +270,8 @@ fn ensure_build_variant_present(
 }
 
 pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
-    let spec = AgentSpec::from_path(&args.spec)?;
+    let mut snapshot = deployment_snapshot(&args.spec)?;
+    let spec = snapshot.spec.clone();
     let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
     if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
         bail!(
@@ -359,6 +360,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         cloud_image_id: published_image_id.clone(),
         deploy_user_data,
     };
+    snapshot.user_data = options.deploy_user_data.clone();
     let mut prepared = if current_manifest.image.is_some() {
         images::prepare(&paths, &spec, &current_manifest, &options)?
     } else {
@@ -366,6 +368,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     };
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
     deploy_manifest.variants = current_manifest.variants.clone();
+    deploy_manifest.deployment = Some(snapshot);
     fs::write(
         &paths.manifest,
         serde_json::to_string_pretty(&deploy_manifest)?,

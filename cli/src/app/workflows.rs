@@ -220,16 +220,25 @@ pub(super) fn build_service_state(
         &prepared.shelter_build_id,
     )?;
     let gateway_identity = ensure_gateway_identity(&paths)?;
+    let deployment = if paths.manifest.try_exists()? {
+        read_build_manifest(&paths.manifest)?.deployment
+    } else {
+        None
+    };
+    let source = match deployment {
+        Some(snapshot) => snapshot.source,
+        None => LocalSpecState {
+            path: absolute_path(spec_path)?,
+            sha256: sha256_file(spec_path)?,
+        },
+    };
     Ok(LocalServiceState {
         schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
         service_id: spec.service.id.clone(),
         generation: old_generation + 1,
         phase: phase.to_string(),
         attestation_mode: attestation_mode_name(spec.attestation.mode).to_string(),
-        spec: LocalSpecState {
-            path: absolute_path(spec_path)?,
-            sha256: sha256_file(spec_path)?,
-        },
+        spec: source,
         build: LocalBuildState {
             build_id: prepared.shelter_build_id.clone(),
             image_name: spec.image_id().to_string(),
@@ -430,6 +439,7 @@ pub(super) fn refresh_active_shelter_deploys(
             cloud_image_id: service.deploy.published_image_id.clone(),
         };
         let mut args = deploy_shelter_args(&prepared);
+        args.push("--network-only".into());
         run_shelter(cli, &mut args)?;
     }
     Ok(())
@@ -440,7 +450,13 @@ pub(super) fn render_service_config_from_state(
     state: &LocalServiceState,
     mesh_peer_cidrs: Vec<String>,
 ) -> Result<()> {
-    let mut spec = AgentSpec::from_path(&state.spec.path)?;
+    let paths = context_paths(state_dir, &state.service_id);
+    let mut manifest = read_build_manifest(&paths.manifest)?;
+    let snapshot = committed_deployment(state, &manifest)?;
+    let mut spec = snapshot.spec.clone();
+    spec.service.ports = state.service.ports.clone();
+    spec.service.connect = state.service.connect.clone();
+    spec.service.mcp_ports = state.service.mcp_ports.clone();
     // Re-rendering an existing deployment must preserve the provider that was
     // committed to durable state. A later AppSpec edit may change desired
     // settings for a future deployment, but it must not remove Trustee
@@ -454,14 +470,13 @@ pub(super) fn render_service_config_from_state(
     } else {
         AttestationMode::Challenge
     };
-    let paths = context_paths(state_dir, &state.service_id);
-    let manifest = read_build_manifest(&paths.manifest)?;
+    // Persist a verified legacy snapshot before any automatic reconciliation.
+    if manifest.deployment.is_none() {
+        manifest.deployment = Some(snapshot.clone());
+        write_json_atomic(&paths.manifest, &manifest)?;
+    }
     if manifest.image.is_some() {
-        let deploy_user_data = if spec.attestation.mode == AttestationMode::Trustee {
-            Some(trustee::runtime_user_data(state_dir, &state.service_id)?)
-        } else {
-            None
-        };
+        let deploy_user_data = snapshot.user_data.clone();
         images::prepare(
             &paths,
             &spec,
@@ -484,11 +499,7 @@ pub(super) fn render_service_config_from_state(
     if let Some(debug_ssh) = variant.debug_ssh.as_ref() {
         apply_debug_ssh_public_key(&mut spec, &debug_ssh.public_key)?;
     }
-    let deploy_user_data = if spec.attestation.mode == AttestationMode::Trustee {
-        Some(trustee::runtime_user_data(state_dir, &state.service_id)?)
-    } else {
-        None
-    };
+    let deploy_user_data = snapshot.user_data;
     spec.deploy.image_variant = Some(state.build.variant.clone());
     let images_dir = manifest.images_dir.clone();
     let cache_dir = manifest.cache_dir.clone();

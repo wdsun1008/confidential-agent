@@ -668,6 +668,7 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
     fs::create_dir_all(&service_dir).unwrap();
     let shelter_work_dir = service_dir.join("shelter");
     let manifest = BuildManifest {
+        deployment: None,
         ssh: None,
         image: None,
         service_id: service_id.to_string(),
@@ -1529,6 +1530,7 @@ resources: {}
     )
     .unwrap();
     let mut state = local_state("openclaw", vec![18789], vec![18789]);
+    state.spec.sha256 = sha256_file(&spec_path).unwrap();
     state.spec.path = spec_path;
     state.deploy.terraform_dir = Some(
         state_dir
@@ -1561,6 +1563,13 @@ resources: {}
     assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
 
+    // Editing the source is a future deployment request, not a mesh update.
+    let source = fs::read_to_string(&state.spec.path).unwrap();
+    fs::write(
+        &state.spec.path,
+        source.replace("ecs.g8i.xlarge", "ecs.g8i.2xlarge"),
+    )
+    .unwrap();
     PeeringsFile::empty()
         .write_to_path(&state_dir.join("peerings.yaml"))
         .unwrap();
@@ -1569,6 +1578,10 @@ resources: {}
     assert!(rendered.contains("deploy:"));
     assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(!rendered.contains("connect_18789_peer_203_0_113_10_32"));
+    assert!(rendered.contains("ecs.g8i.xlarge"));
+    assert!(!rendered.contains("ecs.g8i.2xlarge"));
+    fs::remove_file(&state.spec.path).unwrap();
+    render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
 }
 
 #[test]
@@ -2440,6 +2453,7 @@ resources: {}
     .unwrap();
     let mut state = local_state("openclaw", vec![18789], vec![18789]);
     state.phase = "active".to_string();
+    state.spec.sha256 = sha256_file(&spec_path).unwrap();
     state.spec.path = spec_path;
     state.deploy.published_image_id = Some("m-2ze123abc".to_string());
     write_state(temp.path(), &state);

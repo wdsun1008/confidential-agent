@@ -1,5 +1,59 @@
 use super::*;
 
+pub(super) fn deployment_snapshot(path: &Path) -> Result<DeploymentSnapshot> {
+    let path = absolute_path(path)?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read spec '{}'", path.display()))?;
+    Ok(DeploymentSnapshot {
+        source: LocalSpecState {
+            path: path.clone(),
+            sha256: hex_encode(&Sha256::digest(content.as_bytes())),
+        },
+        spec: AgentSpec::from_yaml(&content, path.parent().context("spec has no parent")?)?,
+        user_data: None,
+    })
+}
+
+pub(super) fn committed_deployment(
+    state: &LocalServiceState,
+    manifest: &BuildManifest,
+) -> Result<DeploymentSnapshot> {
+    let snapshot = match &manifest.deployment {
+        Some(snapshot) => snapshot.clone(),
+        None => {
+            // Older state can be migrated only from its original, unchanged input.
+            let mut snapshot = deployment_snapshot(&state.spec.path)
+                .context("deployment has no saved configuration; restore its original AppSpec before refreshing network rules")?;
+            anyhow::ensure!(
+                snapshot.source.sha256 == state.spec.sha256,
+                "deployment has no saved configuration and its AppSpec was modified; restore the original AppSpec before refreshing network rules"
+            );
+            snapshot.spec.deploy.image_variant = Some(state.build.variant.clone());
+            if let Ok(raw) = fs::read(&manifest.shelter_config) {
+                let config: serde_json::Value = serde_yaml::from_slice(&raw)
+                    .context("invalid saved Shelter deployment configuration")?;
+                snapshot.user_data = config
+                    .pointer("/deploy/user_data")
+                    .or_else(|| {
+                        config.pointer("/runtime/targets/deploy/provider_options/user_data")
+                    })
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            }
+            anyhow::ensure!(
+                state.attestation_mode != "trustee" || snapshot.user_data.is_some(),
+                "legacy Trustee deployment has no saved bootstrap; restore its Shelter configuration before refreshing network rules"
+            );
+            snapshot
+        }
+    };
+    anyhow::ensure!(
+        snapshot.spec.service.id == state.service_id,
+        "saved deployment configuration belongs to a different service"
+    );
+    Ok(snapshot)
+}
+
 pub(super) fn context_paths(state_dir: &Path, service_id: &str) -> ContextPaths {
     let state_dir = absolute_path_for_state(state_dir);
     let service_dir = state_dir.join("services").join(service_id);

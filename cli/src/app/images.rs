@@ -362,10 +362,21 @@ mod tests {
         fs::remove_file(root.path().join("release.json")).unwrap();
         fs::remove_file(root.path().join("publisher.pem")).unwrap();
         for state in states {
+            let paths = context_paths(&cli.state_dir, &state.service_id);
+            let before = fs::read(&paths.rendered_config).unwrap();
+            let source = fs::read_to_string(&state.spec.path).unwrap();
+            fs::write(
+                &state.spec.path,
+                source
+                    .replace("disk_gb: 80", "disk_gb: 200")
+                    .replace("ecs.g9i.xlarge", "ecs.g9i.2xlarge"),
+            )
+            .unwrap();
             render_service_config_from_state(&cli.state_dir, &state, Vec::new()).unwrap();
-            assert!(context_paths(&cli.state_dir, &state.service_id)
-                .rendered_config
-                .exists());
+            assert_eq!(fs::read(&paths.rendered_config).unwrap(), before);
+            fs::remove_file(&state.spec.path).unwrap();
+            render_service_config_from_state(&cli.state_dir, &state, Vec::new()).unwrap();
+            assert_eq!(fs::read(&paths.rendered_config).unwrap(), before);
         }
     }
 
