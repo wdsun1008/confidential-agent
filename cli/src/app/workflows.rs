@@ -932,21 +932,37 @@ pub(super) fn validate_shared_guest_ports(
     spec: &AgentSpec,
     incoming: &BuildManifest,
 ) -> Result<()> {
-    for state in read_service_states(state_dir)? {
-        if state.service_id == spec.service.id
-            || !matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
-            || !state
-                .service
-                .ports
+    let recipients = read_service_states(state_dir)?
+        .into_iter()
+        .filter(|state| {
+            state.service_id != spec.service.id
+                && matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
+        })
+        .collect::<Vec<_>>();
+    let mut ports = BTreeSet::new();
+    let shared = recipients
+        .iter()
+        .map(|state| state.service.ports.as_slice())
+        .chain(std::iter::once(spec.service.ports.as_slice()))
+        .any(|service_ports| {
+            service_ports
                 .iter()
-                .any(|port| spec.service.ports.contains(port))
-        {
-            continue;
-        }
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .any(|port| !ports.insert(port))
+        });
+    if !shared {
+        return Ok(());
+    }
+    anyhow::ensure!(incoming.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
+        "service {} uses a legacy guest without independent mesh client ports; rebuild every mesh recipient before deploying overlapping service ports", spec.service.id);
+    // Clients with no service ports receive the same peer bundle and must also
+    // understand independent local endpoints for duplicate remote ports.
+    for state in recipients {
         let peer = read_build_manifest(&context_paths(state_dir, &state.service_id).manifest)?;
-        anyhow::ensure!(incoming.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports())
-            && peer.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
-            "service {} uses a legacy guest without independent mesh client ports; rebuild legacy images before deploying overlapping service ports", state.service_id);
+        anyhow::ensure!(peer.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
+            "service {} uses a legacy guest without independent mesh client ports; rebuild every mesh recipient before deploying overlapping service ports", state.service_id);
     }
     Ok(())
 }
@@ -1204,6 +1220,57 @@ pub(super) fn render_mesh_bundle(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn duplicate_mesh_ports_require_capable_client_only_recipients() {
+        let root = tempfile::tempdir().unwrap();
+        let capable = BuildManifest {
+            runtime_contract: Some(
+                serde_json::from_value(json!({
+                    "schema_version": "confidential-agent/image-runtime/v1",
+                    "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"],
+                    "rootfs_integrity": true, "writable_layer_encryption": "luks2",
+                    "key_release": "ca-attested", "min_disk_gb": 32, "app_services": [],
+                    "guest_binary_sha256": "e".repeat(64)
+                }))
+                .unwrap(),
+            ),
+            ..BuildManifest::default()
+        };
+        for (id, ports, manifest) in [
+            ("a", vec![18789], capable.clone()),
+            ("c", vec![], BuildManifest::default()),
+        ] {
+            write_local_service_state(
+                root.path(),
+                &test_service_state(id, "active", ports, vec![]),
+            )
+            .unwrap();
+            write_json_atomic(&context_paths(root.path(), id).manifest, &manifest).unwrap();
+        }
+        let yaml = "schema: confidential-agent/v1\nservice: {id: b, ports: [18789]}\nbuild: {image_name: app}\ndeploy: {provider: aliyun, region: cn-beijing, zone_id: cn-beijing-i, instance_type: ecs.g9i.xlarge}\nattestation: {tee: tdx, mode: challenge, reference_values: sample}\nresources: {}";
+        let mut spec = AgentSpec::from_yaml(yaml, root.path()).unwrap();
+        let error = validate_shared_guest_ports(root.path(), &spec, &capable).unwrap_err();
+        assert!(error.to_string().contains("service c uses a legacy guest"));
+        spec.service.ports = vec![18790];
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        spec.service.ports = vec![18789];
+        write_json_atomic(&context_paths(root.path(), "c").manifest, &capable).unwrap();
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        write_local_service_state(
+            root.path(),
+            &test_service_state("b", "active", vec![18789], vec![]),
+        )
+        .unwrap();
+        write_json_atomic(&context_paths(root.path(), "b").manifest, &capable).unwrap();
+        spec.service.id = "d".into();
+        spec.service.ports.clear();
+        assert!(
+            validate_shared_guest_ports(root.path(), &spec, &BuildManifest::default()).is_err()
+        );
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+    }
 
     fn test_service_state(
         id: &str,
