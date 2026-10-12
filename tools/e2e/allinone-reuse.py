@@ -794,9 +794,10 @@ def main():
         first = consumers[0]
         first.command("trustee-configure", *configure)
         doctor = json.loads(first.command("trustee-doctor", "trustee", "doctor", "--json").stdout)
-        first.command("trustee-adopt", "trustee", "adopt", "--attestation-policy-sha256",
-                      doctor["attestation_policy_sha256"], "--resource-policy-sha256",
-                      doctor["resource_policy_sha256"])
+        if not doctor["owned_resource_policy"]:
+            first.command("trustee-adopt", "trustee", "adopt", "--attestation-policy-sha256",
+                          doctor["attestation_policy_sha256"], "--resource-policy-sha256",
+                          doctor["resource_policy_sha256"])
         # One CA state owns the shared Trustee policies; serialize its updates.
         args.parallel = 1
     else:
