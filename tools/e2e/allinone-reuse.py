@@ -297,7 +297,15 @@ class Consumer:
                     except ProcessLookupError:
                         pass
                 if "send" in exchange:
-                    os.write(master, exchange["send"].encode())
+                    # Native TUIs can interpret a burst of text plus Enter as
+                    # pasted multiline input. Allow fixtures to type real keys.
+                    key_delay = exchange.get("key_delay", 0)
+                    if key_delay:
+                        for character in exchange["send"]:
+                            os.write(master, character.encode())
+                            time.sleep(key_delay)
+                    else:
+                        os.write(master, exchange["send"].encode())
             if exit_code is not None:
                 assert process.wait(timeout=30) == exit_code, "interactive exit code was not preserved"
         finally:
