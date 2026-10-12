@@ -189,6 +189,13 @@ pub(super) fn write_service_state(
     phase: &str,
 ) -> Result<LocalServiceState> {
     with_state_dir_lock(state_dir, || {
+        if phase == "deploying" {
+            // Independent services can pass preflight together. Recheck after
+            // acquiring the shared lock, before recording cloud ownership.
+            let manifest =
+                read_build_manifest(&context_paths(state_dir, &spec.service.id).manifest)?;
+            validate_shared_guest_ports(state_dir, spec, &manifest)?;
+        }
         let state = build_service_state(state_dir, spec_path, spec, observation, prepared, phase)?;
         write_local_service_state(state_dir, &state)?;
         Ok(state)
@@ -581,6 +588,20 @@ pub(super) fn sync_mesh_for_services(
         return Ok(0);
     }
 
+    validate_guest_port_recipients(
+        state_dir,
+        services
+            .iter()
+            .filter(|service| service.phase == "active")
+            .map(|service| {
+                (
+                    service.service_id.as_str(),
+                    service.service.ports.as_slice(),
+                    None,
+                )
+            })
+            .collect(),
+    )?;
     let reference_values = collect_reference_values(&services)?;
     let generation = next_mesh_generation(state_dir, &services);
     let bundle = render_mesh_bundle(&services, &reference_values, generation);
@@ -948,11 +969,34 @@ pub(super) fn validate_shared_guest_ports(
                 && matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
         })
         .collect::<Vec<_>>();
+    validate_guest_port_recipients(
+        state_dir,
+        recipients
+            .iter()
+            .map(|state| {
+                (
+                    state.service_id.as_str(),
+                    state.service.ports.as_slice(),
+                    None,
+                )
+            })
+            .chain(std::iter::once((
+                spec.service.id.as_str(),
+                spec.service.ports.as_slice(),
+                Some(incoming),
+            )))
+            .collect(),
+    )
+}
+
+fn validate_guest_port_recipients(
+    state_dir: &Path,
+    recipients: Vec<(&str, &[u16], Option<&BuildManifest>)>,
+) -> Result<()> {
     let mut ports = BTreeSet::new();
     let shared = recipients
         .iter()
-        .map(|state| state.service.ports.as_slice())
-        .chain(std::iter::once(spec.service.ports.as_slice()))
+        .map(|(_, ports, _)| *ports)
         .any(|service_ports| {
             service_ports
                 .iter()
@@ -964,14 +1008,19 @@ pub(super) fn validate_shared_guest_ports(
     if !shared {
         return Ok(());
     }
-    anyhow::ensure!(incoming.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
-        "service {} uses a legacy guest without stable mesh client endpoints; rebuild every mesh recipient before deploying overlapping service ports", spec.service.id);
     // Clients with no service ports receive the same peer bundle and must also
     // understand independent local endpoints for duplicate remote ports.
-    for state in recipients {
-        let peer = read_build_manifest(&context_paths(state_dir, &state.service_id).manifest)?;
+    for (service_id, _, incoming) in recipients {
+        let saved;
+        let peer = match incoming {
+            Some(manifest) => manifest,
+            None => {
+                saved = read_build_manifest(&context_paths(state_dir, service_id).manifest)?;
+                &saved
+            }
+        };
         anyhow::ensure!(peer.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
-            "service {} uses a legacy guest without stable mesh client endpoints; rebuild every mesh recipient before deploying overlapping service ports", state.service_id);
+            "service {service_id} uses a legacy guest without stable mesh client endpoints; rebuild every mesh recipient before deploying overlapping service ports");
     }
     Ok(())
 }
@@ -1230,10 +1279,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn duplicate_mesh_ports_require_capable_client_only_recipients() {
-        let root = tempfile::tempdir().unwrap();
-        let capable = BuildManifest {
+    fn shared_port_manifest() -> BuildManifest {
+        BuildManifest {
             runtime_contract: Some(
                 serde_json::from_value(json!({
                     "schema_version": "confidential-agent/image-runtime/v1",
@@ -1246,7 +1293,13 @@ mod tests {
                 .unwrap(),
             ),
             ..BuildManifest::default()
-        };
+        }
+    }
+
+    #[test]
+    fn duplicate_mesh_ports_require_capable_client_only_recipients() {
+        let root = tempfile::tempdir().unwrap();
+        let capable = shared_port_manifest();
         for (id, ports, manifest) in [
             ("a", vec![18789], capable.clone()),
             ("c", vec![], BuildManifest::default()),
@@ -1279,6 +1332,90 @@ mod tests {
             validate_shared_guest_ports(root.path(), &spec, &BuildManifest::default()).is_err()
         );
         validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+    }
+
+    #[test]
+    fn shared_ports_are_rechecked_when_recording_an_attempt_and_publishing_a_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let capable = shared_port_manifest();
+        let legacy = test_service_state("c", "active", vec![], vec![]);
+        write_local_service_state(root.path(), &legacy).unwrap();
+        write_json_atomic(
+            &context_paths(root.path(), "c").manifest,
+            &BuildManifest::default(),
+        )
+        .unwrap();
+        let yaml = "schema: confidential-agent/v1\nservice: {id: a, ports: [18789]}\nbuild: {image_name: app}\ndeploy: {provider: aliyun, region: cn-beijing, zone_id: cn-beijing-i, instance_type: ecs.g9i.xlarge}\nattestation: {tee: tdx, mode: challenge, reference_values: sample}\nresources: {}";
+        let mut spec = AgentSpec::from_yaml(yaml, root.path()).unwrap();
+        // Both independent invocations passed before either recorded ownership.
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        spec.service.id = "b".into();
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        write_local_service_state(
+            root.path(),
+            &test_service_state("a", "deploying", vec![18789], vec![]),
+        )
+        .unwrap();
+        for id in ["a", "b"] {
+            write_json_atomic(&context_paths(root.path(), id).manifest, &capable).unwrap();
+        }
+        let prepared = PreparedConfig {
+            image: None,
+            rendered_config: root.path().join("unused.yml"),
+            shelter_build_id: "unused".into(),
+            shelter_work_dir: root.path().join("unused"),
+            build_result: root.path().join("unused.json"),
+            deploy_result: root.path().join("unused-deploy.json"),
+            deploy_names: None,
+            terraform_dir: None,
+            debug_ssh: None,
+            cloud_image_id: None,
+        };
+        let error = write_service_state(
+            root.path(),
+            root.path(),
+            &spec,
+            &DeployObservation::default(),
+            &prepared,
+            "deploying",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("service c uses a legacy guest"));
+        assert!(!context_paths(root.path(), "b").service_state.exists());
+
+        // Also reject an incompatible already-recorded topology before replacing
+        // the committed bundle or delivering it, including filtered mesh sync.
+        for id in ["a", "b"] {
+            write_local_service_state(
+                root.path(),
+                &test_service_state(id, "active", vec![18789], vec![]),
+            )
+            .unwrap();
+        }
+        let bundle = root.path().join("mesh-bundle.json");
+        let original = serde_json::to_vec(&render_mesh_bundle(
+            &[legacy],
+            &ReferenceValueArtifacts {
+                sample: BTreeMap::new(),
+                rekor: BTreeMap::new(),
+            },
+            7,
+        ))
+        .unwrap();
+        fs::write(&bundle, &original).unwrap();
+        let cli = Cli {
+            command: Commands::Version,
+            shelter_bin: "shelter".into(),
+            state_dir: root.path().into(),
+            tools_image: "unused".into(),
+        };
+        let error = sync_mesh(&cli, root.path(), Some("a")).unwrap_err();
+        assert!(error.to_string().contains("service c uses a legacy guest"));
+        assert_eq!(fs::read(bundle).unwrap(), original);
+        assert!(read_service_states(root.path())
+            .unwrap()
+            .iter()
+            .all(|state| state.mesh_generation == 1));
     }
 
     fn test_service_state(
