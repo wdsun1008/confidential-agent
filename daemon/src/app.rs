@@ -2390,7 +2390,13 @@ fn runtime_port_plan_with_registry(
                 host: host.clone(),
                 remote_port: port,
                 local_port,
-                tng_ingress_port: allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used)?,
+                // Connect routes expose the TNG listener directly; that public
+                // endpoint must use the same persistent reservation as mesh.
+                tng_ingress_port: if connect_ports.contains(&port) {
+                    local_port
+                } else {
+                    allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used)?
+                },
                 protocol: if mcp_ports.contains(&port) {
                     "mcp".to_string()
                 } else {
@@ -2432,11 +2438,7 @@ fn service_directory(
             .filter(|route| route.service_id == *id)
             .map(|route| ServiceDirectoryPort {
                 address: "127.0.0.1".to_string(),
-                port: if route.connect_mode {
-                    route.tng_ingress_port
-                } else {
-                    route.local_port
-                },
+                port: route.local_port,
                 mode: Some(if route.connect_mode {
                     "connect".to_string()
                 } else {

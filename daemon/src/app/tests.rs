@@ -474,6 +474,42 @@ fn stable_client_endpoints_survive_topology_changes_and_state_reload() {
 }
 
 #[test]
+fn connect_directory_and_tng_listeners_keep_their_reserved_endpoints() {
+    let mut bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION, "generation": 1, "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [], "connect": []},
+            "beta": {"phase": "active", "public_ip": "192.0.2.10", "ports": [18789], "connect": [18789]},
+            "gamma": {"phase": "active", "public_ip": "192.0.2.11", "ports": [18789], "connect": [18789]}
+        }, "reference_values": {"alpha": {"measurement.uki.SHA-384": ["a"]}, "beta": {"measurement.uki.SHA-384": ["a"]}, "gamma": {"measurement.uki.SHA-384": ["a"]}}
+    })).unwrap();
+    let mut registry = BTreeMap::new();
+    let first = runtime_port_plan_with_registry(&bundle, "self", &mut registry).unwrap();
+    let before = service_directory(&bundle, "self", &first);
+    bundle
+        .services
+        .insert("alpha".into(), bundle.services["beta"].clone());
+    let next = runtime_port_plan_with_registry(&bundle, "self", &mut registry).unwrap();
+    let after = service_directory(&bundle, "self", &next);
+    let config = tng_config(&bundle, "self", &next).unwrap();
+    for id in ["beta", "gamma"] {
+        let port = after.services[id].ports[0].port;
+        assert_eq!(port, before.services[id].ports[0].port);
+        let route = next
+            .peer_routes
+            .iter()
+            .find(|route| route.service_id == id)
+            .unwrap();
+        assert_eq!(route.tng_ingress_port, port);
+        assert!(config["add_ingress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["mapping"]["in"]["port"] == port));
+    }
+}
+
+#[test]
 fn application_port_conflicts_are_rejected_before_applying_business_configuration() {
     let temp = tempfile::tempdir().unwrap();
     let _env = no_tee_test_env(&temp);
@@ -591,7 +627,7 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     assert!(directory["services"].get("old").is_none());
     assert_eq!(
         directory["services"]["connect-only"]["ports"][0]["port"],
-        39400
+        4001
     );
     assert_eq!(
         directory["services"]["connect-only"]["ports"][0]["mode"],
@@ -610,7 +646,7 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     assert_eq!(directory["services"]["peer"]["ports"][0]["port"], 3001);
     assert_eq!(directory["services"]["peer"]["ports"][0]["mode"], "mesh");
     assert_eq!(directory["services"]["peer"]["ports"][0]["protocol"], "mcp");
-    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 39402);
+    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 3002);
     assert_eq!(directory["services"]["peer"]["ports"][1]["mode"], "connect");
     assert!(directory["services"]["peer"]["ports"][1]
         .get("protocol")
@@ -1071,11 +1107,11 @@ fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
         "sample"
     );
     assert_eq!(config["add_ingress"][0]["attest"]["aa_type"], "uds");
-    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 39401);
+    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 3002);
     assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 3002);
     assert_eq!(config["add_ingress"][1]["verify"]["as_type"], "builtin");
     assert!(config["add_ingress"][1].get("attest").is_none());
-    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 39402);
+    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 4001);
     assert_eq!(config["add_ingress"][2]["mapping"]["out"]["port"], 4001);
     assert_eq!(config["add_ingress"][2]["verify"]["as_type"], "builtin");
     assert!(config["add_ingress"][2].get("attest").is_none());
@@ -1139,10 +1175,10 @@ fn gateway_config_routes_only_confidential_mesh_ports() {
     assert_eq!(client_routes.len(), 2);
     assert_eq!(client_routes[0]["listen_port"], 3001);
     assert_eq!(client_routes[0]["target_port"], 3001);
-    assert_eq!(client_routes[0]["tng_port"], 39401);
+    assert_eq!(client_routes[0]["tng_port"], 39400);
     assert_eq!(client_routes[1]["listen_port"], 3003);
     assert_eq!(client_routes[1]["target_port"], 3003);
-    assert_eq!(client_routes[1]["tng_port"], 39403);
+    assert_eq!(client_routes[1]["tng_port"], 39401);
     assert_eq!(config["trusted_services"]["peer"]["public_key"], "peer-pub");
     assert_eq!(
         config["trusted_services"]["connect-only"]["public_key"],
