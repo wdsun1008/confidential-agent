@@ -113,8 +113,8 @@ Environment=PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin
 ExecStart=/usr/bin/env node /usr/local/bin/cai-a2a-llm-agent --config /etc/cai/a2a-agent.json
 Restart=always
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

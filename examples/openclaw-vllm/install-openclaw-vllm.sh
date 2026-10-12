@@ -444,8 +444,8 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=120
 ExecStart=/usr/local/bin/cai-openclaw-vllm-runtime-check.sh
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 
 [Install]
@@ -466,8 +466,8 @@ TimeoutStartSec=7200
 Restart=on-failure
 RestartSec=60
 ExecStart=/usr/local/bin/cai-modelscope-fetch.sh
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 
 [Install]
@@ -490,8 +490,8 @@ TimeoutStartSec=10800
 ExecStartPre=/usr/local/bin/cai-vllm-wait-deps.sh
 ExecStartPre=/usr/local/bin/cai-vllm-setup.sh
 ExecStart=/usr/local/bin/cai-vllm-run.sh
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Environment=HOME=/root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 
@@ -556,8 +556,8 @@ ExecStartPre=/usr/local/bin/cai-openclaw-vllm-bootstrap
 ExecStart=/usr/local/bin/openclaw gateway run --port 18789 --bind lan
 Restart=always
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

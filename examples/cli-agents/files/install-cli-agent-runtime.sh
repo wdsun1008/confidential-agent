@@ -231,8 +231,8 @@ ExecStart=/usr/local/bin/codex app-server --listen ws://0.0.0.0:4500 --ws-auth c
 Restart=always
 RestartSec=5
 TimeoutStartSec=600
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

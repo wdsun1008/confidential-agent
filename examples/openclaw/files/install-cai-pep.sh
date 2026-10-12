@@ -95,8 +95,8 @@ ExecStart=/usr/local/bin/cai-pep serve --config /etc/cai/pep/policy.json --socke
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

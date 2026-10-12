@@ -84,8 +84,8 @@ TimeoutStopSec=30
 TimeoutStartSec=600
 SuccessExitStatus=0 143
 KillMode=control-group
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

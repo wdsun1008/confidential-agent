@@ -1166,6 +1166,16 @@ install_attestation_challenge_client() {
     fi
 }
 install_attestation_challenge_client
+# Application logs stay inside the guest. Volatile storage also avoids writing
+# business output to an unprotected log partition supplied by a base image.
+install -d -m 0755 /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-confidential-agent.conf <<'EOF'
+[Journal]
+Storage=volatile
+ForwardToConsole=no
+ForwardToKMsg=no
+ForwardToSyslog=no
+EOF
 expected_tng_nevra='trusted-network-gateway-2.8.0-1.al8.x86_64'
 installed_tng_nevra="$(rpm -q trusted-network-gateway 2>/dev/null || true)"
 if [ "$installed_tng_nevra" != "$expected_tng_nevra" ]; then

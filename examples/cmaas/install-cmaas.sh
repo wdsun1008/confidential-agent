@@ -157,8 +157,8 @@ ExecStart=/usr/local/bin/cmaas-mcp-proxy --host 127.0.0.1 --port 8000 --server s
 Restart=always
 RestartSec=5
 TimeoutStartSec=120
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

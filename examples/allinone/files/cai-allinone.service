@@ -8,6 +8,6 @@ Type=simple
 ExecStart=/usr/local/bin/cai-agent --serve
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 

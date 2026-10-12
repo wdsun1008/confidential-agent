@@ -131,8 +131,8 @@ Type=simple
 ExecStart=/usr/bin/env node /usr/local/share/confidential-agent/cmaas/agent-health.mjs
 Restart=always
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
