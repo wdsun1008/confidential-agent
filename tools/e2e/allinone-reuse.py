@@ -618,12 +618,22 @@ def deploy_with_frozen_inputs(consumers, parallel, aliyun):
         saved.unlink(missing_ok=True)
 
 
+def stable_endpoint_peers(consumers, extra_spec):
+    ports = extra_spec["service"]["ports"]
+    assert ports and not set(ports).intersection(extra_spec["service"].get("connect", [])), \
+        "stable endpoint coverage requires mesh ports, not operator-only connect ports"
+    peers = [item for item in consumers if item.spec["service"]["ports"] == ports
+             and not set(ports).intersection(item.spec["service"].get("connect", []))]
+    assert len(peers) >= 2, "stable endpoint coverage needs two existing mesh peers on the extra peer's port"
+    assert extra_spec["service"]["id"] < min(item.service for item in peers), \
+        "extra peer must sort before existing peers"
+    return peers
+
+
 def verify_stable_endpoints(consumers, fixture):
     client = next(item for item in consumers if not item.spec["service"]["ports"])
     extra = Consumer(fixture.resolve(), client.work.parent, client.ca[0], client.cidr, client.state)
-    peers = [item for item in consumers if item.spec["service"]["ports"] == extra.spec["service"]["ports"]]
-    assert len(peers) >= 2, "stable endpoint coverage needs two existing peers on the extra peer's port"
-    assert extra.service < min(item.service for item in peers), "extra peer must sort before existing peers"
+    peers = stable_endpoint_peers(consumers, extra.spec)
     before = client.directory_ports("stable-endpoints-before")
     assert all(item.service in before for item in peers)
     changed = []
@@ -782,6 +792,9 @@ def main():
                  for path in args.fixture]
     assert len(consumers) >= 2, "reuse requires at least two consumers"
     assert len({item.service for item in consumers}) == len(consumers)
+    if args.stable_endpoints_fixture:
+        extra_spec = json.loads((args.stable_endpoints_fixture / "appspec.json").read_text())
+        stable_endpoint_peers(consumers, extra_spec)
     pins = [item.spec["deploy"]["image"] for item in consumers]
     assert all(pin == pins[0] for pin in pins), "fixtures must select the same release"
     assert all("build" not in item.spec and item.spec["service"]["ssh"] for item in consumers)

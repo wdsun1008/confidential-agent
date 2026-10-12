@@ -112,6 +112,10 @@ The image configuration uses the harness's native provider/model settings.
 An optional `runtime_command` in `probe.json` checks the native gateway or API.
 For a service exposing one HTTP port through `service.connect`, an optional
 `connect_http_path` also checks HTTP 200 through CA's protected connection.
+Stable endpoint routing tests require two peers and the extra peer to expose
+the same mesh port, excluded from `service.connect`. Connect ports are opened
+to operator peerings; they do not grant guest-to-guest mesh access. The runner
+rejects unsuitable stable-endpoint fixtures before deploying infrastructure.
 
 `probe.json` supplies an SSH command and its expected model-response marker.
 Keep the complete marker out of the prompt so echoed input cannot satisfy it:
