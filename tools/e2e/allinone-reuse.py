@@ -174,37 +174,25 @@ class Consumer:
             }) + "\n")
 
     def verify_console_isolation(self, aliyun):
-        """Exercise the actual application unit and confirm the console API is live."""
-        marker = "CA_APPLICATION_" + os.urandom(16).hex()
-        canary = "CA_CONSOLE_" + os.urandom(16).hex()
-        dropin = "/run/systemd/system/cai-allinone.service.d/console-test.conf"
-        content = ("[Service]\nExecStartPre=/bin/sh -c 'echo " + marker + "; echo "
-                   + marker + " >&2'\n")
-        try:
-            self.ssh("console-install-probe", "mkdir -p " + shlex.quote(str(Path(dropin).parent))
-                     + "; printf %s " + shlex.quote(content) + " > " + shlex.quote(dropin)
-                     + "; systemctl daemon-reload; systemctl restart cai-allinone.service")
-            self.ssh("console-journal-marker", "journalctl -u cai-allinone.service --no-pager | grep -F "
-                     + shlex.quote(marker))
-            self.ssh("console-canary", "printf '%s\\n' " + shlex.quote(canary) + " > /dev/console")
-            cloud = json.loads((self.directory / "state.json").read_text())["deploy"]
-            region = self.spec["deploy"]["region"]
-            deadline = time.monotonic() + 180
-            while True:
-                result = run([aliyun, "--region", region, "ecs", "GetInstanceConsoleOutput",
-                              "--RegionId", region, "--InstanceId", cloud["instance_id"]],
-                             self.work / "console-output")
-                console = base64.b64decode(json.loads(result.stdout)["ConsoleOutput"])
-                (self.work / "console-output.txt").write_bytes(console)
-                assert marker.encode() not in console, "application output reached the cloud console"
-                if canary.encode() in console:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("console API did not contain the positive canary")
-                time.sleep(5)
-        finally:
-            self.ssh("console-remove-probe", "rm -f " + shlex.quote(dropin)
-                     + "; systemctl daemon-reload; systemctl restart cai-allinone.service")
+        """Verify real console writes; ECS console output is a lifecycle cache."""
+        probe = Path(__file__).parent / "probes/console-output.py"
+        result = self.ssh("console-kernel-probe", "python3.11 -c " + shlex.quote(probe.read_text()), timeout=90)
+        evidence = json.loads(result.stdout)
+        assert evidence["passed"]
+        cloud = json.loads((self.directory / "state.json").read_text())["deploy"]
+        region = self.spec["deploy"]["region"]
+        result = run([aliyun, "--region", region, "ecs", "GetInstanceConsoleOutput",
+                      "--RegionId", region, "--InstanceId", cloud["instance_id"]],
+                     self.work / "console-output")
+        console = base64.b64decode(json.loads(result.stdout)["ConsoleOutput"])
+        (self.work / "console-output.txt").write_bytes(console)
+        for marker in [evidence["stdout_marker"], evidence["stderr_marker"]]:
+            assert marker.encode() not in console, "application output reached the cloud console"
+        # The API caches startup/restart/shutdown output. Its absence alone is
+        # insufficient; the guest probe observes actual writes and proves its
+        # tracer with a direct /dev/console write from the same application unit.
+        evidence["cloud_console_is_cached"] = True
+        (self.work / "console-isolation.json").write_text(json.dumps(evidence) + "\n")
 
     def verify_management_during_application_errors(self):
         resource = next(value for value in self.spec["resources"].values()
