@@ -673,6 +673,7 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
     fs::create_dir_all(&service_dir).unwrap();
     let shelter_work_dir = service_dir.join("shelter");
     let manifest = BuildManifest {
+        preparation_dir: None,
         runtime_contract: None,
         deployment: None,
         ssh: None,
@@ -1321,14 +1322,14 @@ resources: {}
         },
     )
     .unwrap();
-    std::env::set_var("PATH", old_path);
+    std::env::set_var("PATH", &old_path);
 
     let invocations = fs::read_to_string(&log).unwrap();
     assert!(invocations.contains("openclaw-agent-release-"));
     assert!(invocations.contains("openclaw-agent-debug-"));
     let manifest_path = cli.state_dir.join("services/openclaw/manifest.json");
     let manifest: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
     assert!(manifest["variants"]["release"]["shelter_build_id"]
         .as_str()
         .unwrap()
@@ -1337,6 +1338,116 @@ resources: {}
         .as_str()
         .unwrap()
         .starts_with("openclaw-agent-debug-"));
+
+    // Neither preview nor a partially successful multi-variant build may alter
+    // the committed manifest, state, assets, config, or deployable image.
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let paths = context_paths(&cli.state_dir, "openclaw");
+    let committed = [
+        paths.manifest.clone(),
+        paths.service_state.clone(),
+        paths.rendered_config.clone(),
+        PathBuf::from(manifest["agentd_bin"].as_str().unwrap()),
+    ];
+    let contents: Vec<_> = committed
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect();
+    let saved_spec = fs::read_to_string(&spec).unwrap();
+    let image = latest_built_image(&cli.state_dir, &AgentSpec::from_path(&spec).unwrap()).unwrap();
+    fs::write(&spec, saved_spec.replace("18789", "19999")).unwrap();
+    cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: true,
+        },
+    )
+    .unwrap();
+    for (path, content) in committed.iter().zip(&contents) {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            content,
+            "preview changed {}",
+            path.display()
+        );
+    }
+    let script = fs::read_to_string(&cli.shelter_bin).unwrap();
+    fs::write(
+        &cli.shelter_bin,
+        script.replace(
+            "image_id = arg_after(\"--tag\")",
+            "image_id = arg_after(\"--tag\")\n    if '-debug-' in image_id: sys.exit(42)",
+        ),
+    )
+    .unwrap();
+    assert!(cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false
+        }
+    )
+    .is_err());
+    for (path, content) in committed.iter().zip(&contents) {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            content,
+            "failed build changed {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        latest_built_image(&cli.state_dir, &AgentSpec::from_path(&spec).unwrap()).unwrap(),
+        image
+    );
+    fs::write(
+        &cli.shelter_bin,
+        script.replace("\"a\" * 96", "\"invalid\""),
+    )
+    .unwrap();
+    assert!(cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false
+        }
+    )
+    .is_err());
+    for (path, content) in committed.iter().zip(&contents) {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            content,
+            "invalid build result changed {}",
+            path.display()
+        );
+    }
+    fs::write(&spec, saved_spec).unwrap();
+    // Deployment reuses the exact saved guest assets and project directory.
+    let prepared = prepare(
+        &cli,
+        &cli.state_dir,
+        &spec,
+        PrepareOptions {
+            include_deploy: true,
+            build_id: Some(manifest["shelter_build_id"].as_str().unwrap().into()),
+            image_variant: Some("release".into()),
+            ..PrepareOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.rendered_config,
+        PathBuf::from(manifest["shelter_config"].as_str().unwrap())
+    );
+    assert_eq!(
+        fs::read(PathBuf::from(manifest["agentd_bin"].as_str().unwrap())).unwrap(),
+        contents[3]
+    );
+    std::env::set_var("PATH", &old_path);
 }
 
 #[test]
@@ -1406,8 +1517,15 @@ resources: {}
     .unwrap();
     std::env::set_var("PATH", old_path);
 
-    let rendered =
-        fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    let service = cli.state_dir.join("services/openclaw");
+    assert!(!service.join("manifest.json").exists());
+    let attempt = fs::read_dir(service.join("build-attempts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rendered = fs::read_to_string(attempt.join("release/shelter.yaml")).unwrap();
     assert!(!rendered.contains("variants:"));
     assert!(!rendered.contains("resize:"));
     assert!(!rendered.contains("deploy:"));
@@ -3376,6 +3494,7 @@ resources: {}
     )
     .unwrap();
     let variant = BuildManifestVariant {
+        preparation_dir: None,
         shelter_build_id: state.build.build_id.clone(),
         build_result: temp.path().join("missing-build-result.json"),
         extra_files: Vec::new(),
@@ -3439,6 +3558,7 @@ resources: {}
     )
     .unwrap();
     let variant = BuildManifestVariant {
+        preparation_dir: None,
         shelter_build_id: state.build.build_id.clone(),
         build_result,
         extra_files: Vec::new(),

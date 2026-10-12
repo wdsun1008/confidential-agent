@@ -82,6 +82,8 @@ struct ContextPaths {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuildManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_contract: Option<image_runtime::ImageRuntimeContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deployment: Option<DeploymentSnapshot>,
@@ -124,6 +126,8 @@ struct DeploymentSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BuildManifestVariant {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_dir: Option<PathBuf>,
     shelter_build_id: String,
     build_result: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -147,6 +151,7 @@ struct PreparedConfig {
 
 #[derive(Debug, Clone, Default)]
 struct PrepareOptions {
+    preparation_dir: Option<PathBuf>,
     build_id: Option<String>,
     image_variant: Option<String>,
     include_deploy: bool,
@@ -161,10 +166,26 @@ struct PrepareOptions {
 impl BuildManifest {
     fn fallback_variant(&self) -> BuildManifestVariant {
         BuildManifestVariant {
+            preparation_dir: self.preparation_dir.clone(),
             shelter_build_id: self.shelter_build_id.clone(),
             build_result: self.build_result.clone(),
             extra_files: self.extra_files.clone(),
             debug_ssh: self.debug_ssh.clone(),
+        }
+    }
+
+    fn guest_assets(&self) -> GuestAssets {
+        GuestAssets {
+            agentd_bin: self.agentd_bin.clone(),
+            agentd_service: self.agentd_service.clone(),
+            gateway_bin: self.gateway_bin.clone(),
+            gateway_service: self.gateway_service.clone(),
+            tng_service: self.tng_service.clone(),
+            fde_config_file: self.fde_config_file.clone(),
+            policy_default: self.policy_default.clone(),
+            policy_local_dev: self.policy_local_dev.clone(),
+            guest_setup_script: self.guest_setup_script.clone(),
+            extra_files: self.extra_files.clone(),
         }
     }
 
@@ -521,47 +542,84 @@ fn prepare(
     }
     spec.ensure_mvp_supported()?;
 
-    let paths = context_paths(state_dir, &spec.service.id);
+    let mut paths = context_paths(state_dir, &spec.service.id);
+    let config_alias = paths.rendered_config.clone();
+    let existing = if options.include_deploy && paths.manifest.try_exists()? {
+        let manifest = read_build_manifest(&paths.manifest)?;
+        let variant = manifest.variant(spec.image_variant(), Some(spec.image_variant()))?;
+        Some(match variant.preparation_dir {
+            Some(directory) => read_build_manifest(&directory.join("manifest.json"))?,
+            None => manifest,
+        })
+    } else {
+        None
+    };
+    let preparation_dir = options.preparation_dir.clone().or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|manifest| manifest.preparation_dir.clone())
+    });
+    if let Some(directory) = &preparation_dir {
+        paths.guest_staging_dir = directory.join("guest");
+        paths.secrets_dir = directory.join("secrets");
+        paths.rendered_config = directory.join("shelter.yaml");
+        paths.bootstrap_file = directory.join("bootstrap.json");
+        if !options.include_deploy {
+            paths.manifest = directory.join("manifest.json");
+        }
+    }
     fs::create_dir_all(&paths.guest_staging_dir)
         .with_context(|| format!("failed to create '{}'", paths.guest_staging_dir.display()))?;
     fs::create_dir_all(&paths.shelter_work_dir)
         .with_context(|| format!("failed to create '{}'", paths.shelter_work_dir.display()))?;
-    let debug_ssh = ensure_debug_ssh_key(&paths, &mut spec)?;
-
-    let mut assets = prepare_guest_assets(cli, &paths.guest_staging_dir)?;
-    let runtime_contract = if options.include_deploy && paths.manifest.try_exists()? {
-        read_build_manifest(&paths.manifest)?.runtime_contract
+    let debug_ssh = if let Some(manifest) = &existing {
+        if let Some(key) = &manifest.debug_ssh {
+            apply_debug_ssh_public_key(&mut spec, &key.public_key)?;
+        }
+        manifest.debug_ssh.clone()
+    } else {
+        ensure_debug_ssh_key(&paths, &mut spec)?
+    };
+    let mut assets = if let Some(manifest) = &existing {
+        manifest.guest_assets()
+    } else {
+        prepare_guest_assets(cli, &paths.guest_staging_dir)?
+    };
+    let runtime_contract = if let Some(manifest) = &existing {
+        manifest.runtime_contract.clone()
     } else {
         Some(image_runtime::ImageRuntimeContract::for_build(
             &spec,
             &assets.agentd_bin,
         )?)
     };
-    if let Some(contract) = &runtime_contract {
-        let contract_file = paths.guest_staging_dir.join("image-runtime.json");
-        write_json_atomic(&contract_file, contract)?;
-        assets.extra_files.push(GuestFileAsset {
-            source: contract_file,
-            destination: "/usr/local/share/confidential-agent/image-runtime.json".into(),
-            executable: false,
-        });
+    if existing.is_none() {
+        if let Some(contract) = &runtime_contract {
+            let contract_file = paths.guest_staging_dir.join("image-runtime.json");
+            write_json_atomic(&contract_file, contract)?;
+            assets.extra_files.push(GuestFileAsset {
+                source: contract_file,
+                destination: "/usr/local/share/confidential-agent/image-runtime.json".into(),
+                executable: false,
+            });
+        }
+        assets
+            .extra_files
+            .extend(spec.build.files.iter().map(|file| GuestFileAsset {
+                source: file.source.clone(),
+                destination: file.target.clone(),
+                executable: file.executable,
+            }));
+        stage_mkosi_debug_ssh_authorized_keys(
+            &mut assets,
+            &paths,
+            spec.build
+                .variants
+                .debug
+                .as_ref()
+                .and_then(|debug| debug.ssh_public_key.as_deref()),
+        )?;
     }
-    assets
-        .extra_files
-        .extend(spec.build.files.iter().map(|file| GuestFileAsset {
-            source: file.source.clone(),
-            destination: file.target.clone(),
-            executable: file.executable,
-        }));
-    stage_mkosi_debug_ssh_authorized_keys(
-        &mut assets,
-        &paths,
-        spec.build
-            .variants
-            .debug
-            .as_ref()
-            .and_then(|debug| debug.ssh_public_key.as_deref()),
-    )?;
     let deploy_names = options.deploy_names.clone();
     // Managed runs allocate their own deployment ID and Terraform directory.
     let terraform_dir = None;
@@ -603,6 +661,7 @@ fn prepare(
     let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
+        preparation_dir,
         runtime_contract,
         deployment: None,
         ssh: if options.include_deploy {
@@ -634,6 +693,9 @@ fn prepare(
     };
     fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
+    if options.include_deploy {
+        link_committed_config(&config_alias, &paths.rendered_config)?;
+    }
 
     Ok(PreparedConfig {
         image: None,

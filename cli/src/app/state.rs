@@ -1,5 +1,18 @@
 use super::*;
 
+pub(super) fn link_committed_config(alias: &Path, target: &Path) -> Result<()> {
+    if alias == target {
+        return Ok(());
+    }
+    let temporary = alias.with_extension("config-link.tmp");
+    if temporary.symlink_metadata().is_ok() {
+        fs::remove_file(&temporary)?;
+    }
+    std::os::unix::fs::symlink(target, &temporary)?;
+    fs::rename(&temporary, alias)
+        .with_context(|| format!("failed to publish configuration link {}", alias.display()))
+}
+
 pub(super) fn deployment_snapshot(path: &Path) -> Result<DeploymentSnapshot> {
     let path = absolute_path(path)?;
     let content = fs::read_to_string(&path)
@@ -75,15 +88,14 @@ pub(super) fn context_paths(state_dir: &Path, service_id: &str) -> ContextPaths 
 }
 
 pub(super) fn prepared_from_state(
-    state_dir: &Path,
+    _state_dir: &Path,
     state: &LocalServiceState,
     manifest: &BuildManifest,
 ) -> Result<PreparedConfig> {
-    let paths = context_paths(state_dir, &state.service_id);
     let variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
     Ok(PreparedConfig {
         image: manifest.image.clone(),
-        rendered_config: paths.rendered_config,
+        rendered_config: manifest.shelter_config.clone(),
         shelter_build_id: variant.shelter_build_id,
         shelter_work_dir: manifest.shelter_work_dir.clone(),
         build_result: variant.build_result,

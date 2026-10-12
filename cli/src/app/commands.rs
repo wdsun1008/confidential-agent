@@ -44,6 +44,13 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let existing_state = read_service_state_file(&paths.service_state)?;
     validate_build_start(existing_state.as_ref())?;
     let run_id = current_build_run_id();
+    let mut nonce = [0u8; 8];
+    OsRng.fill_bytes(&mut nonce);
+    let attempt = paths
+        .service_dir
+        .join("build-attempts")
+        .join(format!("{run_id}-{}", hex_encode(&nonce)));
+    ensure_private_dir(&attempt)?;
     let selected_variant = spec.image_variant().to_string();
     let mut selected_prepared = None;
     let mut selected_manifest = None;
@@ -51,6 +58,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let mut variants = BTreeMap::new();
 
     for variant in enabled_build_variants(&spec) {
+        let preparation_dir = attempt.join(&variant);
         let build_id = timestamped_shelter_build_id_for_variant(&spec, &variant, &run_id);
         let mut variant_spec = spec.clone();
         variant_spec.deploy.image_variant = Some(variant.clone());
@@ -59,6 +67,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
             &cli.state_dir,
             &args.spec,
             PrepareOptions {
+                preparation_dir: Some(preparation_dir.clone()),
                 build_id: Some(build_id),
                 image_variant: Some(variant.clone()),
                 resolve_container_images: !args.render_only,
@@ -66,7 +75,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
                 ..PrepareOptions::default()
             },
         )?;
-        let prepared_manifest = read_build_manifest(&paths.manifest)?;
+        let prepared_manifest = read_build_manifest(&preparation_dir.join("manifest.json"))?;
         variants.insert(variant.clone(), manifest_variant_from(&prepared_manifest));
         if !args.render_only {
             verify_shelter_initrd_support(cli, &prepared.rendered_config)?;
@@ -100,8 +109,6 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
         format!("build manifest for variant '{selected_variant}' was not prepared")
     })?;
     manifest.variants = variants;
-    fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
-        .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
     fs::write(
         &prepared.rendered_config,
         selected_rendered.with_context(|| {
@@ -115,14 +122,33 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
         return Ok(());
     }
 
-    let state = write_service_state(
-        &cli.state_dir,
-        &args.spec,
-        &spec,
-        &DeployObservation::default(),
-        &prepared,
-        "built",
-    )?;
+    // Prepare the state before publishing either binding. A missing resource or
+    // invalid build result must leave the previous successful build intact.
+    let state = with_state_dir_lock(&cli.state_dir, || {
+        let state = build_service_state(
+            &cli.state_dir,
+            &args.spec,
+            &spec,
+            &DeployObservation::default(),
+            &prepared,
+            "built",
+        )?;
+        let previous = paths
+            .manifest
+            .try_exists()?
+            .then(|| read_build_manifest(&paths.manifest))
+            .transpose()?;
+        write_json_atomic(&paths.manifest, &manifest)?;
+        if let Err(error) = write_local_service_state(&cli.state_dir, &state) {
+            match previous {
+                Some(previous) => write_json_atomic(&paths.manifest, &previous)?,
+                None => fs::remove_file(&paths.manifest)?,
+            }
+            return Err(error);
+        }
+        Ok(state)
+    })?;
+    link_committed_config(&paths.rendered_config, &prepared.rendered_config)?;
     if let Ok(image) = latest_built_image(&cli.state_dir, &spec) {
         println!(
             "[ca] build completed: service={} image={}",
@@ -369,6 +395,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         None
     };
     let options = PrepareOptions {
+        preparation_dir: None,
         build_id: Some(build_variant.shelter_build_id.clone()),
         image_variant: Some(deploy_variant.clone()),
         include_deploy: true,

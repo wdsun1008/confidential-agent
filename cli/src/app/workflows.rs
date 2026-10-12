@@ -214,13 +214,21 @@ pub(super) fn build_service_state(
         .deploy_names
         .clone()
         .context("deploy names are required when writing service state")?;
+    let mut artifact_paths = context_paths(state_dir, &spec.service.id);
+    if phase == "built" {
+        artifact_paths.service_dir = prepared
+            .rendered_config
+            .parent()
+            .context("build configuration has no preparation directory")?
+            .to_path_buf();
+    }
     let artifacts = materialize_shelter_build_artifacts(
-        &paths,
+        &artifact_paths,
         &prepared.build_result,
         &prepared.shelter_build_id,
     )?;
     let gateway_identity = ensure_gateway_identity(&paths)?;
-    let deployment = if paths.manifest.try_exists()? {
+    let deployment = if phase != "built" && paths.manifest.try_exists()? {
         read_build_manifest(&paths.manifest)?.deployment
     } else {
         None
@@ -494,6 +502,7 @@ pub(super) fn render_service_config_from_state(
     spec.deploy.image_variant = Some(state.build.variant.clone());
     let images_dir = manifest.images_dir.clone();
     let cache_dir = manifest.cache_dir.clone();
+    let rendered_config = manifest.shelter_config.clone();
     let assets = GuestAssets {
         agentd_bin: manifest.agentd_bin,
         agentd_service: manifest.agentd_service,
@@ -524,8 +533,8 @@ pub(super) fn render_service_config_from_state(
             peerings: read_peerings_or_empty(state_dir)?,
         },
     )?;
-    fs::write(&paths.rendered_config, rendered)
-        .with_context(|| format!("failed to write '{}'", paths.rendered_config.display()))?;
+    fs::write(&rendered_config, rendered)
+        .with_context(|| format!("failed to write '{}'", rendered_config.display()))?;
     Ok(())
 }
 
