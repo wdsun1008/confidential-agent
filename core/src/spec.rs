@@ -12,6 +12,7 @@ pub const SCHEMA_VERSION: &str = "confidential-agent/v1";
 pub struct AgentSpec {
     pub schema: String,
     pub service: ServiceSpec,
+    #[serde(default)]
     pub build: BuildSpec,
     pub deploy: DeploySpec,
     pub attestation: AttestationSpec,
@@ -35,7 +36,7 @@ pub struct ServiceSpec {
     pub app_service: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildSpec {
     pub image_name: String,
@@ -182,6 +183,9 @@ pub struct BuildVariantSpec {
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
     pub provider: DeployProvider,
+    /// A publisher-authenticated cloud image; no local build is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<PublishedImageSpec>,
     pub instance_type: String,
     #[serde(default)]
     pub image_variant: Option<String>,
@@ -198,6 +202,16 @@ pub struct DeploySpec {
     pub vswitch_id: Option<String>,
     #[serde(default)]
     pub security_group_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedImageSpec {
+    pub release: PathBuf,
+    pub trusted_key: PathBuf,
+    /// Immutable Shelter manifest identity, selected independently of the release.
+    pub manifest: String,
+    pub account_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -369,7 +383,11 @@ impl AgentSpec {
     }
 
     pub fn image_id(&self) -> &str {
-        &self.build.image_name
+        self.deploy
+            .image
+            .as_ref()
+            .map(|image| image.manifest.as_str())
+            .unwrap_or(&self.build.image_name)
     }
 
     pub fn image_variant(&self) -> &str {
@@ -385,6 +403,14 @@ impl AgentSpec {
     }
 
     fn resolve_paths_against(&mut self, base_dir: &Path) {
+        if let Some(image) = &mut self.deploy.image {
+            if !image.release.as_os_str().is_empty() {
+                resolve_pathbuf(&mut image.release, base_dir);
+            }
+            if !image.trusted_key.as_os_str().is_empty() {
+                resolve_pathbuf(&mut image.trusted_key, base_dir);
+            }
+        }
         for path in &mut self.build.scripts {
             resolve_pathbuf(path, base_dir);
         }
@@ -435,7 +461,38 @@ impl AgentSpec {
         {
             bail!("service.app_service must not be empty when set");
         }
-        validate_id("build.image_name", &self.build.image_name)?;
+        if let Some(image) = &self.deploy.image {
+            if image.release.as_os_str().is_empty() || image.trusted_key.as_os_str().is_empty() {
+                bail!("deploy.image requires release and trusted_key paths");
+            }
+            let digest = image.manifest.strip_prefix("sha256:").unwrap_or_default();
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("deploy.image.manifest must be a full sha256: manifest identity");
+            }
+            if image.account_id.is_empty()
+                || !image.account_id.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                bail!("deploy.image.account_id must be a decimal account ID");
+            }
+            if !self.build.image_name.is_empty()
+                || !self.build.packages.is_empty()
+                || !self.build.files.is_empty()
+                || !self.build.scripts.is_empty()
+                || !self.build.repos.is_empty()
+                || self.build.container.is_some()
+                || self.build.resize.is_some()
+                || self.build.kernel_cmdline_append.is_some()
+                || self.build.cleanup != BuildCleanupSpec::default()
+                || self.build.variants.debug.is_some()
+            {
+                bail!("deploy.image reuses a published image; omit build inputs");
+            }
+            if self.deploys_debug_image() {
+                bail!("deploy.image cannot reuse build-time debug SSH credentials");
+            }
+        } else {
+            validate_id("build.image_name", &self.build.image_name)?;
+        }
         validate_ports("service.ports", &self.service.ports)?;
         validate_connect_ports(&self.service.ports, &self.service.connect)?;
         validate_mcp_ports(
@@ -897,6 +954,66 @@ fn default_enabled_variant() -> BuildVariantSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn published_spec() -> serde_yaml::Value {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(SPEC).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("build"));
+        value["deploy"]["image"] = serde_yaml::from_str(&format!(
+            "release: ./image.json\ntrusted_key: ./publisher.pem\nmanifest: sha256:{}\naccount_id: '1234567890'\n",
+            "a".repeat(64)
+        )).unwrap();
+        value
+    }
+
+    #[test]
+    fn published_image_needs_no_local_build_and_resolves_public_metadata_paths() {
+        let spec = AgentSpec::from_yaml(
+            &serde_yaml::to_string(&published_spec()).unwrap(),
+            Path::new("/project"),
+        )
+        .unwrap();
+        assert!(spec.build.image_name.is_empty());
+        let image = spec.deploy.image.unwrap();
+        assert_eq!(image.release, Path::new("/project/image.json"));
+        assert_eq!(image.trusted_key, Path::new("/project/publisher.pem"));
+    }
+
+    #[test]
+    fn published_image_rejects_ambiguous_builds_unpinned_identity_and_debug_keys() {
+        for field in ["build", "manifest", "account_id", "release", "debug"] {
+            let mut value = published_spec();
+            match field {
+                "build" => {
+                    value["build"] = serde_yaml::from_str("image_name: another-image").unwrap()
+                }
+                "manifest" => value["deploy"]["image"]["manifest"] = "sha256:123".into(),
+                "account_id" => value["deploy"]["image"]["account_id"] = "bad-account".into(),
+                "release" => value["deploy"]["image"]["release"] = "".into(),
+                _ => value["deploy"]["image_variant"] = "debug".into(),
+            }
+            assert!(
+                AgentSpec::from_yaml(
+                    &serde_yaml::to_string(&value).unwrap(),
+                    Path::new("/project")
+                )
+                .is_err(),
+                "accepted {field}"
+            );
+        }
+        let mut value = published_spec();
+        value["deploy"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("image"));
+        assert!(AgentSpec::from_yaml(
+            &serde_yaml::to_string(&value).unwrap(),
+            Path::new("/project")
+        )
+        .is_err());
+    }
 
     const SPEC: &str = r#"
 schema: confidential-agent/v1
