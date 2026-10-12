@@ -35,6 +35,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
 
 pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    let _operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
     anyhow::ensure!(
         spec.deploy.image.is_none(),
         "deploy.image selects a published image; run deploy directly instead of build"
@@ -272,6 +273,7 @@ fn ensure_build_variant_present(
 pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     let mut snapshot = deployment_snapshot(&args.spec)?;
     let spec = snapshot.spec.clone();
+    let operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
     let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
     if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
         bail!(
@@ -287,10 +289,20 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     }
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let current_state = read_service_state_file(&paths.service_state)?;
-    if current_state.is_some() || spec.deploy.image.is_none() {
+    if args.resume {
+        let state = current_state
+            .as_ref()
+            .context("--resume requires an existing deployed instance")?;
+        anyhow::ensure!(state.phase == "deployed",
+            "--resume requires confirmed deployed infrastructure; service is '{}'. For an interrupted infrastructure operation, inspect its saved Shelter state and destroy it before a new deploy", state.phase);
+        let manifest = read_build_manifest(&paths.manifest)?;
+        let saved = committed_deployment(state, &manifest)?;
+        anyhow::ensure!(snapshot.source.sha256 == saved.source.sha256,
+            "--resume requires the original deployment configuration; restore it before resuming resource delivery");
+    } else if current_state.is_some() || spec.deploy.image.is_none() {
         validate_deploy_start(current_state.as_ref())?;
     }
-    let current_manifest = if spec.deploy.image.is_some() {
+    let current_manifest = if spec.deploy.image.is_some() && !args.resume {
         images::import(cli, &spec)?
     } else {
         read_build_manifest(&paths.manifest).with_context(|| {
@@ -329,8 +341,19 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
 
     let existing_services = read_service_states(&cli.state_dir)?;
     let peerings = read_peerings_or_empty(&cli.state_dir)?;
-    let deploy_names = DeployNames::new(&spec);
-    let deploy_user_data = if trustee_mode {
+    let deploy_names = if args.resume {
+        let state = current_state.as_ref().unwrap();
+        DeployNames {
+            run_id: state.deploy.run_id.clone(),
+            resource_name: state.deploy.resource_name.clone(),
+            image_import_name: state.deploy.image_import_name.clone().unwrap_or_default(),
+        }
+    } else {
+        DeployNames::new(&spec)
+    };
+    let deploy_user_data = if args.resume {
+        committed_deployment(current_state.as_ref().unwrap(), &current_manifest)?.user_data
+    } else if trustee_mode {
         if !args.render_only {
             println!("[ca] synchronizing Trustee boot resources before infrastructure launch...");
             trustee::sync_service(
@@ -361,7 +384,13 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         deploy_user_data,
     };
     snapshot.user_data = options.deploy_user_data.clone();
-    let mut prepared = if current_manifest.image.is_some() {
+    let mut prepared = if args.resume {
+        prepared_from_state(
+            &cli.state_dir,
+            current_state.as_ref().unwrap(),
+            &current_manifest,
+        )?
+    } else if current_manifest.image.is_some() {
         images::prepare(&paths, &spec, &current_manifest, &options)?
     } else {
         prepare(cli, &cli.state_dir, &args.spec, options)?
@@ -380,20 +409,22 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     }
     // Apply can create resources before it fails. Save the attempt's name first
     // so Shelter can resolve its recorded directory during destroy.
-    write_service_state(
-        &cli.state_dir,
-        &args.spec,
-        &spec,
-        &DeployObservation::default(),
-        &prepared,
-        "deploying",
-    )?;
-    println!("[ca] deploying infrastructure with Shelter...");
-    let mut shelter_args = deploy_shelter_args(&prepared);
-    run_shelter(cli, &mut shelter_args)?;
-    bind_shelter_deployment(cli, &mut prepared)?;
-    deploy_manifest.deploy_result = prepared.deploy_result.clone();
-    write_json_atomic(&paths.manifest, &deploy_manifest)?;
+    if !args.resume {
+        write_service_state(
+            &cli.state_dir,
+            &args.spec,
+            &spec,
+            &DeployObservation::default(),
+            &prepared,
+            "deploying",
+        )?;
+        println!("[ca] deploying infrastructure with Shelter...");
+        let mut shelter_args = deploy_shelter_args(&prepared);
+        run_shelter(cli, &mut shelter_args).context("infrastructure deployment did not complete; its attempt is recorded in local state. Inspect Shelter status before destroying it; --resume never replays an unknown infrastructure operation")?;
+        bind_shelter_deployment(cli, &mut prepared)?;
+        deploy_manifest.deploy_result = prepared.deploy_result.clone();
+        write_json_atomic(&paths.manifest, &deploy_manifest)?;
+    }
 
     {
         println!("[ca] Shelter deploy completed; resolving instance outputs...");
@@ -455,6 +486,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         write_local_service_state(&cli.state_dir, &active_state)?;
         sync_a2a_bundle(cli, &cli.state_dir)?;
         let active_services = read_service_states(&cli.state_dir)?;
+        drop(operation);
         println!("[ca] refreshing active Shelter deploys for public mesh rules...");
         refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
         println!(
@@ -472,6 +504,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
 
 pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    let operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
     let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
     if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
         bail!(
@@ -540,6 +573,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     write_local_service_state(&cli.state_dir, &active_state)?;
     sync_a2a_bundle(cli, &cli.state_dir)?;
     let active_services = read_service_states(&cli.state_dir)?;
+    drop(operation);
     refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
     Ok(())
 }
@@ -551,6 +585,14 @@ pub(super) fn cmd_mesh(cli: &Cli, args: &MeshArgs) -> Result<()> {
 }
 
 pub(super) fn cmd_peering(cli: &Cli, args: &PeeringArgs) -> Result<()> {
+    let _mutation = if matches!(
+        args.command,
+        PeeringCommands::Add { .. } | PeeringCommands::Remove { .. }
+    ) {
+        Some(lock_state_dir(&cli.state_dir)?)
+    } else {
+        None
+    };
     match &args.command {
         PeeringCommands::Add {
             role,
@@ -2112,6 +2154,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
+    let operation = lock_service_operation(&cli.state_dir, &args.service)?;
     let paths = context_paths(&cli.state_dir, &args.service);
     let existing_state = read_service_state_file(&paths.service_state)?;
     // The AppSpec is mutable and may have been moved after deployment.
@@ -2178,6 +2221,7 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
         state.generation += 1;
         clear_deploy_runtime_state(&mut state.deploy);
         write_local_service_state(&cli.state_dir, &state)?;
+        drop(operation);
         sync_mesh(cli, &cli.state_dir, None)?;
         let services = read_service_states(&cli.state_dir)?;
         refresh_active_shelter_deploys(cli, &cli.state_dir, &services)?;

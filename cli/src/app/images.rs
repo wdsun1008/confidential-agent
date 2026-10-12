@@ -293,6 +293,7 @@ mod tests {
             commands::cmd_deploy(
                 &cli,
                 &DeployArgs {
+                    resume: false,
                     spec: path.clone(),
                     skip_inject: false,
                     render_only: true,
@@ -403,6 +404,7 @@ mod tests {
                 commands::cmd_deploy(
                     &cli,
                     &DeployArgs {
+                        resume: false,
                         spec: path,
                         skip_inject: false,
                         render_only: true,
@@ -417,5 +419,63 @@ mod tests {
             assert!(!paths.bootstrap_file.exists());
             assert!(!paths.shelter_work_dir.join("deploy").exists());
         }
+    }
+
+    #[test]
+    fn resume_rejects_unknown_infrastructure_and_modified_inputs_before_import() {
+        let (root, cli, _) = fixture();
+        let path = instance_spec(root.path(), "agent-a");
+        let args = DeployArgs {
+            spec: path.clone(),
+            resume: true,
+            skip_inject: false,
+            render_only: false,
+            skip_peering_check: false,
+        };
+        assert!(commands::cmd_deploy(&cli, &args)
+            .unwrap_err()
+            .to_string()
+            .contains("existing deployed instance"));
+        let mut state = crate::app::tests::local_state("agent-a", Vec::new(), Vec::new());
+        state.phase = "deploying".into();
+        write_local_service_state(&cli.state_dir, &state).unwrap();
+        assert!(commands::cmd_deploy(&cli, &args)
+            .unwrap_err()
+            .to_string()
+            .contains("confirmed deployed infrastructure"));
+        state.phase = "deleted".into();
+        write_local_service_state(&cli.state_dir, &state).unwrap();
+        commands::cmd_deploy(
+            &cli,
+            &DeployArgs {
+                resume: false,
+                render_only: true,
+                ..args
+            },
+        )
+        .unwrap();
+        let paths = context_paths(&cli.state_dir, "agent-a");
+        state.phase = "deployed".into();
+        write_local_service_state(&cli.state_dir, &state).unwrap();
+        let original_key = fs::read(paths.secrets_dir.join("ssh_client")).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        fs::write(&path, raw.replace("disk_gb: 80", "disk_gb: 200")).unwrap();
+        assert!(commands::cmd_deploy(
+            &cli,
+            &DeployArgs {
+                spec: path,
+                resume: true,
+                skip_inject: false,
+                render_only: false,
+                skip_peering_check: false
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("original deployment configuration"));
+        assert_eq!(
+            fs::read(paths.secrets_dir.join("ssh_client")).unwrap(),
+            original_key
+        );
     }
 }

@@ -412,32 +412,23 @@ pub(super) fn refresh_active_shelter_deploys(
     services: &[LocalServiceState],
 ) -> Result<()> {
     for service in services.iter().filter(|service| service.phase == "active") {
+        let _operation = lock_service_operation(state_dir, &service.service_id)?;
+        let Some(service) =
+            read_service_state_file(&context_paths(state_dir, &service.service_id).service_state)?
+        else {
+            continue;
+        };
+        if service.phase != "active" {
+            continue;
+        }
         render_service_config_from_state(
             state_dir,
-            service,
-            active_peer_public_cidrs(&service.service_id, services)?,
+            &service,
+            active_peer_public_cidrs(&service.service_id, &read_service_states(state_dir)?)?,
         )?;
         let paths = context_paths(state_dir, &service.service_id);
         let manifest = read_build_manifest(&paths.manifest)?;
-        let variant = manifest.variant(&service.build.variant, Some(&service.build.variant))?;
-        let prepared = PreparedConfig {
-            image: manifest.image.clone(),
-            rendered_config: paths.rendered_config,
-            shelter_build_id: variant.shelter_build_id,
-            shelter_work_dir: manifest.shelter_work_dir,
-            build_result: variant.build_result,
-            deploy_result: manifest.deploy_result,
-            deploy_names: Some(DeployNames {
-                run_id: service.deploy.run_id.clone(),
-                resource_name: service.deploy.resource_name.clone(),
-                image_import_name: service.deploy.image_import_name.clone().unwrap_or_else(|| {
-                    format!("{}-{}", service.build.image_name, service.deploy.run_id)
-                }),
-            }),
-            terraform_dir: service.deploy.terraform_dir.clone(),
-            debug_ssh: variant.debug_ssh,
-            cloud_image_id: service.deploy.published_image_id.clone(),
-        };
+        let prepared = prepared_from_state(state_dir, &service, &manifest)?;
         let mut args = deploy_shelter_args(&prepared);
         args.push("--network-only".into());
         run_shelter(cli, &mut args)?;

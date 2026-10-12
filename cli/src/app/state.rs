@@ -74,6 +74,35 @@ pub(super) fn context_paths(state_dir: &Path, service_id: &str) -> ContextPaths 
     }
 }
 
+pub(super) fn prepared_from_state(
+    state_dir: &Path,
+    state: &LocalServiceState,
+    manifest: &BuildManifest,
+) -> Result<PreparedConfig> {
+    let paths = context_paths(state_dir, &state.service_id);
+    let variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
+    Ok(PreparedConfig {
+        image: manifest.image.clone(),
+        rendered_config: paths.rendered_config,
+        shelter_build_id: variant.shelter_build_id,
+        shelter_work_dir: manifest.shelter_work_dir.clone(),
+        build_result: variant.build_result,
+        deploy_result: manifest.deploy_result.clone(),
+        deploy_names: Some(DeployNames {
+            run_id: state.deploy.run_id.clone(),
+            resource_name: state.deploy.resource_name.clone(),
+            image_import_name: state
+                .deploy
+                .image_import_name
+                .clone()
+                .unwrap_or_else(|| format!("{}-{}", state.build.image_name, state.deploy.run_id)),
+        }),
+        terraform_dir: state.deploy.terraform_dir.clone(),
+        debug_ssh: variant.debug_ssh,
+        cloud_image_id: state.deploy.published_image_id.clone(),
+    })
+}
+
 pub(super) fn shelter_build_result_path(work_dir: &Path, build_id: &str) -> PathBuf {
     work_dir
         .join("images")

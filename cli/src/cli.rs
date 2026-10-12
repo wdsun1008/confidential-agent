@@ -302,6 +302,9 @@ pub(crate) struct BuildArgs {
 pub(crate) struct DeployArgs {
     #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
+    /// Resume resource delivery for an instance whose infrastructure is already deployed
+    #[arg(long, conflicts_with = "render_only")]
+    pub(crate) resume: bool,
     #[arg(long, hide = true)]
     pub(crate) skip_inject: bool,
     #[arg(long, hide = true)]

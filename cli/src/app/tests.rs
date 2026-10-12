@@ -291,6 +291,7 @@ fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
         let result = cmd_deploy(
             &cli,
             &DeployArgs {
+                resume: false,
                 spec,
                 skip_inject: true,
                 render_only: false,
@@ -298,7 +299,7 @@ fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
             },
         );
         std::env::set_var("PATH", old_path);
-        assert!(result.unwrap_err().to_string().contains("shelter exited"));
+        assert!(format!("{:#}", result.unwrap_err()).contains("shelter exited"));
         let pending: LocalServiceState =
             serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
         assert_eq!(pending.phase, "deploying");
@@ -595,7 +596,11 @@ fn status_view_separates_phase_from_local_image_presence() {
     assert_eq!(views[0].cloud.tee, None);
 }
 
-fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<u16>) -> LocalServiceState {
+pub(super) fn local_state(
+    service_id: &str,
+    ports: Vec<u16>,
+    connect: Vec<u16>,
+) -> LocalServiceState {
     LocalServiceState {
             schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
             service_id: service_id.to_string(),
@@ -749,6 +754,26 @@ fn state_dir_lock_serializes_concurrent_writers() {
         done_tx.send(()).unwrap();
     });
 
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(first);
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
+fn service_operation_lock_serializes_one_identity_and_allows_independent_services() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = lock_service_operation(temp.path(), "agent-a").unwrap();
+    let _independent = lock_service_operation(temp.path(), "agent-b").unwrap();
+    let state_dir = temp.path().to_path_buf();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let _second = lock_service_operation(&state_dir, "agent-a").unwrap();
+        done_tx.send(()).unwrap();
+    });
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
     drop(first);
@@ -1448,6 +1473,7 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec: spec.clone(),
             skip_inject: false,
             render_only: false,
@@ -1475,6 +1501,7 @@ resources: {}
     cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: true,
             render_only: true,
@@ -1716,6 +1743,7 @@ resources: {}
     cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: true,
             render_only: false,
@@ -3152,6 +3180,7 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: false,
             render_only: false,
@@ -3218,6 +3247,7 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: false,
             render_only: false,
@@ -3291,6 +3321,7 @@ resources: {}
     let deploy_result = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: false,
             render_only: true,

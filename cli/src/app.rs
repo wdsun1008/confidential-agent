@@ -213,14 +213,34 @@ fn with_state_dir_lock<T>(state_dir: &Path, action: impl FnOnce() -> Result<T>) 
 }
 
 fn lock_state_dir(state_dir: &Path) -> Result<StateDirLock> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
-    let lock_path = state_dir.join(".lock");
+    lock_operation_file(&state_dir.join(".lock"))
+}
+
+fn lock_service_operation(state_dir: &Path, service_id: &str) -> Result<StateDirLock> {
+    anyhow::ensure!(
+        !service_id.is_empty()
+            && !matches!(service_id, "." | "..")
+            && !service_id.contains(['/', '\0']),
+        "invalid service ID for operation lock"
+    );
+    lock_operation_file(
+        &context_paths(state_dir, service_id)
+            .service_dir
+            .join(".operation.lock"),
+    )
+}
+
+fn lock_operation_file(lock_path: &Path) -> Result<StateDirLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = lock_path.parent().context("operation lock has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create '{}'", parent.display()))?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .open(&lock_path)
+        .mode(0o600)
+        .open(lock_path)
         .with_context(|| format!("failed to open '{}'", lock_path.display()))?;
     loop {
         let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
@@ -261,7 +281,12 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 impl DeployNames {
     fn new(spec: &AgentSpec) -> Self {
-        Self::from_run_id(spec, &current_run_id())
+        let mut nonce = [0u8; 8];
+        OsRng.fill_bytes(&mut nonce);
+        Self::from_run_id(
+            spec,
+            &format!("{}-{}", current_run_id(), hex_encode(&nonce)),
+        )
     }
 
     fn from_run_id(spec: &AgentSpec, run_id: &str) -> Self {
