@@ -1,0 +1,146 @@
+//! CA compatibility requirements carried in publisher-authenticated metadata.
+use super::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ImageRuntimeContract {
+    schema_version: String,
+    bootstrap_schema: String,
+    capabilities: Vec<String>,
+    rootfs_integrity: bool,
+    writable_layer_encryption: String,
+    key_release: String,
+    min_disk_gb: u32,
+    app_services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration_schema: Option<String>,
+    #[serde(default)]
+    software_versions: BTreeMap<String, String>,
+    #[serde(default)]
+    guest_binary_sha256: String,
+}
+
+impl ImageRuntimeContract {
+    pub(super) fn for_build(spec: &AgentSpec, guest: &Path) -> Result<Self> {
+        let output = Command::new(guest).arg("describe-runtime").output()
+            .context("failed to inspect the guest runtime; rebuild the CA tools image before building a new release")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "guest binary does not expose CA protocol capabilities; rebuild the CA tools image"
+        );
+        let guest_runtime: serde_json::Value = serde_json::from_slice(&output.stdout).context(
+            "guest binary returned invalid runtime capabilities; rebuild the CA tools image",
+        )?;
+        anyhow::ensure!(
+            guest_runtime["schema_version"] == "confidential-agent/guest-runtime/v1"
+                && guest_runtime["bootstrap_schema"] == BOOTSTRAP_SCHEMA_VERSION,
+            "guest binary uses an incompatible CA protocol"
+        );
+        let mut contract = if let Some(path) = &spec.build.runtime_contract {
+            let bytes = fs::read(path).with_context(|| {
+                format!("failed to read image runtime contract {}", path.display())
+            })?;
+            serde_json::from_slice::<Self>(&bytes)
+                .with_context(|| format!("invalid image runtime contract {}", path.display()))?
+        } else {
+            let mut capabilities = vec![
+                "external-fde-v1".into(),
+                "resources-v1".into(),
+                "mesh-client-ports-v1".into(),
+            ];
+            if spec.service.ssh {
+                capabilities.push("instance-ssh-v1".into());
+            }
+            Self {
+                schema_version: "confidential-agent/image-runtime/v1".into(),
+                bootstrap_schema: BOOTSTRAP_SCHEMA_VERSION.into(),
+                capabilities,
+                rootfs_integrity: true,
+                writable_layer_encryption: "luks2".into(),
+                key_release: "ca-attested".into(),
+                min_disk_gb: spec.deploy.disk_gb.unwrap_or(32),
+                app_services: spec.service.app_service.iter().cloned().collect(),
+                configuration_schema: None,
+                software_versions: BTreeMap::new(),
+                guest_binary_sha256: String::new(),
+            }
+        };
+        contract.guest_binary_sha256 = sha256_file(guest)?;
+        for capability in ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"] {
+            anyhow::ensure!(guest_runtime["capabilities"].as_array().is_some_and(|values| values.iter().any(|v| v == capability)),
+                "guest binary does not support required capability {capability}; rebuild the CA tools image");
+        }
+        contract.software_versions.insert(
+            "confidential-agentd".into(),
+            guest_runtime["version"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .context("guest runtime did not report its software version")?
+                .into(),
+        );
+        contract.validate_protocol()?;
+        Ok(contract)
+    }
+
+    fn validate_protocol(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == "confidential-agent/image-runtime/v1"
+                && self.bootstrap_schema == BOOTSTRAP_SCHEMA_VERSION,
+            "image runtime contract uses an incompatible CA protocol"
+        );
+        for required in ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"] {
+            anyhow::ensure!(
+                self.capabilities.iter().any(|v| v == required),
+                "image runtime contract lacks required capability {required}"
+            );
+        }
+        anyhow::ensure!(self.rootfs_integrity && self.writable_layer_encryption == "luks2" && self.key_release == "ca-attested",
+            "image runtime contract does not provide CA integrity, encrypted writable storage and attested key release");
+        anyhow::ensure!(
+            self.min_disk_gb > 0
+                && self.guest_binary_sha256.len() == 64
+                && self
+                    .guest_binary_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit()),
+            "invalid image runtime disk or guest identity requirements"
+        );
+        Ok(())
+    }
+
+    pub(super) fn validate_deploy(
+        &self,
+        spec: &AgentSpec,
+        security: &serde_json::Value,
+    ) -> Result<()> {
+        self.validate_protocol()?;
+        anyhow::ensure!(
+            security.get("rootfs_verity").and_then(|v| v.as_bool()) == Some(true),
+            "published CA image has no authenticated root filesystem integrity protection"
+        );
+        let disk_gb = spec
+            .deploy
+            .disk_gb
+            .context("published images require explicit deploy.disk_gb")?;
+        anyhow::ensure!(disk_gb >= self.min_disk_gb,
+            "image requires at least {} GB of disk including its encrypted writable layer; deploy.disk_gb is {}", self.min_disk_gb, disk_gb);
+        if spec.service.ssh {
+            anyhow::ensure!(
+                self.capabilities.iter().any(|v| v == "instance-ssh-v1"),
+                "image does not support CA instance SSH credentials"
+            );
+        }
+        if let Some(service) = &spec.service.app_service {
+            anyhow::ensure!(
+                self.app_services.contains(service),
+                "image does not support application service {service}"
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn supports_shared_ports(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|v| v == "mesh-client-ports-v1")
+    }
+}

@@ -950,6 +950,7 @@ pub(super) fn published_image_for_deploy(
 }
 
 pub(super) fn cmd_image_publish(cli: &Cli, args: &ImagePublishArgs) -> Result<()> {
+    let _operation = lock_service_operation(&cli.state_dir, &args.service)?;
     let spec = AgentSpec::from_path(&args.spec)?;
     if spec.service.id != args.service {
         bail!(
@@ -1029,6 +1030,7 @@ fn cmd_image_unpublish_with_ops(
     ops: &impl PublishCloudOps,
     args: &ImageUnpublishArgs,
 ) -> Result<()> {
+    let _operation = lock_service_operation(&cli.state_dir, &args.service)?;
     let paths = context_paths(&cli.state_dir, &args.service);
     let mut state = read_service_state_file(&paths.service_state)?
         .with_context(|| format!("no local state for service '{}'", args.service))?;
@@ -1153,7 +1155,14 @@ fn cmd_image_prune_with_ops(
     args: &ImagePruneArgs,
 ) -> Result<()> {
     let mut total = 0usize;
-    for mut state in read_service_states(&cli.state_dir)? {
+    for state in read_service_states(&cli.state_dir)? {
+        let _operation = lock_service_operation(&cli.state_dir, &state.service_id)?;
+        let Some(mut state) = read_service_state_file(
+            &context_paths(&cli.state_dir, &state.service_id).service_state,
+        )?
+        else {
+            continue;
+        };
         let keys = state
             .build
             .published

@@ -16,6 +16,8 @@ struct ImageInspection {
     image: ImageMapping,
     reference_value: serde_json::Value,
     rekor_value: Option<serde_json::Value>,
+    security: serde_json::Value,
+    runtime_metadata: Option<image_runtime::ImageRuntimeContract>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +93,8 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
     if spec.attestation.reference_values == ReferenceValueMode::Rekor {
         anyhow::ensure!(inspected.rekor_value.is_some(), "published image has no Rekor metadata; select sample reference values or export an image built with Rekor");
     }
+    let runtime_contract = inspected.runtime_metadata.context("published image has no CA runtime contract; rebuild and export it with a compatible CA publisher")?;
+    runtime_contract.validate_deploy(spec, &inspected.security)?;
     let build_id = format!("image-{}", source.manifest.trim_start_matches("sha256:"));
     let build_result = paths.artifacts_dir.join("image-metadata.json");
     // Compatibility projection for the existing CA attestation/resource code.
@@ -106,6 +110,7 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
     )?;
     materialize_shelter_build_artifacts(&paths, &build_result, &build_id)?;
     Ok(BuildManifest {
+        runtime_contract: Some(runtime_contract),
         ssh: instance_ssh::identity(&paths, spec)?,
         image: Some(ImageDeployment {
             source,
@@ -173,6 +178,7 @@ pub(super) fn export(
     region: Option<&str>,
     variant: Option<&str>,
 ) -> Result<()> {
+    let _operation = lock_service_operation(&cli.state_dir, service)?;
     anyhow::ensure!(
         !account_id.is_empty() && account_id.bytes().all(|byte| byte.is_ascii_digit()),
         "account_id must be a decimal account ID"
@@ -209,6 +215,14 @@ pub(super) fn export(
         "published image no longer matches the local artifact"
     );
     let mapping = paths.artifacts_dir.join("image-mapping.json");
+    let runtime_metadata = paths.artifacts_dir.join("image-runtime.json");
+    write_json_atomic(
+        &runtime_metadata,
+        manifest
+            .runtime_contract
+            .as_ref()
+            .context("local build has no saved CA runtime contract; rebuild before exporting")?,
+    )?;
     write_json_atomic(
         &mapping,
         &serde_json::json!([{
@@ -230,6 +244,8 @@ pub(super) fn export(
             signing_key.as_os_str().to_os_string(),
             "--output".into(),
             output.as_os_str().to_os_string(),
+            "--runtime-metadata".into(),
+            runtime_metadata.into_os_string(),
         ],
     )
 }
@@ -247,6 +263,15 @@ mod tests {
             "image": {"provider": "terraform-alicloud", "account_id": "1234567890", "region": "cn-beijing", "image_id": "m-shared-image"},
             "reference_value": {"measurement.uki.SHA-384": ["b".repeat(96)], "measurement.uki.SHA-256": ["c".repeat(64)]},
             "rekor_value": null,
+            "security": {"rootfs_verity": true},
+            "runtime_metadata": {
+                "schema_version": "confidential-agent/image-runtime/v1",
+                "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
+                "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "instance-ssh-v1"],
+                "rootfs_integrity": true, "writable_layer_encryption": "luks2", "key_release": "ca-attested",
+                "min_disk_gb": 80, "app_services": ["cai-allinone.service"],
+                "guest_binary_sha256": "e".repeat(64)
+            },
         });
         let inspected = root.path().join("inspection.json");
         fs::write(&inspected, serde_json::to_vec(&inspection).unwrap()).unwrap();
@@ -383,7 +408,18 @@ mod tests {
 
     #[test]
     fn invalid_image_metadata_is_rejected_before_deployment_state_or_resource_release() {
-        for field in ["manifest", "account", "region", "reference", "signature"] {
+        for field in [
+            "manifest",
+            "account",
+            "region",
+            "reference",
+            "signature",
+            "protocol",
+            "disk",
+            "capability",
+            "protection",
+            "missing-contract",
+        ] {
             let (root, cli, inspected) = fixture();
             let path = instance_spec(root.path(), "agent-a");
             let mut value: serde_json::Value =
@@ -393,6 +429,14 @@ mod tests {
                 "account" => value["image"]["account_id"] = "999999".into(),
                 "region" => value["image"]["region"] = "cn-shanghai".into(),
                 "reference" => value["reference_value"] = serde_json::json!({}),
+                "protocol" => {
+                    value["runtime_metadata"]["bootstrap_schema"] =
+                        "confidential-agent/bootstrap/v99".into()
+                }
+                "disk" => value["runtime_metadata"]["min_disk_gb"] = 120.into(),
+                "capability" => value["runtime_metadata"]["capabilities"] = serde_json::json!([]),
+                "protection" => value["security"]["rootfs_verity"] = false.into(),
+                "missing-contract" => value["runtime_metadata"] = serde_json::Value::Null,
                 _ => fs::write(
                     &cli.shelter_bin,
                     "#!/bin/sh\necho 'invalid signature' >&2\nexit 1\n",

@@ -534,3 +534,12 @@ resources:
 | `confidential-agent/agent-card/v1` | AgentCard | CLI → BootstrapConfig → Guest daemon `:8089` | 跨组织 peer agent |
 
 如果手动编辑了 state 文件，注意保持 schema 字符串完全匹配——CLI 会显式校验，不一致直接拒绝。
+
+Published CA images carry an authenticated `confidential-agent/image-runtime/v1`
+contract. CA checks guest/bootstrap capabilities, root integrity, encrypted
+writable storage with CA key release, minimum disk size, application service and
+instance SSH support before creating infrastructure. `build.runtime_contract`
+optionally selects an image-owned JSON contract; it is captured at build time.
+The guest binary reports its protocol capabilities through `describe-runtime`.
+Older image exports without this contract require rebuilding before using the
+published-image entry point; ordinary local artifact deployment remains available.

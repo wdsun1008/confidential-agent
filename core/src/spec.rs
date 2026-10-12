@@ -44,6 +44,9 @@ pub struct ServiceSpec {
 #[serde(deny_unknown_fields)]
 pub struct BuildSpec {
     pub image_name: String,
+    /// Image-owned runtime requirements, captured at build time and signed on export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_contract: Option<PathBuf>,
     #[serde(default)]
     pub kernel_cmdline_append: Option<String>,
     #[serde(default)]
@@ -407,6 +410,9 @@ impl AgentSpec {
     }
 
     fn resolve_paths_against(&mut self, base_dir: &Path) {
+        if let Some(path) = &mut self.build.runtime_contract {
+            resolve_pathbuf(path, base_dir);
+        }
         if let Some(image) = &mut self.deploy.image {
             if !image.release.as_os_str().is_empty() {
                 resolve_pathbuf(&mut image.release, base_dir);
@@ -488,6 +494,7 @@ impl AgentSpec {
                 || !self.build.repos.is_empty()
                 || self.build.container.is_some()
                 || self.build.resize.is_some()
+                || self.build.runtime_contract.is_some()
                 || self.build.kernel_cmdline_append.is_some()
                 || self.build.cleanup != BuildCleanupSpec::default()
                 || self.build.variants.debug.is_some()

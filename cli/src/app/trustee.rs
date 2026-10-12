@@ -1705,6 +1705,13 @@ fn sync_from_local_state(cli: &Cli, service_filter: Option<&str>) -> Result<()> 
             .map(|filter| filter == service.service_id)
             .unwrap_or(true)
     }) {
+        let _operation = lock_service_operation(&cli.state_dir, &service.service_id)?;
+        let Some(service) = read_service_state_file(
+            &context_paths(&cli.state_dir, &service.service_id).service_state,
+        )?
+        else {
+            continue;
+        };
         if service.phase == "deleted" {
             continue;
         }

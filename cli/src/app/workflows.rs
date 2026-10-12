@@ -927,6 +927,30 @@ pub(super) fn read_service_state_file(path: &Path) -> Result<Option<LocalService
     Ok(Some(state))
 }
 
+pub(super) fn validate_shared_guest_ports(
+    state_dir: &Path,
+    spec: &AgentSpec,
+    incoming: &BuildManifest,
+) -> Result<()> {
+    for state in read_service_states(state_dir)? {
+        if state.service_id == spec.service.id
+            || !matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
+            || !state
+                .service
+                .ports
+                .iter()
+                .any(|port| spec.service.ports.contains(port))
+        {
+            continue;
+        }
+        let peer = read_build_manifest(&context_paths(state_dir, &state.service_id).manifest)?;
+        anyhow::ensure!(incoming.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports())
+            && peer.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
+            "service {} uses a legacy guest without independent mesh client ports; rebuild legacy images before deploying overlapping service ports", state.service_id);
+    }
+    Ok(())
+}
+
 pub(super) fn collect_reference_values(
     services: &[LocalServiceState],
 ) -> Result<ReferenceValueArtifacts> {

@@ -82,6 +82,8 @@ struct ContextPaths {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuildManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_contract: Option<image_runtime::ImageRuntimeContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     deployment: Option<DeploymentSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ssh: Option<instance_ssh::InstanceSsh>,
@@ -527,6 +529,23 @@ fn prepare(
     let debug_ssh = ensure_debug_ssh_key(&paths, &mut spec)?;
 
     let mut assets = prepare_guest_assets(cli, &paths.guest_staging_dir)?;
+    let runtime_contract = if options.include_deploy && paths.manifest.try_exists()? {
+        read_build_manifest(&paths.manifest)?.runtime_contract
+    } else {
+        Some(image_runtime::ImageRuntimeContract::for_build(
+            &spec,
+            &assets.agentd_bin,
+        )?)
+    };
+    if let Some(contract) = &runtime_contract {
+        let contract_file = paths.guest_staging_dir.join("image-runtime.json");
+        write_json_atomic(&contract_file, contract)?;
+        assets.extra_files.push(GuestFileAsset {
+            source: contract_file,
+            destination: "/usr/local/share/confidential-agent/image-runtime.json".into(),
+            executable: false,
+        });
+    }
     assets
         .extra_files
         .extend(spec.build.files.iter().map(|file| GuestFileAsset {
@@ -584,6 +603,7 @@ fn prepare(
     let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
+        runtime_contract,
         deployment: None,
         ssh: if options.include_deploy {
             instance_ssh::identity(&paths, &spec)?
@@ -743,6 +763,7 @@ use state::*;
 mod workflows;
 use workflows::*;
 
+mod image_runtime;
 mod images;
 mod instance_ssh;
 mod publish;

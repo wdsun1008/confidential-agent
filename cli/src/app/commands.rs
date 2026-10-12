@@ -313,6 +313,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         })?
     };
     let deploy_variant = spec.image_variant().to_string();
+    validate_shared_guest_ports(&cli.state_dir, &spec, &current_manifest)?;
     let (build_variant, published_image_id) = if let Some(image) = &current_manifest.image {
         (
             current_manifest.fallback_variant(),
@@ -392,6 +393,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     };
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
     deploy_manifest.variants = current_manifest.variants.clone();
+    deploy_manifest.runtime_contract = current_manifest.runtime_contract.clone();
     deploy_manifest.deployment = Some(snapshot);
     fs::write(
         &paths.manifest,
@@ -532,6 +534,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
             spec.service.id
         )
     })?;
+    validate_shared_guest_ports(&cli.state_dir, &spec, &manifest)?;
     let build_variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
 
     if trustee_mode {

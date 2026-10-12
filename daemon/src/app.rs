@@ -220,6 +220,18 @@ fn daemon_cache_dir() -> PathBuf {
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::DescribeRuntime => {
+            println!(
+                "{}",
+                json!({
+                    "schema_version": "confidential-agent/guest-runtime/v1",
+                    "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"]
+                })
+            );
+            Ok(())
+        }
         Commands::Run(args) => run_daemon(args),
         Commands::InitrdFetch(args) => initrd_fetch(args),
         Commands::ApplyOnce(mut args) => {
