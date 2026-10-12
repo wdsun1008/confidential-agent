@@ -927,31 +927,6 @@ pub(super) fn read_service_state_file(path: &Path) -> Result<Option<LocalService
     Ok(Some(state))
 }
 
-pub(super) fn validate_mesh_port_conflicts(
-    states: &[LocalServiceState],
-    incoming_service_id: &str,
-    incoming_ports: &[u16],
-) -> Result<()> {
-    for state in states {
-        if !matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
-            continue;
-        }
-        if state.service_id == incoming_service_id {
-            continue;
-        }
-        for port in incoming_ports {
-            if state.service.ports.contains(port) {
-                bail!(
-                    "port {} is already used by service {}; choose a different service port",
-                    port,
-                    state.service_id
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn collect_reference_values(
     services: &[LocalServiceState],
 ) -> Result<ReferenceValueArtifacts> {
@@ -1265,32 +1240,6 @@ mod tests {
             mesh_generation: 1,
             reference_values: "sample".to_string(),
         }
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_no_conflict() {
-        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
-        assert!(validate_mesh_port_conflicts(&states, "beta", &[9090]).is_ok());
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_detects_conflict() {
-        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
-        let err = validate_mesh_port_conflicts(&states, "beta", &[8080]).unwrap_err();
-        assert!(err.to_string().contains("8080"));
-        assert!(err.to_string().contains("alpha"));
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_skips_inactive() {
-        let states = vec![test_service_state("alpha", "deleted", vec![8080], vec![])];
-        assert!(validate_mesh_port_conflicts(&states, "beta", &[8080]).is_ok());
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_skips_same_service() {
-        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
-        assert!(validate_mesh_port_conflicts(&states, "alpha", &[8080]).is_ok());
     }
 
     #[test]

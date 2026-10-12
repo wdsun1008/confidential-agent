@@ -330,11 +330,6 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     if let Some(image_id) = published_image_id.as_deref() {
         println!("[ca] using published image {image_id} for deploy (skipping upload+import)");
     }
-    validate_mesh_port_conflicts(
-        &read_service_states(&cli.state_dir)?,
-        &spec.service.id,
-        &spec.service.ports,
-    )?;
     if !trustee_mode && !args.render_only && !args.skip_inject {
         verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     }
@@ -518,11 +513,6 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     if !trustee_mode {
         verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     }
-    validate_mesh_port_conflicts(
-        &read_service_states(&cli.state_dir)?,
-        &spec.service.id,
-        &spec.service.ports,
-    )?;
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let state = read_service_state_file(&paths.service_state)?.with_context(|| {
         format!(

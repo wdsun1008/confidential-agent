@@ -3557,26 +3557,6 @@ fn ensure_gateway_identity_rejects_mismatched_public_key() {
 }
 
 #[test]
-fn mesh_port_conflict_is_rejected() {
-    let mut state = local_state("openclaw", vec![18789], vec![18789]);
-    for phase in ["active", "deployed", "deploying"] {
-        state.phase = phase.to_string();
-        let err = validate_mesh_port_conflicts(&[state.clone()], "mcp", &[18789]).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("port 18789 is already used by service openclaw"));
-    }
-}
-
-#[test]
-fn built_services_do_not_reserve_mesh_ports() {
-    let mut built = local_state("openclaw", vec![18789], vec![18789]);
-    built.phase = "built".to_string();
-
-    validate_mesh_port_conflicts(&[built], "mcp", &[18789]).unwrap();
-}
-
-#[test]
 fn filtered_mesh_sync_requires_active_local_state() {
     let cli = test_cli();
     let temp = tempfile::tempdir().unwrap();

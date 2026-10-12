@@ -41,6 +41,7 @@ const DEFAULT_GATEWAY_CONFIG_PATH: &str = "/etc/cai/gateway.json";
 const TNG_EGRESS_PORT_BASE: u16 = 39000;
 const GATEWAY_SERVER_PORT_BASE: u16 = 39200;
 const TNG_INGRESS_PORT_BASE: u16 = 39400;
+const GATEWAY_CLIENT_PORT_BASE: u16 = 39600;
 const DEFAULT_TNG_SO_MARK: u32 = 565;
 const SERVICE_RESTART_MIN_INTERVAL_SEC: u64 = 30;
 const ACTIVE_BOOTSTRAP_IDLE_POLL_SEC: u64 = 30;
@@ -2168,6 +2169,8 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
     }
 
     let mut peer_routes = Vec::new();
+    let mut client_ports = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+    client_ports.extend(service.ports.iter().copied());
     let mut peers = bundle
         .services
         .iter()
@@ -2193,11 +2196,20 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
         ports.sort_unstable();
         ports.dedup();
         for port in ports {
+            // Guest endpoints belong to service identities. Allocate a distinct
+            // local gateway when an endpoint overlaps self or another peer.
+            let local_port = if client_ports.insert(port) {
+                port
+            } else {
+                let local = allocate_internal_port(GATEWAY_CLIENT_PORT_BASE, &mut used)?;
+                client_ports.insert(local);
+                local
+            };
             peer_routes.push(PeerGatewayRoute {
                 service_id: service_id.clone(),
                 host: host.clone(),
                 remote_port: port,
-                local_port: port,
+                local_port,
                 tng_ingress_port: allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used)?,
                 protocol: if mcp_ports.contains(&port) {
                     "mcp".to_string()

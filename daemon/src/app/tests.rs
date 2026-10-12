@@ -414,6 +414,50 @@ fn rejects_excessive_octal_modes() {
 }
 
 #[test]
+fn duplicate_guest_endpoints_get_distinct_client_routes_and_service_directory_entries() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": "confidential-agent/mesh-bundle/v1", "generation": 1, "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [18789], "connect": []},
+            "agent-a": {"phase": "active", "public_ip": "192.0.2.10", "ports": [18789], "connect": []},
+            "agent-b": {"phase": "active", "public_ip": "192.0.2.11", "ports": [18789], "connect": []},
+            "other": {"phase": "active", "public_ip": "192.0.2.12", "ports": [3001], "connect": []}
+        }, "reference_values": {"measurement.uki.SHA-384": ["a"]}
+    })).unwrap();
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+    let local_ports = plan
+        .peer_routes
+        .iter()
+        .map(|route| route.local_port)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(local_ports.len(), 3);
+    assert!(!local_ports.contains(&18789));
+    assert!(local_ports.contains(&3001));
+    let directory = service_directory(&bundle, "self", &plan);
+    for id in ["agent-a", "agent-b"] {
+        let route = plan
+            .peer_routes
+            .iter()
+            .find(|route| route.service_id == id)
+            .unwrap();
+        assert_eq!(route.remote_port, 18789);
+        assert_eq!(directory.services[id].ports[0].port, route.local_port);
+    }
+    let repeated = runtime_port_plan(&bundle, "self").unwrap();
+    assert_eq!(
+        plan.peer_routes
+            .iter()
+            .map(|r| r.local_port)
+            .collect::<Vec<_>>(),
+        repeated
+            .peer_routes
+            .iter()
+            .map(|r| r.local_port)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn service_directory_includes_peer_connect_and_mesh_ports() {
     let bundle: MeshBundle = serde_json::from_value(json!({
         "schema": "confidential-agent/mesh-bundle/v1",
