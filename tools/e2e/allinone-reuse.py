@@ -227,6 +227,32 @@ class Consumer:
     def directory_ports(self, label):
         return json.loads(self.ssh(label, "cat /etc/cai/service-directory.json").stdout)["services"]
 
+    def verify_management_during_token_errors(self):
+        original = self.spec_path.read_bytes()
+        edited = json.loads(original)
+        token = next(resource for resource in edited["resources"].values()
+                     if resource["target"].endswith("/.codex/app-server-token"))
+        token["mode"] = "0644"
+        cloud = json.loads((self.directory / "state.json").read_text())["deploy"]
+        def inject(label):
+            self.command(label, "inject", "--spec", str(self.spec_path),
+                         "--target-ip", cloud["public_ip"], timeout=600)
+        try:
+            self.spec_path.write_text(json.dumps(edited))
+            inject("inject-invalid-token-mode")
+            deadline = time.monotonic() + 90
+            while True:
+                result = self.ssh("token-private-check", "cai-agent --check", success=False)
+                if result.returncode and b"private capability token" in result.stderr:
+                    break
+                assert time.monotonic() < deadline, "invalid token permissions were not applied"
+                time.sleep(3)
+            self.ssh("token-error-management", "systemctl is-active cai-ssh.service; journalctl -u cai-allinone.service --no-pager >/dev/null")
+        finally:
+            self.spec_path.write_bytes(original)
+            inject("restore-token-mode")
+            self.ssh("restart-server-after-token-error", "systemctl reset-failed cai-allinone.service; systemctl restart cai-allinone.service; cai-agent --check")
+
     def verify_pty(self):
         """Run a real interactive remote terminal, with optional native CLI exchanges."""
         script = "set -e; test -t 0 && test -t 1; stty size; printf PTY_READY; read value; test \"$value\" = PTY_INPUT; printf PTY_ACCEPTED; stty size; exit 7"
@@ -403,10 +429,7 @@ def assert_independent(consumers):
     assert wrong_host.returncode != 0 and b"Host key verification failed" in wrong_host.stderr
 
 
-def assert_one_deployment(consumer, aliyun):
-    state = json.loads((consumer.directory / "state.json").read_text())
-    cloud = state["deploy"]
-    prefix = cloud["resource_name"][:-len(cloud["run_id"])]
+def owned_cloud_instances(consumer, aliyun, label):
     image = json.loads((consumer.directory / "manifest.json").read_text())["image"]["image_id"]
     region = consumer.spec["deploy"]["region"]
     matches = []
@@ -415,13 +438,19 @@ def assert_one_deployment(consumer, aliyun):
         result = json.loads(run([aliyun, "--region", region, "ecs", "DescribeInstances",
                                  "--RegionId", region, "--ImageId", image, "--PageSize", "100",
                                  "--PageNumber", str(page)],
-                                consumer.work / f"concurrent-instances-{page}").stdout)
+                                consumer.work / f"{label}-{page}").stdout)
         matches.extend(item["InstanceId"] for item in result["Instances"]["Instance"]
-                       if item["InstanceName"].startswith(prefix))
+                       if any(tag["TagKey"] == "confidential-agent-service" and tag["TagValue"] == consumer.service
+                              for tag in item.get("Tags", {}).get("Tag", [])))
         if page * 100 >= result["TotalCount"]:
             break
         page += 1
-    assert matches == [cloud["instance_id"]], "same-service deployment created unowned instances"
+    return matches
+
+
+def assert_one_deployment(consumer, aliyun):
+    state = json.loads((consumer.directory / "state.json").read_text())
+    assert owned_cloud_instances(consumer, aliyun, "concurrent-instances") == [state["deploy"]["instance_id"]], "same-service deployment created unowned instances"
 
 
 def interrupt_infrastructure(consumer, aliyun):
@@ -453,10 +482,7 @@ def interrupt_infrastructure(consumer, aliyun):
         assert rejected.returncode and b"interrupted infrastructure operation" in rejected.stderr
         consumer.destroy()
         consumer.attempted = False
-        region = consumer.spec["deploy"]["region"]
-        result = run([aliyun, "--region", region, "ecs", "DescribeInstances", "--RegionId", region,
-                      "--InstanceName", state["deploy"]["resource_name"]], consumer.work / "interrupted-instance-deleted")
-        assert not json.loads(result.stdout)["Instances"]["Instance"], "interrupted deployment leaked an instance"
+        assert not owned_cloud_instances(consumer, aliyun, "interrupted-instance-deleted"), "interrupted deployment leaked an instance"
     finally:
         if process is not None and process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
@@ -746,7 +772,7 @@ def main():
         parser.error("resource-delivery resume coverage uses challenge mode")
     os.umask(0o077)
     args.work_dir = args.work_dir.resolve()
-    args.work_dir.mkdir(mode=0o700)
+    args.work_dir.mkdir(mode=0o700, exist_ok=True)
     shared_state = args.work_dir / "state"
     consumers = [Consumer(path.resolve(), args.work_dir, args.ca, args.operator_cidr, shared_state)
                  for path in args.fixture]
@@ -761,6 +787,8 @@ def main():
         assert all(item.spec["attestation"]["mode"] == "trustee" for item in consumers)
         configure = ["trustee", "configure", "--url", args.trustee_url,
                      "--admin-key", str(args.trustee_admin_key.resolve())]
+        if (shared_state / "trustee/config.json").exists():
+            configure += ["--force"]
         if args.trustee_management_url:
             configure += ["--management-url", args.trustee_management_url]
         first = consumers[0]
@@ -796,6 +824,9 @@ def main():
         assert_independent(consumers)
         if args.application_errors:
             consumers[0].verify_management_during_application_errors()
+            for item in consumers:
+                if any(resource["target"].endswith("/.codex/app-server-token") for resource in item.spec["resources"].values()):
+                    item.verify_management_during_token_errors()
         if args.stable_endpoints_fixture:
             verify_stable_endpoints(consumers, args.stable_endpoints_fixture)
         if args.console_isolation:
