@@ -414,6 +414,97 @@ fn rejects_excessive_octal_modes() {
 }
 
 #[test]
+fn stable_client_endpoints_survive_topology_changes_and_state_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let mut bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION, "generation": 1, "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [], "connect": []},
+            "beta": {"phase": "active", "public_ip": "192.0.2.10", "ports": [18789], "connect": []},
+            "gamma": {"phase": "active", "public_ip": "192.0.2.11", "ports": [18789], "connect": []}
+        }, "reference_values": {"measurement.uki.SHA-384": ["a"]}
+    }))
+    .unwrap();
+    let mut registry = BTreeMap::new();
+    let before = runtime_port_plan_with_registry(&bundle, "self", &mut registry).unwrap();
+    let ports = |plan: &RuntimePortPlan| {
+        plan.peer_routes
+            .iter()
+            .map(|route| (route.service_id.clone(), route.local_port))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = ports(&before);
+    assert_eq!(before["beta"], 18789);
+    assert_eq!(before["gamma"], 39600);
+    let state = DaemonState {
+        mesh_client_owner: Some("self".into()),
+        mesh_client_ports: registry,
+        ..DaemonState::default()
+    };
+    write_daemon_state(&state).unwrap();
+    let mut restored = read_daemon_state().unwrap();
+    bundle
+        .services
+        .insert("alpha".into(), bundle.services["beta"].clone());
+    let after =
+        runtime_port_plan_with_registry(&bundle, "self", &mut restored.mesh_client_ports).unwrap();
+    let after = ports(&after);
+    assert_eq!(after["beta"], before["beta"]);
+    assert_eq!(after["gamma"], before["gamma"]);
+    assert_eq!(after["alpha"], 39601);
+    bundle.services.remove("beta");
+    bundle
+        .services
+        .insert("delta".into(), bundle.services["gamma"].clone());
+    let next =
+        runtime_port_plan_with_registry(&bundle, "self", &mut restored.mesh_client_ports).unwrap();
+    let next = ports(&next);
+    assert_eq!(next["gamma"], before["gamma"]);
+    assert_ne!(
+        next["delta"], before["beta"],
+        "a removed peer endpoint was recycled"
+    );
+    let mut bootstrap = test_bootstrap_config("self");
+    bootstrap.ports = vec![before["gamma"]];
+    assert!(validate_mesh_client_reservations(&bootstrap, &restored).is_err());
+    bootstrap.ports.clear();
+    bootstrap.service_id = "different-owner".into();
+    assert!(validate_mesh_client_reservations(&bootstrap, &restored).is_err());
+}
+
+#[test]
+fn application_port_conflicts_are_rejected_before_applying_business_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let args = test_run_args(temp.path().join("cdh"));
+    let mut bootstrap = test_bootstrap_config("self");
+    bootstrap.ports = vec![39600];
+    let source = args.cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("runtime.json");
+    write_test_file(&source, b"new-config");
+    write_test_file(&target, b"committed-config");
+    bootstrap.resources.push(GuestResource {
+        id: "config".into(),
+        resource_path: "default/local-resources/config".into(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".into(),
+        required: true,
+        mutable: false,
+        sha256: Some(sha256_file(&source).unwrap()),
+    });
+    let mut state = DaemonState {
+        mesh_client_owner: Some("self".into()),
+        mesh_client_ports: BTreeMap::from([("peer".into(), BTreeMap::from([(18789, 39600)]))]),
+        ..DaemonState::default()
+    };
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).is_err());
+    assert_eq!(fs::read(target).unwrap(), b"committed-config");
+}
+
+#[test]
 fn duplicate_guest_endpoints_get_distinct_client_routes_and_service_directory_entries() {
     let bundle: MeshBundle = serde_json::from_value(json!({
         "schema": "confidential-agent/mesh-bundle/v1", "generation": 1, "updated_at": 0,

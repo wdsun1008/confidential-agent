@@ -1060,7 +1060,7 @@ fn effective_shelter_bin_respects_explicit_env_override() {
 fn write_fake_prepare_tools(temp: &Path) -> PathBuf {
     let current = std::env::current_exe().unwrap();
     let agentd = current.parent().unwrap().join("confidential-agentd");
-    fs::write(&agentd, "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":\"confidential-agent/guest-runtime/v1\",\"bootstrap_schema\":\"confidential-agent/bootstrap/v1\",\"version\":\"0.1.0\",\"capabilities\":[\"external-fde-v1\",\"resources-v1\",\"mesh-client-ports-v1\"]}'\n").unwrap();
+    fs::write(&agentd, "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":\"confidential-agent/guest-runtime/v1\",\"bootstrap_schema\":\"confidential-agent/bootstrap/v1\",\"version\":\"0.1.0\",\"capabilities\":[\"external-fde-v1\",\"resources-v1\",\"mesh-client-ports-v1\",\"mesh-client-ports-v2\"]}'\n").unwrap();
     set_mode(&agentd, 0o755).unwrap();
     let bin_dir = temp.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();

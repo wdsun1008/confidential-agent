@@ -132,6 +132,10 @@ struct DaemonState {
     bootstrap_generation: u64,
     #[serde(default)]
     mesh_generation: u64,
+    #[serde(default)]
+    mesh_client_owner: Option<String>,
+    #[serde(default)]
+    mesh_client_ports: BTreeMap<String, BTreeMap<u16, u16>>,
     applied_resources: BTreeMap<String, AppliedResourceState>,
     mesh_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,7 +231,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
                     "schema_version": "confidential-agent/guest-runtime/v1",
                     "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
-                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "application-runtime-v1", "instance-ssh-credentials-v1"]
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "mesh-client-ports-v2", "application-runtime-v1", "instance-ssh-credentials-v1"]
                 })
             );
             Ok(())
@@ -1483,6 +1487,7 @@ fn apply_bootstrap_resources(
         .applied_resources
         .retain(|resource_id, _| resource_ids.contains(resource_id));
     apply_management_credentials(args, bootstrap, state, management_directory)?;
+    validate_mesh_client_reservations(bootstrap, state)?;
     for resource in &bootstrap.resources {
         let Some((source, digest)) = verified_resource_source(args, resource)? else {
             if fail_missing || resource.required {
@@ -1614,6 +1619,28 @@ fn apply_bootstrap_resources(
     }
 
     Ok(true)
+}
+
+fn validate_mesh_client_reservations(
+    bootstrap: &BootstrapConfig,
+    state: &DaemonState,
+) -> Result<()> {
+    anyhow::ensure!(
+        state
+            .mesh_client_owner
+            .as_deref()
+            .map_or(true, |owner| owner == bootstrap.service_id),
+        "persisted mesh client endpoints belong to a different guest service"
+    );
+    for port in state
+        .mesh_client_ports
+        .values()
+        .flat_map(|ports| ports.values())
+    {
+        anyhow::ensure!(!bootstrap.ports.contains(port),
+            "application port {port} is reserved for an existing mesh client endpoint; choose a different application port");
+    }
+    Ok(())
 }
 
 /// Project only verified bootstrap data; applications never select a provider cache.
@@ -2078,7 +2105,15 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
             cache_dir.join("mesh-bundle.json"),
             serde_json::to_string_pretty(&bundle)?,
         )?;
-        let plan = runtime_port_plan(&bundle, &bootstrap.service_id)?;
+        validate_mesh_client_reservations(bootstrap, state)?;
+        let mut client_ports = state.mesh_client_ports.clone();
+        let plan =
+            runtime_port_plan_with_registry(&bundle, &bootstrap.service_id, &mut client_ports)?;
+        // Persist reservations before replacing listeners. Even a failed restart
+        // must never give a previously published endpoint to a different peer.
+        state.mesh_client_owner = Some(bootstrap.service_id.clone());
+        state.mesh_client_ports = client_ports;
+        write_daemon_state(state)?;
         let dir = service_directory(&bundle, &bootstrap.service_id, &plan);
         let cfg = tng_config(&bundle, &bootstrap.service_id, &plan)?;
         let gateway_cfg = gateway_config(&bundle, &bootstrap.service_id, bootstrap, &plan)?;
@@ -2090,11 +2125,19 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
         let confidential_port_set = confidential_ports(&bootstrap.ports, &bootstrap.connect)
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let mut used = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+        used.extend(bootstrap.ports.iter().copied());
+        used.extend(
+            state
+                .mesh_client_ports
+                .values()
+                .flat_map(|ports| ports.values())
+                .copied(),
+        );
         let egress = bootstrap
             .ports
             .iter()
-            .enumerate()
-            .map(|(idx, port)| {
+            .map(|port| -> Result<Value> {
                 let mut route = json!({
                     "rats_tls": {
                         "multiplex": true,
@@ -2102,16 +2145,16 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
                     "netfilter": {
                         "capture_dst": { "port": port },
                         "capture_local_traffic": false,
-                        "listen_port": 39000 + idx as u16,
+                        "listen_port": allocate_internal_port(TNG_EGRESS_PORT_BASE, &mut used)?,
                     },
                     "attest": tng_attest_config(),
                 });
                 if confidential_port_set.contains(port) {
                     route["verify"] = tng_verify_config(Value::Array(Vec::new()));
                 }
-                route
+                Ok(route)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut cfg = empty_tng_config();
         cfg["add_egress"] = Value::Array(egress);
         let dir = ServiceDirectory {
@@ -2122,10 +2165,18 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
     };
 
     if let Some(a2a_bundle) = a2a_bundle.as_ref() {
+        let mut reserved_ports = bootstrap.ports.clone();
+        reserved_ports.extend(
+            state
+                .mesh_client_ports
+                .values()
+                .flat_map(|ports| ports.values())
+                .copied(),
+        );
         let (peer_ingress, peer_directory) = a2a_tng_ingress(
             a2a_bundle,
             &bootstrap.service_id,
-            &bootstrap.ports,
+            &reserved_ports,
             &directory,
             state,
         );
@@ -2218,7 +2269,16 @@ struct PeerGatewayRoute {
     connect_mode: bool,
 }
 
+#[cfg(test)]
 fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPlan> {
+    runtime_port_plan_with_registry(bundle, self_id, &mut BTreeMap::new())
+}
+
+fn runtime_port_plan_with_registry(
+    bundle: &MeshBundle,
+    self_id: &str,
+    registry: &mut BTreeMap<String, BTreeMap<u16, u16>>,
+) -> Result<RuntimePortPlan> {
     let service = bundle
         .services
         .get(self_id)
@@ -2227,7 +2287,19 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
         bail!("service '{self_id}' is not active in mesh bundle");
     }
 
+    let mut reserved = BTreeSet::new();
+    for port in registry.values().flat_map(|ports| ports.values()) {
+        anyhow::ensure!(
+            reserved.insert(*port),
+            "persisted mesh client endpoint reservations overlap"
+        );
+        anyhow::ensure!(
+            !service.ports.contains(port),
+            "application port {port} overlaps a reserved mesh client endpoint"
+        );
+    }
     let mut used = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+    used.extend(reserved.iter().copied());
     for service in bundle
         .services
         .values()
@@ -2284,12 +2356,34 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
         for port in ports {
             // Guest endpoints belong to service identities. Allocate a distinct
             // local gateway when an endpoint overlaps self or another peer.
-            let local_port = if client_ports.insert(port) {
-                port
-            } else {
-                let local = allocate_internal_port(GATEWAY_CLIENT_PORT_BASE, &mut used)?;
-                client_ports.insert(local);
-                local
+            let local_port = match registry
+                .get(service_id.as_str())
+                .and_then(|ports| ports.get(&port))
+                .copied()
+            {
+                Some(local) => {
+                    anyhow::ensure!(
+                        client_ports.insert(local),
+                        "reserved mesh client endpoint {local} overlaps a guest listener"
+                    );
+                    local
+                }
+                None => {
+                    let local = if !reserved.contains(&port) && client_ports.insert(port) {
+                        port
+                    } else {
+                        let local = allocate_internal_port(GATEWAY_CLIENT_PORT_BASE, &mut used)?;
+                        client_ports.insert(local);
+                        local
+                    };
+                    registry
+                        .entry(service_id.to_string())
+                        .or_default()
+                        .insert(port, local);
+                    reserved.insert(local);
+                    used.insert(local);
+                    local
+                }
             };
             peer_routes.push(PeerGatewayRoute {
                 service_id: service_id.clone(),

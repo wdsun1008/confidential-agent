@@ -956,13 +956,13 @@ pub(super) fn validate_shared_guest_ports(
         return Ok(());
     }
     anyhow::ensure!(incoming.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
-        "service {} uses a legacy guest without independent mesh client ports; rebuild every mesh recipient before deploying overlapping service ports", spec.service.id);
+        "service {} uses a legacy guest without stable mesh client endpoints; rebuild every mesh recipient before deploying overlapping service ports", spec.service.id);
     // Clients with no service ports receive the same peer bundle and must also
     // understand independent local endpoints for duplicate remote ports.
     for state in recipients {
         let peer = read_build_manifest(&context_paths(state_dir, &state.service_id).manifest)?;
         anyhow::ensure!(peer.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
-            "service {} uses a legacy guest without independent mesh client ports; rebuild every mesh recipient before deploying overlapping service ports", state.service_id);
+            "service {} uses a legacy guest without stable mesh client endpoints; rebuild every mesh recipient before deploying overlapping service ports", state.service_id);
     }
     Ok(())
 }
@@ -1229,7 +1229,7 @@ mod tests {
                 serde_json::from_value(json!({
                     "schema_version": "confidential-agent/image-runtime/v1",
                     "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
-                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"],
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "mesh-client-ports-v2"],
                     "rootfs_integrity": true, "writable_layer_encryption": "luks2",
                     "key_release": "ca-attested", "min_disk_gb": 32, "app_services": [],
                     "guest_binary_sha256": "e".repeat(64)

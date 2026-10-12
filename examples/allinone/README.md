@@ -108,9 +108,13 @@ requires an empty port list. Unsupported modes and mismatches fail startup.
 Different instances can retain the same native service port in one CA workspace.
 Mesh client port collisions are mapped to independent loopback endpoints listed
 by service ID in `/etc/cai/service-directory.json`; use that directory rather
-than assuming a peer's local endpoint always equals its native port. Re-read the
-mapping after mesh generation changes. Legacy guests must be rebuilt before
-adding overlapping ports. Local `ca connect` tunnels still need separate local
+than assuming a peer's local endpoint always equals its native port. Endpoint
+assignments persist across topology changes and reboots within the same guest;
+removed endpoints are reserved and never assigned to a different service.
+Changing a local application port to a reserved client endpoint is rejected.
+Every receiving guest, including client-only instances, must support stable
+mesh endpoints before overlapping ports can be introduced. Legacy guests must
+be rebuilt first. Local `ca connect` tunnels still need separate local
 listening ports when kept running concurrently.
 
 Background mesh and peering maintenance uses the saved deployment snapshot;

@@ -47,6 +47,7 @@ impl ImageRuntimeContract {
                 "external-fde-v1".into(),
                 "resources-v1".into(),
                 "mesh-client-ports-v1".into(),
+                "mesh-client-ports-v2".into(),
             ];
             if spec.service.ssh {
                 capabilities.push("instance-ssh-v1".into());
@@ -70,7 +71,11 @@ impl ImageRuntimeContract {
             anyhow::ensure!(guest_runtime["capabilities"].as_array().is_some_and(|values| values.iter().any(|v| v == capability)),
                 "guest binary does not support required capability {capability}; rebuild the CA tools image");
         }
-        for capability in ["application-runtime-v1", "instance-ssh-credentials-v1"] {
+        for capability in [
+            "application-runtime-v1",
+            "instance-ssh-credentials-v1",
+            "mesh-client-ports-v2",
+        ] {
             if contract
                 .capabilities
                 .iter()
@@ -151,6 +156,6 @@ impl ImageRuntimeContract {
     pub(super) fn supports_shared_ports(&self) -> bool {
         self.capabilities
             .iter()
-            .any(|v| v == "mesh-client-ports-v1")
+            .any(|v| v == "mesh-client-ports-v2")
     }
 }
