@@ -2204,6 +2204,16 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
             .as_ref()
             .map(|state| state.attestation_mode.as_str()),
     )?;
+    // Trustee may stage boot resources before configuration preparation creates
+    // a manifest. Infrastructure always starts after local state is recorded.
+    if existing_state.is_none() && !paths.manifest.try_exists()? {
+        if trustee_mode {
+            trustee::revoke_service(&cli.state_dir, &args.service)?;
+            trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
+        }
+        println!("service '{}' has no recorded infrastructure", args.service);
+        return Ok(());
+    }
     if let Some(state) = existing_state.as_ref() {
         if state.phase == "deleted" && !deploy_runtime_state_present(&state.deploy) {
             if trustee_mode {

@@ -3209,6 +3209,37 @@ fn destroy_is_idempotent_for_deleted_service_without_cloud_state() {
 }
 
 #[test]
+fn destroy_before_an_infrastructure_attempt_does_not_invoke_shelter() {
+    let temp = tempfile::tempdir().unwrap();
+    let shelter = temp.path().join("shelter-should-not-run");
+    write_script(&shelter, "#!/bin/sh\nexit 42\n");
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+    cli.shelter_bin = shelter;
+    cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "not-started".into(),
+        },
+    )
+    .unwrap();
+    let paths = context_paths(&cli.state_dir, "not-started");
+    assert!(!paths.service_state.exists());
+    assert!(!paths.manifest.exists());
+    // A recorded attempt with a lost manifest must still fail closed.
+    let mut state = local_state("not-started", Vec::new(), Vec::new());
+    state.phase = "deploying".into();
+    write_state(&cli.state_dir, &state);
+    assert!(cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "not-started".into()
+        }
+    )
+    .is_err());
+}
+
+#[test]
 fn live_status_skips_deleted_services() {
     let mut service = local_state("openclaw", vec![18789], vec![18789]);
     service.phase = "deleted".to_string();
