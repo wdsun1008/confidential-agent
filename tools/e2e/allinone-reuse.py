@@ -6,18 +6,23 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
+import fcntl
+import pty
+import select
 from pathlib import Path
 import signal
 import shlex
 import subprocess
+import struct
+import termios
 import time
 import urllib.error
 import urllib.request
 
 
-def run(command, evidence, timeout=1800, success=True):
+def run(command, evidence, timeout=1800, success=True, env=None):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               start_new_session=True)
+                               start_new_session=True, env=env)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -60,7 +65,7 @@ class Consumer:
     def directory(self):
         return self.state / "services" / self.service
 
-    def deploy(self):
+    def deploy(self, concurrent=False, resume=False):
         self.command("validate", "spec", "validate", "--spec", str(self.spec_path))
         peering = self.command("peering-show", "peering", "show", "reuse-test", success=False)
         if peering.returncode:
@@ -69,7 +74,41 @@ class Consumer:
         else:
             assert f"cidr: {self.cidr}".encode() in peering.stdout
         self.attempted = True
-        self.command("deploy", "deploy", "--spec", str(self.spec_path), timeout=3600)
+        if concurrent:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda index: self.command(
+                    f"concurrent-deploy-{index}", "deploy", "--spec", str(self.spec_path),
+                    success=False, timeout=3600), range(2)))
+            assert sorted(result.returncode == 0 for result in results) == [False, True]
+            rejected = next(result for result in results if result.returncode)
+            assert b"destroy it before deploying again" in rejected.stderr, "concurrent rejection was not the service state guard"
+        elif resume:
+            self.command("deploy-without-delivery", "deploy", "--spec", str(self.spec_path),
+                         "--skip-inject", timeout=3600)
+            before = json.loads((self.directory / "state.json").read_text())
+            assert before["phase"] == "deployed"
+            identities = {name: (self.directory / "secrets" / name).read_bytes()
+                          for name in ["ssh_client", "ssh_host", "disk_passphrase"]}
+            resource = Path(next(iter(self.spec["resources"].values()))["source"])
+            original = resource.read_bytes()
+            try:
+                resource.write_bytes(original + b"changed-resume-input")
+                rejected = self.command("reject-changed-resource", "deploy", "--resume", "--spec", str(self.spec_path), success=False)
+                assert rejected.returncode and b"deployment input" in rejected.stderr
+                moved = self.work / "moved-appspec.json"
+                moved.write_bytes(self.spec_path.read_bytes())
+                rejected = self.command("reject-moved-resume", "deploy", "--resume", "--spec", str(moved), success=False)
+                assert rejected.returncode and b"canonical path" in rejected.stderr
+            finally:
+                resource.write_bytes(original)
+            self.command("resume-deploy", "deploy", "--resume", "--spec", str(self.spec_path),
+                         timeout=3600)
+            after = json.loads((self.directory / "state.json").read_text())
+            assert after["deploy"]["instance_id"] == before["deploy"]["instance_id"]
+            assert all((self.directory / "secrets" / name).read_bytes() == value
+                       for name, value in identities.items()), "resume replaced an identity"
+        else:
+            self.command("deploy", "deploy", "--spec", str(self.spec_path), timeout=3600)
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             if self.ssh("wait-ssh", "true", success=False, timeout=20).returncode == 0:
@@ -81,6 +120,7 @@ class Consumer:
         self.ssh("single-harness", "! systemctl is-enabled --quiet "
                  "cai-codex-app-server.service cai-hermes-agent.service sshd.service sshd.socket")
         self.ssh("version", "cai-agent --version")
+        self.ssh("configuration", "cai-agent --check")
         self.ssh("disk-protection", "set -eu\n"
                  "dmsetup status --target crypt | grep -w crypt\n"
                  "dmsetup status --target verity | grep -w verity")
@@ -124,6 +164,126 @@ class Consumer:
             (self.work / "model-skipped.json").write_text(json.dumps({
                 "reason": self.probe["skip_reason"]
             }) + "\n")
+
+    def verify_console_isolation(self, aliyun):
+        """Exercise the actual application unit and confirm the console API is live."""
+        marker = "CA_APPLICATION_" + os.urandom(16).hex()
+        canary = "CA_CONSOLE_" + os.urandom(16).hex()
+        dropin = "/run/systemd/system/cai-allinone.service.d/console-test.conf"
+        content = ("[Service]\nExecStartPre=/bin/sh -c 'echo " + marker + "; echo "
+                   + marker + " >&2'\n")
+        try:
+            self.ssh("console-install-probe", "mkdir -p " + shlex.quote(str(Path(dropin).parent))
+                     + "; printf %s " + shlex.quote(content) + " > " + shlex.quote(dropin)
+                     + "; systemctl daemon-reload; systemctl restart cai-allinone.service")
+            self.ssh("console-journal-marker", "journalctl -u cai-allinone.service --no-pager | grep -F "
+                     + shlex.quote(marker))
+            self.ssh("console-canary", "printf '%s\\n' " + shlex.quote(canary) + " > /dev/console")
+            cloud = json.loads((self.directory / "state.json").read_text())["deploy"]
+            region = self.spec["deploy"]["region"]
+            deadline = time.monotonic() + 180
+            while True:
+                result = run([aliyun, "--region", region, "ecs", "GetInstanceConsoleOutput",
+                              "--RegionId", region, "--InstanceId", cloud["instance_id"]],
+                             self.work / "console-output")
+                console = base64.b64decode(json.loads(result.stdout)["ConsoleOutput"])
+                (self.work / "console-output.txt").write_bytes(console)
+                assert marker.encode() not in console, "application output reached the cloud console"
+                if canary.encode() in console:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("console API did not contain the positive canary")
+                time.sleep(5)
+        finally:
+            self.ssh("console-remove-probe", "rm -f " + shlex.quote(dropin)
+                     + "; systemctl daemon-reload; systemctl restart cai-allinone.service")
+
+    def verify_management_during_application_errors(self):
+        resource = next(value for value in self.spec["resources"].values()
+                        if value["target"] == "/opt/data/allinone/runtime.json")
+        source = Path(resource["source"])
+        original = source.read_bytes()
+        cloud = json.loads((self.directory / "state.json").read_text())["deploy"]
+        def inject(label):
+            self.command(label, "inject", "--spec", str(self.spec_path),
+                         "--target-ip", cloud["public_ip"], timeout=600)
+        try:
+            for label, content in [("invalid-json", b"not-json"), ("invalid-port", json.dumps({"harness": "codex", "mode": "app-server", "port": 4501}).encode())]:
+                source.write_bytes(content)
+                inject("inject-" + label)
+                deadline = time.monotonic() + 90
+                while True:
+                    checked = self.ssh(label + "-check", "cai-agent --check", success=False)
+                    if checked.returncode and b"allinone startup failed" in checked.stderr:
+                        break
+                    assert time.monotonic() < deadline, "invalid business configuration was not delivered"
+                    time.sleep(3)
+                self.ssh(label + "-management", "systemctl is-active cai-ssh.service; journalctl -u cai-allinone.service --no-pager >/dev/null")
+        finally:
+            source.write_bytes(original)
+            inject("restore-application")
+            self.ssh("restart-restored-application", "systemctl reset-failed cai-allinone.service; systemctl restart cai-allinone.service; cai-agent --check")
+
+    def directory_ports(self, label):
+        return json.loads(self.ssh(label, "cat /etc/cai/service-directory.json").stdout)["services"]
+
+    def verify_pty(self):
+        """Run a real interactive remote terminal, with optional native CLI exchanges."""
+        script = "set -e; test -t 0 && test -t 1; stty size; printf PTY_READY; read value; test \"$value\" = PTY_INPUT; printf PTY_ACCEPTED; stty size; exit 7"
+        self.interactive("pty-shell", script, [{"expect": "PTY_READY", "send": "PTY_INPUT\n"},
+                                             {"expect": "PTY_ACCEPTED"}, {"expect": "30 100"}], exit_code=7)
+        if self.probe.get("interactive"):
+            self.interactive("pty-harness", self.probe["interactive"]["command"],
+                             self.probe["interactive"]["exchanges"],
+                             exit_code=self.probe["interactive"].get("exit_code"))
+
+    def interactive(self, label, command, exchanges, exit_code=None):
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        env = dict(os.environ, TERM="xterm-256color")
+        process = subprocess.Popen(self.ca + ["ssh", self.service, "--tty", "--", command],
+                                   stdin=slave, stdout=slave, stderr=slave, env=env,
+                                   start_new_session=True)
+        os.close(slave)
+        transcript = bytearray()
+        cursor = 0
+        try:
+            for exchange in exchanges:
+                deadline = time.monotonic() + exchange.get("timeout", 120)
+                expected = exchange["expect"].encode()
+                while expected not in transcript[cursor:]:
+                    if select.select([master], [], [], 1)[0]:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError:
+                            chunk = b""
+                        transcript.extend(chunk)
+                        # Answer the terminal cursor query used by native TUIs.
+                        if b"\x1b[6n" in chunk:
+                            os.write(master, b"\x1b[1;1R")
+                    if expected not in transcript[cursor:] and (time.monotonic() >= deadline or process.poll() is not None):
+                        raise RuntimeError(f"{label}: interactive expectation failed; see private transcript")
+                cursor = transcript.index(expected, cursor) + len(expected)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+                if process.poll() is None:
+                    try:
+                        os.kill(process.pid, signal.SIGWINCH)
+                    except ProcessLookupError:
+                        pass
+                if "send" in exchange:
+                    os.write(master, exchange["send"].encode())
+            if exit_code is not None:
+                assert process.wait(timeout=30) == exit_code, "interactive exit code was not preserved"
+        finally:
+            (self.work / (label + ".transcript")).write_bytes(transcript)
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+            os.close(master)
 
     def verify_connect(self):
         ready = self.work / "connect-ready.json"
@@ -197,6 +357,21 @@ def reject_invalid_release(consumer):
         assert not (rejected / "bootstrap.json").exists()
 
 
+def reject_incompatible_release(consumer, release):
+    spec = json.loads(json.dumps(consumer.spec))
+    spec["service"]["id"] += "-incompatible"
+    spec["deploy"]["image"]["release"] = str(release.resolve())
+    path = consumer.spec_path.parent / "incompatible-appspec.json"
+    path.write_text(json.dumps(spec))
+    result = consumer.command("reject-incompatible-runtime", "deploy", "--spec", str(path),
+                              "--render-only", success=False)
+    assert result.returncode and b"runtime contract" in result.stderr
+    assert b"authentication failed" not in result.stderr, "incompatible fixture did not have a valid publisher signature"
+    directory = consumer.state / "services" / spec["service"]["id"]
+    assert not (directory / "state.json").exists()
+    assert not (directory / "bootstrap.json").exists()
+
+
 def assert_independent(consumers):
     for name in ["ssh_client", "ssh_host", "disk_passphrase"]:
         values = [(item.directory / "secrets" / name).read_bytes() for item in consumers]
@@ -228,8 +403,69 @@ def assert_independent(consumers):
     assert wrong_host.returncode != 0 and b"Host key verification failed" in wrong_host.stderr
 
 
+def assert_one_deployment(consumer, aliyun):
+    state = json.loads((consumer.directory / "state.json").read_text())
+    cloud = state["deploy"]
+    prefix = cloud["resource_name"][:-len(cloud["run_id"])]
+    image = json.loads((consumer.directory / "manifest.json").read_text())["image"]["image_id"]
+    region = consumer.spec["deploy"]["region"]
+    matches = []
+    page = 1
+    while True:
+        result = json.loads(run([aliyun, "--region", region, "ecs", "DescribeInstances",
+                                 "--RegionId", region, "--ImageId", image, "--PageSize", "100",
+                                 "--PageNumber", str(page)],
+                                consumer.work / f"concurrent-instances-{page}").stdout)
+        matches.extend(item["InstanceId"] for item in result["Instances"]["Instance"]
+                       if item["InstanceName"].startswith(prefix))
+        if page * 100 >= result["TotalCount"]:
+            break
+        page += 1
+    assert matches == [cloud["instance_id"]], "same-service deployment created unowned instances"
+
+
+def interrupt_infrastructure(consumer, aliyun):
+    """Kill CA after a real provider apply, before CA can confirm its outcome."""
+    marker = consumer.work / "provider-completed"
+    wrapper = consumer.work / "shelter-interruption"
+    real = subprocess.check_output(["sh", "-c", "command -v shelter"], text=True).strip()
+    wrapper.write_text("#!/bin/sh\n" + shlex.quote(real) + ' "$@"\nstatus=$?\n'
+                       + '[ "$status" = 0 ] || exit "$status"\n'
+                       + 'for arg in "$@"; do\ncase "$arg" in deploy-release)\n'
+                       + "touch " + shlex.quote(str(marker)) + "\nexec sleep 3600\n;; esac\ndone\n")
+    wrapper.chmod(0o700)
+    consumer.attempted = True
+    process = None
+    try:
+        with (consumer.work / "interrupted-deploy.out").open("wb") as stdout, (consumer.work / "interrupted-deploy.err").open("wb") as stderr:
+            process = subprocess.Popen(consumer.ca + ["--shelter-bin", str(wrapper), "deploy", "--spec", str(consumer.spec_path)],
+                                       stdout=stdout, stderr=stderr, start_new_session=True)
+            deadline = time.monotonic() + 1800
+            while not marker.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("interruption fixture did not complete its real provider apply")
+                time.sleep(2)
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        state = json.loads((consumer.directory / "state.json").read_text())
+        assert state["phase"] == "deploying", "CA had already confirmed the provider result"
+        rejected = consumer.command("reject-unknown-resume", "deploy", "--resume", "--spec", str(consumer.spec_path), success=False)
+        assert rejected.returncode and b"interrupted infrastructure operation" in rejected.stderr
+        consumer.destroy()
+        consumer.attempted = False
+        region = consumer.spec["deploy"]["region"]
+        result = run([aliyun, "--region", region, "ecs", "DescribeInstances", "--RegionId", region,
+                      "--InstanceName", state["deploy"]["resource_name"]], consumer.work / "interrupted-instance-deleted")
+        assert not json.loads(result.stdout)["Instances"]["Instance"], "interrupted deployment leaked an instance"
+    finally:
+        if process is not None and process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
 def reboot(consumer, aliyun):
     before = consumer.ssh("boot-before", "cat /proc/sys/kernel/random/boot_id").stdout.strip()
+    endpoints = consumer.directory_ports("endpoints-before-reboot")
     consumer.ssh("persistent-write", "printf REUSE_PERSISTENT > /opt/data/allinone/reboot-marker; sync")
     state = json.loads((consumer.directory / "state.json").read_text())
     cloud = state["deploy"]
@@ -248,6 +484,10 @@ def reboot(consumer, aliyun):
         if result.returncode == 0 and result.stdout.strip() != before:
             consumer.ssh("persistent-after", "grep -Fx REUSE_PERSISTENT /opt/data/allinone/reboot-marker")
             consumer.ssh("runtime-after", "systemctl is-active cai-allinone.service cai-ssh.service")
+            deadline = time.monotonic() + 90
+            while consumer.directory_ports("endpoints-after-reboot") != endpoints:
+                assert time.monotonic() < deadline, "reboot changed peer endpoint assignments"
+                time.sleep(3)
             return
         time.sleep(10)
     raise RuntimeError(f"{consumer.service}: reboot recovery failed")
@@ -308,6 +548,166 @@ def trustee_outage(consumer, aliyun, unit):
     raise RuntimeError(f"{consumer.service}: Trustee recovery failed without reinjection")
 
 
+def deploy_with_frozen_inputs(consumers, parallel, aliyun):
+    """Changing or removing A's source must not apply its edits when B is added."""
+    first, second, *remaining = consumers
+    assert remaining, "frozen-input coverage needs three consumers"
+    original = first.spec_path.read_bytes()
+    saved = first.spec_path.with_suffix(".saved")
+    before = json.loads((first.directory / "manifest.json").read_text())["deployment"]
+    cloud = json.loads((first.directory / "state.json").read_text())["deploy"]
+    region = first.spec["deploy"]["region"]
+    def cloud_configuration(label):
+        instance = json.loads(run([aliyun, "--region", region, "ecs", "DescribeInstances",
+                                  "--RegionId", region, "--InstanceIds", json.dumps([cloud["instance_id"]])],
+                                 first.work / (label + "-instance")).stdout)["Instances"]["Instance"]
+        disks = json.loads(run([aliyun, "--region", region, "ecs", "DescribeDisks", "--RegionId", region,
+                               "--InstanceId", cloud["instance_id"]],
+                              first.work / (label + "-disks")).stdout)["Disks"]["Disk"]
+        assert len(instance) == 1
+        return instance[0]["InstanceType"], sorted((item["DiskId"], item["Size"]) for item in disks)
+    before_cloud = cloud_configuration("frozen-before")
+    edited = json.loads(original)
+    edited["deploy"]["instance_type"] = "ecs.g9i.2xlarge"
+    edited["deploy"]["disk_gb"] += 40
+    edited["service"]["ports"] = [19999]
+    first.spec_path.write_text(json.dumps(edited))
+    try:
+        second.deploy()
+        first.spec_path.rename(saved)
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            list(pool.map(lambda item: item.deploy(), remaining))
+        after = json.loads((first.directory / "manifest.json").read_text())["deployment"]
+        assert after == before, "background maintenance replaced committed deployment inputs"
+        current = json.loads((first.directory / "state.json").read_text())["deploy"]
+        assert current == cloud, "background maintenance changed instance ownership"
+        assert cloud_configuration("frozen-after") == before_cloud, "background maintenance changed cloud compute/storage"
+        first.ssh("unchanged-runtime", "cai-agent --check")
+    finally:
+        first.spec_path.write_bytes(original)
+        saved.unlink(missing_ok=True)
+
+
+def verify_stable_endpoints(consumers, fixture):
+    client = next(item for item in consumers if not item.spec["service"]["ports"])
+    extra = Consumer(fixture.resolve(), client.work.parent, client.ca[0], client.cidr, client.state)
+    peers = [item for item in consumers if item.spec["service"]["ports"] == extra.spec["service"]["ports"]]
+    assert len(peers) >= 2, "stable endpoint coverage needs two existing peers on the extra peer's port"
+    assert extra.service < min(item.service for item in peers), "extra peer must sort before existing peers"
+    before = client.directory_ports("stable-endpoints-before")
+    assert all(item.service in before for item in peers)
+    changed = []
+    dropin = "/run/systemd/system/cai-allinone.service.d/routing-test.conf"
+    probe = "/run/cai-e2e-routing.py"
+
+    def install_identity_server(item):
+        port, = item.spec["service"]["ports"]
+        script = ("from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+                  "class Handler(BaseHTTPRequestHandler):\n"
+                  " def do_GET(self):\n"
+                  "  self.send_response(200); self.end_headers(); self.wfile.write(" + repr(item.service.encode()) + ")\n"
+                  " def log_message(self, *args): pass\n"
+                  "HTTPServer(('0.0.0.0', " + str(port) + "), Handler).serve_forever()\n")
+        unit = "[Service]\nExecStart=\nExecStart=/usr/bin/python3.11 " + probe + "\n"
+        changed.append(item)
+        item.ssh("routing-probe-install", "mkdir -p " + shlex.quote(str(Path(dropin).parent))
+                 + "; printf %s " + shlex.quote(script) + " > " + probe
+                 + "; printf %s " + shlex.quote(unit) + " > " + dropin
+                 + "; systemctl daemon-reload; systemctl restart cai-allinone.service")
+
+    def verify_routes(label, targets, absent=()):
+        deadline = time.monotonic() + 180
+        while True:
+            directory = client.directory_ports(label + "-directory")
+            if all(item.service in directory for item in targets) and all(id not in directory for id in absent):
+                break
+            assert time.monotonic() < deadline, "mesh directory did not converge"
+            time.sleep(3)
+        for item in peers:
+            assert directory[item.service] == before[item.service], "existing endpoint changed target"
+        for item in targets:
+            port = directory[item.service]["ports"][0]["port"]
+            command = ("python3.11 -c " + shlex.quote("import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:"
+                       + str(port) + "/', timeout=10).read().decode())"))
+            while True:
+                result = client.ssh(label + "-call-" + item.service, command, success=False, timeout=20)
+                if result.returncode == 0 and result.stdout.strip().decode() == item.service:
+                    break
+                assert time.monotonic() < deadline, "stable endpoint did not reach its attested service"
+                time.sleep(3)
+        return directory
+
+    try:
+        for item in peers:
+            install_identity_server(item)
+        verify_routes("stable-before", peers)
+        extra.deploy()
+        install_identity_server(extra)
+        after = verify_routes("stable-added", peers + [extra])
+        removed_port = after[extra.service]["ports"][0]["port"]
+        removed_id = extra.service
+        extra.destroy()
+        extra.attempted = False
+        verify_routes("stable-removed", peers, [removed_id])
+        replacement = client.work.parent / "replacement-fixture"
+        replacement.mkdir(mode=0o700)
+        spec = json.loads(json.dumps(extra.spec))
+        spec["service"]["id"] = "zzzz-" + extra.service
+        (replacement / "appspec.json").write_text(json.dumps(spec))
+        (replacement / "probe.json").write_text(json.dumps(extra.probe))
+        extra = Consumer(replacement, client.work.parent, client.ca[0], client.cidr, client.state)
+        extra.deploy()
+        install_identity_server(extra)
+        after = verify_routes("stable-replaced", peers + [extra], [removed_id])
+        assert after[extra.service]["ports"][0]["port"] != removed_port, "removed address was recycled for another service"
+    finally:
+        for item in changed:
+            if item is extra or item in peers:
+                item.ssh("routing-probe-remove", "rm -f " + dropin + " " + probe
+                         + "; systemctl daemon-reload; systemctl restart cai-allinone.service", success=False)
+        extra.destroy()
+
+
+def verify_publication_cleanup(consumers, publication_state, aliyun):
+    consumer = consumers[0]
+    image = json.loads((consumer.directory / "manifest.json").read_text())["image"]["image_id"]
+    publisher = json.loads(publication_state.read_text())
+    entries = {key: value for key, value in publisher["build"]["published"].items()
+               if value.get("image_id") == image}
+    assert len(entries) == 1, "publication evidence does not identify the selected image"
+    entry, = entries.values()
+    # Use a local publication fixture to isolate reference protection from the
+    # export-retention flag. Dummy credentials keep every delete unauthorized.
+    entry.update(exported=False, oss_cleaned=True)
+    publisher.update(service_id="reuse-test-publisher", phase="built")
+    publisher["build"]["published"] = entries
+    publisher["deploy"]["published_image_id"] = None
+    directory = consumer.state / "services/reuse-test-publisher"
+    directory.mkdir(mode=0o700)
+    state_file = directory / "state.json"
+    state_file.write_text(json.dumps(publisher))
+    denied_env = dict(os.environ)
+    for key in ["ALICLOUD_ACCESS_KEY", "ALIBABA_CLOUD_ACCESS_KEY_ID"]:
+        denied_env[key] = "CA_E2E_INVALID_ACCESS_KEY"
+    for key in ["ALICLOUD_SECRET_KEY", "ALIBABA_CLOUD_ACCESS_KEY_SECRET"]:
+        denied_env[key] = "CA_E2E_INVALID_SECRET_KEY"
+    for key in ["ALICLOUD_STS_TOKEN", "ALIBABA_CLOUD_SECURITY_TOKEN"]:
+        denied_env.pop(key, None)
+    base = ["image", "unpublish", "reuse-test-publisher", "--image-id", image]
+    rejected = consumer.command("cleanup-reject-consumers", *base, success=False, env=denied_env)
+    assert rejected.returncode and b"is retained" in rejected.stderr
+    assert any(item.service.encode() in rejected.stderr for item in consumers), "cleanup did not inspect independent consumers"
+    preview = consumer.command("cleanup-prune-retains-consumers", "image", "prune", "--dry-run", "--all")
+    assert image.encode() not in b"\n".join(line for line in preview.stdout.splitlines() if b"would prune service=reuse-test-publisher" in line)
+    failed = consumer.command("cleanup-denied-cloud-delete", *base, "--force", success=False, env=denied_env)
+    assert failed.returncode and b"partially failed" in failed.stderr
+    written = json.loads(state_file.read_text())["build"]["published"]
+    assert any(entry["status"] == "failed" and entry["image_id"] == image for entry in written.values())
+    region = consumer.spec["deploy"]["region"]
+    result = run([aliyun, "--region", region, "ecs", "DescribeImages", "--RegionId", region, "--ImageId", image], consumer.work / "cleanup-shared-image-preserved")
+    assert len(json.loads(result.stdout)["Images"]["Image"]) == 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, action="append", required=True)
@@ -316,6 +716,18 @@ def main():
     parser.add_argument("--ca", default="confidential-agent")
     parser.add_argument("--aliyun", default="aliyun")
     parser.add_argument("--parallel", type=int, choices=range(1, 7), default=3)
+    parser.add_argument("--allow-model-skip", action="store_true",
+                        help="Explicitly accept fixtures without real model calls")
+    parser.add_argument("--concurrent-deploy", action="store_true")
+    parser.add_argument("--interrupt-infrastructure", action="store_true")
+    parser.add_argument("--resume-deploy", action="store_true")
+    parser.add_argument("--frozen-inputs", action="store_true")
+    parser.add_argument("--console-isolation", action="store_true")
+    parser.add_argument("--application-errors", action="store_true")
+    parser.add_argument("--stable-endpoints-fixture", type=Path)
+    parser.add_argument("--incompatible-release", type=Path)
+    parser.add_argument("--publication-state", type=Path)
+    parser.add_argument("--pty", action="store_true")
     parser.add_argument("--reboot", action="store_true",
                         help="Force-reboot one consumer and verify encrypted data survives")
     parser.add_argument("--trustee-url", help="Guest-visible URL for a disposable Trustee")
@@ -328,10 +740,14 @@ def main():
         parser.error("--trustee-url and --trustee-admin-key must be supplied together")
     if args.trustee_outage_service and not args.trustee_url:
         parser.error("--trustee-outage-service requires Trustee fixtures")
+    if args.concurrent_deploy and args.resume_deploy:
+        parser.error("choose concurrent or resumable first deployment")
+    if args.resume_deploy and args.trustee_url:
+        parser.error("resource-delivery resume coverage uses challenge mode")
     os.umask(0o077)
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(mode=0o700)
-    shared_state = args.work_dir / "state" if args.trustee_url else None
+    shared_state = args.work_dir / "state"
     consumers = [Consumer(path.resolve(), args.work_dir, args.ca, args.operator_cidr, shared_state)
                  for path in args.fixture]
     assert len(consumers) >= 2, "reuse requires at least two consumers"
@@ -339,6 +755,8 @@ def main():
     pins = [item.spec["deploy"]["image"] for item in consumers]
     assert all(pin == pins[0] for pin in pins), "fixtures must select the same release"
     assert all("build" not in item.spec and item.spec["service"]["ssh"] for item in consumers)
+    if not args.allow_model_skip:
+        assert all(item.probe.get("command") for item in consumers), "model probes are required; use --allow-model-skip to report exclusions"
     if args.trustee_url:
         assert all(item.spec["attestation"]["mode"] == "trustee" for item in consumers)
         configure = ["trustee", "configure", "--url", args.trustee_url,
@@ -356,16 +774,43 @@ def main():
     else:
         assert all(item.spec["attestation"]["mode"] == "challenge" for item in consumers)
     try:
+        consumers[0].command("peering", "peering", "add", "--role", "operator",
+                             "--cidr", args.operator_cidr, "--label", "reuse-test")
         reject_invalid_release(consumers[0])
-        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-            list(pool.map(lambda item: item.deploy(), consumers))
+        if args.incompatible_release:
+            reject_incompatible_release(consumers[0], args.incompatible_release)
+        if args.interrupt_infrastructure:
+            interrupt_infrastructure(consumers[0], args.aliyun)
+        if args.frozen_inputs or args.concurrent_deploy or args.resume_deploy:
+            consumers[0].deploy(concurrent=args.concurrent_deploy, resume=args.resume_deploy)
+            if args.concurrent_deploy:
+                assert_one_deployment(consumers[0], args.aliyun)
+            if args.frozen_inputs:
+                deploy_with_frozen_inputs(consumers, args.parallel, args.aliyun)
+            else:
+                with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+                    list(pool.map(lambda item: item.deploy(), consumers[1:]))
+        else:
+            with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+                list(pool.map(lambda item: item.deploy(), consumers))
         assert_independent(consumers)
+        if args.application_errors:
+            consumers[0].verify_management_during_application_errors()
+        if args.stable_endpoints_fixture:
+            verify_stable_endpoints(consumers, args.stable_endpoints_fixture)
+        if args.console_isolation:
+            consumers[0].verify_console_isolation(args.aliyun)
+        if args.pty:
+            for item in consumers:
+                item.verify_pty()
         if args.reboot:
             reboot(consumers[0], args.aliyun)
             for consumer in consumers[1:]:
                 consumer.ssh("independent-data", "test ! -e /opt/data/allinone/reboot-marker")
         if args.trustee_outage_service:
             trustee_outage(consumers[0], args.aliyun, args.trustee_outage_service)
+        if args.publication_state:
+            verify_publication_cleanup(consumers, args.publication_state, args.aliyun)
         first, *remaining = consumers
         first.destroy()
         first.attempted = False
@@ -389,6 +834,17 @@ def main():
     (args.work_dir / "result.json").write_text(json.dumps({
         "passed": True, "consumers": [item.service for item in consumers],
         "shared_image_preserved": True,
+        "shared_workspace": True,
+        "concurrent_deploy": args.concurrent_deploy,
+        "interrupt_infrastructure": args.interrupt_infrastructure,
+        "resume_deploy": args.resume_deploy,
+        "frozen_inputs": args.frozen_inputs,
+        "console_isolation": args.console_isolation,
+        "application_errors": args.application_errors,
+        "stable_endpoints": bool(args.stable_endpoints_fixture),
+        "incompatible_runtime_rejected": bool(args.incompatible_release),
+        "cleanup_consumers_and_failure_status": bool(args.publication_state),
+        "pty": args.pty,
         "trustee_outage": bool(args.trustee_outage_service),
         "model_calls": {item.service: "passed" if item.probe.get("command")
                         else {"skipped": item.probe["skip_reason"]} for item in consumers}
