@@ -101,6 +101,55 @@ Artifacts:
 
 All CA image builds use mkosi. The runner verifies Shelter `initrd.binaries` support and records the selected binary SHA256. Cleanup failures make the case fail. Use fresh work/state directories when validating a Shelter upgrade; do not reuse old build artifacts.
 
+### Shared-image consumers
+
+`allinone-reuse.py` tests a published allinone image from a deployment host
+without producer state or a local QCOW2. Prepare at least two private fixture
+directories. Each contains `appspec.json` (a standard AppSpec written as JSON)
+and `probe.json`; use distinct service IDs, `service.ssh: true`, and the same
+`deploy.image` selection. Resource paths and release/key paths must be absolute.
+The image configuration uses the harness's native provider/model settings.
+An optional `runtime_command` in `probe.json` checks the native gateway or API.
+For a service exposing one HTTP port through `service.connect`, an optional
+`connect_http_path` also checks HTTP 200 through CA's protected connection.
+
+`probe.json` supplies an SSH command and its expected model-response marker.
+Keep the complete marker out of the prompt so echoed input cannot satisfy it:
+
+```json
+{"command": "cai-agent --print 'Join REUSE_ and OK without a space'", "expect": "REUSE_OK"}
+```
+
+If account credentials are unavailable, explicitly use `command: null` and a
+`skip_reason`; installation and startup are still checked, and the model call
+is recorded as skipped. Keep fixtures and credentials outside the repository.
+
+```bash
+python3.11 tools/e2e/allinone-reuse.py \
+  --fixture /private/fixtures/agent-a --fixture /private/fixtures/agent-b \
+  --work-dir /private/results/reuse-01 --operator-cidr YOUR_IP/32 \
+  --parallel 2 --reboot
+```
+
+The work directory must be new. Consumers use independent state directories.
+The test rejects altered signatures, wrong publisher keys and incorrect pins;
+checks attestation, resource content, independent credentials and pinned SSH
+host keys; optionally forces a reboot and verifies persisted data; and destroys all attempted
+consumers, checking that the published image survives. Challenge reboot recovery
+uses the existing `inject` command; Trustee recovery does not invoke it. Private
+command output and any cleanup failure remain in the work directory.
+
+For Trustee fixtures, supply `--trustee-url`, `--trustee-admin-key`, and optionally
+`--trustee-management-url`. Use a fresh disposable stock Trustee and restrict its
+guest-facing port to the test instances. The runner explicitly adopts its
+current policies, uses one shared CA state to own those policies, and serializes
+deployment updates. Per-instance keys, secrets and guest data remain separate.
+If that disposable Trustee runs on the runner host, `--trustee-outage-service
+trustee-gateway.service` additionally checks that reboot cannot bypass unavailable key
+release and that restoring Trustee allows recovery without CLI reinjection.
+Select the unit serving the configured guest URL; the stock Trustee RPM exposes
+that URL through `trustee-gateway.service`.
+
 ### Clean ECS build host
 
 Use a new Alibaba Cloud Linux 3 system image and copy only the CA source tree
@@ -114,7 +163,8 @@ rpm -V shelter cryptpilot-fde-host
 hack/check-shelter.sh /usr/bin/shelter
 ```
 
-The Shelter RPM bundles the official Cryptpilot guest. Its host tool and
+The Shelter RPM bundles the Cryptpilot guest pinned in its `PKGINFO`; check that
+metadata for the source commit and any pending upstream fix. Its host tool and
 convert/enhance scripts are installed from the system package repository through
 the `cryptpilot-fde-host` dependency.
 
