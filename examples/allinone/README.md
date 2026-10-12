@@ -65,6 +65,11 @@ model credentials or a successful model request. Run the image-local
 `cai-agent --check` for configuration/port checks and an explicit model smoke
 test for model connectivity. Application logs stay in the guest volatile journal
 and are lost on reboot. They are not forwarded to the cloud console.
+The daemon supplies the application runtime context after verifying and applying
+the selected provider's resources. The launcher does not read challenge or
+Trustee caches. Management SSH starts independently when its own attested
+credentials are ready, so application configuration errors can be diagnosed
+with `ca ssh SERVICE -- journalctl -u cai-allinone.service --no-pager`.
 OpenClaw and Hermes run only the selected gateway. All per-harness units from
 individual installers remain disabled.
 

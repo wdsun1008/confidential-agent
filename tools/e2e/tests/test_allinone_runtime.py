@@ -40,18 +40,21 @@ class AllinoneRuntimeTest(unittest.TestCase):
                 self.assertEqual(args[2]["TEST_API_KEY"], "private-token")
                 self.assertEqual(args[2]["HOME"], str(root / "home"))
 
-    def test_modes_and_listening_ports_are_checked_against_delivered_bootstrap(self):
+    def test_modes_and_listening_ports_are_checked_against_verified_runtime_context(self):
         namespace = runpy.run_path(str(RUNTIME))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config, bootstrap = root / "runtime.json", root / "bootstrap.json"
             config.write_text(json.dumps({"harness": "openclaw", "port": 18790}))
             self.assertEqual(namespace["load_configuration"](config)[:3], ("openclaw", "gateway", 18790))
-            bootstrap.write_text(json.dumps({"ports": [18789]}))
+            bootstrap.write_text(json.dumps({"schema_version": "confidential-agent/application-runtime/v1", "ports": [18789]}))
             with self.assertRaises(ValueError):
                 namespace["validate_declared_ports"](18790, bootstrap)
-            bootstrap.write_text(json.dumps({"ports": [18790]}))
+            bootstrap.write_text(json.dumps({"schema_version": "confidential-agent/application-runtime/v1", "ports": [18790]}))
             namespace["validate_declared_ports"](18790, bootstrap)
+            bootstrap.write_text(json.dumps({"ports": [18790]}))
+            with self.assertRaisesRegex(ValueError, "application runtime context"):
+                namespace["validate_declared_ports"](18790, bootstrap)
             for value in [{"harness": "codex", "mode": "gateway"},
                           {"harness": "codex", "mode": "cli", "port": 4500},
                           {"harness": "openclaw", "port": True},

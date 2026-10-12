@@ -227,7 +227,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
                     "schema_version": "confidential-agent/guest-runtime/v1",
                     "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
-                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"]
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "application-runtime-v1", "instance-ssh-credentials-v1"]
                 })
             );
             Ok(())
@@ -1442,6 +1442,22 @@ fn apply_bootstrap(
     state: &mut DaemonState,
     fail_missing: bool,
 ) -> Result<bool> {
+    apply_bootstrap_resources(
+        args,
+        bootstrap,
+        state,
+        fail_missing,
+        Path::new("/opt/data/cai-ssh"),
+    )
+}
+
+fn apply_bootstrap_resources(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    state: &mut DaemonState,
+    fail_missing: bool,
+    management_directory: &Path,
+) -> Result<bool> {
     struct PlannedResource<'a> {
         resource: &'a GuestResource,
         source: PathBuf,
@@ -1466,65 +1482,14 @@ fn apply_bootstrap(
     state
         .applied_resources
         .retain(|resource_id, _| resource_ids.contains(resource_id));
+    apply_management_credentials(args, bootstrap, state, management_directory)?;
     for resource in &bootstrap.resources {
-        let source = args.cdh_root.join(&resource.resource_path);
-        let metadata = match source.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if fail_missing || resource.required {
-                    missing_required.push(resource.id.clone());
-                }
-                eprintln!(
-                    "waiting for resource '{}' at '{}'",
-                    resource.id,
-                    source.display()
-                );
-                continue;
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to stat resource '{}'", source.display()));
-            }
-        };
-        if !metadata.is_file() {
-            bail!(
-                "resource '{}' at '{}' is not a regular file",
-                resource.id,
-                source.display()
-            );
-        }
-        if metadata.len() == 0 {
+        let Some((source, digest)) = verified_resource_source(args, resource)? else {
             if fail_missing || resource.required {
                 missing_required.push(resource.id.clone());
             }
-            eprintln!(
-                "waiting for resource '{}' at '{}'",
-                resource.id,
-                source.display()
-            );
             continue;
-        }
-        if metadata.len() > MAX_RESOURCE_BYTES {
-            bail!(
-                "resource '{}' at '{}' is {} bytes, exceeding maximum {} bytes",
-                resource.id,
-                source.display(),
-                metadata.len(),
-                MAX_RESOURCE_BYTES
-            );
-        }
-
-        let digest = sha256_file(&source)?;
-        if let Some(expected) = &resource.sha256 {
-            if expected != &digest {
-                bail!(
-                    "resource '{}' digest mismatch: expected {}, got {}",
-                    resource.id,
-                    expected,
-                    digest
-                );
-            }
-        }
+        };
         let update = if resource.mutable {
             match state.applied_resources.get(&resource.id) {
                 None => ResourceUpdate::WriteContent,
@@ -1631,6 +1596,7 @@ fn apply_bootstrap(
         return Err(err);
     }
 
+    write_application_runtime_context(bootstrap)?;
     state.bootstrap_generation = bootstrap.generation;
     let readiness = ensure_runtime_ready(bootstrap, false);
     write_status(status_for(bootstrap, state, "resources-applied", readiness))?;
@@ -1648,6 +1614,114 @@ fn apply_bootstrap(
     }
 
     Ok(true)
+}
+
+/// Project only verified bootstrap data; applications never select a provider cache.
+fn write_application_runtime_context(bootstrap: &BootstrapConfig) -> Result<()> {
+    write_json_atomic(
+        &daemon_status_path().with_file_name("application-runtime.json"),
+        &json!({
+            "schema_version": "confidential-agent/application-runtime/v1",
+            "service_id": bootstrap.service_id,
+            "ports": bootstrap.ports,
+            "app_service": bootstrap.app_service,
+        }),
+    )
+}
+
+fn verified_resource_source(
+    args: &RunArgs,
+    resource: &GuestResource,
+) -> Result<Option<(PathBuf, String)>> {
+    let source = args.cdh_root.join(&resource.resource_path);
+    let metadata = match source.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "waiting for resource '{}' at '{}'",
+                resource.id,
+                source.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to stat resource '{}'", source.display()))
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "resource '{}' at '{}' is not a regular file",
+        resource.id,
+        source.display()
+    );
+    if metadata.len() == 0 {
+        eprintln!(
+            "waiting for resource '{}' at '{}'",
+            resource.id,
+            source.display()
+        );
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        metadata.len() <= MAX_RESOURCE_BYTES,
+        "resource '{}' at '{}' is {} bytes, exceeding maximum {} bytes",
+        resource.id,
+        source.display(),
+        metadata.len(),
+        MAX_RESOURCE_BYTES
+    );
+    let digest = sha256_file(&source)?;
+    if let Some(expected) = &resource.sha256 {
+        anyhow::ensure!(
+            expected == &digest,
+            "resource '{}' digest mismatch: expected {}, got {}",
+            resource.id,
+            expected,
+            digest
+        );
+    }
+    Ok(Some((source, digest)))
+}
+
+/// Management credentials can become ready even when a business resource is missing
+/// or invalid. Verify both first, then publish the image's SSH readiness trigger.
+fn apply_management_credentials(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    state: &mut DaemonState,
+    directory: &Path,
+) -> Result<()> {
+    let mut credentials = Vec::new();
+    for (id, file) in [
+        ("cai_ssh_authorized_keys", "authorized_keys"),
+        ("cai_ssh_host_key", "host_key"),
+    ] {
+        let Some(resource) = bootstrap
+            .resources
+            .iter()
+            .find(|resource| resource.id == id)
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(resource.target == directory.join(file) && resource.required && !resource.mutable && resource.sha256.is_some(),
+            "instance SSH credentials must be required, immutable and bound to their management paths");
+        let Some((source, digest)) = verified_resource_source(args, resource)? else {
+            return Ok(());
+        };
+        credentials.push((resource, source, digest));
+    }
+    for (resource, source, digest) in credentials {
+        apply_resource_once(resource, &source, &digest)?;
+        state.applied_resources.insert(
+            resource.id.clone(),
+            applied_resource_state(resource, &digest),
+        );
+    }
+    write_file_atomic(
+        &daemon_status_path().with_file_name("instance-ssh.ready"),
+        b"ready\n",
+    )
 }
 
 fn applied_resource_state(resource: &GuestResource, digest: &str) -> AppliedResourceState {

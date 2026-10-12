@@ -70,6 +70,16 @@ impl ImageRuntimeContract {
             anyhow::ensure!(guest_runtime["capabilities"].as_array().is_some_and(|values| values.iter().any(|v| v == capability)),
                 "guest binary does not support required capability {capability}; rebuild the CA tools image");
         }
+        for capability in ["application-runtime-v1", "instance-ssh-credentials-v1"] {
+            if contract
+                .capabilities
+                .iter()
+                .any(|value| value == capability)
+            {
+                anyhow::ensure!(guest_runtime["capabilities"].as_array().is_some_and(|values| values.iter().any(|value| value == capability)),
+                    "guest binary does not support required capability {capability}; rebuild the CA guest binary");
+            }
+        }
         contract.software_versions.insert(
             "confidential-agentd".into(),
             guest_runtime["version"]

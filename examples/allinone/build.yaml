@@ -39,6 +39,8 @@ build:
       target: /etc/systemd/system/cai-allinone.service
     - source: ./files/cai-ssh.service
       target: /etc/systemd/system/cai-ssh.service
+    - source: ./files/cai-ssh.path
+      target: /etc/systemd/system/cai-ssh.path
     - source: ./files/sshd_config
       target: /usr/local/libexec/confidential-agent/allinone/sshd_config
   scripts: [./install-allinone.sh]

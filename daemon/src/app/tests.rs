@@ -1293,6 +1293,98 @@ fn resource_apply_supports_numeric_owner_and_group() {
 }
 
 #[test]
+fn management_credentials_and_runtime_context_use_only_the_selected_provider() {
+    for provider in ["challenge", "trustee"] {
+        let temp = tempfile::tempdir().unwrap();
+        let env = no_tee_test_env(&temp);
+        let args = test_run_args(temp.path().join(provider));
+        let management = temp.path().join("management");
+        let mut bootstrap = test_bootstrap_config("test-app");
+        bootstrap.mode = provider.into();
+        bootstrap.ports = vec![18789];
+        for (id, file) in [
+            ("cai_ssh_authorized_keys", "authorized_keys"),
+            ("cai_ssh_host_key", "host_key"),
+        ] {
+            let resource_path = format!("default/local-resources/{id}");
+            // A foreign cache exists, but must never supply the current provider.
+            write_test_file(
+                &temp.path().join("foreign").join(&resource_path),
+                b"foreign-credential",
+            );
+            bootstrap.resources.push(GuestResource {
+                id: id.into(),
+                resource_path,
+                target: management.join(file),
+                owner: None,
+                group: None,
+                mode: "0600".into(),
+                required: true,
+                mutable: false,
+                sha256: Some(hex_encode(&Sha256::digest(b"verified-credential"))),
+            });
+        }
+        let business = GuestResource {
+            id: "business".into(),
+            resource_path: "default/local-resources/business".into(),
+            target: temp.path().join("business"),
+            owner: None,
+            group: None,
+            mode: "0600".into(),
+            required: true,
+            mutable: false,
+            sha256: Some(hex_encode(&Sha256::digest(b"valid-config"))),
+        };
+        bootstrap.resources.push(business.clone());
+        let ready = env.status.with_file_name("instance-ssh.ready");
+        let context = env.status.with_file_name("application-runtime.json");
+        let mut state = DaemonState::default();
+        assert!(
+            !apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).unwrap()
+        );
+        assert!(!ready.exists());
+        assert!(!management.exists());
+        for resource in &bootstrap.resources[..2] {
+            write_test_file(
+                &args.cdh_root.join(&resource.resource_path),
+                b"verified-credential",
+            );
+        }
+        assert!(
+            !apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).unwrap()
+        );
+        assert!(ready.exists());
+        assert!(!context.exists());
+        assert_eq!(
+            fs::read(management.join("host_key")).unwrap(),
+            b"verified-credential"
+        );
+        write_test_file(
+            &args.cdh_root.join(&business.resource_path),
+            b"corrupt-config",
+        );
+        assert!(
+            apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).is_err()
+        );
+        assert!(ready.exists());
+        write_test_file(
+            &args.cdh_root.join(&business.resource_path),
+            b"valid-config",
+        );
+        assert!(
+            apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).unwrap()
+        );
+        let value: Value = read_json_file(&context);
+        assert_eq!(
+            value["schema_version"],
+            "confidential-agent/application-runtime/v1"
+        );
+        assert_eq!(value["ports"], json!([18789]));
+        assert!(!fs::read_to_string(&context).unwrap().contains("priv"));
+    }
+}
+
+#[test]
 fn bootstrap_reapplies_resource_when_target_content_drifted() {
     let temp = tempfile::tempdir().unwrap();
     let cdh_root = temp.path().join("cdh");

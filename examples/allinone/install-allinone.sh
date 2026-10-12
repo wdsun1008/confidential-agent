@@ -34,6 +34,7 @@ disable cai-codex-app-server.service
 disable cai-hermes-agent.service
 disable sshd.service
 disable sshd.socket
+enable cai-ssh.path
 PRESET
 # mkosi applies preset-all after post-install scripts and would otherwise
 # re-enable the distribution SSH server before instance credentials arrive.
@@ -43,6 +44,7 @@ for unit in cai-codex-app-server.service cai-hermes-agent.service sshd.service s
     fi
 done
 rm -f /etc/ssh/ssh_host_* /root/.ssh/authorized_keys
+systemctl enable cai-ssh.path
 install -d -m 0755 /usr/local/share/confidential-agent
 {
     npm list -g --depth=0 --json

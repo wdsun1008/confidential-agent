@@ -1,0 +1,10 @@
+[Unit]
+Description=Start management SSH after CA verifies its credentials
+After=confidential-agentd.service
+
+[Path]
+PathExists=/run/confidential-agent/instance-ssh.ready
+Unit=cai-ssh.service
+
+[Install]
+WantedBy=multi-user.target

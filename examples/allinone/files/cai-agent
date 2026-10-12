@@ -11,7 +11,7 @@ import sys
 CONFIG = Path("/opt/data/allinone/runtime.json")
 HOME = Path("/opt/data/allinone/home")
 WORKSPACE = Path("/opt/data/allinone/workspace")
-BOOTSTRAP = Path("/run/confidential-containers/cdh/default/local-resources/cagent_bootstrap_config")
+RUNTIME_CONTEXT = Path("/run/confidential-agent/application-runtime.json")
 class ConfigurationError(ValueError):
     """Messages contain static diagnostics, never instance environment values."""
 
@@ -65,8 +65,10 @@ def load_configuration(path=CONFIG):
     return harness, mode, port, environment
 
 
-def validate_declared_ports(port, path=BOOTSTRAP):
+def validate_declared_ports(port, path=RUNTIME_CONTEXT):
     bootstrap = json.loads(path.read_text())
+    if bootstrap.get("schema_version") != "confidential-agent/application-runtime/v1":
+        raise ConfigurationError("invalid daemon application runtime context")
     expected = [] if port is None else [port]
     if sorted(bootstrap["ports"]) != expected:
         raise ConfigurationError("runtime listening port does not match CA service.ports")
@@ -109,10 +111,6 @@ def main():
         if arguments == ["--check"]:
             print(json.dumps({"harness": harness, "mode": mode, "port": port}))
             return
-        # Credentials arrive only through the existing CA attested resource flow.
-        ssh = Path("/opt/data/cai-ssh")
-        if (ssh / "authorized_keys").is_file() and (ssh / "host_key").is_file():
-            subprocess.run(["systemctl", "start", "cai-ssh.service"], check=True)
         if mode == "gateway" and harness == "openclaw":
             command += ["gateway", "--port", str(port)]
         elif mode == "gateway" and harness == "hermes":

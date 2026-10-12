@@ -6,7 +6,9 @@
     "resources-v1",
     "mesh-client-ports-v1",
     "instance-ssh-v1",
-    "allinone-runtime-v1"
+    "allinone-runtime-v1",
+    "application-runtime-v1",
+    "instance-ssh-credentials-v1"
   ],
   "rootfs_integrity": true,
   "writable_layer_encryption": "luks2",
