@@ -543,3 +543,10 @@ optionally selects an image-owned JSON contract; it is captured at build time.
 The guest binary reports its protocol capabilities through `describe-runtime`.
 Older image exports without this contract require rebuilding before using the
 published-image entry point; ordinary local artifact deployment remains available.
+
+`ca deploy --resume` resumes resource delivery only for confirmed `deployed`
+infrastructure with the original configuration. It does not apply Terraform or
+replay an interrupted infrastructure operation. Same-service build/deploy/inject/
+destroy operations are mutually exclusive; independent services may proceed in
+parallel. `ca ssh --tty SERVICE -- COMMAND` explicitly allocates a terminal;
+script execution retains its existing output and exit-code behavior.

@@ -5,6 +5,15 @@ export NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com/}"
 export UV_INDEX_URL="${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
 export PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST:-https://npmmirror.com/mirrors/playwright}"
 
+# The staged contract fixes both the install inputs and published version metadata.
+contract=/usr/local/share/confidential-agent/image-runtime.json
+export CODEX_VERSION="$(jq -er '.software_versions.codex' "$contract")"
+export CLAUDE_CODE_VERSION="$(jq -er '.software_versions["claude-code"]' "$contract")"
+export HERMES_COMMIT="$(jq -er '.software_versions.hermes' "$contract")"
+OPENCLAW_VERSION="$(jq -er '.software_versions.openclaw' "$contract")"
+QODER_VERSION="$(jq -er '.software_versions.qodercli' "$contract")"
+OPENCODE_VERSION="$(jq -er '.software_versions.opencode' "$contract")"
+
 cli=/usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh
 "$cli" codex
 "$cli" claude-code
@@ -13,9 +22,9 @@ HERMES_HOME=/opt/data/allinone/hermes \
     /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
 npm config set registry "$NPM_REGISTRY"
 npm install -g --no-audit --no-fund \
-    "openclaw@${OPENCLAW_VERSION:-2026.5.7}" \
-    "@qoder-ai/qodercli@${QODER_VERSION:-latest}" \
-    "opencode-ai@${OPENCODE_VERSION:-latest}"
+    "openclaw@$OPENCLAW_VERSION" \
+    "@qoder-ai/qodercli@$QODER_VERSION" \
+    "opencode-ai@$OPENCODE_VERSION"
 
 # Current Shelter preserves ELF payloads. Select the harness only after CA has
 # delivered this instance's resources; individual installers enable their units.

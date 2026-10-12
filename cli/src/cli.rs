@@ -670,6 +670,9 @@ pub(crate) struct TuiArgs {
 #[derive(Debug, Args)]
 pub(crate) struct SshArgs {
     pub(crate) service: String,
+    /// Allocate a terminal for an interactive remote command; scripts keep no PTY
+    #[arg(short = 't', long)]
+    pub(crate) tty: bool,
     #[arg(last = true)]
     pub(crate) ssh_args: Vec<OsString>,
 }

@@ -1882,7 +1882,12 @@ pub(super) struct DebugSshCommand {
 }
 
 pub(super) fn cmd_ssh(cli: &Cli, args: &SshArgs) -> Result<()> {
-    let command = resolve_debug_ssh_command(&cli.state_dir, &args.service, &args.ssh_args)?;
+    let mut ssh_args = Vec::new();
+    if args.tty {
+        ssh_args.push("-tt".into());
+    }
+    ssh_args.extend(args.ssh_args.iter().cloned());
+    let command = resolve_debug_ssh_command(&cli.state_dir, &args.service, &ssh_args)?;
     exec_debug_ssh_command(&command)
 }
 

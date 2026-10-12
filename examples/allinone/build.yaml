@@ -6,6 +6,7 @@ service:
   ssh: true
 build:
   image_name: allinone
+  runtime_contract: ./runtime-contract.json
   resize: 80G
   repos:
     - name: alinux-os
