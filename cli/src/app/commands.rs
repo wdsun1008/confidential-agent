@@ -357,6 +357,12 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     if let Some(image_id) = published_image_id.as_deref() {
         println!("[ca] using published image {image_id} for deploy (skipping upload+import)");
     }
+    // Keep publication cleanup out of the interval before the consumer's
+    // deployment binding is persisted. Different consumers can deploy together.
+    let image_lease = published_image_id
+        .as_deref()
+        .map(|image_id| lock_image_operation(&cli.state_dir, &spec.deploy.region, image_id, true))
+        .transpose()?;
     if !trustee_mode && !args.render_only && !args.skip_inject {
         verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     }
@@ -462,6 +468,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             &prepared,
             "deployed",
         )?;
+        drop(image_lease);
         if args.skip_inject {
             return Ok(());
         }

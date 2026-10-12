@@ -184,7 +184,7 @@ pub(super) fn export(
         "account_id must be a decimal account ID"
     );
     let paths = context_paths(&cli.state_dir, service);
-    let state = read_service_state_file(&paths.service_state)?
+    let mut state = read_service_state_file(&paths.service_state)?
         .context("image export requires an existing local build and publication")?;
     let manifest = read_build_manifest(&paths.manifest)?;
     anyhow::ensure!(
@@ -195,11 +195,11 @@ pub(super) fn export(
     let region = region.unwrap_or(&spec.deploy.region);
     let variant = variant.unwrap_or(&state.build.variant);
     let built = manifest.variant(variant, Some(&state.build.variant))?;
-    let published = state
+    let (publication_key, published) = state
         .build
         .published
-        .values()
-        .find(|entry| {
+        .iter()
+        .find(|(_, entry)| {
             entry.provider == "aliyun"
                 && entry.region == region
                 && entry.variant == variant
@@ -209,6 +209,16 @@ pub(super) fn export(
         .context(
             "no available publication for this image variant and region; run image publish first",
         )?;
+    let publication_key = publication_key.clone();
+    let _lease = lock_image_operation(
+        &cli.state_dir,
+        region,
+        published
+            .image_id
+            .as_deref()
+            .context("available publication has no image ID")?,
+        true,
+    )?;
     let result = read_shelter_build_result(&built.build_result, &built.shelter_build_id)?;
     anyhow::ensure!(
         sha256_file(&result.image_path)? == published.source_sha256,
@@ -230,6 +240,15 @@ pub(super) fn export(
             "region": region, "image_id": published.image_id.as_ref().context("available publication has no image ID")?,
         }]),
     )?;
+    // Record retention before producing a distributable release. Even if export
+    // is interrupted, automatic pruning must not delete a possibly shared image.
+    state
+        .build
+        .published
+        .get_mut(&publication_key)
+        .unwrap()
+        .exported = true;
+    write_local_service_state(&cli.state_dir, &state)?;
     run_shelter(
         cli,
         &mut [

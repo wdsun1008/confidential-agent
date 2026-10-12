@@ -723,6 +723,7 @@ fn test_published_image(build_id: &str, source_sha256: &str) -> PublishedImage {
         created_at: "2026-06-02T00:00:00Z".to_string(),
         updated_at: "2026-06-02T00:00:00Z".to_string(),
         oss_cleaned: true,
+        exported: false,
         error: None,
     }
 }
@@ -779,6 +780,29 @@ fn service_operation_lock_serializes_one_identity_and_allows_independent_service
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
     drop(first);
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
+fn image_cleanup_waits_for_consumers_to_commit_their_bindings() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = lock_image_operation(temp.path(), "cn-beijing", "m-shared", true).unwrap();
+    let second = lock_image_operation(temp.path(), "cn-beijing", "m-shared", true).unwrap();
+    let _independent = lock_image_operation(temp.path(), "cn-beijing", "m-other", false).unwrap();
+    let state_dir = temp.path().to_path_buf();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let _cleanup = lock_image_operation(&state_dir, "cn-beijing", "m-shared", false).unwrap();
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(first);
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(second);
     done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     waiter.join().unwrap();
 }

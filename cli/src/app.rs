@@ -216,6 +216,7 @@ struct StateDirLock {
 }
 
 const LOCK_EX: i32 = 2;
+const LOCK_SH: i32 = 1;
 const LOCK_UN: i32 = 8;
 
 extern "C" {
@@ -254,6 +255,25 @@ fn lock_service_operation(state_dir: &Path, service_id: &str) -> Result<StateDir
 }
 
 fn lock_operation_file(lock_path: &Path) -> Result<StateDirLock> {
+    lock_operation_file_with_mode(lock_path, LOCK_EX)
+}
+
+fn lock_image_operation(
+    state_dir: &Path,
+    region: &str,
+    image_id: &str,
+    shared: bool,
+) -> Result<StateDirLock> {
+    let digest = hex_encode(&Sha256::digest(format!("{region}\0{image_id}").as_bytes()));
+    lock_operation_file_with_mode(
+        &absolute_path_for_state(state_dir)
+            .join("image-locks")
+            .join(digest),
+        if shared { LOCK_SH } else { LOCK_EX },
+    )
+}
+
+fn lock_operation_file_with_mode(lock_path: &Path, mode: i32) -> Result<StateDirLock> {
     use std::os::unix::fs::OpenOptionsExt;
     let parent = lock_path.parent().context("operation lock has no parent")?;
     fs::create_dir_all(parent)
@@ -266,7 +286,7 @@ fn lock_operation_file(lock_path: &Path) -> Result<StateDirLock> {
         .open(lock_path)
         .with_context(|| format!("failed to open '{}'", lock_path.display()))?;
     loop {
-        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        let rc = unsafe { flock(file.as_raw_fd(), mode) };
         if rc == 0 {
             break;
         }

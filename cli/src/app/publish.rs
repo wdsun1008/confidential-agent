@@ -577,6 +577,7 @@ fn published_base_entry(seed: PublishEntrySeed<'_>) -> PublishedImage {
         created_at: now.clone(),
         updated_at: now,
         oss_cleaned: false,
+        exported: false,
         error: None,
     }
 }
@@ -1025,6 +1026,50 @@ pub(super) fn cmd_image_unpublish(cli: &Cli, args: &ImageUnpublishArgs) -> Resul
     cmd_image_unpublish_with_ops(cli, &RealPublishCloudOps, args)
 }
 
+fn image_references(state_dir: &Path, image_id: &str) -> Result<Vec<String>> {
+    let mut references = BTreeSet::new();
+    for state in read_service_states(state_dir)? {
+        if matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
+            && state.deploy.published_image_id.as_deref() == Some(image_id)
+        {
+            references.insert(format!("service '{}' is {}", state.service_id, state.phase));
+        }
+        if state
+            .build
+            .published
+            .values()
+            .any(|entry| entry.exported && entry.image_id.as_deref() == Some(image_id))
+        {
+            references.insert(format!(
+                "service '{}' exported a signed release",
+                state.service_id
+            ));
+        }
+    }
+    // Imports can precede state creation (including deploy --render-only).
+    // Retain these references until their consumer is explicitly removed.
+    let services = absolute_path_for_state(state_dir).join("services");
+    if services.try_exists()? {
+        for directory in fs::read_dir(services)? {
+            let manifest = directory?.path().join("manifest.json");
+            if manifest.try_exists()? {
+                let manifest = read_build_manifest(&manifest)?;
+                if manifest
+                    .image
+                    .as_ref()
+                    .is_some_and(|image| image.image_id == image_id)
+                {
+                    references.insert(format!(
+                        "service '{}' imported this release",
+                        manifest.service_id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(references.into_iter().collect())
+}
+
 fn cmd_image_unpublish_with_ops(
     cli: &Cli,
     ops: &impl PublishCloudOps,
@@ -1063,23 +1108,30 @@ fn cmd_image_unpublish_with_ops(
         );
         return Ok(());
     }
-    if !args.force && matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
-        if let Some(deployed_id) = state.deploy.published_image_id.as_deref() {
-            if keys
-                .iter()
-                .any(|key| state.build.published[key].image_id.as_deref() == Some(deployed_id))
-            {
-                bail!(
-                    "service '{}' is {} and uses published image {}; use --force to unpublish it",
-                    args.service,
-                    state.phase,
-                    deployed_id
-                );
-            }
+    let images: BTreeSet<_> = keys
+        .iter()
+        .filter_map(|key| {
+            let entry = &state.build.published[key];
+            entry
+                .image_id
+                .as_ref()
+                .map(|image| (entry.region.clone(), image.clone()))
+        })
+        .collect();
+    let _leases = images
+        .iter()
+        .map(|(region, image)| lock_image_operation(&cli.state_dir, region, image, false))
+        .collect::<Result<Vec<_>>>()?;
+    if !args.force {
+        for (_, image) in &images {
+            let references = image_references(&cli.state_dir, image)?;
+            anyhow::ensure!(references.is_empty(),
+                "published image {image} is retained: {}; retire its consumers before explicitly unpublishing with --force", references.join("; "));
         }
     }
 
     let mut removed = 0usize;
+    let mut failures = 0usize;
     for key in keys {
         let mut entry = state.build.published[&key].clone();
         let mut failed = false;
@@ -1102,10 +1154,13 @@ fn cmd_image_unpublish_with_ops(
                 if let Err(err) = ops.cleanup_oss_object(cli, bucket, object_key, &entry.region) {
                     eprintln!("[ca] warning: failed to cleanup OSS object: {err:#}");
                     failed = true;
+                } else {
+                    entry.oss_cleaned = true;
                 }
             }
         }
         if failed {
+            failures += 1;
             update_entry_status(
                 &mut entry,
                 STATUS_FAILED,
@@ -1127,6 +1182,7 @@ fn cmd_image_unpublish_with_ops(
         "[ca] unpublished {} image(s) for service '{}'",
         removed, args.service
     );
+    anyhow::ensure!(failures == 0, "image unpublish partially failed: {failures} publication(s) retained for retry; {removed} removed");
     Ok(())
 }
 
@@ -1143,6 +1199,7 @@ fn should_prune_published_entry(
 ) -> bool {
     (all || entry.build_id != state.build.build_id || entry.status == STATUS_FAILED)
         && !published_entry_is_deployed(state, entry)
+        && !entry.exported
 }
 
 pub(super) fn cmd_image_prune(cli: &Cli, args: &ImagePruneArgs) -> Result<()> {
@@ -1155,6 +1212,7 @@ fn cmd_image_prune_with_ops(
     args: &ImagePruneArgs,
 ) -> Result<()> {
     let mut total = 0usize;
+    let mut failures = 0usize;
     for state in read_service_states(&cli.state_dir)? {
         let _operation = lock_service_operation(&cli.state_dir, &state.service_id)?;
         let Some(mut state) = read_service_state_file(
@@ -1172,6 +1230,18 @@ fn cmd_image_prune_with_ops(
             .collect::<Vec<_>>();
         for key in keys {
             let mut entry = state.build.published[&key].clone();
+            let _lease = entry
+                .image_id
+                .as_deref()
+                .map(|image| lock_image_operation(&cli.state_dir, &entry.region, image, false))
+                .transpose()?;
+            if let Some(image) = &entry.image_id {
+                let references = image_references(&cli.state_dir, image)?;
+                if !references.is_empty() {
+                    println!("[ca] retaining image {image}: {}", references.join("; "));
+                    continue;
+                }
+            }
             if args.dry_run {
                 println!(
                     "[ca] would prune service={} key={} image_id={}",
@@ -1182,6 +1252,7 @@ fn cmd_image_prune_with_ops(
             } else {
                 if let Some(image_id) = entry.image_id.clone() {
                     if let Err(err) = ops.delete_cloud_image(cli, &entry.region, &image_id) {
+                        failures += 1;
                         eprintln!("[ca] warning: failed to delete image {image_id}: {err:#}");
                         update_entry_status(
                             &mut entry,
@@ -1205,6 +1276,7 @@ fn cmd_image_prune_with_ops(
                         if let Err(err) =
                             ops.cleanup_oss_object(cli, bucket, object_key, &entry.region)
                         {
+                            failures += 1;
                             eprintln!("[ca] warning: failed to cleanup OSS object: {err:#}");
                             update_entry_status(
                                 &mut entry,
@@ -1229,6 +1301,7 @@ fn cmd_image_prune_with_ops(
     } else {
         println!("[ca] pruned {total} published image(s)");
     }
+    anyhow::ensure!(failures == 0, "image prune partially failed: {failures} publication(s) retained for retry; {total} removed");
     Ok(())
 }
 
@@ -1328,6 +1401,86 @@ mod tests {
             state.phase = phase.to_string();
             assert!(!should_prune_published_entry(&state, &entry, true));
         }
+    }
+
+    #[test]
+    fn cleanup_retains_independent_consumers_and_exported_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let mut publisher = test_state("builder");
+        let mut entry = test_published_entry("old-build", STATUS_AVAILABLE);
+        entry.oss_cleaned = true;
+        publisher
+            .build
+            .published
+            .insert("old".into(), entry.clone());
+        write_local_service_state(temp.path(), &publisher).unwrap();
+        let ops = FakePublishCloudOps::default();
+        let unpublish = ImageUnpublishArgs {
+            service: "builder".into(),
+            region: None,
+            variant: None,
+            image_id: None,
+            force: false,
+        };
+        let prune = ImagePruneArgs {
+            dry_run: false,
+            all: true,
+        };
+        for phase in ["active", "deployed", "deploying"] {
+            let mut consumer = test_state("consumer-a");
+            consumer.phase = phase.into();
+            consumer.deploy.published_image_id = entry.image_id.clone();
+            write_local_service_state(temp.path(), &consumer).unwrap();
+            assert!(cmd_image_unpublish_with_ops(&cli, &ops, &unpublish)
+                .unwrap_err()
+                .to_string()
+                .contains("consumer-a"));
+            cmd_image_prune_with_ops(&cli, &ops, &prune).unwrap();
+            assert!(ops.calls().is_empty());
+        }
+        let consumer = test_state("consumer-a");
+        write_local_service_state(temp.path(), &consumer).unwrap();
+        let imported = BuildManifest {
+            service_id: "consumer-a".into(),
+            image: Some(images::ImageDeployment {
+                image_id: entry.image_id.clone().unwrap(),
+                source: confidential_agent_core::spec::PublishedImageSpec {
+                    release: "/release.json".into(),
+                    trusted_key: "/publisher.pem".into(),
+                    manifest: format!("sha256:{}", "a".repeat(64)),
+                    account_id: "123".into(),
+                },
+            }),
+            ..BuildManifest::default()
+        };
+        let manifest_path = context_paths(temp.path(), "consumer-a").manifest;
+        write_json_atomic(&manifest_path, &imported).unwrap();
+        assert!(cmd_image_unpublish_with_ops(&cli, &ops, &unpublish)
+            .unwrap_err()
+            .to_string()
+            .contains("imported"));
+        cmd_image_prune_with_ops(&cli, &ops, &prune).unwrap();
+        assert!(ops.calls().is_empty());
+        fs::remove_file(manifest_path).unwrap();
+        publisher.build.published.get_mut("old").unwrap().exported = true;
+        write_local_service_state(temp.path(), &publisher).unwrap();
+        cmd_image_prune_with_ops(&cli, &ops, &prune).unwrap();
+        assert!(ops.calls().is_empty());
+        assert!(cmd_image_unpublish_with_ops(&cli, &ops, &unpublish)
+            .unwrap_err()
+            .to_string()
+            .contains("exported"));
+        cmd_image_unpublish_with_ops(
+            &cli,
+            &ops,
+            &ImageUnpublishArgs {
+                force: true,
+                ..unpublish
+            },
+        )
+        .unwrap();
+        assert_eq!(ops.calls(), vec!["delete:m-2ze123abc"]);
     }
 
     #[test]
@@ -1829,7 +1982,7 @@ mod tests {
             ..FakePublishCloudOps::default()
         };
 
-        cmd_image_unpublish_with_ops(
+        let error = cmd_image_unpublish_with_ops(
             &cli,
             &ops,
             &ImageUnpublishArgs {
@@ -1840,7 +1993,8 @@ mod tests {
                 force: true,
             },
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(error.to_string().contains("partially failed"));
 
         let written =
             read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
@@ -1869,7 +2023,7 @@ mod tests {
             ..FakePublishCloudOps::default()
         };
 
-        cmd_image_unpublish_with_ops(
+        let error = cmd_image_unpublish_with_ops(
             &cli,
             &ops,
             &ImageUnpublishArgs {
@@ -1880,7 +2034,8 @@ mod tests {
                 force: true,
             },
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(error.to_string().contains("partially failed"));
 
         let written =
             read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
@@ -1938,7 +2093,7 @@ mod tests {
             ..FakePublishCloudOps::default()
         };
 
-        cmd_image_prune_with_ops(
+        let error = cmd_image_prune_with_ops(
             &cli,
             &ops,
             &ImagePruneArgs {
@@ -1946,7 +2101,8 @@ mod tests {
                 all: false,
             },
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(error.to_string().contains("partially failed"));
 
         let written =
             read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
@@ -2065,6 +2221,7 @@ mod tests {
             created_at: "2026-06-02T00:00:00Z".to_string(),
             updated_at: "2026-06-02T00:00:00Z".to_string(),
             oss_cleaned: false,
+            exported: false,
             error: None,
         }
     }

@@ -38,6 +38,15 @@ The example deploys a 120 GB disk for the 80 GB base image: Cryptpilot allocates
 the remaining volume-group space to the encrypted writable delta. Keep this
 headroom when choosing the deployment disk size.
 
+Cleanup checks all consumers and imported releases visible in the publisher's
+workspace. Exporting a signed release records retention: even `image prune --all`
+keeps that cloud image. Before retiring a release, stop distributing it, allow
+your advertised retention period to expire, and confirm that local and remote
+consumers no longer need it for creation or recovery. Then explicitly run
+`image unpublish SERVICE --image-id IMAGE_ID --force`. The publisher cannot
+discover consumers in another workspace or on another host. Cleanup failures
+return a nonzero exit status and retain failed entries for retry.
+
 ## Image configuration
 
 `runtime.json` accepts `harness` (`openclaw`, `hermes`, `qodercli`, `opencode`,
