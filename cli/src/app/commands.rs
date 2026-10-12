@@ -35,6 +35,10 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
 
 pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    anyhow::ensure!(
+        spec.deploy.image.is_none(),
+        "deploy.image selects a published image; run deploy directly instead of build"
+    );
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let existing_state = read_service_state_file(&paths.service_state)?;
     validate_build_start(existing_state.as_ref())?;
@@ -282,30 +286,34 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     }
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let current_state = read_service_state_file(&paths.service_state)?;
-    validate_deploy_start(current_state.as_ref())?;
-    let current_state = current_state.with_context(|| {
-        format!(
-            "deploy requires a local build for service '{}'; run build first",
-            spec.service.id
-        )
-    })?;
-    let current_manifest = read_build_manifest(&paths.manifest).with_context(|| {
-        format!(
-            "deploy requires a local build manifest for service '{}'; run build first",
-            spec.service.id
-        )
-    })?;
+    if current_state.is_some() || spec.deploy.image.is_none() {
+        validate_deploy_start(current_state.as_ref())?;
+    }
+    let current_manifest = if spec.deploy.image.is_some() {
+        images::import(cli, &spec)?
+    } else {
+        read_build_manifest(&paths.manifest).with_context(|| {
+            format!(
+                "deploy requires a local build manifest for service '{}'; run build first",
+                spec.service.id
+            )
+        })?
+    };
     let deploy_variant = spec.image_variant().to_string();
-    let build_variant =
-        current_manifest.variant(&deploy_variant, Some(&current_state.build.variant))?;
-    let published_image_id =
-        publish::published_image_for_deploy(&current_state, &spec, &build_variant);
-    ensure_build_variant_present(
-        &current_state,
-        &deploy_variant,
-        &build_variant,
-        published_image_id.is_some(),
-    )?;
+    let (build_variant, published_image_id) = if let Some(image) = &current_manifest.image {
+        (
+            current_manifest.fallback_variant(),
+            Some(image.image_id.clone()),
+        )
+    } else {
+        let state = current_state
+            .as_ref()
+            .context("deploy requires a local build; run build first")?;
+        let variant = current_manifest.variant(&deploy_variant, Some(&state.build.variant))?;
+        let published = publish::published_image_for_deploy(state, &spec, &variant);
+        ensure_build_variant_present(state, &deploy_variant, &variant, published.is_some())?;
+        (variant, published)
+    };
     if let Some(image_id) = published_image_id.as_deref() {
         println!("[ca] using published image {image_id} for deploy (skipping upload+import)");
     }
@@ -340,22 +348,22 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     } else {
         None
     };
-    let mut prepared = prepare(
-        cli,
-        &cli.state_dir,
-        &args.spec,
-        PrepareOptions {
-            build_id: Some(build_variant.shelter_build_id.clone()),
-            image_variant: Some(deploy_variant.clone()),
-            include_deploy: true,
-            resolve_container_images: false,
-            deploy_names: Some(deploy_names.clone()),
-            mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
-            peerings,
-            cloud_image_id: published_image_id.clone(),
-            deploy_user_data,
-        },
-    )?;
+    let options = PrepareOptions {
+        build_id: Some(build_variant.shelter_build_id.clone()),
+        image_variant: Some(deploy_variant.clone()),
+        include_deploy: true,
+        resolve_container_images: false,
+        deploy_names: Some(deploy_names.clone()),
+        mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
+        peerings,
+        cloud_image_id: published_image_id.clone(),
+        deploy_user_data,
+    };
+    let mut prepared = if current_manifest.image.is_some() {
+        images::prepare(&paths, &spec, &current_manifest, &options)?
+    } else {
+        prepare(cli, &cli.state_dir, &args.spec, options)?
+    };
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
     deploy_manifest.variants = current_manifest.variants.clone();
     fs::write(
@@ -1236,6 +1244,22 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
             Ok(())
         }
         ImageCommands::Publish(args) => publish::cmd_image_publish(cli, args),
+        ImageCommands::Export {
+            service,
+            account_id,
+            signing_key,
+            output,
+            region,
+            variant,
+        } => images::export(
+            cli,
+            service,
+            account_id,
+            signing_key,
+            output,
+            region.as_deref(),
+            variant.as_deref(),
+        ),
         ImageCommands::Unpublish(args) => publish::cmd_image_unpublish(cli, args),
         ImageCommands::Prune(args) => publish::cmd_image_prune(cli, args),
     }
@@ -2181,6 +2205,28 @@ fn deploy_runtime_state_present(deploy: &LocalDeployState) -> bool {
 }
 
 pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
+    if let Some(image) = &prepared.image {
+        return vec![
+            "--work-dir".into(),
+            prepared.shelter_work_dir.as_os_str().to_os_string(),
+            "deploy-release".into(),
+            image.source.release.as_os_str().to_os_string(),
+            "--trusted-key".into(),
+            image.source.trusted_key.as_os_str().to_os_string(),
+            "--expect-manifest".into(),
+            image.source.manifest.clone().into(),
+            "--runtime-target".into(),
+            prepared.rendered_config.as_os_str().to_os_string(),
+            "--name".into(),
+            prepared
+                .deploy_names
+                .as_ref()
+                .map(|names| names.resource_name.clone())
+                .unwrap_or_else(|| prepared.shelter_build_id.clone())
+                .into(),
+            "--auto-approve".into(),
+        ];
+    }
     let mut args = vec![
         OsString::from("--work-dir"),
         prepared.shelter_work_dir.as_os_str().to_os_string(),

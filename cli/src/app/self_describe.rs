@@ -85,6 +85,10 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
     match AgentSpec::from_path(spec_path) {
         Ok(spec) => {
             push_check(&mut checks, "parse", true, "AppSpec parsed");
+            if let Some(image) = &spec.deploy.image {
+                push_path_check(&mut checks, "deploy.image.release", &image.release);
+                push_path_check(&mut checks, "deploy.image.trusted_key", &image.trusted_key);
+            }
             match spec.ensure_mvp_supported() {
                 Ok(()) => push_check(&mut checks, "supported", true, "uses supported features"),
                 Err(err) => push_check(&mut checks, "supported", false, err.to_string()),
@@ -466,7 +470,8 @@ fn docs_topic(topic: DocsTopic) -> MarkdownDoc {
 fn spec_schema_json() -> serde_json::Value {
     serde_json::json!({
         "schema": "confidential-agent/v1",
-        "required_top_level": ["schema", "service", "build", "deploy", "attestation", "resources"],
+        "required_top_level": ["schema", "service", "deploy", "attestation", "resources"],
+        "image_source": "provide build for a local image, or deploy.image for an authenticated published release",
         "service": {
             "id": "stable service name",
             "ports": "guest TCP ports exposed by the workload",
@@ -485,6 +490,7 @@ fn spec_schema_json() -> serde_json::Value {
         "deploy": {
             "provider": "aliyun",
             "image_variant": "release or debug",
+            "image": {"release": "signed image release JSON", "trusted_key": "trusted publisher Ed25519 SPKI PEM", "manifest": "pinned sha256 manifest digest", "account_id": "authorized decimal cloud account ID"},
             "region": "Aliyun region",
             "zone_id": "Aliyun zone",
             "instance_type": "TDX-capable ECS instance type",
@@ -507,13 +513,13 @@ Required top-level keys:
 
 - `schema`: currently `confidential-agent/v1`.
 - `service`: workload identity, ports, connect ports, and readiness systemd unit.
-- `build`: image name, packages, copied files, build scripts, and optional variants.
 - `deploy`: cloud provider and Aliyun TDX ECS placement/shape.
 - `attestation`: TDX mode and reference value policy.
 - `resources`: files injected after deploy; use `{}` if no runtime files are needed.
 
 Common optional keys:
 
+- `build`: required for local builds; omit it when `deploy.image` selects a published image.
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
@@ -521,6 +527,8 @@ Use `confidential-agent spec validate --spec <path> --format json` before build/
 
 CA builds the guest rootfs with mkosi. Use `build.container` for an OCI workload image or archive; it is rendered as Shelter `container:` and is not a replacement for the mkosi base image. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 `build.scripts` entries are local script paths from the controller work directory, usually the same file listed in `build.files[].source`; they are not the guest `build.files[].target` path.
+
+To deploy without producer state or a local disk image, set `deploy.image.release`, `trusted_key`, `manifest` (a full `sha256:` manifest digest), and `account_id`. Omit `build` and run `deploy` directly. CA authenticates the release through Shelter before provisioning or releasing resources; challenge/Trustee resource delivery remains unchanged. `image export <service> --account-id <id> --signing-key <Ed25519 PKCS8 PEM> --output <release.json>` exports an available publication from the producer. Transfer only the release and publisher public key to consumers. Consumer `destroy` preserves the shared image.
 "#;
 
 const OVERVIEW_DOC: &str = r#"
@@ -601,7 +609,8 @@ mod self_describe_tests {
             .and_then(|value| value.as_array())
             .unwrap();
         assert!(required.iter().any(|value| value == "service"));
-        assert!(required.iter().any(|value| value == "build"));
+        assert!(!required.iter().any(|value| value == "build"));
+        assert!(schema["deploy"]["image"]["manifest"].is_string());
         assert!(required.iter().any(|value| value == "resources"));
     }
 

@@ -273,6 +273,29 @@ fn render_deploy_config(spec: &AgentSpec, options: &ShelterRenderOptions) -> She
     }
 }
 
+/// Compile the same CA provider options for an already published image.
+/// CA continues to own attestation and resource delivery for this target.
+pub fn render_image_runtime_target(
+    spec: &AgentSpec,
+    options: &ShelterRenderOptions,
+    account_id: &str,
+) -> Result<String> {
+    let mut deploy = render_deploy_config(spec, options);
+    deploy.image = None;
+    deploy.image_id = None;
+    deploy.terraform_dir = None;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "schema_version": "io.shelter.release-runtime-target/v1",
+        "name": "deploy",
+        "provider": "terraform-alicloud",
+        "account_id": account_id,
+        "region": spec.deploy.region,
+        "security": {"profile": "verified", "attestation": "disabled", "forbid_fallback": true},
+        "ports": [],
+        "deploy": deploy,
+    }))?)
+}
+
 pub fn shelter_build_id(spec: &AgentSpec) -> String {
     format!("{}-{}", spec.image_id(), spec.image_variant())
 }

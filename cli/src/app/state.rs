@@ -209,7 +209,7 @@ fn shelter_command_with_bin(bin: &Path, args: &mut [OsString]) -> Command {
     command
 }
 
-fn effective_shelter_bin(cli: &Cli) -> PathBuf {
+pub(super) fn effective_shelter_bin(cli: &Cli) -> PathBuf {
     effective_shelter_bin_from_candidates(
         cli,
         &[
@@ -262,7 +262,7 @@ pub(super) fn bind_shelter_deployment(cli: &Cli, prepared: &mut PreparedConfig) 
         .context("Shelter status contains an invalid deployment ID")?;
     let terraform_dir = prepared.shelter_work_dir.join("deploy").join(id);
     let deploy_result = shelter_deploy_result_path(&terraform_dir);
-    let result = read_shelter_deploy_result(&deploy_result, expected_name)?;
+    let result = read_shelter_deploy_result(&deploy_result, id)?;
     anyhow::ensure!(
         result.id == id,
         "Shelter deploy result does not match deployment ID '{id}'"
@@ -281,7 +281,23 @@ pub(super) fn resolve_deploy_observation(
         .as_ref()
         .map(|names| names.resource_name.as_str())
         .unwrap_or(&prepared.shelter_build_id);
-    let deploy_result = read_shelter_deploy_result(&prepared.deploy_result, expected_name)?;
+    let expected = if prepared.image.is_some() {
+        prepared
+            .terraform_dir
+            .as_ref()
+            .and_then(|directory| directory.file_name())
+            .and_then(|id| id.to_str())
+            .context("published image deployment has no bound Shelter deployment ID")?
+    } else {
+        expected_name
+    };
+    let deploy_result = read_shelter_deploy_result(&prepared.deploy_result, expected)?;
+    if prepared.image.is_some() {
+        anyhow::ensure!(
+            deploy_result.id == expected,
+            "published image deploy result has a different Shelter deployment ID"
+        );
+    }
     let public_ip = deploy_result_value_as_string(
         deploy_result
             .deploy
@@ -321,9 +337,9 @@ pub(super) fn read_shelter_deploy_result(
         .with_context(|| format!("failed to read Shelter deploy result '{}'", path.display()))?;
     let result: ShelterDeployResult = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse Shelter deploy result '{}'", path.display()))?;
-    if result.deploy.name.as_deref() != Some(expected_id)
-        && !(result.deploy.name.is_none() && result.id == expected_id)
-    {
+    // Status binds an instance alias to its durable ID. A release deployment's
+    // provider resource name is independent of that alias.
+    if result.deploy.name.as_deref() != Some(expected_id) && result.id != expected_id {
         bail!(
             "Shelter deploy result '{}' contains deployment '{}' named {:?}, expected '{}'",
             path.display(),

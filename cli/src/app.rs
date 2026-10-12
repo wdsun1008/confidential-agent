@@ -79,8 +79,10 @@ struct ContextPaths {
     agent_card: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuildManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<images::ImageDeployment>,
     service_id: String,
     shelter_build_id: String,
     shelter_work_dir: PathBuf,
@@ -118,6 +120,7 @@ struct BuildManifestVariant {
 }
 
 struct PreparedConfig {
+    image: Option<images::ImageDeployment>,
     rendered_config: PathBuf,
     shelter_build_id: String,
     shelter_work_dir: PathBuf,
@@ -545,6 +548,7 @@ fn prepare(
     let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
+        image: None,
         service_id: spec.service.id.clone(),
         shelter_build_id: build_id.clone(),
         shelter_work_dir: paths.shelter_work_dir.clone(),
@@ -570,6 +574,7 @@ fn prepare(
         .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
 
     Ok(PreparedConfig {
+        image: None,
         rendered_config: paths.rendered_config,
         shelter_build_id: build_id,
         shelter_work_dir: paths.shelter_work_dir,
@@ -696,6 +701,7 @@ use state::*;
 mod workflows;
 use workflows::*;
 
+mod images;
 mod publish;
 
 mod report;

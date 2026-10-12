@@ -668,6 +668,7 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
     fs::create_dir_all(&service_dir).unwrap();
     let shelter_work_dir = service_dir.join("shelter");
     let manifest = BuildManifest {
+        image: None,
         service_id: service_id.to_string(),
         shelter_build_id: build_id.to_string(),
         shelter_work_dir: shelter_work_dir.clone(),
@@ -1179,6 +1180,7 @@ fn cryptpilot_fde_config_matches_current_schema() {
 #[test]
 fn deploy_args_use_positional_build_id_without_cloud_image_override() {
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "cai-e2e-agent-release".to_string(),
         shelter_work_dir: PathBuf::from("/state/shelter-work"),
@@ -1212,6 +1214,7 @@ fn deploy_args_use_positional_build_id_without_cloud_image_override() {
 #[test]
 fn deploy_args_use_the_project_without_overriding_managed_state() {
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "cai-e2e-agent-debug".to_string(),
         shelter_work_dir: PathBuf::from("/state/shelter-work"),
@@ -2136,6 +2139,7 @@ fn bind_shelter_deployment_rejects_mismatched_or_unsafe_status() {
             &format!("#!/bin/sh\ncat <<'JSON'\n{status}\nJSON\n"),
         );
         let mut prepared = PreparedConfig {
+            image: None,
             rendered_config: temp.path().join("shelter.yaml"),
             shelter_build_id: "openclaw".into(),
             shelter_work_dir: temp.path().to_path_buf(),
@@ -2180,7 +2184,8 @@ fn resolve_deploy_observation_reads_shelter_deploy_result_json() {
         .unwrap(),
     )
     .unwrap();
-    let prepared = PreparedConfig {
+    let mut prepared = PreparedConfig {
+        image: None,
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "openclaw-agent-release".to_string(),
         shelter_work_dir: temp.path().join("shelter"),
@@ -2224,6 +2229,43 @@ resources: {}
     assert_eq!(observation.security_group_id.as_deref(), Some("sg-test"));
     assert_eq!(observation.public_ip.as_deref(), Some("39.0.0.1"));
     assert_eq!(observation.private_ip.as_deref(), Some("10.0.0.8"));
+
+    // A published-image alias is bound by status; provider resource names can
+    // differ. Accept only the result carrying that exact bound deployment ID.
+    let id = "a".repeat(64);
+    prepared.image = Some(images::ImageDeployment {
+        source: confidential_agent_core::spec::PublishedImageSpec {
+            release: temp.path().join("release.json"),
+            trusted_key: temp.path().join("publisher.pem"),
+            manifest: format!("sha256:{}", "0".repeat(64)),
+            account_id: "1234567890".into(),
+        },
+        image_id: "m-shared".into(),
+    });
+    prepared.terraform_dir = Some(temp.path().join("deploy").join(&id));
+    let mut result: serde_json::Value =
+        serde_json::from_slice(&fs::read(&prepared.deploy_result).unwrap()).unwrap();
+    result["deploy"]["name"] = format!("shelter-{id}").into();
+    fs::write(
+        &prepared.deploy_result,
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_deploy_observation(&prepared, &spec)
+            .unwrap()
+            .instance_id,
+        observation.instance_id
+    );
+    result["deployment_id"] = "b".repeat(64).into();
+    fs::write(
+        &prepared.deploy_result,
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    assert!(resolve_deploy_observation(&prepared, &spec).is_err());
+    prepared.terraform_dir = None;
+    assert!(resolve_deploy_observation(&prepared, &spec).is_err());
 }
 
 #[test]
@@ -2275,6 +2317,7 @@ resources: {}
         )
         .unwrap();
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: paths.rendered_config.clone(),
         shelter_build_id: build_id,
         shelter_work_dir: paths.shelter_work_dir.clone(),
@@ -2338,6 +2381,7 @@ resources: {}
     write_build_result(&build_result, &build_id, &image_path);
     fs::write(&image_path, "image").unwrap();
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: paths.rendered_config.clone(),
         shelter_build_id: build_id,
         shelter_work_dir: paths.shelter_work_dir.clone(),

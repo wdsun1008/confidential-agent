@@ -5,7 +5,7 @@
 ```yaml
 schema: confidential-agent/v1   # 必填，固定字符串
 service:        { ... }         # 必填
-build:          { ... }         # 必填
+build:          { ... }         # 本地构建必填；deploy.image 模式省略
 deploy:         { ... }         # 必填
 attestation:    { ... }         # 必填
 secrets:        { ... }         # 可选，默认空
@@ -19,7 +19,7 @@ a2a:            { ... }         # 可选，跨组织 Agent 发现
 |---|---|:-:|---|
 | `schema` | string | ✅ | 必须等于 `confidential-agent/v1` |
 | `service` | object | ✅ | 见 §2 |
-| `build` | object | ✅ | 见 §3 |
+| `build` | object | 条件 | 本地构建必填；与 `deploy.image` 互斥，见 §3 |
 | `deploy` | object | ✅ | 见 §4 |
 | `attestation` | object | ✅ | 见 §5 |
 | `secrets` | object | ❌ | 默认 `{}`，见 §6 |
@@ -189,6 +189,24 @@ deploy:
 `deploy` 不再包含 `security.allowed_cidr` / `security.a2a_peer_cidrs`。所有入向安全组规则都从 `<state-dir>/peerings.yaml` 派生，由 `confidential-agent peering ...` 管理；旧字段会被严格模式拒绝，可用 `confidential-agent migrate <spec>` 迁移。`build` 阶段只产出镜像和 build artifact，不读取 `peerings.yaml`；operator peering 应在 build 完成后、首次 deploy 前添加。
 
 若先执行 `confidential-agent image publish <service> --spec <path>`，CLI 会在本地 service state 中记录 published image。后续 `deploy` 仅在 provider、region、variant、build id 和镜像内容 hash 均匹配，且本地发布状态为 `available` 时复用该 `image_id`，并在 Shelter deploy 配置中跳过本地镜像上传和 ImportImage。Published image 不由 `destroy` 统一删除；使用 `image unpublish` 删除指定服务的发布镜像，或使用 `image prune --dry-run --all` 审计后清理旧 build/failed 发布记录。
+
+独立部署端可以省略 `build`，通过 `deploy.image` 选择发布者签名的镜像：
+
+```yaml
+deploy:
+  provider: aliyun
+  region: cn-beijing
+  zone_id: cn-beijing-i
+  instance_type: ecs.g9i.xlarge
+  disk_gb: 80
+  image:
+    release: ./image-release.json
+    trusted_key: ./publisher.pem
+    manifest: sha256:<完整的64位manifest摘要>
+    account_id: "<云账号ID>"
+```
+
+发布端先运行 `image publish`，再运行 `image export <service> --account-id <id> --signing-key <Ed25519 PKCS8 PEM> --output image-release.json`。消费者仅需要 release、独立认可的发布者公钥以及自己的 AppSpec 和资源文件，不需要生产端 state、构建输入或 QCOW2。CA 在创建资源前验证签名、固定摘要和账号/地域映射，将验证过的参考值交给现有 challenge/Trustee 流程。每个 service 使用自己的身份、磁盘口令和 Terraform state；`destroy` 不删除共享镜像。该模式只允许 release 变体；需要内置调试密钥的 debug 镜像不能作为共享发布镜像。
 
 当前 E2E 默认示例使用 `cn-beijing-i + ecs.g9i.xlarge`。香港 region 的 TDX 默认组合为 `cn-hongkong-d + ecs.g8i.xlarge`；实际可用性仍可能受账号库存和可用区限制影响，必要时显式覆盖 `region`、`zone_id` 和 `instance_type`。
 

@@ -582,6 +582,20 @@ pub(crate) enum ImageCommands {
         force: bool,
     },
     Publish(ImagePublishArgs),
+    /// Export authenticated public metadata for deploying this image elsewhere.
+    Export {
+        service: String,
+        #[arg(long)]
+        account_id: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        region: Option<String>,
+        #[arg(long)]
+        variant: Option<String>,
+    },
     Unpublish(ImageUnpublishArgs),
     Prune(ImagePruneArgs),
 }
