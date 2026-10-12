@@ -34,6 +34,10 @@ pub struct ServiceSpec {
     pub mcp_ports: Vec<u16>,
     #[serde(default)]
     pub app_service: Option<String>,
+    /// Deliver instance SSH credentials through the attested resource flow.
+    /// The image must provide a service using these credentials.
+    #[serde(default)]
+    pub ssh: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -460,6 +464,9 @@ impl AgentSpec {
             .is_some_and(|service| service.trim().is_empty())
         {
             bail!("service.app_service must not be empty when set");
+        }
+        if self.service.ssh && self.deploys_debug_image() {
+            bail!("service.ssh requires a release image; debug images use their existing SSH mechanism");
         }
         if let Some(image) = &self.deploy.image {
             if image.release.as_os_str().is_empty() || image.trusted_key.as_os_str().is_empty() {

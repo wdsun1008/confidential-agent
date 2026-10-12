@@ -893,6 +893,8 @@ pub(super) fn sync_service(
     }
     let paths = context_paths(state_dir, &spec.service.id);
     ensure_private_context_dirs(&paths)?;
+    let runtime_spec = instance_ssh::runtime_spec(&paths, spec)?;
+    let spec = &runtime_spec;
     let artifacts = materialize_shelter_build_artifacts(&paths, build_result, build_id)?;
     let sample_rv = artifacts.sample_rv.as_ref().with_context(|| {
         format!(

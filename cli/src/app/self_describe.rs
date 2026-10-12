@@ -476,7 +476,8 @@ fn spec_schema_json() -> serde_json::Value {
             "id": "stable service name",
             "ports": "guest TCP ports exposed by the workload",
             "connect": "ports to proxy with `confidential-agent connect`",
-            "app_service": "systemd unit that indicates workload readiness"
+            "app_service": "systemd unit that indicates workload readiness",
+            "ssh": "opt in to instance client/host keys delivered through CA; requires an image SSH service using /opt/data/cai-ssh"
         },
         "build": {
             "image_name": "base Shelter image name",

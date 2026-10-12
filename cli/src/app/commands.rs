@@ -1861,6 +1861,14 @@ pub(super) fn resolve_debug_ssh_command(
             paths.service_state.display()
         )
     })?;
+    if let Some(ssh) = read_build_manifest(&paths.manifest)
+        .ok()
+        .and_then(|manifest| manifest.ssh)
+    {
+        anyhow::ensure!(state.phase != "deleted", "service is deleted");
+        let target = debug_ssh_target(&state).context("service has no deploy IP")?;
+        return Ok(ssh.command(target, ssh_args));
+    }
     build_debug_ssh_command(&state, ssh_args)
 }
 

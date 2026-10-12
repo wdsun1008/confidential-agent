@@ -37,6 +37,7 @@ service:
   connect: [18789]              # ports 子集；允许 host connect / A2A 单向 RA 接入
   mcp_ports: []                 # mesh_ports 子集；按 MCP 协议做 gateway 审计和 virtual tools 注入
   app_service: cai-openclaw-gateway.service  # 可选；daemon 用它判断应用 systemd unit + 端口是否 ready
+  ssh: false                   # 可选；release 镜像的独立实例 SSH 身份
 ```
 
 | 字段 | 类型 | 必填 | 校验 |
@@ -46,8 +47,11 @@ service:
 | `connect` | `[u16]` | ❌ | 默认 `[]`；每个端口必须出现在 `ports` 中；不能重复 |
 | `mcp_ports` | `[u16]` | ❌ | 默认 `[]`；每个端口必须属于 `service.ports - service.connect`（即 `mesh_ports`）；不能重复 |
 | `app_service` | string | ❌ | 可选；设置后不能为空；应为 guest 内的 systemd unit 名，例如 `cai-openclaw-gateway.service` |
+| `ssh` | bool | ❌ | 默认 false；使用 release 镜像，镜像必须支持下述 SSH 文件契约 |
 
 `app_service` 会写入 daemon bootstrap。若设置，`confidential-agentd` 会启动并检查该 systemd unit，同时确认 `service.ports` 都在 guest 本地可连接；`status --live` 中的 `app_ready` 才会变成 ready。若不设置，`app_ready` 只表示资源和 TNG 层就绪，不证明用户应用已经启动。
+
+`service.ssh: true` 在部署端生成每个实例独立的 Ed25519 client/host 密钥。CA 通过现有 challenge/Trustee 资源流程下发 `/opt/data/cai-ssh/authorized_keys` 和 `/opt/data/cai-ssh/host_key`，并仅向 peering 的 `ssh` scope 放行 22 端口；SSH 不属于应用 `service.ports`。镜像自行提供使用这两个文件的 SSH 服务，并在资源就绪后启动它（参见 allinone 示例）。`confidential-agent ssh <service> -- <command>` 使用私钥及固定的 host 公钥校验连接。私钥不进入共享镜像或发布元数据，且该模式与 debug 镜像的原有 SSH 机制互斥。
 
 端口语义固定为：`service.ports` 是应用在 Guest 内真实监听的业务端口集合，也是 TNG 对外建立 ingress/egress 的端口全集；gateway 和 MCP 不会引入新的业务端口。`service.ports: []` 表示该 workload 是 client-only/job，不暴露入站业务端口，但仍会获得 gateway identity、进入 mesh bundle，并可通过 `/etc/cai/service-directory.json` 访问其他 active 服务。`service.connect` 是其中允许 host connect 和跨组织 A2A 以单向 RA 访问的子集，调用方只验证服务端 TEE。`mesh_ports = service.ports - service.connect` 是同 state-dir confidential-only mesh 端口，调用双方都会做 RA。敏感的 confidential-only API 只能放在 `mesh_ports` 上，不应暴露在 `connect` 端口上。
 

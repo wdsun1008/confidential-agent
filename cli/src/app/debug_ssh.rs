@@ -92,11 +92,20 @@ pub(super) fn generate_debug_ssh_key(
     private_key: &Path,
     public_key: &Path,
 ) -> Result<()> {
+    generate_ssh_key(service_id, "debug", private_key, public_key)
+}
+
+pub(super) fn generate_ssh_key(
+    service_id: &str,
+    purpose: &str,
+    private_key: &Path,
+    public_key: &Path,
+) -> Result<()> {
     let mut rng = OsRng;
     let mut seed = [0_u8; 32];
     rng.fill_bytes(&mut seed);
     let (public_key_bytes, private_key_bytes) = ed25519_keypair_from_seed(&seed);
-    let comment = format!("confidential-agent:{service_id}:debug");
+    let comment = format!("confidential-agent:{service_id}:{purpose}");
     let public_blob = openssh_ed25519_public_blob(&public_key_bytes)?;
     let private_pem = openssh_ed25519_private_key(
         &public_blob,

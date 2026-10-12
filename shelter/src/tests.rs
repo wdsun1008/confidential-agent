@@ -255,6 +255,23 @@ fn renders_mkosi_build_without_from_or_legacy_variants() {
 }
 
 #[test]
+fn instance_ssh_preserves_the_server_without_baking_credentials_or_enabling_default_sshd() {
+    let mut spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
+    spec.service.ssh = true;
+    let rendered = render_build_config(&spec, &assets(), &ShelterRenderOptions::default()).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+    assert!(rendered.contains("mode: partial"));
+    assert!(rendered.contains("openssh-server"));
+    assert!(!rendered.contains("ssh_key:"));
+    assert!(!rendered.contains("sshd.service"));
+    assert!(rendered.contains("engine: cryptpilot"));
+    assert_eq!(
+        yaml["security"]["disk"]["cryptpilot"]["rootfs"]["integrity"],
+        true
+    );
+}
+
+#[test]
 fn renders_debug_deploy_with_ssh_security_group() {
     let spec = AgentSpec::from_yaml(
         &SPEC.replace("image_variant: release", "image_variant: debug"),

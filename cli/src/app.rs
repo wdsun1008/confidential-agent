@@ -82,6 +82,8 @@ struct ContextPaths {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuildManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh: Option<instance_ssh::InstanceSsh>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<images::ImageDeployment>,
     service_id: String,
     shelter_build_id: String,
@@ -548,6 +550,11 @@ fn prepare(
     let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
+        ssh: if options.include_deploy {
+            instance_ssh::identity(&paths, &spec)?
+        } else {
+            None
+        },
         image: None,
         service_id: spec.service.id.clone(),
         shelter_build_id: build_id.clone(),
@@ -702,6 +709,7 @@ mod workflows;
 use workflows::*;
 
 mod images;
+mod instance_ssh;
 mod publish;
 
 mod report;
@@ -820,6 +828,8 @@ fn timestamped_resource_name(service: &str, run_id: &str) -> String {
 }
 
 fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapConfig> {
+    let runtime_spec = instance_ssh::runtime_spec(paths, spec)?;
+    let spec = &runtime_spec;
     let gateway_identity = ensure_gateway_identity(paths)?;
     let resources = spec
         .resources

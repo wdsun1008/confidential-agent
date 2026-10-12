@@ -15,6 +15,8 @@ pub(super) fn inject_resources(
     let tee = tee_name(spec.attestation.tee);
     let paths = context_paths(state_dir, &spec.service.id);
     ensure_private_context_dirs(&paths)?;
+    let runtime_spec = instance_ssh::runtime_spec(&paths, spec)?;
+    let spec = &runtime_spec;
 
     let artifacts = materialize_shelter_build_artifacts(&paths, build_result, build_id)?;
     prepare_challenge_reference_values(
@@ -207,7 +209,7 @@ pub(super) fn build_service_state(
         .as_ref()
         .map(|state| state.generation)
         .unwrap_or(0);
-    let resources = resource_states(spec)?;
+    let resources = resource_states(&instance_ssh::runtime_spec(&paths, spec)?)?;
     let names = prepared
         .deploy_names
         .clone()
@@ -310,7 +312,8 @@ pub(super) fn activate_existing_service_state(
         connect: spec.service.connect.clone(),
         mcp_ports: spec.service.mcp_ports.clone(),
     };
-    state.resources = resource_states(spec)?;
+    let paths = context_paths(state_dir, &spec.service.id);
+    state.resources = resource_states(&instance_ssh::runtime_spec(&paths, spec)?)?;
     state.reference_values =
         reference_value_mode_name(spec.attestation.reference_values).to_string();
     state.deploy.tee = tee_name(spec.attestation.tee).to_string();

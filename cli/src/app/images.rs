@@ -106,6 +106,7 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
     )?;
     materialize_shelter_build_artifacts(&paths, &build_result, &build_id)?;
     Ok(BuildManifest {
+        ssh: instance_ssh::identity(&paths, spec)?,
         image: Some(ImageDeployment {
             source,
             image_id: inspected.image.image_id,
@@ -278,7 +279,7 @@ mod tests {
 
     fn instance_spec(root: &Path, id: &str) -> PathBuf {
         let path = root.join(format!("{id}.yaml"));
-        fs::write(&path, format!("schema: confidential-agent/v1\nservice:\n  id: {id}\n  ports: []\n  app_service: cai-allinone.service\ndeploy:\n  provider: aliyun\n  instance_type: ecs.g9i.xlarge\n  region: cn-beijing\n  zone_id: cn-beijing-i\n  disk_gb: 80\n  image:\n    release: ./release.json\n    trusted_key: ./publisher.pem\n    manifest: sha256:{}\n    account_id: '1234567890'\nattestation:\n  tee: tdx\n  mode: challenge\n  reference_values: sample\nresources: {{}}\n", "a".repeat(64))).unwrap();
+        fs::write(&path, format!("schema: confidential-agent/v1\nservice:\n  id: {id}\n  ports: []\n  app_service: cai-allinone.service\n  ssh: true\ndeploy:\n  provider: aliyun\n  instance_type: ecs.g9i.xlarge\n  region: cn-beijing\n  zone_id: cn-beijing-i\n  disk_gb: 80\n  image:\n    release: ./release.json\n    trusted_key: ./publisher.pem\n    manifest: sha256:{}\n    account_id: '1234567890'\nattestation:\n  tee: tdx\n  mode: challenge\n  reference_values: sample\nresources: {{}}\n", "a".repeat(64))).unwrap();
         path
     }
 
@@ -302,6 +303,7 @@ mod tests {
             let spec = AgentSpec::from_path(&path).unwrap();
             let paths = context_paths(&cli.state_dir, id);
             let manifest = read_build_manifest(&paths.manifest).unwrap();
+            assert!(manifest.ssh.is_some());
             let image = manifest.image.as_ref().unwrap();
             assert_eq!(image.image_id, "m-shared-image");
             assert!(image.source.release.starts_with(&paths.artifacts_dir));
@@ -336,6 +338,9 @@ mod tests {
             .unwrap();
             assert!(state.build.remote);
             assert!(state.build.published.is_empty());
+            assert_eq!(state.resources.len(), 2);
+            assert!(state.resources["cai_ssh_host_key"].required);
+            assert!(!state.resources["cai_ssh_host_key"].mutable);
             assert_eq!(
                 state
                     .build

@@ -129,7 +129,9 @@ fn shelter_packages(spec: &AgentSpec, _assets: &GuestAssets) -> Vec<String> {
     if !packages.iter().any(|package| package == "libtdx-verify") {
         packages.push("libtdx-verify".to_string());
     }
-    if spec.deploys_debug_image() && !packages.iter().any(|package| package == "openssh-server") {
+    if (spec.deploys_debug_image() || spec.service.ssh)
+        && !packages.iter().any(|package| package == "openssh-server")
+    {
         packages.push("openssh-server".to_string());
     }
     packages
@@ -347,7 +349,7 @@ fn security_group_rules(
             cidr,
         ));
     }
-    if spec.deploys_debug_image() {
+    if spec.deploys_debug_image() || spec.service.ssh {
         for cidr in options.peerings.cidrs_for_scope(PeeringScope::Ssh) {
             rules.push(ShelterDeploySecurityGroupRule::ingress(
                 format!("ssh_22_peer_{}", sanitize_rule_name_component(&cidr)),
@@ -510,7 +512,9 @@ impl ShelterSecurity {
         Self {
             harden: ShelterHarden {
                 enabled: true,
-                mode: if spec.deploys_debug_image() {
+                // Full Cryptpilot hardening removes openssh-server. Instance SSH
+                // still uses attested credentials and its image-provided service.
+                mode: if spec.deploys_debug_image() || spec.service.ssh {
                     "partial".to_string()
                 } else {
                     "full".to_string()

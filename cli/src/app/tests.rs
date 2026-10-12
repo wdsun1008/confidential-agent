@@ -668,6 +668,7 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
     fs::create_dir_all(&service_dir).unwrap();
     let shelter_work_dir = service_dir.join("shelter");
     let manifest = BuildManifest {
+        ssh: None,
         image: None,
         service_id: service_id.to_string(),
         shelter_build_id: build_id.to_string(),
