@@ -21,7 +21,8 @@ import urllib.request
 
 
 def run(command, evidence, timeout=1800, success=True, env=None):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True, env=env)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -158,7 +159,14 @@ class Consumer:
         if self.probe.get("connect_http_path"):
             self.verify_connect()
         if self.probe.get("command"):
-            result = self.ssh("model", self.probe["command"], timeout=600)
+            try:
+                result = self.ssh("model", self.probe["command"], timeout=600)
+            except RuntimeError:
+                self.ssh("model-network-diagnostics", "cat /etc/resolv.conf; "
+                         "systemctl show NetworkManager -p ActiveState -p Result; "
+                         "journalctl -u NetworkManager --no-pager -n 80",
+                         success=False, timeout=30)
+                raise
             assert self.probe["expect"].encode() in result.stdout, "model response missing marker"
         else:
             (self.work / "model-skipped.json").write_text(json.dumps({
