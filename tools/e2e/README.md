@@ -120,9 +120,11 @@ Keep the complete marker out of the prompt so echoed input cannot satisfy it:
 {"command": "cai-agent --print 'Join REUSE_ and OK without a space'", "expect": "REUSE_OK"}
 ```
 
-If account credentials are unavailable, explicitly use `command: null` and a
-`skip_reason`; installation and startup are still checked, and the model call
-is recorded as skipped. Keep fixtures and credentials outside the repository.
+If account credentials are unavailable, explicitly use `command: null`, a
+`skip_reason`, and `--allow-model-skip`; installation and startup are still
+checked, and the model call is recorded as skipped. Keep fixtures and credentials
+outside the repository. Give parallel test lanes independent resource source
+files, especially when enabling application error or resume fault injection.
 
 ```bash
 python3.11 tools/e2e/allinone-reuse.py \
@@ -131,13 +133,20 @@ python3.11 tools/e2e/allinone-reuse.py \
   --parallel 2 --reboot
 ```
 
-The work directory must be new. Consumers use independent state directories.
+The work directory must be new. Consumers share one CA state directory, with
+independent service identities and keys.
 The test rejects altered signatures, wrong publisher keys and incorrect pins;
 checks attestation, resource content, independent credentials and pinned SSH
 host keys; optionally forces a reboot and verifies persisted data; and destroys all attempted
 consumers, checking that the published image survives. Challenge reboot recovery
 uses the existing `inject` command; Trustee recovery does not invoke it. Private
 command output and any cleanup failure remain in the work directory.
+
+`--console-isolation` requires guest function tracing. It checks application
+stdout and stderr in the private journal and traces console/kernel-log writes,
+using a direct `/dev/console` write from the same unit as a positive control.
+ECS console output is also checked for application markers; this API returns
+startup/restart/shutdown caches, so its output alone cannot prove isolation.
 
 For Trustee fixtures, supply `--trustee-url`, `--trustee-admin-key`, and optionally
 `--trustee-management-url`. Use a fresh disposable stock Trustee and restrict its
