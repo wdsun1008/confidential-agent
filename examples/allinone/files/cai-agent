@@ -1,0 +1,79 @@
+#!/usr/bin/python3.11
+"""Image-owned harness selection; CA delivers this configuration as a resource."""
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+CONFIG = Path("/opt/data/allinone/runtime.json")
+HOME = Path("/opt/data/allinone/home")
+WORKSPACE = Path("/opt/data/allinone/workspace")
+COMMANDS = {
+    "openclaw": ["openclaw"],
+    "hermes": ["hermes"],
+    "qodercli": ["qoder"],
+    "opencode": ["opencode"],
+    "codex": ["codex"],
+    "claude-code": ["claude"],
+}
+
+
+def load_configuration(path=CONFIG):
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict) or set(value) - {"harness", "environment"}:
+        raise ValueError("runtime configuration accepts harness and environment")
+    if value.get("harness") not in COMMANDS:
+        raise ValueError("unknown allinone harness")
+    environment = value.get("environment", {})
+    if not isinstance(environment, dict) or any(
+        not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) or not isinstance(item, str)
+        or "\x00" in item or key in {"HOME", "PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"}
+        for key, item in environment.items()
+    ):
+        raise ValueError("invalid harness environment")
+    return value["harness"], environment
+
+
+def main():
+    harness, configured = load_configuration()
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    WORKSPACE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    environment = dict(os.environ, **configured)
+    environment.update(HOME=str(HOME), XDG_CONFIG_HOME=str(HOME / ".config"),
+                       HERMES_HOME="/opt/data/allinone/hermes",
+                       CODEX_HOME=str(HOME / ".codex"),
+                       QODER_CONFIG_DIR=str(HOME / ".qoder"),
+                       PATH="/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin:/sbin")
+    command = COMMANDS[harness].copy()
+    if not shutil.which(command[0], path=environment["PATH"]):
+        raise RuntimeError("selected harness is absent from the image")
+    arguments = sys.argv[1:]
+    if arguments == ["--serve"]:
+        # Credentials arrive only through the existing CA attested resource flow.
+        ssh = Path("/opt/data/cai-ssh")
+        if (ssh / "authorized_keys").is_file() and (ssh / "host_key").is_file():
+            subprocess.run(["systemctl", "start", "cai-ssh.service"], check=True)
+        if harness == "openclaw":
+            command += ["gateway", "--port", "18789"]
+        elif harness == "hermes":
+            command += ["gateway", "run"]
+        else:
+            # Interactive CLIs run through `ca ssh <id> -- cai-agent ...`.
+            # Keep the readiness unit alive without starting another harness.
+            command = ["/usr/bin/sleep", "infinity"]
+    else:
+        command += arguments
+    os.chdir(WORKSPACE)
+    os.execvpe(command[0], command, environment)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        # Do not print configuration contents: environment may contain secrets.
+        print("allinone startup failed: " + type(error).__name__, file=sys.stderr)
+        sys.exit(1)

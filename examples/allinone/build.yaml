@@ -1,0 +1,54 @@
+schema: confidential-agent/v1
+service:
+  id: allinone-builder
+  ports: []
+  app_service: cai-allinone.service
+  ssh: true
+build:
+  image_name: allinone
+  resize: 80G
+  repos:
+    - name: alinux-os
+      baseurl: https://mirrors-ssl.aliyuncs.com/alinux/3/os/$basearch/
+      gpgkey: https://mirrors-ssl.aliyuncs.com/alinux/3/RPM-GPG-KEY-ALINUX-3
+    - name: alinux-updates
+      baseurl: https://mirrors-ssl.aliyuncs.com/alinux/3/updates/$basearch/
+      gpgkey: https://mirrors-ssl.aliyuncs.com/alinux/3/RPM-GPG-KEY-ALINUX-3
+    - name: alinux-plus
+      baseurl: https://mirrors-ssl.aliyuncs.com/alinux/3/plus/$basearch/
+      gpgkey: https://mirrors-ssl.aliyuncs.com/alinux/3/RPM-GPG-KEY-ALINUX-3
+    - name: alinux-module
+      baseurl: https://mirrors-ssl.aliyuncs.com/alinux/3/module/$basearch/
+      gpgkey: https://mirrors-ssl.aliyuncs.com/alinux/3/RPM-GPG-KEY-ALINUX-3
+    - name: alinux-powertools
+      baseurl: https://mirrors-ssl.aliyuncs.com/alinux/3/powertools/$basearch/
+      gpgkey: https://mirrors-ssl.aliyuncs.com/alinux/3/RPM-GPG-KEY-ALINUX-3
+  packages: [ca-certificates, curl, findutils, git, jq, libatomic, nodejs, npm, openssh-server, python3.11, shadow-utils, tar, util-linux, xz]
+  files:
+    - source: ../cli-agents/files/install-cli-agent-runtime.sh
+      target: /usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh
+      executable: true
+    - source: ../hermes-agent/files/install-hermes-agent-runtime.sh
+      target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
+      executable: true
+    - source: ./files/cai-agent
+      target: /usr/local/bin/cai-agent
+      executable: true
+    - source: ./files/cai-allinone.service
+      target: /etc/systemd/system/cai-allinone.service
+    - source: ./files/cai-ssh.service
+      target: /etc/systemd/system/cai-ssh.service
+    - source: ./files/sshd_config
+      target: /usr/local/libexec/confidential-agent/allinone/sshd_config
+  scripts: [./install-allinone.sh]
+deploy:
+  provider: aliyun
+  region: cn-beijing
+  zone_id: cn-beijing-i
+  instance_type: ecs.g9i.xlarge
+  disk_gb: 80
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources: {}
