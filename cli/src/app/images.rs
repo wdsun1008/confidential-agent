@@ -601,6 +601,21 @@ mod tests {
                 }
                 let error = commands::cmd_inject(&cli, &args).unwrap_err();
                 assert!(error.to_string().contains(expected), "{mode}: {error:#}");
+                if mode == "trustee" {
+                    let error = trustee::cmd_trustee(
+                        &cli,
+                        &crate::cli::TrusteeArgs {
+                            command: crate::cli::TrusteeCommands::Sync {
+                                service: Some("agent-a".into()),
+                            },
+                        },
+                    )
+                    .unwrap_err();
+                    assert!(
+                        error.to_string().contains(expected),
+                        "trustee sync: {error:#}"
+                    );
+                }
                 assert_eq!(fs::read(&paths.service_state).unwrap(), original_state);
                 assert_eq!(fs::read(&paths.manifest).unwrap(), original_manifest);
                 // No challenge bootstrap or Trustee resource staging was reached.

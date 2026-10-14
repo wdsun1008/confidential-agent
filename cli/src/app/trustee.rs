@@ -1731,11 +1731,12 @@ fn sync_from_local_state(cli: &Cli, service_filter: Option<&str>) -> Result<()> 
         spec.attestation.mode = AttestationMode::Trustee;
         let paths = context_paths(&cli.state_dir, &service.service_id);
         let manifest = read_build_manifest(&paths.manifest)?;
+        let delivery_spec = validated_injection_spec(&service, &manifest, &spec, &paths)?;
         let variant = manifest.variant(&service.build.variant, Some(&service.build.variant))?;
         sync_service(
             cli,
             &cli.state_dir,
-            &spec,
+            &delivery_spec,
             &variant.build_result,
             &variant.shelter_build_id,
             service.deploy.preferred_injection_ip(),
