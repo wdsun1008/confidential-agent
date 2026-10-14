@@ -561,10 +561,24 @@ mod tests {
             let mut state = crate::app::tests::local_state("agent-a", vec![], vec![]);
             state.phase = "active".into();
             state.build.image_name = spec.image_id().into();
+            state.spec = manifest.deployment.as_ref().unwrap().source.clone();
             state.attestation_mode = mode.into();
             write_local_service_state(&cli.state_dir, &state).unwrap();
             let original_state = fs::read(&paths.service_state).unwrap();
             let original_manifest = fs::read(&paths.manifest).unwrap();
+            let trustee_state = cli.state_dir.join("trustee/state.json");
+            let original_trustee = if mode == "trustee" {
+                fs::create_dir_all(trustee_state.parent().unwrap()).unwrap();
+                write_json_atomic(&trustee_state, &serde_json::json!({
+                    "schema": "confidential-agent/trustee-state/v1",
+                    "owner_id": "a".repeat(32), "revision": 1,
+                    "services": {"agent-a": {"enabled": true,
+                        "runtime_config_sha384": "b".repeat(96), "updated_at": "2026-10-14T00:00:00Z"}}
+                })).unwrap();
+                Some(fs::read(&trustee_state).unwrap())
+            } else {
+                None
+            };
             let disk = paths.secrets_dir.join("disk_passphrase");
             let original_disk = fs::read(&disk).unwrap();
             let args = InjectArgs {
@@ -620,7 +634,10 @@ mod tests {
                 assert_eq!(fs::read(&paths.manifest).unwrap(), original_manifest);
                 // No challenge bootstrap or Trustee resource staging was reached.
                 assert!(!paths.bootstrap_file.exists());
-                assert!(!cli.state_dir.join("trustee").exists());
+                match &original_trustee {
+                    Some(original) => assert_eq!(fs::read(&trustee_state).unwrap(), *original),
+                    None => assert!(!cli.state_dir.join("trustee").exists()),
+                }
             }
             fs::write(&path, &raw).unwrap();
             fs::write(&disk, &original_disk).unwrap();
