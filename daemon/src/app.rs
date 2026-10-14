@@ -239,6 +239,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Commands::Run(args) => run_daemon(args),
         Commands::InitrdFetch(args) => initrd_fetch(args),
         Commands::ApplyOnce(mut args) => {
+            let mut state = read_daemon_state()?;
             let trustee_runtime = trustee::load_rootfs_runtime()?;
             let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
                 // The rootfs Attestation Agent is a different service
@@ -272,7 +273,6 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
                 refresh_trustee_bootstrap_resources(runtime, &args, &bootstrap);
                 refresh_trustee_dynamic_resources(runtime, &args);
             }
-            let mut state = read_daemon_state().unwrap_or_default();
             if apply_bootstrap(&args, &bootstrap, &mut state, true)? {
                 sync_mesh(&args, &bootstrap, &mut state)?;
             }
@@ -447,6 +447,7 @@ fn initrd_poweroff_enabled() -> bool {
 }
 
 fn run_daemon(mut args: RunArgs) -> Result<()> {
+    let mut state = read_daemon_state()?;
     println!("confidential-agentd starting");
     let trustee_runtime = trustee::load_rootfs_runtime()?;
     let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
@@ -487,7 +488,6 @@ fn run_daemon(mut args: RunArgs) -> Result<()> {
             Path::new(&args.a2a_bundle_resource),
         ],
     )?;
-    let mut state = read_daemon_state().unwrap_or_default();
     let mut active_bootstrap: Option<BootstrapConfig> = None;
     loop {
         if let Some(runtime) = trustee_runtime.as_ref() {
@@ -3210,19 +3210,84 @@ fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
     Ok(true)
 }
 
+fn daemon_state_initialized_path() -> PathBuf {
+    daemon_state_path().with_extension("initialized")
+}
+
+fn mark_daemon_state_initialized() -> Result<()> {
+    let path = daemon_state_initialized_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(b"confidential-agent/state/v1\n")?;
+            file.sync_all()?;
+            fs::File::open(path.parent().context("state marker has no parent")?)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(
+                fs::read(&path)? == b"confidential-agent/state/v1\n",
+                "invalid daemon state initialization marker: {}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to initialize {}", path.display()))
+        }
+    }
+    Ok(())
+}
+
 fn read_daemon_state() -> Result<DaemonState> {
     let path = daemon_state_path();
-    if !path.exists() {
-        return Ok(DaemonState::default());
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let state = serde_json::from_str(&content).with_context(|| {
+                format!(
+                    "failed to parse daemon state {}; restore the saved state before restarting",
+                    path.display()
+                )
+            })?;
+            // Upgrade an existing valid state before it can publish endpoints.
+            mark_daemon_state_initialized()?;
+            Ok(state)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A marker survives restarts and deletion of state.json. Existing
+            // mesh outputs also identify guests initialized by older versions.
+            let initialized = daemon_state_initialized_path().try_exists()?
+                || service_directory_path().try_exists()?
+                || daemon_cache_dir().join("mesh-bundle.json").try_exists()?;
+            anyhow::ensure!(!initialized && fs::symlink_metadata(&path).is_err(),
+                "daemon state {} is missing on an initialized guest; restore it before restarting to preserve endpoint identities", path.display());
+            let state = DaemonState::default();
+            write_daemon_state(&state)?;
+            Ok(state)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read daemon state {}; restore it before restarting",
+                path.display()
+            )
+        }),
     }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&content).context("failed to parse daemon state")
 }
 
 fn write_daemon_state(state: &DaemonState) -> Result<()> {
     let path = daemon_state_path();
-    write_json_atomic(&path, state)
+    // Reserve initialization before the first state write. If interrupted,
+    // missing state must fail closed rather than publish a new endpoint table.
+    mark_daemon_state_initialized()?;
+    write_json_atomic(&path, state)?;
+    fs::File::open(&path)?.sync_all()?;
+    fs::File::open(path.parent().context("daemon state has no parent")?)?.sync_all()?;
+    Ok(())
 }
 
 fn write_status(status: DaemonStatus) -> Result<()> {

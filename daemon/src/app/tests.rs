@@ -3996,6 +3996,68 @@ fn gateway_config_listen_ports_deduplicates_and_ignores_invalid_values() {
 }
 
 #[test]
+fn daemon_state_errors_do_not_rebuild_or_overwrite_endpoint_reservations() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let mut state = read_daemon_state().unwrap();
+    state.mesh_client_owner = Some("self".into());
+    state.mesh_client_ports = BTreeMap::from([
+        ("beta".into(), BTreeMap::from([(18789, 18789)])),
+        ("gamma".into(), BTreeMap::from([(18789, 39600)])),
+    ]);
+    write_daemon_state(&state).unwrap();
+    let original = fs::read(&env.state).unwrap();
+    for damaged in [b"{invalid".as_slice(), b"\xff".as_slice()] {
+        fs::write(&env.state, damaged).unwrap();
+        assert!(read_daemon_state().is_err());
+        assert_eq!(fs::read(&env.state).unwrap(), damaged);
+        // Both real command entry points must propagate the state failure
+        // before applying bootstrap, replacing listeners or publishing status.
+        let args = test_run_args(temp.path().join("cdh"));
+        assert!(run_daemon(args.clone()).is_err());
+        assert!(run(Cli {
+            command: Commands::ApplyOnce(args)
+        })
+        .is_err());
+        assert_eq!(fs::read(&env.state).unwrap(), damaged);
+        assert!(!env.service_directory.exists());
+        assert!(!env.status.exists());
+    }
+    fs::remove_file(&env.state).unwrap();
+    let error = read_daemon_state().unwrap_err();
+    assert!(error.to_string().contains("initialized guest"));
+    assert!(!env.state.exists());
+    fs::create_dir(&env.state).unwrap();
+    assert!(read_daemon_state().is_err());
+    fs::remove_dir(&env.state).unwrap();
+    fs::write(&env.state, &original).unwrap();
+    let restored = read_daemon_state().unwrap();
+    assert_eq!(restored.mesh_client_ports, state.mesh_client_ports);
+}
+
+#[test]
+fn daemon_state_initialization_distinguishes_new_and_legacy_guests() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    assert!(!env.state.exists());
+    assert_eq!(read_daemon_state().unwrap().mesh_client_ports.len(), 0);
+    assert!(env.state.exists());
+    assert!(daemon_state_initialized_path().exists());
+    // A valid legacy state is accepted and gains a durable marker.
+    fs::remove_file(daemon_state_initialized_path()).unwrap();
+    assert!(read_daemon_state().is_ok());
+    assert!(daemon_state_initialized_path().exists());
+    fs::remove_file(daemon_state_initialized_path()).unwrap();
+    fs::remove_file(&env.state).unwrap();
+    // Legacy mesh output is initialization evidence even without a marker.
+    fs::create_dir_all(env.service_directory.parent().unwrap()).unwrap();
+    fs::write(&env.service_directory, "existing directory").unwrap();
+    assert!(read_daemon_state().is_err());
+    assert!(!env.state.exists());
+    assert!(!daemon_state_initialized_path().exists());
+}
+
+#[test]
 fn daemon_state_round_trips_through_configured_path() {
     let temp = tempfile::tempdir().unwrap();
     let env = no_tee_test_env(&temp);
