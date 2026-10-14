@@ -571,6 +571,15 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
             spec.service.id
         )
     })?;
+    anyhow::ensure!(
+        [
+            state.deploy.public_ip.as_deref(),
+            state.deploy.private_ip.as_deref()
+        ]
+        .contains(&Some(args.target_ip.as_str())),
+        "inject target must match a recorded address of the deployed instance"
+    );
+    let delivery_spec = validated_injection_spec(&state, &manifest, &spec, &paths)?;
     validate_shared_guest_ports(&cli.state_dir, &spec, &manifest)?;
     let build_variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
 
@@ -578,7 +587,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
         trustee::sync_service(
             cli,
             &cli.state_dir,
-            &spec,
+            &delivery_spec,
             &build_variant.build_result,
             &build_variant.shelter_build_id,
             Some(&args.target_ip),
@@ -587,7 +596,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
         inject_resources(
             cli,
             &cli.state_dir,
-            &spec,
+            &delivery_spec,
             &build_variant.build_result,
             &build_variant.shelter_build_id,
             &args.target_ip,

@@ -145,6 +145,95 @@ pub(super) fn deployment_delivery_spec(snapshot: &DeploymentSnapshot) -> Result<
     Ok(spec)
 }
 
+fn immutable_deployment_input(id: &str) -> bool {
+    id.starts_with("secret:")
+        || id.starts_with("identity:")
+        || matches!(
+            id,
+            "resource:cai_ssh_authorized_keys" | "resource:cai_ssh_host_key"
+        )
+}
+
+/// Check the instance binding before either resource provider can be updated.
+pub(super) fn validated_injection_spec(
+    state: &LocalServiceState,
+    manifest: &BuildManifest,
+    current: &AgentSpec,
+    paths: &ContextPaths,
+) -> Result<AgentSpec> {
+    let saved = committed_deployment(state, manifest)?;
+    anyhow::ensure!(
+        current.image_id() == saved.spec.image_id()
+            && current.image_variant() == state.build.variant
+            && serde_json::to_value(&current.build)? == serde_json::to_value(&saved.spec.build)?,
+        "inject cannot change the deployed image or build inputs; deploy a new instance to use a different image"
+    );
+    let mut deployed = saved.spec.deploy.clone();
+    let mut proposed = current.deploy.clone();
+    deployed.image_variant = Some(state.build.variant.clone());
+    proposed.image_variant = Some(current.image_variant().to_string());
+    anyhow::ensure!(
+        serde_json::to_value(&proposed)? == serde_json::to_value(&deployed)?,
+        "inject cannot change the committed image release or infrastructure configuration; deploy a new instance for those changes"
+    );
+    anyhow::ensure!(
+        serde_json::to_value(&current.attestation)?
+            == serde_json::to_value(&saved.spec.attestation)?
+            && current.service.ssh == saved.spec.service.ssh,
+        "inject cannot change the committed attestation or management identity configuration"
+    );
+    if let (Some(image), Some(committed)) = (&current.deploy.image, &manifest.image) {
+        for (name, source, frozen) in [
+            ("release", &image.release, &committed.source.release),
+            (
+                "publisher key",
+                &image.trusted_key,
+                &committed.source.trusted_key,
+            ),
+        ] {
+            anyhow::ensure!(sha256_file(source)? == sha256_file(frozen)?,
+                "inject cannot change the committed image {name}; deploy a new instance to select another release");
+        }
+    }
+    let expected = saved.inputs.as_ref().context(
+        "inject requires the deployment's frozen disk and identity inputs; this legacy deployment has no safe update binding, so restore its saved inputs or deploy a new instance",
+    )?;
+    let actual = deployment_input_paths(paths, current)?;
+    let actual_immutable: BTreeSet<_> = actual
+        .keys()
+        .filter(|id| immutable_deployment_input(id))
+        .collect();
+    let expected_immutable: BTreeSet<_> = expected
+        .keys()
+        .filter(|id| immutable_deployment_input(id))
+        .collect();
+    anyhow::ensure!(
+        actual_immutable == expected_immutable,
+        "inject cannot change the committed disk or management identity input set"
+    );
+    for id in expected_immutable {
+        let input = &expected[id];
+        anyhow::ensure!(actual[id] == input.source && sha256_file(&actual[id])? == input.sha256,
+            "inject cannot change committed input {id}; restore the original input (disk key rotation and identity replacement are not supported by inject)");
+    }
+    // Deliver the committed disk bytes, closing the gap between checking a
+    // mutable source file and sending its contents to CDH or KBS.
+    let disk = expected
+        .get("secret:disk_passphrase")
+        .context("deployment has no frozen disk binding")?;
+    let frozen = disk
+        .snapshot
+        .as_ref()
+        .context("deployment has no saved disk secret")?;
+    anyhow::ensure!(
+        sha256_file(frozen)? == disk.sha256,
+        "saved deployment disk secret was modified"
+    );
+    let mut delivery = current.clone();
+    delivery.secrets.disk_passphrase = Some(frozen.clone());
+    Ok(delivery)
+}
+
 pub(super) fn validate_resume_inputs(
     saved: &DeploymentSnapshot,
     current: &DeploymentSnapshot,
@@ -152,7 +241,7 @@ pub(super) fn validate_resume_inputs(
 ) -> Result<()> {
     anyhow::ensure!(current.source.path == saved.source.path && current.source.sha256 == saved.source.sha256,
         "--resume requires the original deployment configuration and canonical path; restore them before resuming resource delivery");
-    let expected = saved.inputs.as_ref().context("this deployment has no frozen resource inputs; use an explicit inject to apply current resources instead of --resume")?;
+    let expected = saved.inputs.as_ref().context("this deployment has no frozen resource inputs; restore its saved deployment inputs or deploy a new instance")?;
     let actual = deployment_input_paths(paths, &current.spec)?;
     anyhow::ensure!(
         actual.keys().eq(expected.keys()),
@@ -160,8 +249,12 @@ pub(super) fn validate_resume_inputs(
     );
     for (id, path) in actual {
         let input = &expected[&id];
-        anyhow::ensure!(path == input.source && sha256_file(&path)? == input.sha256,
-            "--resume deployment input {id} changed (source path or contents); restore the original input, or use an explicit inject to apply current resources");
+        if path != input.source || sha256_file(&path)? != input.sha256 {
+            if immutable_deployment_input(&id) {
+                bail!("--resume committed input {id} changed (source path or contents); restore the original input; inject cannot rotate disk keys or replace instance identities");
+            }
+            bail!("--resume deployment input {id} changed (source path or contents); restore the original input, or use an explicit inject to update application resources");
+        }
     }
     deployment_delivery_spec(saved)?;
     Ok(())

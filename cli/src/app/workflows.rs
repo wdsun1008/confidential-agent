@@ -318,19 +318,6 @@ pub(super) fn activate_existing_service_state(
         path: absolute_path(spec_path)?,
         sha256: sha256_file(spec_path)?,
     };
-    state.build = LocalBuildState {
-        build_id: state.build.build_id.clone(),
-        image_name: spec.image_id().to_string(),
-        variant: spec.image_variant().to_string(),
-        image_path: state.build.image_path.clone(),
-        images_dir: state.build.images_dir.clone(),
-        cache_dir: state.build.cache_dir.clone(),
-        debug_ssh: state.build.debug_ssh.clone(),
-        sample_rv: state.build.sample_rv.clone(),
-        rekor_meta: state.build.rekor_meta.clone(),
-        remote: state.build.remote,
-        published: state.build.published.clone(),
-    };
     state.service = LocalServiceNetwork {
         ports: spec.service.ports.clone(),
         connect: spec.service.connect.clone(),

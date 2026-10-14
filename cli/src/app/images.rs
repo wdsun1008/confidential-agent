@@ -543,6 +543,104 @@ mod tests {
     }
 
     #[test]
+    fn inject_rejects_instance_changes_before_either_provider_is_written() {
+        for mode in ["challenge", "trustee"] {
+            let (root, cli, _) = fixture();
+            let path = instance_spec(root.path(), "agent-a");
+            let raw = fs::read_to_string(&path)
+                .unwrap()
+                .replace("mode: challenge", &format!("mode: {mode}"));
+            fs::write(&path, &raw).unwrap();
+            let paths = context_paths(&cli.state_dir, "agent-a");
+            let spec = AgentSpec::from_path(&path).unwrap();
+            let mut manifest = import(&cli, &spec).unwrap();
+            let mut snapshot = deployment_snapshot(&path).unwrap();
+            freeze_deployment_inputs(&mut snapshot, &paths, "attempt").unwrap();
+            manifest.deployment = Some(snapshot);
+            write_json_atomic(&paths.manifest, &manifest).unwrap();
+            let mut state = crate::app::tests::local_state("agent-a", vec![], vec![]);
+            state.phase = "active".into();
+            state.build.image_name = spec.image_id().into();
+            state.attestation_mode = mode.into();
+            write_local_service_state(&cli.state_dir, &state).unwrap();
+            let original_state = fs::read(&paths.service_state).unwrap();
+            let original_manifest = fs::read(&paths.manifest).unwrap();
+            let disk = paths.secrets_dir.join("disk_passphrase");
+            let original_disk = fs::read(&disk).unwrap();
+            let args = InjectArgs {
+                spec: path.clone(),
+                target_ip: state.deploy.public_ip.clone().unwrap(),
+                skip_peering_check: true,
+            };
+            for (yaml, replacement_disk, expected) in [
+                (
+                    raw.clone(),
+                    Some("replacement disk key"),
+                    "secret:disk_passphrase",
+                ),
+                (
+                    raw.replace(&"a".repeat(64), &"b".repeat(64)),
+                    None,
+                    "deployed image",
+                ),
+                (
+                    raw.replace("disk_gb: 80", "disk_gb: 200"),
+                    None,
+                    "infrastructure configuration",
+                ),
+                (
+                    raw.replace("region: cn-beijing", "region: cn-hangzhou"),
+                    None,
+                    "infrastructure configuration",
+                ),
+            ] {
+                fs::write(&path, yaml).unwrap();
+                fs::write(&disk, &original_disk).unwrap();
+                if let Some(bytes) = replacement_disk {
+                    fs::write(&disk, bytes).unwrap();
+                }
+                let error = commands::cmd_inject(&cli, &args).unwrap_err();
+                assert!(error.to_string().contains(expected), "{mode}: {error:#}");
+                assert_eq!(fs::read(&paths.service_state).unwrap(), original_state);
+                assert_eq!(fs::read(&paths.manifest).unwrap(), original_manifest);
+                // No challenge bootstrap or Trustee resource staging was reached.
+                assert!(!paths.bootstrap_file.exists());
+                assert!(!cli.state_dir.join("trustee").exists());
+            }
+            fs::write(&path, &raw).unwrap();
+            fs::write(&disk, &original_disk).unwrap();
+            let mut updated = spec.clone();
+            let token = root.path().join("new-api-token");
+            fs::write(&token, "ordinary application update").unwrap();
+            updated.resources.insert(
+                "token".into(),
+                confidential_agent_core::spec::ResourceSpec {
+                    source: token.clone(),
+                    target: "/opt/data/token".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    required: true,
+                    mutable: false,
+                },
+            );
+            let delivery = validated_injection_spec(&state, &manifest, &updated, &paths).unwrap();
+            assert_eq!(delivery.resources["token"].source, token);
+            let frozen = delivery.secrets.disk_passphrase.unwrap();
+            fs::write(&disk, "changed after validation").unwrap();
+            assert_eq!(fs::read(frozen).unwrap(), original_disk);
+            // Immutable failures must not suggest inject as their remedy.
+            let error = validate_resume_inputs(
+                manifest.deployment.as_ref().unwrap(),
+                &deployment_snapshot(&path).unwrap(),
+                &paths,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("inject cannot rotate disk keys"));
+        }
+    }
+
+    #[test]
     fn resume_binds_canonical_resource_paths_contents_and_instance_identities() {
         let (root, cli, _) = fixture();
         let path = instance_spec(root.path(), "agent-a");
