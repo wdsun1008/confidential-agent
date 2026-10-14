@@ -1751,6 +1751,35 @@ fn sync_from_local_state(cli: &Cli, service_filter: Option<&str>) -> Result<()> 
     Ok(())
 }
 
+pub(super) fn historical_disk_digest(
+    state_dir: &Path,
+    service: &LocalServiceState,
+) -> Result<String> {
+    anyhow::ensure!(service.attestation_mode == "trustee",
+        "legacy challenge state has no historical disk digest; retain the previous host toolchain for resource delivery and back up/export data before upgrading; current files cannot establish the original disk binding");
+    let (paths, config, state) = load_trustee(state_dir)?;
+    let snapshot = TrusteeClient::load(&config, &paths.admin_key)?.snapshot()?;
+    ensure_remote_control(&state, &snapshot, None)?;
+    let recorded = state
+        .services
+        .get(&service.service_id)
+        .context("no historical Trustee service binding")?;
+    anyhow::ensure!(recorded.enabled, "historical Trustee service is revoked");
+    let disk = recorded
+        .resources
+        .get("default/local-resources/disk_passphrase")
+        .context("no historical Trustee disk digest")?;
+    validate_sha256("historical disk digest", disk)?;
+    anyhow::ensure!(
+        recorded
+            .resources
+            .get("default/local-resources/data_passphrase")
+            == Some(disk),
+        "historical disk and data secrets differ; automatic input migration is unsupported"
+    );
+    Ok(disk.clone())
+}
+
 pub(super) fn revoke_service(state_dir: &Path, service_id: &str) -> Result<bool> {
     with_state_dir_lock(state_dir, || {
         let (paths, config, mut state) = load_trustee(state_dir)?;

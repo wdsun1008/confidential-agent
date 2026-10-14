@@ -597,6 +597,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_inputs_are_bound_only_after_historical_disk_and_identity_checks() {
+        let (root, cli, _) = fixture();
+        let path = instance_spec(root.path(), "agent-a");
+        let mut saved = deployment_snapshot(&path).unwrap();
+        let paths = context_paths(&cli.state_dir, "agent-a");
+        let spec = instance_ssh::runtime_spec(&paths, &saved.spec).unwrap();
+        let gateway = ensure_gateway_identity(&paths).unwrap();
+        let disk = ensure_disk_passphrase(&paths).unwrap();
+        let digest = sha256_file(&disk).unwrap();
+        let mut state = crate::app::tests::local_state("agent-a", vec![], vec![]);
+        state.gateway_identity = Some(gateway.clone());
+        state.resources = resource_states(&spec).unwrap();
+        state.phase = "active".into();
+        let mut manifest = import(&cli, &saved.spec).unwrap();
+        manifest.deployment = Some(saved.clone());
+        write_json_atomic(&paths.manifest, &manifest).unwrap();
+        write_local_service_state(&cli.state_dir, &state).unwrap();
+        let original_manifest = fs::read(&paths.manifest).unwrap();
+        let check = UpgradeArgs {
+            command: UpgradeCommands::Check,
+        };
+        assert!(upgrade::run(&cli, &check)
+            .unwrap_err()
+            .to_string()
+            .contains("before resource updates or cold boot"));
+        assert!(upgrade::run(
+            &cli,
+            &UpgradeArgs {
+                command: UpgradeCommands::BindInputs {
+                    service: "agent-a".into()
+                }
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no historical disk digest"));
+        assert_eq!(fs::read(&paths.manifest).unwrap(), original_manifest);
+        assert!(upgrade::bind_legacy_inputs(&state, &mut saved, &paths, &"0".repeat(64)).is_err());
+        assert!(saved.inputs.is_none());
+        let original = fs::read(&gateway.private_key_path).unwrap();
+        fs::write(&gateway.private_key_path, URL_SAFE_NO_PAD.encode([99; 32])).unwrap();
+        assert!(upgrade::bind_legacy_inputs(&state, &mut saved, &paths, &digest).is_err());
+        assert!(saved.inputs.is_none());
+        fs::write(&gateway.private_key_path, original).unwrap();
+        let authorized = paths.secrets_dir.join("ssh_client.pub");
+        let original = fs::read(&authorized).unwrap();
+        fs::write(&authorized, "replacement SSH identity").unwrap();
+        assert!(upgrade::bind_legacy_inputs(&state, &mut saved, &paths, &digest).is_err());
+        assert!(saved.inputs.is_none());
+        fs::write(&authorized, original).unwrap();
+        upgrade::bind_legacy_inputs(&state, &mut saved, &paths, &digest).unwrap();
+        assert_eq!(
+            saved.inputs.as_ref().unwrap()["secret:disk_passphrase"].sha256,
+            digest
+        );
+        assert!(saved.inputs.as_ref().unwrap()["secret:disk_passphrase"]
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .is_file());
+        manifest.deployment = Some(saved);
+        write_json_atomic(&paths.manifest, &manifest).unwrap();
+        upgrade::run(&cli, &check).unwrap();
+        manifest.deployment.as_mut().unwrap().inputs = Some(BTreeMap::new());
+        write_json_atomic(&paths.manifest, &manifest).unwrap();
+        assert!(upgrade::run(&cli, &check).is_err());
+    }
+
+    #[test]
     fn inject_rejects_instance_changes_before_either_provider_is_written() {
         for mode in ["challenge", "trustee"] {
             let (root, cli, _) = fixture();

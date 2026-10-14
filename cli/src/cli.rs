@@ -187,6 +187,8 @@ pub(crate) enum Commands {
     Peering(PeeringArgs),
     A2a(A2aArgs),
     Migrate(MigrateArgs),
+    /// Check host upgrade compatibility or bind verified legacy deployment inputs.
+    Upgrade(UpgradeArgs),
     Image(ImageArgs),
     Ssh(SshArgs),
     Tui(TuiArgs),
@@ -565,6 +567,23 @@ pub(crate) struct MigrateArgs {
     pub(crate) out: Option<PathBuf>,
     #[arg(long)]
     pub(crate) peerings_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UpgradeArgs {
+    #[command(subcommand)]
+    pub(crate) command: UpgradeCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum UpgradeCommands {
+    /// Check existing deployments before replacing the host CLI or rebooting guests.
+    Check,
+    /// Freeze legacy inputs using historical Trustee disk digests and recorded identities.
+    BindInputs {
+        #[arg(long)]
+        service: String,
+    },
 }
 
 #[derive(Debug, Args)]

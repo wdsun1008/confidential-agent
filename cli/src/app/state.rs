@@ -219,7 +219,7 @@ pub(super) fn validated_injection_spec(
         "inject cannot change the committed attestation or management identity configuration"
     );
     let expected = saved.inputs.as_ref().context(
-        "inject requires the deployment's frozen disk and identity inputs; this legacy deployment has no safe update binding, so restore its saved inputs or deploy a new instance",
+        "legacy deployment has no frozen input binding; run `ca upgrade check` before rebooting and `ca upgrade bind-inputs --service SERVICE` when historical evidence is available; keep the previous host toolchain for unsupported legacy state (do not destroy a data-bearing instance)",
     )?;
     let actual = deployment_input_paths(paths, current)?;
     let actual_immutable: BTreeSet<_> = actual
@@ -269,7 +269,7 @@ pub(super) fn validate_resume_inputs(
 ) -> Result<()> {
     anyhow::ensure!(current.source.path == saved.source.path && current.source.sha256 == saved.source.sha256,
         "--resume requires the original deployment configuration and canonical path; restore them before resuming resource delivery");
-    let expected = saved.inputs.as_ref().context("this deployment has no frozen resource inputs; restore its saved deployment inputs or deploy a new instance")?;
+    let expected = saved.inputs.as_ref().context("this deployment has no frozen resource inputs; run `ca upgrade check` and migrate using historical evidence before resuming; retain the previous host toolchain for unsupported legacy state")?;
     let actual = deployment_input_paths(paths, &current.spec)?;
     anyhow::ensure!(
         actual.keys().eq(expected.keys()),

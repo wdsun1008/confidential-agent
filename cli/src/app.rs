@@ -4,7 +4,7 @@ use crate::cli::{
     ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitReferenceValues,
     InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands, MigrateArgs,
     OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands, SshArgs,
-    StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs,
+    StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs, UpgradeArgs, UpgradeCommands,
 };
 use anyhow::{bail, Context, Result};
 use base64::{
@@ -859,6 +859,7 @@ mod image_runtime;
 mod images;
 mod instance_ssh;
 mod publish;
+mod upgrade;
 
 mod report;
 use report::*;

@@ -553,8 +553,17 @@ infrastructure with the original configuration at its canonical path. Deployment
 records canonical resource paths and digests and delivers private snapshots of
 user resources and the disk secret. Resume rejects changed resource contents,
 retargeted paths, or changed instance credentials; restore the original inputs
-before resuming. Legacy attempts without frozen inputs require an explicit
-`inject` to apply current resources. It does not apply Terraform or
+before resuming. Run the candidate host CLI's `upgrade check` against the existing
+state directory before upgrading or rebooting; one-click performs this check
+before replacing installed binaries. Legacy deployments without frozen inputs
+require explicit `upgrade bind-inputs --service SERVICE`. This reads unchanged
+committed configuration, verifies disk bytes against historical Trustee disk/data
+digests, verifies recorded gateway and SSH identities, and saves a private input
+snapshot without changing remote resources. A missing or conflicting historical
+binding is not replaced by current files. Legacy challenge deployments without
+disk evidence must retain the previous host toolchain for resource delivery and
+back up/export data before migration; destroying data-bearing instances is not
+an upgrade procedure. Resume does not apply Terraform or
 replay an interrupted infrastructure operation. Same-service build/deploy/inject/
 destroy operations are mutually exclusive; independent services may proceed in
 parallel. `ca ssh --tty SERVICE -- COMMAND` explicitly allocates a terminal;

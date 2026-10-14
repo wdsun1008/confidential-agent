@@ -90,6 +90,8 @@ install_confidential_agent_cli() {
   local cli_dest="/usr/local/bin/confidential-agent"
   local agentd_dest="/usr/local/bin/confidential-agentd"
   local gateway_dest="/usr/local/bin/cai-gateway"
+  # Inspect using the candidate CLI before replacing the working host binaries.
+  "$CA_BIN" --state-dir "$CA_STATE_DIR" upgrade check || die "host upgrade blocked by legacy deployment inputs; retain the installed CLI and migrate the affected state first"
   install -D -m 0755 "$CA_BIN" "$cli_dest"
   install -D -m 0755 "$CA_AGENTD_BIN" "$agentd_dest"
   install -D -m 0755 "$CA_GATEWAY_BIN" "$gateway_dest"

@@ -20,6 +20,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Peering(args) => cmd_peering(cli, args),
         Commands::A2a(args) => cmd_a2a(cli, args),
         Commands::Migrate(args) => cmd_migrate(cli, args),
+        Commands::Upgrade(args) => upgrade::run(cli, args),
         Commands::Image(args) => cmd_image(cli, args),
         Commands::Ssh(args) => cmd_ssh(cli, args),
         Commands::Tui(args) => cmd_tui(cli, args),
