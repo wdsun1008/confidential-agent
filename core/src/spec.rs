@@ -565,6 +565,12 @@ impl AgentSpec {
         }
         for (name, resource) in &self.resources {
             validate_id("resources key", name)?;
+            anyhow::ensure!(
+                !matches!(name.as_str(), "disk_passphrase" | "data_passphrase"
+                    | "cagent_bootstrap_config" | "cagent_mesh_bundle"
+                    | "cagent_a2a_bundle" | "cagent_reference_value_list"),
+                "resources.{name} is reserved for CA platform delivery; application resources cannot overwrite instance secrets or control bundles"
+            );
             if resource.source.as_os_str().is_empty() {
                 bail!("resources.{}.source must not be empty", name);
             }
@@ -980,6 +986,53 @@ mod tests {
             "a".repeat(64)
         )).unwrap();
         value
+    }
+
+    #[test]
+    fn application_resources_cannot_overwrite_platform_delivery_slots() {
+        let yaml = "schema: confidential-agent/v1\nservice: {id: app, ports: []}\nbuild: {image_name: app}\ndeploy: {provider: aliyun, region: cn-beijing, zone_id: cn-beijing-i, instance_type: ecs.g9i.xlarge}\nattestation: {tee: tdx, mode: challenge, reference_values: sample}\nresources: {}";
+        let mut spec = AgentSpec::from_yaml(yaml, Path::new("/project")).unwrap();
+        for id in [
+            "disk_passphrase",
+            "data_passphrase",
+            "cagent_bootstrap_config",
+            "cagent_mesh_bundle",
+            "cagent_a2a_bundle",
+            "cagent_reference_value_list",
+        ] {
+            spec.resources.clear();
+            spec.resources.insert(
+                id.into(),
+                ResourceSpec {
+                    source: PathBuf::from("/project/token"),
+                    target: "/opt/data/token".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    required: true,
+                    mutable: false,
+                },
+            );
+            assert!(spec
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("reserved for CA platform delivery"));
+        }
+        spec.resources.clear();
+        spec.resources.insert(
+            "api_token".into(),
+            ResourceSpec {
+                source: PathBuf::from("/project/token"),
+                target: "/opt/data/token".into(),
+                owner: None,
+                group: None,
+                mode: None,
+                required: true,
+                mutable: false,
+            },
+        );
+        spec.validate().unwrap();
     }
 
     #[test]
