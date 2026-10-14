@@ -164,14 +164,50 @@ pub(super) fn validated_injection_spec(
     let saved = committed_deployment(state, manifest)?;
     anyhow::ensure!(
         current.image_id() == saved.spec.image_id()
-            && current.image_variant() == state.build.variant
-            && serde_json::to_value(&current.build)? == serde_json::to_value(&saved.spec.build)?,
-        "inject cannot change the deployed image or build inputs; deploy a new instance to use a different image"
+            && current.image_variant() == state.build.variant,
+        "inject cannot change the deployed image; deploy a new instance to use a different image"
     );
     let mut deployed = saved.spec.deploy.clone();
     let mut proposed = current.deploy.clone();
     deployed.image_variant = Some(state.build.variant.clone());
     proposed.image_variant = Some(current.image_variant().to_string());
+    // The saved release and publisher key are the authorization. Download
+    // locations are not instance identity, and need not remain available.
+    if let (Some(image), Some(committed)) = (&mut proposed.image, &manifest.image) {
+        for (name, source, frozen) in [
+            ("release", &image.release, &committed.source.release),
+            (
+                "publisher key",
+                &image.trusted_key,
+                &committed.source.trusted_key,
+            ),
+        ] {
+            let frozen_digest = sha256_file(frozen)
+                .with_context(|| format!("failed to read committed image {name}"))?;
+            match fs::symlink_metadata(source) {
+                Ok(_) => anyhow::ensure!(sha256_file(source)? == frozen_digest,
+                    "inject cannot change the committed image {name}; deploy a new instance to select another release"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("failed to inspect image {name}")),
+            }
+        }
+        image.release = saved
+            .spec
+            .deploy
+            .image
+            .as_ref()
+            .context("missing committed image release")?
+            .release
+            .clone();
+        image.trusted_key = saved
+            .spec
+            .deploy
+            .image
+            .as_ref()
+            .context("missing committed publisher key")?
+            .trusted_key
+            .clone();
+    }
     anyhow::ensure!(
         serde_json::to_value(&proposed)? == serde_json::to_value(&deployed)?,
         "inject cannot change the committed image release or infrastructure configuration; deploy a new instance for those changes"
@@ -182,19 +218,6 @@ pub(super) fn validated_injection_spec(
             && current.service.ssh == saved.spec.service.ssh,
         "inject cannot change the committed attestation or management identity configuration"
     );
-    if let (Some(image), Some(committed)) = (&current.deploy.image, &manifest.image) {
-        for (name, source, frozen) in [
-            ("release", &image.release, &committed.source.release),
-            (
-                "publisher key",
-                &image.trusted_key,
-                &committed.source.trusted_key,
-            ),
-        ] {
-            anyhow::ensure!(sha256_file(source)? == sha256_file(frozen)?,
-                "inject cannot change the committed image {name}; deploy a new instance to select another release");
-        }
-    }
     let expected = saved.inputs.as_ref().context(
         "inject requires the deployment's frozen disk and identity inputs; this legacy deployment has no safe update binding, so restore its saved inputs or deploy a new instance",
     )?;
@@ -213,8 +236,8 @@ pub(super) fn validated_injection_spec(
     );
     for id in expected_immutable {
         let input = &expected[id];
-        anyhow::ensure!(actual[id] == input.source && sha256_file(&actual[id])? == input.sha256,
-            "inject cannot change committed input {id}; restore the original input (disk key rotation and identity replacement are not supported by inject)");
+        anyhow::ensure!(sha256_file(&actual[id])? == input.sha256,
+            "inject cannot change the contents of committed input {id}; moving an unchanged file is allowed, but disk key rotation and identity replacement are not supported by inject");
     }
     // Deliver the committed disk bytes, closing the gap between checking a
     // mutable source file and sending its contents to CDH or KBS.
@@ -230,6 +253,11 @@ pub(super) fn validated_injection_spec(
         "saved deployment disk secret was modified"
     );
     let mut delivery = current.clone();
+    delivery.build = saved.spec.build.clone();
+    delivery.deploy = saved.spec.deploy.clone();
+    if let Some(committed) = &manifest.image {
+        delivery.deploy.image = Some(committed.source.clone());
+    }
     delivery.secrets.disk_passphrase = Some(frozen.clone());
     Ok(delivery)
 }

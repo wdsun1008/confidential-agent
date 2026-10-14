@@ -543,6 +543,60 @@ mod tests {
     }
 
     #[test]
+    fn inject_uses_committed_authorization_after_project_and_secret_relocation() {
+        let (root, cli, _) = fixture();
+        let path = instance_spec(root.path(), "agent-a");
+        let spec = AgentSpec::from_path(&path).unwrap();
+        let paths = context_paths(&cli.state_dir, "agent-a");
+        let mut manifest = import(&cli, &spec).unwrap();
+        let mut saved = deployment_snapshot(&path).unwrap();
+        freeze_deployment_inputs(&mut saved, &paths, "attempt").unwrap();
+        manifest.deployment = Some(saved.clone());
+        let mut state = crate::app::tests::local_state("agent-a", vec![], vec![]);
+        state.build.image_name = spec.image_id().into();
+        fs::remove_file(root.path().join("release.json")).unwrap();
+        fs::remove_file(root.path().join("publisher.pem")).unwrap();
+        let relocated = root.path().join("moved-project");
+        fs::create_dir(&relocated).unwrap();
+        let moved_spec = relocated.join("agent-a.yaml");
+        fs::copy(&path, &moved_spec).unwrap();
+        let moved_disk = relocated.join("disk-key");
+        fs::copy(paths.secrets_dir.join("disk_passphrase"), &moved_disk).unwrap();
+        let mut current = AgentSpec::from_path(&moved_spec).unwrap();
+        current.secrets.disk_passphrase = Some(moved_disk.clone());
+        let delivery = validated_injection_spec(&state, &manifest, &current, &paths).unwrap();
+        assert_eq!(
+            delivery.deploy.image.unwrap().release,
+            manifest.image.as_ref().unwrap().source.release
+        );
+        assert_ne!(delivery.secrets.disk_passphrase.unwrap(), moved_disk);
+        // Resume remains strict; ordinary inject is an explicit resource update.
+        assert!(
+            validate_resume_inputs(&saved, &deployment_snapshot(&moved_spec).unwrap(), &paths)
+                .is_err()
+        );
+        fs::write(&moved_disk, "different disk key").unwrap();
+        assert!(
+            validated_injection_spec(&state, &manifest, &current, &paths)
+                .unwrap_err()
+                .to_string()
+                .contains("contents of committed input")
+        );
+        fs::copy(paths.secrets_dir.join("disk_passphrase"), &moved_disk).unwrap();
+        fs::write(
+            &current.deploy.image.as_ref().unwrap().trusted_key,
+            "different publisher",
+        )
+        .unwrap();
+        assert!(
+            validated_injection_spec(&state, &manifest, &current, &paths)
+                .unwrap_err()
+                .to_string()
+                .contains("publisher key")
+        );
+    }
+
+    #[test]
     fn inject_rejects_instance_changes_before_either_provider_is_written() {
         for mode in ["challenge", "trustee"] {
             let (root, cli, _) = fixture();

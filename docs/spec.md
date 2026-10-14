@@ -559,3 +559,11 @@ replay an interrupted infrastructure operation. Same-service build/deploy/inject
 destroy operations are mutually exclusive; independent services may proceed in
 parallel. `ca ssh --tty SERVICE -- COMMAND` explicitly allocates a terminal;
 script execution retains its existing output and exit-code behavior.
+
+Ordinary `inject` permits moving unchanged secret files and project directories.
+It compares secret contents and instance identity, uses saved release/public-key
+authorization and the committed disk copy, and never applies build or infrastructure
+changes. Supplied release/key files that still exist must match saved copies;
+their original download locations need not remain available. `--resume` retains
+its stricter original-path requirement.
+
