@@ -447,7 +447,7 @@ fn initrd_poweroff_enabled() -> bool {
 }
 
 fn run_daemon(mut args: RunArgs) -> Result<()> {
-    let mut state = read_daemon_state()?;
+    let initial_state = read_daemon_state();
     println!("confidential-agentd starting");
     let trustee_runtime = trustee::load_rootfs_runtime()?;
     let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
@@ -480,6 +480,10 @@ fn run_daemon(mut args: RunArgs) -> Result<()> {
         HttpServerKind::AgentCard,
         http_limits,
     )?;
+    let mut state = match initial_state {
+        Ok(state) => state,
+        Err(error) => recover_daemon_state(&args, runtime_mode, trustee_runtime.as_ref(), error)?,
+    };
     let mut resource_watcher = ResourceWatcher::new(
         &args.cdh_root,
         [
@@ -569,6 +573,102 @@ fn run_daemon(mut args: RunArgs) -> Result<()> {
             ResourceWatcherWait::Event | ResourceWatcherWait::Timeout => {}
         }
     }
+}
+
+// Persistent endpoint reservations are authoritative. Recovery only installs
+// independently attested management credentials; it never creates business
+// state or assigns endpoints. Restoring the original state resumes normal work.
+fn recover_daemon_state(
+    args: &RunArgs,
+    mode: RuntimeMode,
+    trustee: Option<&TrusteeRuntime>,
+    initial_error: anyhow::Error,
+) -> Result<DaemonState> {
+    stop_recovery_services(None)?;
+    let mut error = initial_error;
+    loop {
+        eprintln!("daemon state recovery required: {error:#}");
+        if let Some(runtime) = trustee {
+            if let Err(error) =
+                runtime.fetch_to_trusted_root(&args.cdh_root, &args.bootstrap_resource)
+            {
+                eprintln!("management bootstrap refresh failed: {error:#}");
+            }
+        }
+        let recovery = (|| {
+            let Some(bootstrap) = read_bootstrap(args, mode)? else {
+                return Ok(());
+            };
+            if let Some(runtime) = trustee {
+                let mut management = bootstrap.clone();
+                management
+                    .resources
+                    .retain(|resource| is_management_credential(&resource.id));
+                refresh_trustee_bootstrap_resources(runtime, args, &management);
+            }
+            apply_management_recovery(args, &bootstrap, &error, Path::new("/opt/data/cai-ssh"))
+        })();
+        if let Err(error) = recovery {
+            eprintln!("management recovery failed: {error:#}");
+        }
+        std::thread::sleep(Duration::from_secs(args.poll_interval_sec.max(1)));
+        match read_daemon_state() {
+            Ok(state) => return Ok(state),
+            Err(next) => error = next,
+        }
+    }
+}
+
+fn apply_management_recovery(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    error: &anyhow::Error,
+    directory: &Path,
+) -> Result<()> {
+    stop_recovery_services(bootstrap.app_service.as_deref())?;
+    let applied = install_management_credentials(args, bootstrap, directory)?;
+    let status_state = DaemonState {
+        applied_resources: applied,
+        last_error: Some(format!("management recovery only: {error:#}")),
+        ..Default::default()
+    };
+    write_status(status_for(
+        bootstrap,
+        &status_state,
+        "management-recovery",
+        RuntimeReadiness {
+            app_ready: false,
+            mesh_ready: false,
+            debug_ssh_ready: false,
+        },
+    ))
+}
+
+fn stop_recovery_services(app: Option<&str>) -> Result<()> {
+    // Stop existing listeners as well as preventing a cold-boot start. Their
+    // on-disk configurations and the damaged state remain untouched.
+    if std::env::var_os("CA_SKIP_SYSTEMCTL").is_none() {
+        let mut services = vec![TNG_SERVICE, GATEWAY_SERVICE];
+        if let Some(app) = app {
+            services.push(app);
+        }
+        for service in services {
+            let output = Command::new("systemctl").args(["stop", service]).output()?;
+            anyhow::ensure!(
+                output.status.success()
+                    || systemctl_reports_missing_unit(
+                        &output.status,
+                        &String::from_utf8_lossy(&output.stderr)
+                    ),
+                "failed to stop {service} during management recovery"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_management_credential(id: &str) -> bool {
+    matches!(id, "cai_ssh_authorized_keys" | "cai_ssh_host_key")
 }
 
 fn next_resource_refresh_timeout(
@@ -1719,6 +1819,17 @@ fn apply_management_credentials(
     state: &mut DaemonState,
     directory: &Path,
 ) -> Result<()> {
+    state
+        .applied_resources
+        .extend(install_management_credentials(args, bootstrap, directory)?);
+    Ok(())
+}
+
+fn install_management_credentials(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    directory: &Path,
+) -> Result<BTreeMap<String, AppliedResourceState>> {
     let mut credentials = Vec::new();
     for (id, file) in [
         ("cai_ssh_authorized_keys", "authorized_keys"),
@@ -1729,18 +1840,19 @@ fn apply_management_credentials(
             .iter()
             .find(|resource| resource.id == id)
         else {
-            return Ok(());
+            return Ok(BTreeMap::new());
         };
         anyhow::ensure!(resource.target == directory.join(file) && resource.required && !resource.mutable && resource.sha256.is_some(),
             "instance SSH credentials must be required, immutable and bound to their management paths");
         let Some((source, digest)) = verified_resource_source(args, resource)? else {
-            return Ok(());
+            return Ok(BTreeMap::new());
         };
         credentials.push((resource, source, digest));
     }
+    let mut applied = BTreeMap::new();
     for (resource, source, digest) in credentials {
         apply_resource_once(resource, &source, &digest)?;
-        state.applied_resources.insert(
+        applied.insert(
             resource.id.clone(),
             applied_resource_state(resource, &digest),
         );
@@ -1748,7 +1860,8 @@ fn apply_management_credentials(
     write_file_atomic(
         &daemon_status_path().with_file_name("instance-ssh.ready"),
         b"ready\n",
-    )
+    )?;
+    Ok(applied)
 }
 
 fn applied_resource_state(resource: &GuestResource, digest: &str) -> AppliedResourceState {

@@ -4011,10 +4011,9 @@ fn daemon_state_errors_do_not_rebuild_or_overwrite_endpoint_reservations() {
         fs::write(&env.state, damaged).unwrap();
         assert!(read_daemon_state().is_err());
         assert_eq!(fs::read(&env.state).unwrap(), damaged);
-        // Both real command entry points must propagate the state failure
-        // before applying bootstrap, replacing listeners or publishing status.
+        // ApplyOnce must propagate the failure. The long-running daemon has
+        // a separate management-only recovery path tested below.
         let args = test_run_args(temp.path().join("cdh"));
-        assert!(run_daemon(args.clone()).is_err());
         assert!(run(Cli {
             command: Commands::ApplyOnce(args)
         })
@@ -4033,6 +4032,79 @@ fn daemon_state_errors_do_not_rebuild_or_overwrite_endpoint_reservations() {
     fs::write(&env.state, &original).unwrap();
     let restored = read_daemon_state().unwrap();
     assert_eq!(restored.mesh_client_ports, state.mesh_client_ports);
+}
+
+#[test]
+fn cold_boot_recovery_authenticates_management_without_rebuilding_business_state() {
+    for provider in ["challenge", "trustee"] {
+        let temp = tempfile::tempdir().unwrap();
+        let env = no_tee_test_env(&temp);
+        let mut original = read_daemon_state().unwrap();
+        original.mesh_client_owner = Some("self".into());
+        original.mesh_client_ports =
+            BTreeMap::from([("gamma".into(), BTreeMap::from([(18789, 39600)]))]);
+        write_daemon_state(&original).unwrap();
+        let saved = fs::read(&env.state).unwrap();
+        fs::write(&env.state, "{damaged").unwrap();
+        let args = test_run_args(temp.path().join(provider));
+        let management = temp.path().join("management");
+        let mut bootstrap = test_bootstrap_config("broken-app");
+        bootstrap.mode = provider.into();
+        for (id, file) in [
+            ("cai_ssh_authorized_keys", "authorized_keys"),
+            ("cai_ssh_host_key", "host_key"),
+        ] {
+            let resource_path = format!("default/local-resources/{id}");
+            write_test_file(
+                &temp.path().join("foreign").join(&resource_path),
+                b"credential",
+            );
+            bootstrap.resources.push(GuestResource {
+                id: id.into(),
+                resource_path,
+                target: management.join(file),
+                owner: None,
+                group: None,
+                mode: "0600".into(),
+                required: true,
+                mutable: false,
+                sha256: Some(hex_encode(&Sha256::digest(b"credential"))),
+            });
+        }
+        let ready = env.status.with_file_name("instance-ssh.ready");
+        assert!(!ready.exists()); // /run starts empty, unlike a daemon restart.
+        let error = read_daemon_state().unwrap_err();
+        apply_management_recovery(&args, &bootstrap, &error, &management).unwrap();
+        assert!(!ready.exists());
+        for resource in &bootstrap.resources {
+            write_test_file(&args.cdh_root.join(&resource.resource_path), b"credential");
+        }
+        let key = args
+            .cdh_root
+            .join(&bootstrap.resources.last().unwrap().resource_path);
+        fs::write(&key, b"forged").unwrap();
+        assert!(apply_management_recovery(&args, &bootstrap, &error, &management).is_err());
+        assert!(!ready.exists());
+        assert!(!management.exists());
+        fs::write(&key, b"credential").unwrap();
+        apply_management_recovery(&args, &bootstrap, &error, &management).unwrap();
+        assert!(ready.exists());
+        let status: DaemonStatus = serde_json::from_slice(&fs::read(&env.status).unwrap()).unwrap();
+        assert_eq!(status.phase, "management-recovery");
+        assert!(!status.app_ready && !status.mesh_ready);
+        assert_eq!(status.applied_resources.len(), 2);
+        assert!(!env.service_directory.exists());
+        assert!(!env
+            .status
+            .with_file_name("application-runtime.json")
+            .exists());
+        assert_eq!(fs::read(&env.state).unwrap(), b"{damaged");
+        fs::write(&env.state, saved).unwrap();
+        assert_eq!(
+            read_daemon_state().unwrap().mesh_client_ports,
+            original.mesh_client_ports
+        );
+    }
 }
 
 #[test]
