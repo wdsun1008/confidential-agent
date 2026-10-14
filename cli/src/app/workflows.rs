@@ -387,12 +387,27 @@ pub(super) fn sync_mesh_with_candidate(
     state_dir: &Path,
     candidate: LocalServiceState,
 ) -> Result<u64> {
+    commit_mesh_candidate(state_dir, candidate, |services| {
+        sync_mesh_for_services(cli, state_dir, services, None)
+    })
+}
+
+fn commit_mesh_candidate(
+    state_dir: &Path,
+    mut candidate: LocalServiceState,
+    sync: impl FnOnce(Vec<LocalServiceState>) -> Result<u64>,
+) -> Result<u64> {
     with_state_dir_lock(state_dir, || {
         let mut services = read_service_states(state_dir)?;
         services.retain(|service| service.service_id != candidate.service_id);
-        services.push(candidate);
+        services.push(candidate.clone());
         services.sort_by(|left, right| left.service_id.cmp(&right.service_id));
-        sync_mesh_for_services(cli, state_dir, services, None)
+        let generation = sync(services)?;
+        // Publish the candidate before releasing the topology lock. The next
+        // service must see every member of the bundle just delivered.
+        candidate.mesh_generation = generation;
+        write_local_service_state(state_dir, &candidate)?;
+        Ok(generation)
     })
 }
 
@@ -568,6 +583,20 @@ pub(super) fn sync_mesh_for_services(
     services: Vec<LocalServiceState>,
     service_filter: Option<&str>,
 ) -> Result<u64> {
+    sync_mesh_for_services_with_delivery(
+        state_dir,
+        services,
+        service_filter,
+        |service, bundle_path| deliver_mesh_bundle(cli, state_dir, service, bundle_path),
+    )
+}
+
+fn sync_mesh_for_services_with_delivery(
+    state_dir: &Path,
+    services: Vec<LocalServiceState>,
+    service_filter: Option<&str>,
+    mut deliver: impl FnMut(&LocalServiceState, &Path) -> Result<()>,
+) -> Result<u64> {
     if let Some(filter) = service_filter {
         let service = services
             .iter()
@@ -618,49 +647,59 @@ pub(super) fn sync_mesh_for_services(
                 .unwrap_or(true)
         })
     {
-        if trustee::service_uses_trustee(
-            state_dir,
-            &service.service_id,
-            Some(&service.attestation_mode),
-        )? {
-            // `sync_mesh` and `sync_mesh_with_candidate` hold the global
-            // state lock across bundle generation and delivery.
-            trustee::put_dynamic_resource_with_state_lock(
-                state_dir,
-                &service.service_id,
-                "default/local-resources/cagent_mesh_bundle",
-                &bundle_path,
-            )?;
-        } else {
-            let Some(target_ip) = service.deploy.preferred_injection_ip() else {
-                bail!(
-                    "service '{}' has no IP for mesh injection",
-                    service.service_id
-                );
-            };
-            prepare_challenge_reference_values(
-                cli,
-                state_dir,
-                &service.service_id,
-                service.build.sample_rv.as_ref(),
-                service.build.rekor_meta.as_ref(),
-                &service.reference_values,
-            )?;
-            challenge_inject(
-                cli,
-                state_dir,
-                target_ip,
-                "default/local-resources/cagent_mesh_bundle",
-                &bundle_path,
-                &service.deploy.tee,
-            )?;
-        }
+        deliver(service, &bundle_path)?;
         delivered.push(service.service_id.clone());
     }
 
     update_mesh_generation(state_dir, &delivered, generation)?;
     println!("synced mesh bundle to active services");
     Ok(generation)
+}
+
+fn deliver_mesh_bundle(
+    cli: &Cli,
+    state_dir: &Path,
+    service: &LocalServiceState,
+    bundle_path: &Path,
+) -> Result<()> {
+    if trustee::service_uses_trustee(
+        state_dir,
+        &service.service_id,
+        Some(&service.attestation_mode),
+    )? {
+        // `sync_mesh` and `sync_mesh_with_candidate` hold the global
+        // state lock across bundle generation and delivery.
+        trustee::put_dynamic_resource_with_state_lock(
+            state_dir,
+            &service.service_id,
+            "default/local-resources/cagent_mesh_bundle",
+            bundle_path,
+        )?;
+    } else {
+        let Some(target_ip) = service.deploy.preferred_injection_ip() else {
+            bail!(
+                "service '{}' has no IP for mesh injection",
+                service.service_id
+            );
+        };
+        prepare_challenge_reference_values(
+            cli,
+            state_dir,
+            &service.service_id,
+            service.build.sample_rv.as_ref(),
+            service.build.rekor_meta.as_ref(),
+            &service.reference_values,
+        )?;
+        challenge_inject(
+            cli,
+            state_dir,
+            target_ip,
+            "default/local-resources/cagent_mesh_bundle",
+            bundle_path,
+            &service.deploy.tee,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn next_mesh_generation(state_dir: &Path, services: &[LocalServiceState]) -> u64 {
@@ -1416,6 +1455,82 @@ mod tests {
             .unwrap()
             .iter()
             .all(|state| state.mesh_generation == 1));
+    }
+
+    #[test]
+    fn concurrent_candidates_commit_state_before_the_next_topology() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let root = tempfile::tempdir().unwrap();
+        let rv = root.path().join("rv.json");
+        fs::write(&rv, "{}").unwrap();
+        let mut candidates = Vec::new();
+        for id in ["a", "b"] {
+            let mut state = test_service_state(id, "deployed", vec![18789], vec![]);
+            state.build.sample_rv = Some(rv.clone());
+            write_local_service_state(root.path(), &state).unwrap();
+            write_json_atomic(
+                &context_paths(root.path(), id).manifest,
+                &shared_port_manifest(),
+            )
+            .unwrap();
+            state.phase = "active".into();
+            state.generation += 1;
+            candidates.push(state);
+        }
+        let deliveries = Arc::new(Mutex::new(BTreeMap::<String, MeshBundle>::new()));
+        let returned = Arc::new(Barrier::new(2));
+        let resume_caller = Arc::new(Barrier::new(2));
+        let a = candidates.remove(0);
+        let directory = root.path().to_path_buf();
+        let received = deliveries.clone();
+        let arrived = returned.clone();
+        let resume = resume_caller.clone();
+        let worker = thread::spawn(move || {
+            let _operation = lock_service_operation(&directory, "a").unwrap();
+            commit_mesh_candidate(&directory, a, |services| {
+                sync_mesh_for_services_with_delivery(&directory, services, None, |service, path| {
+                    received.lock().unwrap().insert(
+                        service.service_id.clone(),
+                        serde_json::from_slice(&fs::read(path)?).unwrap(),
+                    );
+                    Ok(())
+                })
+            })
+            .unwrap();
+            // Deterministically pause at the former gap between mesh return
+            // and the caller's active-state write while B completes activation.
+            arrived.wait();
+            resume.wait();
+        });
+        returned.wait();
+        assert_eq!(read_service_states(root.path()).unwrap()[0].phase, "active");
+        let _operation = lock_service_operation(root.path(), "b").unwrap();
+        let generation = commit_mesh_candidate(root.path(), candidates.remove(0), |services| {
+            sync_mesh_for_services_with_delivery(root.path(), services, None, |service, path| {
+                deliveries.lock().unwrap().insert(
+                    service.service_id.clone(),
+                    serde_json::from_slice(&fs::read(path)?).unwrap(),
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+        resume_caller.wait();
+        worker.join().unwrap();
+        let committed: MeshBundle =
+            serde_json::from_slice(&fs::read(root.path().join("mesh-bundle.json")).unwrap())
+                .unwrap();
+        let states = read_service_states(root.path()).unwrap();
+        assert!(states
+            .iter()
+            .all(|state| state.phase == "active" && state.mesh_generation == generation));
+        assert_eq!(committed.services.len(), 2);
+        for id in ["a", "b"] {
+            assert_eq!(
+                serde_json::to_value(&deliveries.lock().unwrap()[id]).unwrap(),
+                serde_json::to_value(&committed).unwrap()
+            );
+        }
     }
 
     fn test_service_state(

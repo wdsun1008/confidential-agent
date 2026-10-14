@@ -518,7 +518,6 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         )?;
         let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
         active_state.mesh_generation = mesh_generation;
-        write_local_service_state(&cli.state_dir, &active_state)?;
         sync_a2a_bundle(cli, &cli.state_dir)?;
         let active_services = read_service_states(&cli.state_dir)?;
         drop(operation);
@@ -601,7 +600,6 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     }
     let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
     active_state.mesh_generation = mesh_generation;
-    write_local_service_state(&cli.state_dir, &active_state)?;
     sync_a2a_bundle(cli, &cli.state_dir)?;
     let active_services = read_service_states(&cli.state_dir)?;
     drop(operation);
@@ -2266,9 +2264,16 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
         state.phase = "deleted".to_string();
         state.generation += 1;
         clear_deploy_runtime_state(&mut state.deploy);
-        write_local_service_state(&cli.state_dir, &state)?;
+        with_state_dir_lock(&cli.state_dir, || {
+            write_local_service_state(&cli.state_dir, &state)?;
+            sync_mesh_for_services(
+                cli,
+                &cli.state_dir,
+                read_service_states(&cli.state_dir)?,
+                None,
+            )
+        })?;
         drop(operation);
-        sync_mesh(cli, &cli.state_dir, None)?;
         let services = read_service_states(&cli.state_dir)?;
         refresh_active_shelter_deploys(cli, &cli.state_dir, &services)?;
     }
