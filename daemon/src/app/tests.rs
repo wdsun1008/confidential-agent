@@ -4049,6 +4049,7 @@ fn cold_boot_recovery_authenticates_management_without_rebuilding_business_state
         let args = test_run_args(temp.path().join(provider));
         let management = temp.path().join("management");
         let mut bootstrap = test_bootstrap_config("broken-app");
+        bootstrap.app_service = Some("broken-app.service".into());
         bootstrap.mode = provider.into();
         for (id, file) in [
             ("cai_ssh_authorized_keys", "authorized_keys"),
@@ -4098,6 +4099,21 @@ fn cold_boot_recovery_authenticates_management_without_rebuilding_business_state
             .status
             .with_file_name("application-runtime.json")
             .exists());
+        // A service-manager failure must not hide the authenticated repair
+        // path. Recreate the volatile marker even when every stop fails.
+        fs::remove_file(&ready).unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let systemctl = bin.join("systemctl");
+        fs::write(&systemctl, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        env._guard.remove("CA_SKIP_SYSTEMCTL");
+        env._guard.set_path("PATH", &bin);
+        apply_management_recovery(&args, &bootstrap, &error, &management).unwrap();
+        assert!(ready.exists());
+        let status: DaemonStatus = serde_json::from_slice(&fs::read(&env.status).unwrap()).unwrap();
+        assert!(!status.app_ready && !status.mesh_ready);
+        assert!(status.last_error.unwrap().contains("broken-app.service"));
         assert_eq!(fs::read(&env.state).unwrap(), b"{damaged");
         fs::write(&env.state, saved).unwrap();
         assert_eq!(

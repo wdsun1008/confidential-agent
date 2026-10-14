@@ -584,7 +584,9 @@ fn recover_daemon_state(
     trustee: Option<&TrusteeRuntime>,
     initial_error: anyhow::Error,
 ) -> Result<DaemonState> {
-    stop_recovery_services(None)?;
+    if let Err(error) = stop_recovery_services(None) {
+        eprintln!("failed to stop mesh during management recovery: {error:#}");
+    }
     let mut error = initial_error;
     loop {
         eprintln!("daemon state recovery required: {error:#}");
@@ -625,11 +627,17 @@ fn apply_management_recovery(
     error: &anyhow::Error,
     directory: &Path,
 ) -> Result<()> {
-    stop_recovery_services(bootstrap.app_service.as_deref())?;
     let applied = install_management_credentials(args, bootstrap, directory)?;
+    // Management remains available even when a broken business unit cannot be
+    // stopped. Report the failure, but never withhold authenticated SSH for it.
+    let stop_error = stop_recovery_services(bootstrap.app_service.as_deref()).err();
+    let mut diagnostic = format!("management recovery only: {error:#}");
+    if let Some(error) = stop_error {
+        diagnostic.push_str(&format!("; {error:#}"));
+    }
     let status_state = DaemonState {
         applied_resources: applied,
-        last_error: Some(format!("management recovery only: {error:#}")),
+        last_error: Some(diagnostic),
         ..Default::default()
     };
     write_status(status_for(
@@ -648,21 +656,27 @@ fn stop_recovery_services(app: Option<&str>) -> Result<()> {
     // Stop existing listeners as well as preventing a cold-boot start. Their
     // on-disk configurations and the damaged state remain untouched.
     if std::env::var_os("CA_SKIP_SYSTEMCTL").is_none() {
+        let mut failures = Vec::new();
         let mut services = vec![TNG_SERVICE, GATEWAY_SERVICE];
         if let Some(app) = app {
             services.push(app);
         }
         for service in services {
-            let output = Command::new("systemctl").args(["stop", service]).output()?;
-            anyhow::ensure!(
-                output.status.success()
-                    || systemctl_reports_missing_unit(
-                        &output.status,
-                        &String::from_utf8_lossy(&output.stderr)
-                    ),
-                "failed to stop {service} during management recovery"
-            );
+            match Command::new("systemctl").args(["stop", service]).output() {
+                Ok(output)
+                    if output.status.success()
+                        || systemctl_reports_missing_unit(
+                            &output.status,
+                            &String::from_utf8_lossy(&output.stderr),
+                        ) => {}
+                _ => failures.push(service),
+            }
         }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "failed to stop {} during management recovery",
+            failures.join(", ")
+        );
     }
     Ok(())
 }

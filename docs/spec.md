@@ -577,8 +577,10 @@ their original download locations need not remain available. `--resume` retains
 its stricter original-path requirement.
 
 If persistent guest daemon state is unreadable, the daemon enters
-`management-recovery`: business and mesh services remain stopped, endpoint state
-is not recreated, and only provider-specific, hash-verified management credentials
-are installed. Instance SSH can restore the original state after a cold boot.
+`management-recovery`: it stops business and mesh services, leaves endpoint state
+untouched, and only installs provider-specific, hash-verified management credentials.
+Failed stop requests are reported without withholding authenticated SSH. The daemon
+does not start or reconfigure business services during recovery. Instance SSH can
+restore the original state after a cold boot.
 Status reports both application and mesh unready. Restoring valid state lets the
 daemon resume with the saved endpoint reservations.
