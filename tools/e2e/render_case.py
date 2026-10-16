@@ -157,7 +157,7 @@ def context_from_env(work_dir):
         "CLI_AGENT_NPM_REGISTRY",
         context.get("E2E_CLI_AGENT_NPM_REGISTRY")
         or context.get("E2E_NPM_REGISTRY")
-        or "https://registry.npmjs.org/",
+        or "https://registry.npmmirror.com/",
     )
     default("NPM_REGISTRY", context.get("E2E_NPM_REGISTRY", "https://registry.npmmirror.com/"))
     default("CLAUDE_CODE_VERSION", context.get("E2E_CLAUDE_CODE_VERSION", PINS["claude-code"]))

@@ -96,7 +96,7 @@ Common environment:
 | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `DASHSCOPE_ANTHROPIC_BASE_URL` | `https://dashscope.aliyuncs.com/apps/anthropic` |
 | `DASHSCOPE_MODEL` | `qwen3.8-max` |
-| `E2E_CLI_AGENT_NPM_REGISTRY` | `https://registry.npmjs.org/`; used by `claude-code` and `codex` CLI package installs |
+| `E2E_CLI_AGENT_NPM_REGISTRY` | `https://registry.npmmirror.com/`; inherits `E2E_NPM_REGISTRY` when set; used by `claude-code` and `codex` CLI package installs |
 | `E2E_CLAUDE_CODE_VERSION` | 固定清单中的 Claude Code 版本 |
 | `E2E_CODEX_VERSION` | 固定清单中的 Codex 版本 |
 
@@ -244,6 +244,10 @@ reporting acceptance results. Standard cloud/Bailian credentials are read
 from the environment. Version defaults come from the root
 [`software-versions.json`](../../software-versions.json); the six-harness tests
 also inspect the actual guest versions and make real model calls.
+Fresh OpenClaw builds pin the DingTalk plugin commit and its pnpm version in the
+same manifest. The pnpm tarball can come from the configured npm mirror, but its
+bytes must match the checked-in SHA-512 digest before installation. CLI agent
+and Node bootstrap downloads use the mainland npm mirror by default.
 Published consumers configure Rekor using the installed Shelter tool path,
 without a build-time signing key. Their reference metadata is authenticated
 through the signed image release. Image export binds runtime metadata to the

@@ -5,6 +5,9 @@ echo "installing A2A data collaboration LLM agent"
 
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
+# Configure the registry before bootstrapping Node with npm.
+npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
+
 resolve_n_bin() {
     local candidate npm_prefix npm_root
     candidate="$(command -v n 2>/dev/null || true)"

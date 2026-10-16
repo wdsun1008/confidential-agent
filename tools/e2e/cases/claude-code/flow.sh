@@ -178,7 +178,7 @@ run_case() {
     --dashscope-anthropic-base-url "$DASHSCOPE_ANTHROPIC_BASE_URL"
     --model "$DASHSCOPE_MODEL"
     --node-version "${E2E_CLI_AGENT_NODE_VERSION:-24.21.0}"
-    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
+    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}}"
     --claude-code-version "${E2E_CLAUDE_CODE_VERSION:-$(ca_software_version claude-code)}"
   )
   export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
@@ -192,7 +192,7 @@ run_case() {
   assert_claude_code_secret_rendering "$dashscope_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- Claude Code npm version: \`${E2E_CLAUDE_CODE_VERSION:-$(ca_software_version claude-code)}\`."
-  record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}\`."
+  record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}}\`."
 
   validate_specs "$STATE_DIR" "$CLAUDE_CODE_DIR/claude-code.yaml"
 

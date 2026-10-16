@@ -18,6 +18,23 @@ spec.loader.exec_module(suite)
 
 
 class SuiteTest(unittest.TestCase):
+    def test_termination_keeps_cleaning_up_when_a_case_exits_during_signal(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            runner = suite.Suite(Path(directory), {}, {}, 1, 1)
+            runner.processes = {
+                'just-exited': Mock(pid=101, poll=Mock(return_value=None)),
+                'still-running': Mock(pid=202, poll=Mock(return_value=None)),
+            }
+            try:
+                with patch.object(suite.os, 'killpg', side_effect=[ProcessLookupError(), None]) as kill:
+                    runner.terminate()
+                self.assertTrue(runner.stop.is_set())
+                self.assertEqual([call.args[0] for call in kill.call_args_list], [101, 202])
+            finally:
+                for pool in runner.pools.values():
+                    pool.shutdown()
+
     def test_case_retains_trustee_until_service_cleanup_retry_succeeds(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)

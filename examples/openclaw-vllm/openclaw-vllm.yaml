@@ -24,6 +24,7 @@ build:
     - ca-certificates
     - curl
     - elfutils-libelf-devel
+    - findutils
     - gcc
     - gcc-c++
     - git

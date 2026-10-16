@@ -50,6 +50,14 @@ github_proxy_prefix() {
     github_proxy_url "https://github.com/"
 }
 
+alternate_github_route() {
+    if [[ "$1" == "$REPO_URL" ]]; then
+        github_proxy_url "$REPO_URL"
+    else
+        printf '%s\n' "$REPO_URL"
+    fi
+}
+
 git_with_timeout() {
     local git_env=(
         "GIT_HTTP_LOW_SPEED_LIMIT=${GIT_HTTP_LOW_SPEED_LIMIT:-1024}"
@@ -65,18 +73,19 @@ git_with_timeout() {
 git_fetch_with_fallback() {
     local dir="$1"
     local ref="$2"
-    local primary="$REPO_URL"
+    shift 2
+    local primary
     local fallback
 
-    git -C "$dir" remote set-url origin "$primary"
-    if git_with_timeout -C "$dir" fetch --filter=blob:none origin "$ref"; then
+    primary="$(git -C "$dir" remote get-url origin)" || return 1
+    if git_with_timeout -C "$dir" fetch --no-tags --filter=blob:none "$@" origin "$ref"; then
         return 0
     fi
 
-    fallback="$(github_proxy_url "$primary")"
-    echo "Direct GitHub fetch failed for ${REPO_PATH}; retrying via ${fallback}" >&2
+    fallback="$(alternate_github_route "$primary")" || return 1
+    echo "Hermes source fetch failed; retrying the alternate GitHub route" >&2
     git -C "$dir" remote set-url origin "$fallback"
-    git_with_timeout -C "$dir" fetch --filter=blob:none origin "$ref"
+    git_with_timeout -C "$dir" fetch --no-tags --filter=blob:none "$@" origin "$ref"
 }
 
 clone_hermes_source() {
@@ -86,22 +95,57 @@ clone_hermes_source() {
     rm -rf "$HERMES_INSTALL_DIR"
     install -d -m 0755 "$(dirname "$HERMES_INSTALL_DIR")"
 
-    # The official installer verifies pinned commits against the branch history.
-    # Keep that history and its trees; fetch file contents only when needed.
-    if git_with_timeout clone --filter=blob:none --branch "$HERMES_BRANCH" "$primary" "$HERMES_INSTALL_DIR"; then
+    # Fetch the tip first, then acquire the pinned ancestry before checkout.
+    # Downloading all historical trees up front makes a fresh install fragile
+    # on slow routes even when the requested source revision is already known.
+    if git_with_timeout clone --no-tags --filter=blob:none --depth 1 --single-branch --no-checkout --branch "$HERMES_BRANCH" "$primary" "$HERMES_INSTALL_DIR"; then
         return 0
     fi
 
     fallback="$(github_proxy_url "$primary")"
     echo "Direct GitHub clone failed for ${REPO_PATH}; retrying via ${fallback}" >&2
     rm -rf "$HERMES_INSTALL_DIR"
-    git_with_timeout clone --filter=blob:none --branch "$HERMES_BRANCH" "$fallback" "$HERMES_INSTALL_DIR"
+    git_with_timeout clone --no-tags --filter=blob:none --depth 1 --single-branch --no-checkout --branch "$HERMES_BRANCH" "$fallback" "$HERMES_INSTALL_DIR"
 }
 
 pin_hermes_commit() {
-    [[ -n "$HERMES_COMMIT" ]] || return 0
-    git_fetch_with_fallback "$HERMES_INSTALL_DIR" "$HERMES_COMMIT"
-    git -C "$HERMES_INSTALL_DIR" checkout --detach "$HERMES_COMMIT"
+    local checkout=(checkout "$HERMES_BRANCH")
+    if [[ -n "$HERMES_COMMIT" ]]; then
+        git_fetch_with_fallback "$HERMES_INSTALL_DIR" "$HERMES_COMMIT" --depth 1 || return 1
+        if ! git -C "$HERMES_INSTALL_DIR" merge-base --is-ancestor "$HERMES_COMMIT" "origin/$HERMES_BRANCH"; then
+            local branch_ref
+            branch_ref="+refs/heads/$HERMES_BRANCH:refs/remotes/origin/$HERMES_BRANCH"
+            # Start just before the pin instead of downloading years of merged
+            # history and unrelated release tags. Git still proves ancestry;
+            # unusual commit dates fall back to a bounded history extension.
+            local pinned_epoch
+            pinned_epoch="$(git -C "$HERMES_INSTALL_DIR" show -s --format=%ct "$HERMES_COMMIT")" || return 1
+            git_fetch_with_fallback "$HERMES_INSTALL_DIR" "$branch_ref" "--shallow-since=@$((pinned_epoch - 86400))" || true
+            if ! git -C "$HERMES_INSTALL_DIR" merge-base --is-ancestor "$HERMES_COMMIT" "origin/$HERMES_BRANCH"; then
+                git_fetch_with_fallback "$HERMES_INSTALL_DIR" "$branch_ref" --deepen=4096 || return 1
+            fi
+            if ! git -C "$HERMES_INSTALL_DIR" merge-base --is-ancestor "$HERMES_COMMIT" "origin/$HERMES_BRANCH"; then
+                if [[ "$(git -C "$HERMES_INSTALL_DIR" rev-parse --is-shallow-repository)" == true ]]; then
+                    git_fetch_with_fallback "$HERMES_INSTALL_DIR" "$branch_ref" --unshallow || return 1
+                fi
+            fi
+            git -C "$HERMES_INSTALL_DIR" merge-base --is-ancestor "$HERMES_COMMIT" "origin/$HERMES_BRANCH" || {
+                echo "Hermes commit $HERMES_COMMIT is not on branch $HERMES_BRANCH" >&2
+                return 1
+            }
+        fi
+        checkout=(checkout --detach "$HERMES_COMMIT")
+    fi
+    if git_with_timeout -C "$HERMES_INSTALL_DIR" "${checkout[@]}"; then
+        return 0
+    fi
+    # A blobless clone can succeed before checkout needs another network fetch.
+    # Apply the same fallback and deadline to that materialization step.
+    local current alternate
+    current="$(git -C "$HERMES_INSTALL_DIR" remote get-url origin)" || return 1
+    alternate="$(alternate_github_route "$current")" || return 1
+    git -C "$HERMES_INSTALL_DIR" remote set-url origin "$alternate"
+    git_with_timeout -C "$HERMES_INSTALL_DIR" "${checkout[@]}"
 }
 
 hermes_entrypoint() {
@@ -154,7 +198,13 @@ exec "$curl_bin" --connect-timeout "$HERMES_DOWNLOAD_CONNECT_TIMEOUT_SEC" --max-
 EOF
     chmod 0755 "$installer_support/bin/curl"
     export PATH="$installer_support/bin:$PATH"
-    git config --file "$git_config" url."$(github_proxy_prefix)".insteadOf "https://github.com/"
+    local source_url
+    source_url="$(git -C "$HERMES_INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
+    if [[ "$source_url" == "$REPO_URL" ]]; then
+        : > "$git_config"
+    else
+        git config --file "$git_config" url."$(github_proxy_prefix)".insteadOf "https://github.com/"
+    fi
     export GIT_CONFIG_GLOBAL="$git_config"
     export GIT_TERMINAL_PROMPT=0
     export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1024}"

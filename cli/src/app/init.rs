@@ -918,7 +918,7 @@ service:
 build:
   image_name: openclaw-agent
   resize: 30G
-  packages: [ca-certificates, curl, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, findutils, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
   files:
 {files}  scripts: [./install-openclaw.sh]
   variants:
@@ -990,7 +990,7 @@ build:
     - name: epel
       baseurl: https://mirrors.aliyun.com/epel/8/Everything/$basearch/
       gpgkey: https://mirrors.aliyun.com/epel/RPM-GPG-KEY-EPEL-8
-  packages: [binutils, ca-certificates, curl, elfutils-libelf-devel, gcc, gcc-c++, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  packages: [binutils, ca-certificates, curl, elfutils-libelf-devel, findutils, gcc, gcc-c++, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
 {files}  scripts: [./install-openclaw-vllm.sh]
   variants:

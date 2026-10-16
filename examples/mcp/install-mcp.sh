@@ -8,7 +8,7 @@ MCP_SERVER_EVERYTHING_VERSION="${MCP_SERVER_EVERYTHING_VERSION:-latest}"
 mkdir -p /opt/mcp-server
 cd /opt/mcp-server
 
-npm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
+npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
 if [ ! -f package.json ]; then
     npm init -y
 fi

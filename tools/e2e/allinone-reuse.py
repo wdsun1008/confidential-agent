@@ -148,10 +148,12 @@ class Consumer:
             report = json.loads(self.command("report", "report", "--service", self.service,
                                             "--json").stdout)
             service = next(item for item in report["services"] if item["service_id"] == self.service)
-            if service.get("daemon", {}).get("app_ready") and service["daemon"].get("mesh_ready"):
+            if (service.get("collect_status") == "ok"
+                    and service.get("daemon", {}).get("app_ready")
+                    and service["daemon"].get("mesh_ready")):
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"{self.service}: application readiness did not settle")
+                raise RuntimeError(f"{self.service}: application and attestation report did not settle")
             time.sleep(5)
         assert report["schema"] == "confidential-agent/attestation-report/v1"
         assert service["collect_status"] == "ok"

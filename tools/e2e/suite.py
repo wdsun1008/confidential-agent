@@ -168,7 +168,12 @@ class Suite:
         with self.lock:
             for process in self.processes.values():
                 if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        # A case may exit between poll() and killpg(). Continue
+                        # interrupting the remaining cases and retain results.
+                        pass
 
     def execute(self, name, case):
         if self.stop.is_set():

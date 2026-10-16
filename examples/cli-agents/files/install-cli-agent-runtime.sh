@@ -13,7 +13,7 @@ NODE_VERSION="${CLI_AGENT_NODE_VERSION:-$(ca_software_version node)}"
 FINALIZE_REPAIR="${CLI_AGENT_FINALIZE_REPAIR:-0}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
-npm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
+npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
 
 resolve_n_bin() {
     local candidate npm_prefix npm_root
@@ -143,7 +143,7 @@ write_finalize_repair_script() {
         printf 'set -euo pipefail\n'
         printf 'export CLI_AGENT_FINALIZE_REPAIR=1\n'
         printf 'export CLI_AGENT_NODE_VERSION=%s\n' "$(quote_env_value "$NODE_VERSION")"
-        printf 'export NPM_REGISTRY=%s\n' "$(quote_env_value "${NPM_REGISTRY:-https://registry.npmjs.org/}")"
+        printf 'export NPM_REGISTRY=%s\n' "$(quote_env_value "${NPM_REGISTRY:-https://registry.npmmirror.com/}")"
         if [[ -n "${CLAUDE_CODE_VERSION:-}" ]]; then
             printf 'export CLAUDE_CODE_VERSION=%s\n' "$(quote_env_value "$CLAUDE_CODE_VERSION")"
         fi

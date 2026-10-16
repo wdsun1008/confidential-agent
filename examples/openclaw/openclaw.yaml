@@ -14,6 +14,7 @@ build:
   packages:
     - ca-certificates
     - curl
+    - findutils
     - git
     - jq
     - kernel

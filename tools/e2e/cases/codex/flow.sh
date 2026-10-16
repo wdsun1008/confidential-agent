@@ -58,7 +58,7 @@ run_case() {
     --model "$DASHSCOPE_MODEL"
     --codex-app-server-token "$remote_token"
     --node-version "${E2E_CLI_AGENT_NODE_VERSION:-24.21.0}"
-    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
+    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}}"
     --codex-version "${E2E_CODEX_VERSION:-$(ca_software_version codex)}"
   )
   export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
@@ -72,7 +72,7 @@ run_case() {
   assert_codex_secret_rendering "$dashscope_key" "$remote_token"
   record "- allowed_cidr: \`$allowed_cidr\`"
   record "- Codex npm version: \`${E2E_CODEX_VERSION:-$(ca_software_version codex)}\`."
-  record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}\`."
+  record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}}\`."
   record "- Codex app-server token generated but not printed."
 
   validate_specs "$STATE_DIR" "$CODEX_DIR/codex.yaml"

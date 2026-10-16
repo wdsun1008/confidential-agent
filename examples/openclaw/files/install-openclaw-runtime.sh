@@ -17,7 +17,7 @@ OPENCLAW_GIT_TIMEOUT_SEC="${OPENCLAW_GIT_TIMEOUT_SEC:-120}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
 install -d -m 1777 /tmp
-npm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
+npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
 
 ensure_openclaw_dirs() {
     getent group openclaw >/dev/null 2>&1 || groupadd -r openclaw
@@ -198,15 +198,29 @@ git_with_timeout() {
     fi
 }
 
+clone_github_snapshot() {
+    local url="$1" directory="$2" commit="$3"
+    git_with_timeout clone --depth 1 --no-checkout "$url" "$directory" || return 1
+    if [[ -n "$commit" ]]; then
+        if [[ "$(git -C "$directory" rev-parse HEAD)" != "$commit" ]]; then
+            git_with_timeout -C "$directory" fetch --depth 1 origin "$commit" || return 1
+        fi
+        git_with_timeout -C "$directory" checkout --detach "$commit" || return 1
+    else
+        git_with_timeout -C "$directory" reset --hard HEAD || return 1
+    fi
+}
+
 clone_github_with_fallback() {
     local repo_path="$1"
     local dest_dir="$2"
+    local commit="${3:-}"
     local primary_url="https://github.com/${repo_path}"
     local proxy="${CA_GITHUB_PROXY_URL:-https://gh-proxy.org/}"
     local fallback_url="${proxy%/}/https://github.com/${repo_path}"
 
     rm -rf "${dest_dir}.tmp-direct" "${dest_dir}.tmp-proxy"
-    if git_with_timeout clone --depth 1 "$primary_url" "${dest_dir}.tmp-direct"; then
+    if clone_github_snapshot "$primary_url" "${dest_dir}.tmp-direct" "$commit"; then
         rm -rf "$dest_dir"
         mv "${dest_dir}.tmp-direct" "$dest_dir"
         return 0
@@ -214,7 +228,7 @@ clone_github_with_fallback() {
 
     echo "Direct GitHub clone failed, retrying via gh-proxy..."
     rm -rf "${dest_dir}.tmp-direct"
-    if git_with_timeout clone --depth 1 "$fallback_url" "${dest_dir}.tmp-proxy"; then
+    if clone_github_snapshot "$fallback_url" "${dest_dir}.tmp-proxy" "$commit"; then
         rm -rf "$dest_dir"
         mv "${dest_dir}.tmp-proxy" "$dest_dir"
         return 0
@@ -225,26 +239,60 @@ clone_github_with_fallback() {
     return 1
 }
 
+install_pinned_pnpm() (
+    local version integrity work
+    version="$(ca_software_version pnpm)"
+    integrity="$(ca_software_version pnpm_integrity)"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    local registry="${NPM_REGISTRY:-https://registry.npmmirror.com/}"
+    if ! curl --fail --location --retry 3 --connect-timeout 20 --max-time 180 \
+        "${registry%/}/pnpm/-/pnpm-$version.tgz" --output "$work/pnpm-$version.tgz"; then
+        # Preserve npm's authentication and custom tarball layout for private registries.
+        npm pack "pnpm@$version" --registry "$registry" --ignore-scripts \
+            --pack-destination "$work" --json --no-update-notifier > "$work/pack.json" || exit 1
+    fi
+    # Mirror transport must preserve the independently pinned npm tarball bytes.
+    node - "$work" "$version" "$integrity" <<'JS' || exit 1
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const [work, version, expected] = process.argv.slice(2);
+const bytes = fs.readFileSync(`${work}/pnpm-${version}.tgz`);
+const actual = 'sha512-' + crypto.createHash('sha512').update(bytes).digest('base64');
+if (actual !== expected) throw new Error('pinned pnpm tarball integrity mismatch');
+JS
+    npm install -g "$work/pnpm-$version.tgz" --ignore-scripts --no-audit --no-fund --no-update-notifier
+)
+
 install_dingtalk_extension() {
     local extension_dir="$OPENCLAW_CONFIG_DIR/extensions/dingtalk"
     command -v git >/dev/null 2>&1 || {
         echo "git is required to install the DingTalk OpenClaw plugin" >&2
         exit 1
     }
-    if ! command -v pnpm >/dev/null 2>&1; then
-        npm install -g pnpm@latest-10 --no-audit --no-fund
-        hash -r
-    fi
-    pnpm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
     if [[ ! -d "$extension_dir" ]]; then
-        clone_github_with_fallback "soimy/openclaw-channel-dingtalk" "$extension_dir"
+        clone_github_with_fallback "soimy/openclaw-channel-dingtalk" "$extension_dir" \
+            "$(ca_software_version dingtalk)" || return 1
     fi
+    # Match the plugin's declared manager before entering its directory, so an
+    # ambient newer pnpm cannot initiate another package-manager download.
+    node - "$extension_dir/package.json" "$(ca_software_version pnpm)" <<'JS' || return 1
+const fs = require('node:fs');
+const [manifest, version] = process.argv.slice(2);
+const declared = JSON.parse(fs.readFileSync(manifest, 'utf8')).packageManager;
+if (declared !== `pnpm@${version}`) {
+    throw new Error(`DingTalk requires ${declared}; update the checked-in pnpm pin`);
+}
+JS
+    install_pinned_pnpm || return 1
+    hash -r
     (
         cd "$extension_dir"
-        pnpm install
-        pnpm build
+        [[ "$(pnpm --version)" == "$(ca_software_version pnpm)" ]] || exit 1
+        pnpm install --registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}" || exit 1
+        pnpm build || exit 1
         test -f dist/index.js
-    )
+    ) || return 1
     chown -R "$OPENCLAW_USER:openclaw" "$extension_dir" || true
 }
 

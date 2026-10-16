@@ -10,7 +10,7 @@ build:
 
   image_name: alpha-agent
   resize: 30G
-  packages: [ca-certificates, curl, git, jq, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, findutils, git, jq, nodejs, npm, podman, tar, xz]
   files:
     - source: {{yaml:CAI_PEP}}
       target: /usr/local/bin/cai-pep

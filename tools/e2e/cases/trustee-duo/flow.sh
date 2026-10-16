@@ -138,7 +138,7 @@ prepare_codex_fixture() {
     --model "$DASHSCOPE_MODEL"
     --codex-app-server-token "$CODEX_REMOTE_TOKEN_VALUE"
     --node-version "${E2E_CLI_AGENT_NODE_VERSION:-24.21.0}"
-    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
+    --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}}"
     --codex-version "${E2E_CODEX_VERSION:-$(ca_software_version codex)}"
   )
   if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/codex-init.out" "$WORK_DIR/codex-init.err" codex "${init_args[@]}"; then

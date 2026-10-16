@@ -8,6 +8,9 @@ MCP_MEMORY_VERSION="${MCP_MEMORY_VERSION:-2026.1.26}"
 CMAAS_NODE_PREFIX="${CMAAS_NODE_PREFIX:-/opt/confidential-agent/cmaas-node}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
+# Configure the registry before bootstrapping Node with npm.
+npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
+
 resolve_n_bin() {
     local candidate npm_prefix npm_root
     candidate="$(command -v n 2>/dev/null || true)"
@@ -113,7 +116,7 @@ install -d -m 0755 "$CMAAS_NODE_PREFIX"
 
 prepare_cmaas_node_prefix() {
     cd "$CMAAS_NODE_PREFIX"
-    npm config set registry "${NPM_REGISTRY:-https://registry.npmjs.org/}"
+    npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
     if [[ ! -f package.json ]]; then
         npm init -y
     fi

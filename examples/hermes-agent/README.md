@@ -52,6 +52,11 @@ export HERMES_BRANCH='main'
 export HERMES_COMMIT=''
 ```
 
+Fresh installs fetch a small branch tip without checking out its files, then
+extend that branch's history far enough to verify the pinned commit's ancestry.
+Full history remains a fallback. The selected commit is checked out only after
+that verification; a pin from another branch is rejected.
+
 Set `CA_GITHUB_PROXY_URL` to override the GitHub fallback proxy. The default is
 `https://gh-proxy.org/`. Set `HERMES_PYPI_INDEX_URL` or `UV_INDEX_URL` to
 override the Python package index used by the official installer; the default is
