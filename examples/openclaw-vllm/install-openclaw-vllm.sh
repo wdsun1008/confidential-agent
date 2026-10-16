@@ -1,18 +1,19 @@
 #!/bin/bash
 set -euo pipefail
+umask 022
 
 MODEL_ID="${OPENCLAW_VLLM_MODEL_ID:-Qwen/Qwen3.6-35B-A3B}"
 MODEL_DIR="${OPENCLAW_VLLM_MODEL_DIR:-/opt/models/Qwen3.6-35B-A3B}"
 SERVED_MODEL_NAME="${OPENCLAW_VLLM_SERVED_MODEL_NAME:-Qwen3.6-35B-A3B}"
 VLLM_PORT="${OPENCLAW_VLLM_PORT:-8090}"
-VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.19.1}"
+VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.28.0}"
 PYPI_INDEX_URL="${OPENCLAW_VLLM_PYPI_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
-NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-550.144.03}"
+NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-580.82.07}"
 NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://cn.download.nvidia.cn/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run}"
 NVIDIA_DRIVER_REFERER="${NVIDIA_DRIVER_REFERER:-https://www.nvidia.cn/}"
 NVIDIA_DRIVER_SHA256="${NVIDIA_DRIVER_SHA256:-}"
-CUDA_TOOLKIT_VERSION="${OPENCLAW_VLLM_CUDA_TOOLKIT_VERSION:-12.4.1}"
-CUDA_BUNDLED_DRIVER_VERSION="${OPENCLAW_VLLM_CUDA_BUNDLED_DRIVER_VERSION:-550.54.15}"
+CUDA_TOOLKIT_VERSION="${OPENCLAW_VLLM_CUDA_TOOLKIT_VERSION:-13.0.1}"
+CUDA_BUNDLED_DRIVER_VERSION="${OPENCLAW_VLLM_CUDA_BUNDLED_DRIVER_VERSION:-580.82.07}"
 CUDA_TOOLKIT_URL="${OPENCLAW_VLLM_CUDA_TOOLKIT_URL:-https://developer.download.nvidia.com/compute/cuda/${CUDA_TOOLKIT_VERSION}/local_installers/cuda_${CUDA_TOOLKIT_VERSION}_${CUDA_BUNDLED_DRIVER_VERSION}_linux.run}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 BUILD_POSTINSTALL_MARKER=/var/lib/cai/openclaw-vllm/build-postinstall.done
@@ -37,7 +38,7 @@ fi
 
 ensure_build_dependencies() {
   local missing=()
-  for cmd in curl gcc git jq make npm python3.11 rpm sha256sum wget; do
+  for cmd in curl gcc c++ git jq make npm python3.11 rpm sha256sum wget; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   command -v depmod >/dev/null 2>&1 || missing+=("kmod")
@@ -136,7 +137,7 @@ preinstall_nvidia_driver() {
 
 preinstall_cuda_toolkit() {
   local state_dir runfile
-  if [[ -x /usr/local/cuda/bin/nvcc || -d /usr/local/cuda/targets/x86_64-linux/lib ]]; then
+  if [[ -x /usr/local/cuda/bin/nvcc ]]; then
     return 0
   fi
   state_dir=/var/lib/cai/nvidia-cc
@@ -152,6 +153,7 @@ preinstall_cuda_toolkit() {
     chmod 0755 "$runfile"
   fi
   bash "$runfile" --silent --toolkit
+  /usr/local/cuda/bin/nvcc --version
   rm -f "$runfile"
 }
 
@@ -199,7 +201,7 @@ if ! preinstall_nvidia_driver; then
   fi
   echo "warning: failed to pre-install NVIDIA driver; guest bootstrap will only try loading existing modules" >&2
 fi
-if [[ "${OPENCLAW_VLLM_PREINSTALL_CUDA_TOOLKIT:-0}" == "1" ]] && ! preinstall_cuda_toolkit; then
+if [[ "${OPENCLAW_VLLM_PREINSTALL_CUDA_TOOLKIT:-1}" == "1" ]] && ! preinstall_cuda_toolkit; then
   if [[ "${CAI_CUDA_TOOLKIT_PREINSTALL_REQUIRED:-1}" == "1" ]]; then
     echo "failed to pre-install CUDA toolkit during image build" >&2
     exit 1
@@ -233,7 +235,7 @@ cat >/usr/local/bin/cai-vllm-install-deps.sh <<'EOF'
 set -euo pipefail
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 PYPI_INDEX_URL="${OPENCLAW_VLLM_PYPI_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
-VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.19.1}"
+VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.28.0}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/cai-pip-cache}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/cai-uv-cache}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/cai-cache}"
@@ -254,7 +256,7 @@ restore_vllm_build_headers() {
   cp -a "$src"/. /usr/include/
 }
 vllm_deps_ready() {
-  [[ -x /root/.venv/bin/python && -x /root/.venv/bin/vllm ]] || return 1
+  [[ -x /root/.venv/bin/python && -x /root/.venv/bin/vllm && -x /root/.venv/bin/ninja ]] || return 1
   VLLM_VERSION="$VLLM_VERSION" /root/.venv/bin/python - <<'PY' || return 1
 import importlib.metadata
 import os
@@ -282,7 +284,7 @@ cd /root
 if [[ ! -d .venv ]]; then
   uv venv --python 3.11
 fi
-uv pip install -i "$PYPI_INDEX_URL" --only-binary=:all: "vllm==$VLLM_VERSION"
+uv pip install -i "$PYPI_INDEX_URL" --only-binary=:all: "vllm==$VLLM_VERSION" ninja
 cleanup_package_caches
 EOF
 chmod 0755 /usr/local/bin/cai-vllm-install-deps.sh
@@ -297,7 +299,7 @@ cat >/usr/local/bin/cai-vllm-setup.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.19.1}"
+VLLM_VERSION="${OPENCLAW_VLLM_VERSION:-0.28.0}"
 restore_vllm_build_headers() {
   local src=/opt/confidential-agent/openclaw-vllm/usr-include
   if [[ -f /usr/include/python3.11/Python.h && -f /usr/include/stdio.h ]]; then
@@ -411,6 +413,7 @@ cd /root
 /root/.venv/bin/vllm serve "$MODEL_DIR/" \\
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \\
   --port "$VLLM_PORT" --host 127.0.0.1 --served-model-name "$SERVED_MODEL_NAME" \\
+  --max-num-seqs 512 \\
   --gdn-prefill-backend triton
 EOF
 chmod 0755 /usr/local/bin/cai-vllm-run.sh
@@ -443,8 +446,8 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=120
 ExecStart=/usr/local/bin/cai-openclaw-vllm-runtime-check.sh
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 
 [Install]
@@ -465,8 +468,8 @@ TimeoutStartSec=7200
 Restart=on-failure
 RestartSec=60
 ExecStart=/usr/local/bin/cai-modelscope-fetch.sh
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 
 [Install]
@@ -489,10 +492,10 @@ TimeoutStartSec=10800
 ExecStartPre=/usr/local/bin/cai-vllm-wait-deps.sh
 ExecStartPre=/usr/local/bin/cai-vllm-setup.sh
 ExecStart=/usr/local/bin/cai-vllm-run.sh
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Environment=HOME=/root
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+Environment=PATH=/root/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
@@ -555,8 +558,8 @@ ExecStartPre=/usr/local/bin/cai-openclaw-vllm-bootstrap
 ExecStart=/usr/local/bin/openclaw gateway run --port 18789 --bind lan
 Restart=always
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

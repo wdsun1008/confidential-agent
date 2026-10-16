@@ -62,15 +62,15 @@ require_node22() {
         return 0
     fi
     command -v npm >/dev/null 2>&1 || {
-        echo "npm is required to install Node.js ${A2A_NODE_VERSION:-22.19.0}" >&2
+        echo "npm is required to install Node.js ${A2A_NODE_VERSION:-24.21.0}" >&2
         exit 1
     }
     command -v tar >/dev/null 2>&1 || {
-        echo "tar is required to install Node.js ${A2A_NODE_VERSION:-22.19.0}" >&2
+        echo "tar is required to install Node.js ${A2A_NODE_VERSION:-24.21.0}" >&2
         exit 1
     }
     command -v xz >/dev/null 2>&1 || {
-        echo "xz is required to install Node.js ${A2A_NODE_VERSION:-22.19.0}" >&2
+        echo "xz is required to install Node.js ${A2A_NODE_VERSION:-24.21.0}" >&2
         exit 1
     }
     if ! n_bin="$(resolve_n_bin)"; then
@@ -87,7 +87,7 @@ require_node22() {
         ln -sf "$n_bin" /usr/local/bin/n
         hash -r
     fi
-    node_version="${A2A_NODE_VERSION:-22.19.0}"
+    node_version="${A2A_NODE_VERSION:-24.21.0}"
     install_node_with_retry "$node_version"
     hash -r
     node -e 'const [major] = process.versions.node.split(".").map(Number); process.exit(major >= 22 ? 0 : 1)'
@@ -113,8 +113,8 @@ Environment=PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin
 ExecStart=/usr/bin/env node /usr/local/bin/cai-a2a-llm-agent --config /etc/cai/a2a-agent.json
 Restart=always
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

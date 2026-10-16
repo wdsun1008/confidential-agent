@@ -1,11 +1,18 @@
 #!/bin/bash
 set -euo pipefail
+if [[ -f /usr/local/libexec/confidential-agent/software-versions.sh ]]; then
+    source /usr/local/libexec/confidential-agent/software-versions.sh
+elif [[ -n "${ROOT_DIR:-}" && -f "$ROOT_DIR/common/software-versions.sh" ]]; then
+    source "$ROOT_DIR/common/software-versions.sh"
+else
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/common/software-versions.sh"
+fi
 
 OPENCLAW_USER="${1:?usage: install-openclaw-runtime.sh <openclaw-user> <openclaw-user-home>}"
 OPENCLAW_USER_HOME="${2:?missing OpenClaw user home}"
 OPENCLAW_CONFIG_DIR="${OPENCLAW_USER_HOME%/}/.openclaw"
-OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.5.7}"
-OPENCLAW_NODE_VERSION="${OPENCLAW_NODE_VERSION:-22.19.0}"
+OPENCLAW_VERSION="${OPENCLAW_VERSION:-$(ca_software_version openclaw)}"
+OPENCLAW_NODE_VERSION="${OPENCLAW_NODE_VERSION:-$(ca_software_version node)}"
 OPENCLAW_GIT_TIMEOUT_SEC="${OPENCLAW_GIT_TIMEOUT_SEC:-120}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
@@ -84,7 +91,7 @@ install_node_with_retry() {
 
 ensure_node22() {
     local n_bin
-    if command -v node >/dev/null 2>&1 && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' >/dev/null 2>&1; then
+    if command -v node >/dev/null 2>&1 && [[ "$(node --version)" == "v$OPENCLAW_NODE_VERSION" ]] >/dev/null 2>&1; then
         return 0
     fi
     command -v tar >/dev/null 2>&1 || {
@@ -115,13 +122,56 @@ ensure_node22() {
     hash -r
 }
 
+normalize_openclaw_bundled_manifest() {
+    node - "$1" "$2" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const [manifestPath, openclawRoot] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+const workspaceDeps = Object.entries(manifest.dependencies || {})
+  .filter(([, version]) => typeof version === 'string' && version.startsWith('workspace:'));
+if (workspaceDeps.length) {
+  // Published extensions contain compiled entrypoints. Workspace references left
+  // in their manifests are removable only when the published code bundles them.
+  const entries = manifest.openclaw?.extensions || [];
+  if (!entries.length || entries.some(entry => !/\.(?:[cm]?js)$/.test(entry)
+      || !fs.statSync(path.resolve(path.dirname(manifestPath), entry), {throwIfNoEntry: false})?.isFile())) {
+    throw new Error(`cannot verify compiled OpenClaw extension: ${manifestPath}`);
+  }
+  const artifacts = [];
+  function collect(directory) {
+    for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
+      const filename = path.join(directory, entry.name);
+      if (entry.isDirectory() && entry.name !== 'node_modules') collect(filename);
+      else if (entry.isFile() && /\.(?:[cm]?js)$/.test(entry.name)) artifacts.push(filename);
+    }
+  }
+  collect(path.join(openclawRoot, 'dist'));
+  for (const [name] of workspaceDeps) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const reference = new RegExp("(['\"`])" + escaped + "(?:/[^'\"`\\r\\n]*)?\\1");
+    for (const filename of artifacts) {
+      if (reference.test(fs.readFileSync(filename, 'utf8'))) {
+        throw new Error(`published OpenClaw code still references workspace dependency ${name}: ${filename}`);
+      }
+    }
+  }
+  for (const [name] of workspaceDeps) delete manifest.dependencies[name];
+}
+if (Object.values(manifest.devDependencies || {}).some(version =>
+    typeof version === 'string' && version.startsWith('workspace:'))) delete manifest.devDependencies;
+fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+NODE
+}
+
 preinstall_openclaw_bundled_runtime_deps() {
-    local extensions_dir
-    extensions_dir="$(npm root -g)/openclaw/dist/extensions"
+    local openclaw_root extensions_dir
+    openclaw_root="$(npm root -g)/openclaw"
+    extensions_dir="$openclaw_root/dist/extensions"
     [[ -d "$extensions_dir" ]] || return 0
 
     while IFS= read -r -d '' package_json; do
-        local plugin_dir tmp_package
+        local plugin_dir
         plugin_dir="$(dirname "$package_json")"
         jq -e '(.dependencies // {}) | length > 0' "$package_json" >/dev/null || continue
         (
@@ -129,13 +179,7 @@ preinstall_openclaw_bundled_runtime_deps() {
             if [[ -d node_modules ]]; then
                 exit 0
             fi
-            if jq -e '(.devDependencies // {}) | to_entries | any(.value | type == "string" and startswith("workspace:"))' package.json >/dev/null; then
-                install -d -m 1777 /tmp
-                tmp_package="$(mktemp)"
-                jq 'del(.devDependencies)' package.json >"$tmp_package"
-                cp "$tmp_package" package.json
-                rm -f "$tmp_package"
-            fi
+            normalize_openclaw_bundled_manifest package.json "$openclaw_root"
             npm install --omit=dev --ignore-scripts --no-audit --no-fund
         )
     done < <(find "$extensions_dir" -mindepth 2 -maxdepth 2 -name package.json -print0 | sort -z)
@@ -206,11 +250,13 @@ install_dingtalk_extension() {
 
 ensure_openclaw_dirs
 ensure_node22
-node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'
+[[ "$(node --version)" == "v$OPENCLAW_NODE_VERSION" ]]
 command -v npm >/dev/null
-if ! command -v openclaw >/dev/null 2>&1; then
+if ! command -v openclaw >/dev/null 2>&1 ||
+    [[ "$(node -p 'require(process.argv[1]).version' "$(npm root -g)/openclaw/package.json" 2>/dev/null || true)" != "$OPENCLAW_VERSION" ]]; then
     npm install -g "openclaw@$OPENCLAW_VERSION" --no-audit --no-fund
 fi
+[[ "$(node -p 'require(process.argv[1]).version' "$(npm root -g)/openclaw/package.json")" == "$OPENCLAW_VERSION" ]]
 OPENCLAW_BIN="$(command -v openclaw)"
 if [[ -z "$OPENCLAW_BIN" ]]; then
     echo "openclaw binary was not installed" >&2

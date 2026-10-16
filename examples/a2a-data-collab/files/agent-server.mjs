@@ -75,7 +75,7 @@ function errorMessage(error) {
 
 async function callLlm(config, messages, purpose) {
   const baseUrl = String(config.dashscopeBaseUrl || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/+$/, "");
-  const model = String(config.model || "qwen3.7-max");
+  const model = String(config.model || "qwen3.8-max");
   const apiKey = String(config.apiKey || "").trim();
   if (!apiKey) throw new Error("apiKey is required for real LLM inference");
   let response;
@@ -88,6 +88,9 @@ async function callLlm(config, messages, purpose) {
         messages,
         temperature: 0.1,
         max_tokens: 1200,
+        // This example needs concise aggregate summaries, not an unbounded
+        // reasoning phase before the non-streaming response becomes available.
+        enable_thinking: false,
       },
       Number(config.llmTimeoutMs || 180000),
     );

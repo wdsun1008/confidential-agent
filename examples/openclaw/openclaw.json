@@ -8,8 +8,8 @@
         "api": "openai-completions",
         "models": [
           {
-            "id": "qwen3-max-2026-01-23",
-            "name": "qwen3-max-2026-01-23",
+            "id": "qwen3.8-max",
+            "name": "qwen3.8-max",
             "reasoning": false,
             "input": ["text"],
             "contextWindow": 262144,
@@ -30,7 +30,7 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "bailian/qwen3-max-2026-01-23"
+        "primary": "bailian/qwen3.8-max"
       }
     }
   },

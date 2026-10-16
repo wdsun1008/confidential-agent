@@ -18,16 +18,9 @@ if [[ -f "$BUILD_POSTINSTALL_MARKER" ]]; then
   exit 0
 fi
 
-# Debug image variant only: install openssh-server so the guest daemon can
-# enable+start sshd when the debug-ssh marker is present. Release images stay
-# sshd-free; this block is a no-op without the marker.
-if [[ -f /etc/confidential-agent/debug-ssh-enabled ]]; then
-  dnf install -y openssh-server || yum install -y openssh-server || true
-fi
-
 ensure_build_dependencies() {
   local missing=()
-  for cmd in curl gcc git jq make python3.11 rpm sha256sum wget; do
+  for cmd in curl gcc git gocryptfs jq make python3.11 rpm s3fs sha256sum wget; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   command -v depmod >/dev/null 2>&1 || missing+=("kmod")
@@ -126,7 +119,7 @@ preinstall_nvidia_driver() {
 
 preinstall_cuda_toolkit() {
   local state_dir runfile
-  if [[ -x /usr/local/cuda/bin/nvcc || -d /usr/local/cuda/targets/x86_64-linux/lib ]]; then
+  if [[ -x /usr/local/cuda/bin/nvcc ]]; then
     return 0
   fi
   state_dir=/var/lib/cai/nvidia-cc
@@ -142,6 +135,7 @@ preinstall_cuda_toolkit() {
     chmod 0755 "$runfile"
   fi
   bash "$runfile" --silent --toolkit
+  /usr/local/cuda/bin/nvcc --version
   rm -f "$runfile"
 }
 
@@ -309,17 +303,7 @@ EOF
 chmod 0755 /usr/local/bin/cai-vllm-setup.sh
 
 # --- native s3fs + gocryptfs decryption stack ---
-# gocryptfs is in alinux3-plus (already in build.packages); s3fs-fuse is in EPEL.
-# Enable the Aliyun internal EPEL mirror (reachable from the build host's VPC).
-install -d -m 0755 /etc/yum.repos.d
-cat >/etc/yum.repos.d/epel-cai.repo <<'EOF'
-[epel-cai]
-name=Aliyun EPEL mirror for s3fs-fuse
-baseurl=http://mirrors.cloud.aliyuncs.com/epel/8/Everything/$basearch/
-enabled=1
-gpgcheck=0
-EOF
-yum install -y gocryptfs fuse s3fs-fuse
+# The image's declared packages and EPEL repository provide both tools.
 install -d -m 0755 /etc/cai
 
 cat >/usr/local/bin/cai-s3fs-start.sh <<'UNIT'

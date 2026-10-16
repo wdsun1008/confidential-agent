@@ -11,11 +11,9 @@ service:
 build:
   image_name: openclaw-agent
   resize: 30G
-  with_network: true
   packages:
     - ca-certificates
     - curl
-    - dracut
     - git
     - jq
     - kernel

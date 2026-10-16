@@ -12,6 +12,13 @@ Before using it directly, create `secrets/hermes.env` and
 resources into `/opt/data`; they are not baked into the Shelter build config or
 disk image.
 
+The fixed Hermes source, verified toolchain, and dependency environment are
+packaged under `/usr/local/lib/cai-hermes`. `/usr/local/lib/hermes-agent` links
+to that source checkout. The package uses Hermes' supported payload manifest
+so each service can keep its own `/opt/data` home without downloading another
+runtime. The image disables lazy dependency installation and marks updates as
+externally managed; update the image to change its fixed software version.
+
 `secrets/hermes.env` should contain the API server and DashScope credentials:
 
 ```dotenv
@@ -22,7 +29,7 @@ API_SERVER_KEY=replace-with-openssl-rand-hex-32
 DASHSCOPE_API_KEY=replace-with-dashscope-api-key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 HERMES_HOME=/opt/data
-HERMES_MODEL=qwen3.7-max
+HERMES_MODEL=qwen3.8-max
 ```
 
 `secrets/config.yaml` should select the provider/model:
@@ -30,8 +37,8 @@ HERMES_MODEL=qwen3.7-max
 ```yaml
 model:
   provider: alibaba
-  default: qwen3.7-max
-  model: qwen3.7-max
+  default: qwen3.8-max
+  model: qwen3.8-max
 ```
 
 `hermes_config` is marked `mutable: true` in the AppSpec because the Hermes
@@ -46,8 +53,23 @@ export HERMES_COMMIT=''
 ```
 
 Set `CA_GITHUB_PROXY_URL` to override the GitHub fallback proxy. The default is
-`https://gh-proxy.org/`. Set `HERMES_PYPI_INDEX_URL` or `UV_DEFAULT_INDEX` to
+`https://gh-proxy.org/`. Set `HERMES_PYPI_INDEX_URL` or `UV_INDEX_URL` to
 override the Python package index used by the official installer; the default is
 `https://mirrors.aliyun.com/pypi/simple/`. Set `HERMES_NPM_REGISTRY_URL` or
 `NPM_CONFIG_REGISTRY` to override the npm registry used by optional browser-tool
 dependencies; the default is `https://registry.npmmirror.com/`.
+`PLAYWRIGHT_DOWNLOAD_HOST` defaults to `https://npmmirror.com/mirrors/playwright`.
+Installer curl downloads have a 20-second connection timeout and a 180-second
+total timeout, allowing the upstream hash-verified artifact mirror to handle
+unavailable GitHub downloads. Override these with
+`HERMES_DOWNLOAD_CONNECT_TIMEOUT_SEC` and `HERMES_DOWNLOAD_TIMEOUT_SEC`.
+
+The build uses every stage declared by the official installer. After repository
+checkout, it maps frozen PyPI artifact URLs to
+`https://mirrors.aliyun.com/pypi/packages/`; package versions, SHA-256 hashes,
+registry identity and dependency markers stay unchanged. Set
+`HERMES_PYPI_ARTIFACT_MIRROR` to another HTTPS artifact prefix, or to an empty
+value to retain the original `files.pythonhosted.org` URLs. Lock digests before
+and after this transport change are recorded in
+`/usr/local/lib/cai-hermes/locked-downloads.json`. Other runtime assets still
+require access to their upstream or hash-verified mirror endpoints.

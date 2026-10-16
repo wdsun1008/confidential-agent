@@ -10,8 +10,8 @@ Restart=always
 RestartSec=5
 TimeoutStartSec=600
 KillMode=mixed
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

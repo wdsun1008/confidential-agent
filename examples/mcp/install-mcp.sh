@@ -40,8 +40,8 @@ ExecStart=/opt/mcp-server/node_modules/.bin/mcp-server-everything streamableHttp
 Restart=always
 RestartSec=5
 TimeoutStartSec=600
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

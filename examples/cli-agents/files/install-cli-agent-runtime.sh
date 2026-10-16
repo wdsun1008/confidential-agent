@@ -1,8 +1,15 @@
 #!/bin/bash
 set -euo pipefail
+if [[ -f /usr/local/libexec/confidential-agent/software-versions.sh ]]; then
+    source /usr/local/libexec/confidential-agent/software-versions.sh
+elif [[ -n "${ROOT_DIR:-}" && -f "$ROOT_DIR/common/software-versions.sh" ]]; then
+    source "$ROOT_DIR/common/software-versions.sh"
+else
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/common/software-versions.sh"
+fi
 
 AGENT="${1:?usage: install-cli-agent-runtime.sh <claude-code|codex>}"
-NODE_VERSION="${CLI_AGENT_NODE_VERSION:-22.19.0}"
+NODE_VERSION="${CLI_AGENT_NODE_VERSION:-$(ca_software_version node)}"
 FINALIZE_REPAIR="${CLI_AGENT_FINALIZE_REPAIR:-0}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
@@ -67,7 +74,7 @@ install_node_with_retry() {
 ensure_node22() {
     local n_bin
     if command -v node >/dev/null 2>&1 &&
-       node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' >/dev/null 2>&1; then
+       [[ "$(node --version)" == "v$NODE_VERSION" ]] >/dev/null 2>&1; then
         return 0
     fi
     command -v npm >/dev/null 2>&1 || {
@@ -99,7 +106,7 @@ ensure_node22() {
     install_node_with_retry "$NODE_VERSION"
     export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
     hash -r
-    node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'
+    [[ "$(node --version)" == "v$NODE_VERSION" ]]
 }
 
 install_package() {
@@ -152,7 +159,7 @@ install_claude_code() {
     install -d -m 0700 /root/.claude /root/.claude/skills
     install -d -m 0775 /workspace
     git -C /workspace init -q || true
-    local version="${CLAUDE_CODE_VERSION:-latest}"
+    local version="${CLAUDE_CODE_VERSION:-$(ca_software_version claude-code)}"
     # Shelter's image cleanup strips ELF files during finalize. Claude Code's
     # Bun standalone binary stores its payload after the ELF sections, so it
     # must be reinstalled after that cleanup step.
@@ -174,7 +181,7 @@ install_codex() {
     install -d -m 0755 /root/.agents /root/.agents/skills
     install -d -m 0775 /workspace
     git -C /workspace init -q || true
-    local version="${CODEX_VERSION:-latest}"
+    local version="${CODEX_VERSION:-$(ca_software_version codex)}"
     if [[ "$FINALIZE_REPAIR" == "1" ]]; then
         npm uninstall -g @openai/codex >/dev/null 2>&1 || true
     fi
@@ -231,8 +238,8 @@ ExecStart=/usr/local/bin/codex app-server --listen ws://0.0.0.0:4500 --ws-auth c
 Restart=always
 RestartSec=5
 TimeoutStartSec=600
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

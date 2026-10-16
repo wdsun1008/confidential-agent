@@ -68,15 +68,15 @@ require_node22() {
         return 0
     fi
     command -v npm >/dev/null 2>&1 || {
-        echo "npm is required to install Node.js ${CMAAS_NODE_VERSION:-22.19.0}" >&2
+        echo "npm is required to install Node.js ${CMAAS_NODE_VERSION:-24.21.0}" >&2
         exit 1
     }
     command -v tar >/dev/null 2>&1 || {
-        echo "tar is required to install Node.js ${CMAAS_NODE_VERSION:-22.19.0}" >&2
+        echo "tar is required to install Node.js ${CMAAS_NODE_VERSION:-24.21.0}" >&2
         exit 1
     }
     command -v xz >/dev/null 2>&1 || {
-        echo "xz is required to install Node.js ${CMAAS_NODE_VERSION:-22.19.0}" >&2
+        echo "xz is required to install Node.js ${CMAAS_NODE_VERSION:-24.21.0}" >&2
         exit 1
     }
     if ! n_bin="$(resolve_n_bin)"; then
@@ -94,7 +94,7 @@ require_node22() {
         hash -r
         n_bin="$(command -v n 2>/dev/null || printf '%s' "$n_bin")"
     fi
-    node_version="${CMAAS_NODE_VERSION:-22.19.0}"
+    node_version="${CMAAS_NODE_VERSION:-24.21.0}"
     install_node_with_retry "$node_version"
     export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
     hash -r
@@ -131,8 +131,8 @@ Type=simple
 ExecStart=/usr/bin/env node /usr/local/share/confidential-agent/cmaas/agent-health.mjs
 Restart=always
 RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

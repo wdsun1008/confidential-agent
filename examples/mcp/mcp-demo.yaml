@@ -12,7 +12,6 @@ service:
 build:
   image_name: mcp-agent
   resize: 30G
-  with_network: true
   packages:
     - ca-certificates
     - nodejs
