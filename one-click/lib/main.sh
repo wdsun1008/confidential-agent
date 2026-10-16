@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # shellcheck source=one-click/lib/common.sh
 . "$SCRIPT_DIR/common.sh"
+. "$ROOT_DIR/common/software-versions.sh"
+export CA_SOFTWARE_VERSIONS_FILE="$ROOT_DIR/software-versions.json"
 # shellcheck source=one-click/lib/deps-alinux.sh
 . "$SCRIPT_DIR/deps-alinux.sh"
 # shellcheck source=one-click/lib/credentials.sh
@@ -45,28 +47,26 @@ Deploy options:
   --disk-gb GB                   Default: 512
   --allowed-cidr CIDR[,CIDR...]  Operator access CIDR list; may be repeated
   --gateway-token TOKEN          OpenClaw gateway token; generated if omitted
-  --openclaw-version VERSION     Default: 2026.5.7
-  --node-version VERSION         Default: 22.19.0
+  --openclaw-version VERSION     Default: 2026.10.3
+  --node-version VERSION         Default: 24.21.0
   --npm-registry URL             npm registry used inside the guest image
   --vllm-model-id ID             vLLM ModelScope model id; default: Qwen/Qwen3.6-35B-A3B
   --vllm-model-dir PATH          vLLM model directory; default: /opt/models/Qwen3.6-35B-A3B
   --vllm-served-model-name NAME  vLLM served model name; default: Qwen3.6-35B-A3B
   --vllm-port PORT               vLLM OpenAI-compatible API port; default: 8090
-  --vllm-version VERSION         vLLM package version; default: 0.19.1
+  --vllm-version VERSION         vLLM package version; default: 0.28.0
   --vllm-build-variants LIST     vLLM build variants: release, debug, or release,debug; default: release
   --enable-dingtalk              Enable DingTalk channel
   --reference-values MODE        rekor or sample; default: rekor
   --cosign-key PATH              Existing cosign private key for rekor mode
   --slsa-generator PATH          Default: /usr/libexec/shelter/slsa/slsa-generator
-  --build-backend MODE           mkosi or base-image; default: mkosi
-  --base-image PATH              Required when --build-backend base-image is used
   --skip-build                   Skip confidential image build
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
 
 Shelter options:
   --shelter-bin PATH             Existing shelter binary
-  --shelter-rpm PATH             Shelter RPM to install when no binary exists
+  --shelter-rpm PATH             Shelter RPM to install when missing or incompatible
 
 Examples:
   one-click/install-openclaw-vllm.sh
@@ -109,15 +109,13 @@ Deploy options:
   --vllm-port PORT               vLLM OpenAI-compatible API port; default: 8080
   --vllm-version VERSION         vLLM package version; default: 0.28.0
   --vllm-build-variants LIST     vLLM image variants: release or debug; default: release
-  --vllm-served-model-name NAME  vLLM served model name; default: Qwen3-32B
+  --vllm-served-model-name NAME  vLLM served model name; default: Qwen3.8-27B
   --oss-bucket NAME              OSS bucket holding the encrypted model artifact (required)
   --oss-endpoint URL             OSS endpoint; default: https://oss-cn-beijing-internal.aliyuncs.com
   --model-key-file PATH          Local gocryptfs model key file (required, must exist)
   --reference-values MODE        rekor or sample; default: rekor
   --cosign-key PATH              Existing cosign private key for rekor mode
   --slsa-generator PATH          Default: /usr/libexec/shelter/slsa/slsa-generator
-  --build-backend MODE           mkosi or base-image; default: mkosi
-  --base-image PATH              Required when --build-backend base-image is used
   --skip-build                   Skip confidential image build
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
@@ -128,7 +126,7 @@ Shelter options:
 
 Examples:
   one-click/install-vllm-inference.sh --oss-bucket my-bucket --model-key-file /path/key
-  one-click/install-vllm-inference.sh --vllm-served-model-name Qwen3-32B
+  one-click/install-vllm-inference.sh --vllm-served-model-name Qwen3.8-27B
   one-click/install-vllm-inference.sh cleanup --state-dir "\$HOME/.confidential-agent"
 EOF
     return
@@ -163,24 +161,22 @@ Deploy options:
   --disk-gb GB                   Default: 200
   --allowed-cidr CIDR[,CIDR...]  Operator access CIDR list; may be repeated
   --bailian-api-key KEY          Bailian/DashScope API key
-  --bailian-model MODEL          Bailian model id; default: qwen3.7-max
+  --bailian-model MODEL          Bailian model id; default: qwen3.8-max
   --gateway-token TOKEN          OpenClaw gateway token; generated if omitted
-  --openclaw-version VERSION     Default: 2026.5.7
-  --node-version VERSION         Default: 22.19.0
+  --openclaw-version VERSION     Default: 2026.10.3
+  --node-version VERSION         Default: 24.21.0
   --npm-registry URL             npm registry used inside the guest image
   --enable-dingtalk              Enable DingTalk channel
   --reference-values MODE        rekor or sample; default: rekor
   --cosign-key PATH              Existing cosign private key for rekor mode
   --slsa-generator PATH          Default: /usr/libexec/shelter/slsa/slsa-generator
-  --build-backend MODE           mkosi or base-image; default: mkosi
-  --base-image PATH              Required when --build-backend base-image is used
   --skip-build                   Skip confidential image build
   --skip-deploy                  Skip cloud deploy
   --no-start-connect             Do not start the local connect tunnel after deploy
 
 Shelter options:
   --shelter-bin PATH             Existing shelter binary
-  --shelter-rpm PATH             Shelter RPM to install when no binary exists
+  --shelter-rpm PATH             Shelter RPM to install when missing or incompatible
 
 Examples:
   one-click/install.sh
@@ -216,25 +212,23 @@ init_defaults() {
   CA_DISK_GB="${CA_DISK_GB:-}"
   CA_REPLICAS="${CA_REPLICAS:-1}"
   CA_REFERENCE_VALUES="${CA_REFERENCE_VALUES:-rekor}"
-  CA_BAILIAN_MODEL="${CA_BAILIAN_MODEL:-qwen3.7-max}"
-  CA_OPENCLAW_VERSION="${CA_OPENCLAW_VERSION:-2026.5.7}"
-  CA_NODE_VERSION="${CA_NODE_VERSION:-22.19.0}"
+  CA_BAILIAN_MODEL="${CA_BAILIAN_MODEL:-$(ca_software_version bailian_model)}"
+  CA_OPENCLAW_VERSION="${CA_OPENCLAW_VERSION:-$(ca_software_version openclaw)}"
+  CA_NODE_VERSION="${CA_NODE_VERSION:-$(ca_software_version node)}"
   CA_NPM_REGISTRY="${CA_NPM_REGISTRY:-https://registry.npmmirror.com/}"
   CA_OPENCLAW_VLLM_MODEL_ID="${CA_OPENCLAW_VLLM_MODEL_ID:-${OPENCLAW_VLLM_MODEL_ID:-Qwen/Qwen3.6-35B-A3B}}"
   CA_OPENCLAW_VLLM_MODEL_DIR="${CA_OPENCLAW_VLLM_MODEL_DIR:-${OPENCLAW_VLLM_MODEL_DIR:-/opt/models/Qwen3.6-35B-A3B}}"
   CA_OPENCLAW_VLLM_SERVED_MODEL_NAME="${CA_OPENCLAW_VLLM_SERVED_MODEL_NAME:-${OPENCLAW_VLLM_SERVED_MODEL_NAME:-Qwen3.6-35B-A3B}}"
   CA_OPENCLAW_VLLM_PORT="${CA_OPENCLAW_VLLM_PORT:-${OPENCLAW_VLLM_PORT:-8090}}"
-  CA_OPENCLAW_VLLM_VERSION="${CA_OPENCLAW_VLLM_VERSION:-${OPENCLAW_VLLM_VERSION:-0.19.1}}"
+  CA_OPENCLAW_VLLM_VERSION="${CA_OPENCLAW_VLLM_VERSION:-${OPENCLAW_VLLM_VERSION:-0.28.0}}"
   CA_OPENCLAW_VLLM_BUILD_VARIANTS="${CA_OPENCLAW_VLLM_BUILD_VARIANTS:-${OPENCLAW_VLLM_BUILD_VARIANTS:-release}}"
   CA_VLLM_INFERENCE_PORT="${CA_VLLM_INFERENCE_PORT:-${VLLM_INFERENCE_PORT:-8080}}"
   CA_VLLM_INFERENCE_VERSION="${CA_VLLM_INFERENCE_VERSION:-${VLLM_INFERENCE_VERSION:-0.28.0}}"
   CA_VLLM_INFERENCE_BUILD_VARIANTS="${CA_VLLM_INFERENCE_BUILD_VARIANTS:-${VLLM_INFERENCE_BUILD_VARIANTS:-release}}"
-  CA_VLLM_INFERENCE_SERVED_MODEL_NAME="${CA_VLLM_INFERENCE_SERVED_MODEL_NAME:-${VLLM_INFERENCE_SERVED_MODEL_NAME:-Qwen3-32B}}"
+  CA_VLLM_INFERENCE_SERVED_MODEL_NAME="${CA_VLLM_INFERENCE_SERVED_MODEL_NAME:-${VLLM_INFERENCE_SERVED_MODEL_NAME:-Qwen3.8-27B}}"
   CA_OSS_BUCKET="${CA_OSS_BUCKET:-${OSS_BUCKET:-}}"
   CA_OSS_ENDPOINT="${CA_OSS_ENDPOINT:-${OSS_ENDPOINT:-https://oss-cn-beijing-internal.aliyuncs.com}}"
   CA_MODEL_KEY_FILE="${CA_MODEL_KEY_FILE:-${MODEL_KEY_FILE:-}}"
-  CA_BUILD_BACKEND="${CA_BUILD_BACKEND:-mkosi}"
-  CA_BASE_IMAGE="${CA_BASE_IMAGE:-}"
   CA_TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
   CA_STATE_DIR="${CA_STATE_DIR:-${HOME:-/root}/.confidential-agent}"
   CA_WORK_DIR="${CA_WORK_DIR:-$CA_STATE_DIR/one-click}"
@@ -332,8 +326,6 @@ parse_args() {
       --reference-values) CA_REFERENCE_VALUES="${2:?missing value for --reference-values}"; shift 2 ;;
       --cosign-key) CA_COSIGN_KEY="${2:?missing value for --cosign-key}"; shift 2 ;;
       --slsa-generator) CA_SLSA_GENERATOR="${2:?missing value for --slsa-generator}"; shift 2 ;;
-      --build-backend) CA_BUILD_BACKEND="${2:?missing value for --build-backend}"; shift 2 ;;
-      --base-image) CA_BASE_IMAGE="${2:?missing value for --base-image}"; shift 2 ;;
       --skip-build) CA_SKIP_BUILD=1; shift ;;
       --skip-deploy) CA_SKIP_DEPLOY=1; shift ;;
       --no-start-connect) CA_START_CONNECT=0; shift ;;
@@ -423,13 +415,6 @@ validate_options() {
   case "$CA_REFERENCE_VALUES" in
     sample|rekor) ;;
     *) die "--reference-values must be sample or rekor" ;;
-  esac
-  case "$CA_BUILD_BACKEND" in
-    mkosi) ;;
-    base-image)
-      [[ -n "$CA_BASE_IMAGE" ]] || die "--base-image is required with --build-backend base-image"
-      ;;
-    *) die "--build-backend must be mkosi or base-image" ;;
   esac
   [[ "$CA_DISK_GB" =~ ^[0-9]+$ ]] || die "--disk-gb must be an integer"
   [[ -n "$CA_BAILIAN_MODEL" ]] || die "--bailian-model cannot be empty"

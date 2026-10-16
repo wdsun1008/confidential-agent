@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 
 ensure_shelter() {
+  local shelter_rpm=""
   if [[ -n "${CA_SHELTER_BIN:-}" ]]; then
     [[ -x "$CA_SHELTER_BIN" ]] || die "CA_SHELTER_BIN is not executable: $CA_SHELTER_BIN"
     export CA_SHELTER_BIN
-  elif command -v shelter >/dev/null 2>&1; then
-    CA_SHELTER_BIN="$(command -v shelter)"
-    export CA_SHELTER_BIN
   else
-    local shelter_rpm
     shelter_rpm="$(resolve_shelter_rpm)"
-    install_shelter_rpm "$shelter_rpm"
     CA_SHELTER_BIN="$(command -v shelter || true)"
-    [[ -n "$CA_SHELTER_BIN" ]] || die "Shelter RPM installed but shelter is not on PATH"
+    if [[ -z "$CA_SHELTER_BIN" ]] ||
+       ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1 ||
+       ! "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$shelter_rpm" >/dev/null 2>&1; then
+      install_shelter_rpm "$shelter_rpm"
+      CA_SHELTER_BIN=/usr/bin/shelter
+    fi
     export CA_SHELTER_BIN
   fi
 
+  if [[ -n "$shelter_rpm" ]]; then
+    "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$shelter_rpm" || die "Shelter RPM does not satisfy the bundled package version"
+  fi
+  "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" || die "Shelter is incompatible; install the bundled RPM or set CA_SHELTER_BIN to a compatible binary"
   "$CA_SHELTER_BIN" --version >/dev/null
   log "using Shelter: $CA_SHELTER_BIN"
   if [[ "${CA_MODE:-}" != "cleanup" && "${CA_MODE:-}" != "cleanup-openclaw-vllm" && "${CA_MODE:-}" != "cleanup-vllm-inference" && "$CA_REFERENCE_VALUES" == "rekor" && ! -x "$CA_SLSA_GENERATOR" ]]; then
@@ -39,13 +44,28 @@ resolve_shelter_rpm() {
   die "Shelter is required and no bundled Shelter RPM was found under $ROOT_DIR/hack. Set CA_SHELTER_BIN or CA_SHELTER_RPM."
 }
 
+assert_shelter_upgrade_idle() {
+  local executable process pid
+  for executable in "$@"; do
+    [[ -f "$executable" ]] || continue
+    for process in /proc/[0-9]*/exe; do
+      if [[ "$process" -ef "$executable" ]]; then
+        pid="${process#/proc/}"
+        die "Shelter upgrade blocked by running process ${pid%/exe} using $executable; finish or stop the active Shelter operation before installing the RPM"
+        return 1
+      fi
+    done
+  done
+}
+
 install_shelter_rpm() {
   local rpm="$1"
   local pm
   is_root || die "Shelter is missing and installing the Shelter RPM requires root. Re-run as root, install Shelter first, or set CA_SHELTER_BIN."
   pm="$(package_manager)" || die "yum or dnf is required to install the Shelter RPM"
+  assert_shelter_upgrade_idle /usr/bin/shelter /usr/bin/shelter-slim
   log "installing Shelter RPM: $rpm"
-  "$pm" install -y "$rpm"
+  "$pm" install -y "$rpm" libguestfs-tools-c
 }
 
 build_confidential_agent() {
@@ -85,6 +105,8 @@ install_confidential_agent_cli() {
   local cli_dest="/usr/local/bin/confidential-agent"
   local agentd_dest="/usr/local/bin/confidential-agentd"
   local gateway_dest="/usr/local/bin/cai-gateway"
+  # Inspect using the candidate CLI before replacing the working host binaries.
+  "$CA_BIN" --state-dir "$CA_STATE_DIR" upgrade check || die "host upgrade blocked by legacy deployment inputs; retain the installed CLI and migrate the affected state first"
   install -D -m 0755 "$CA_BIN" "$cli_dest"
   install -D -m 0755 "$CA_AGENTD_BIN" "$agentd_dest"
   install -D -m 0755 "$CA_GATEWAY_BIN" "$gateway_dest"

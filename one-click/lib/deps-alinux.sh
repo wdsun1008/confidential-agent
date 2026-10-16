@@ -75,6 +75,7 @@ install_os_dependencies() {
     git
     glibc-devel
     jq
+    libguestfs-tools-c
     make
     openssh-clients
     openssl
@@ -117,7 +118,7 @@ install_os_dependencies() {
 
 host_node22_usable() {
   command -v node >/dev/null 2>&1 || return 1
-  node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' >/dev/null 2>&1
+  [[ "$(node --version)" == "v${CA_NODE_VERSION:-$(ca_software_version node)}" ]] >/dev/null 2>&1
 }
 
 resolve_n_bin() {
@@ -180,8 +181,8 @@ ensure_host_node22() {
   if host_node22_usable; then
     return
   fi
-  is_root || die "installing Node.js ${CA_NODE_VERSION:-22.19.0} requires root"
-  command -v npm >/dev/null 2>&1 || die "npm is required to install Node.js ${CA_NODE_VERSION:-22.19.0}; rerun without --skip-deps or install npm manually"
+  is_root || die "installing Node.js ${CA_NODE_VERSION:-24.21.0} requires root"
+  command -v npm >/dev/null 2>&1 || die "npm is required to install Node.js ${CA_NODE_VERSION:-24.21.0}; rerun without --skip-deps or install npm manually"
   npm config set registry "${CA_NPM_REGISTRY:-https://registry.npmmirror.com/}"
   require_cmd tar
   require_cmd xz
@@ -197,10 +198,10 @@ ensure_host_node22() {
     ln -sf "$n_bin" /usr/local/bin/n
     hash -r
   fi
-  install_node_with_retry "${CA_NODE_VERSION:-22.19.0}" "$n_bin"
+  install_node_with_retry "${CA_NODE_VERSION:-24.21.0}" "$n_bin"
   export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
   hash -r
-  host_node22_usable || die "Node.js ${CA_NODE_VERSION:-22.19.0} is not usable after installation"
+  host_node22_usable || die "Node.js ${CA_NODE_VERSION:-24.21.0} is not usable after installation"
 }
 
 openclaw_global_package_version() {
