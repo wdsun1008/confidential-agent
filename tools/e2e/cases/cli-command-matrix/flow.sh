@@ -167,7 +167,9 @@ def service_state(root: Path, service_id: str, phase: str, public_ip="", image_p
         "shelter_config": str(service_dir / "shelter.yaml"),
         "agentd_bin": "/tmp/confidential-agentd",
         "agentd_service": str(service_dir / "guest" / "confidential-agentd.service"),
-        "initrd_secret_fetch_module": str(service_dir / "guest" / "secret-fetch"),
+        "gateway_bin": "/tmp/cai-gateway",
+        "gateway_service": str(service_dir / "guest" / "cai-gateway.service"),
+        "tng_service": str(service_dir / "guest" / "trusted-network-gateway.service"),
         "fde_config_file": str(service_dir / "guest" / "cryptpilot.toml"),
         "policy_default": str(service_dir / "guest" / "default.rego"),
         "policy_local_dev": str(service_dir / "guest" / "local-dev.rego"),
@@ -437,6 +439,7 @@ matrix_wait_cloud_image_available() {
     status="$(
       matrix_aliyun_json "$region" \
         ecs DescribeImages \
+        --Status ALL \
         --RegionId "$region" \
         --ImageId "$image_id" \
         --ImageOwnerAlias self |
@@ -461,7 +464,7 @@ matrix_verify_cloud_image_deleted() {
   local image_id="$1"
   local region="$2"
   local out="$WORK_DIR/deleted-image-check.json"
-  matrix_aliyun_json "$region" ecs DescribeImages --RegionId "$region" --ImageId "$image_id" --ImageOwnerAlias self >"$out"
+  matrix_aliyun_json "$region" ecs DescribeImages --Status ALL --RegionId "$region" --ImageId "$image_id" --ImageOwnerAlias self >"$out"
   record_file_as_block "Deleted image verification:" "$out" json
   python3.11 - "$out" <<'PY'
 import json
@@ -491,16 +494,12 @@ matrix_generate_real_cloud_fixture() {
   record_cmd "python3.11 tools/e2e/render_case.py --case cli-command-matrix --work-dir $(printf '%q' "$MATRIX_REAL_WORK_DIR")"
   REFERENCE_VALUES="$MATRIX_REAL_REFERENCE_VALUES" \
     COSIGN_KEY="$cosign_key" \
-    BUILD_BACKEND="$MATRIX_REAL_BUILD_BACKEND" \
-    BASE_IMAGE="$BASE_IMAGE" \
     REGION="$MATRIX_REAL_REGION" \
     ZONE_ID="$MATRIX_REAL_ZONE_ID" \
     INSTANCE_TYPE="$MATRIX_REAL_INSTANCE_TYPE" \
     DISK_GB="${E2E_MATRIX_DISK_GB:-80}" \
     SLSA_GENERATOR="$SLSA_GENERATOR" \
     MATRIX_REAL_SERVICE_ID="$MATRIX_REAL_SERVICE_ID" \
-    MATRIX_REAL_BUILD_BACKEND="$MATRIX_REAL_BUILD_BACKEND" \
-    MATRIX_REAL_BASE_IMAGE="$BASE_IMAGE" \
     MATRIX_REAL_REFERENCE_VALUES="$MATRIX_REAL_REFERENCE_VALUES" \
     MATRIX_REAL_COSIGN_KEY="$cosign_key" \
     MATRIX_REAL_SLSA_GENERATOR="$SLSA_GENERATOR" \
@@ -524,7 +523,6 @@ matrix_run_real_cloud_publish_flow() {
   MATRIX_REAL_CASE_DIR="$MATRIX_REAL_WORK_DIR/rendered"
   MATRIX_REAL_SERVICE_ID="${E2E_MATRIX_SERVICE_ID:-matrix-${E2E_RUN_ID//[^a-zA-Z0-9-]/-}}"
   MATRIX_REAL_REFERENCE_VALUES="${E2E_MATRIX_REFERENCE_VALUES:-sample}"
-  MATRIX_REAL_BUILD_BACKEND="${E2E_BUILD_BACKEND:-mkosi}"
   mkdir -p "$MATRIX_REAL_WORK_DIR" "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_CASE_DIR"
 
   require_cmd aliyun
@@ -538,6 +536,8 @@ matrix_run_real_cloud_publish_flow() {
   matrix_generate_real_cloud_fixture
 
   validate_specs "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SPEC"
+  register_destroy_target "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID"
+
   ca_run "$MATRIX_REAL_STATE_DIR" build --spec "$MATRIX_REAL_SPEC"
   record_manifest_variants "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID"
 
@@ -568,7 +568,6 @@ matrix_run_real_cloud_publish_flow() {
   matrix_assert_not_contains "$rendered_config" "nvme_support:"
 
   E2E_DEPLOY_ATTEMPTED=1
-  register_destroy_target "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID"
   ca_run "$MATRIX_REAL_STATE_DIR" deploy --spec "$MATRIX_REAL_SPEC"
 
   local public_ip
@@ -624,7 +623,7 @@ case_cleanup() {
     image_id="$(matrix_first_published_image_id "$MATRIX_REAL_STATE_DIR" "$MATRIX_REAL_SERVICE_ID" 2>/dev/null || true)"
     if [[ "$E2E_DEPLOY_ATTEMPTED" == "1" ]]; then
       log "destroying $MATRIX_REAL_SERVICE_ID before failed real-cloud lane image cleanup"
-      ca_run "$MATRIX_REAL_STATE_DIR" destroy "$MATRIX_REAL_SERVICE_ID" || true
+      ca_run "$MATRIX_REAL_STATE_DIR" destroy "$MATRIX_REAL_SERVICE_ID" || return
       E2E_DEPLOY_ATTEMPTED=0
     fi
     if [[ -n "$image_id" && -n "${MATRIX_REAL_SPEC:-}" && -f "$MATRIX_REAL_SPEC" ]]; then
@@ -632,8 +631,39 @@ case_cleanup() {
       ca_run "$MATRIX_REAL_STATE_DIR" image publish "$MATRIX_REAL_SERVICE_ID" --spec "$MATRIX_REAL_SPEC" --region "$MATRIX_REAL_REGION" || true
     fi
     log "unpublishing $MATRIX_REAL_SERVICE_ID after failed real-cloud lane"
-    ca_run "$MATRIX_REAL_STATE_DIR" image unpublish "$MATRIX_REAL_SERVICE_ID" --force || true
+    ca_run "$MATRIX_REAL_STATE_DIR" image unpublish "$MATRIX_REAL_SERVICE_ID" --force
   fi
+}
+
+case_post_destroy_cleanup() {
+  local status="$1"
+  [[ "${E2E_MATRIX_REAL_CLOUD:-0}" == "1" ]] || return 0
+  if [[ "$status" == "0" && "$DESTROY_ON_SUCCESS" != "1" ]] ||
+     [[ "$status" != "0" && "$DESTROY_ON_FAILURE" != "1" ]]; then
+    return 0
+  fi
+  local buckets=() bucket cleanup_status=0
+  mapfile -t buckets < <(python3.11 - "$WORK_DIR" <<'PYBUCKET'
+import re
+import sys
+from pathlib import Path
+buckets = set()
+for path in Path(sys.argv[1]).glob("published-after-*.txt"):
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and re.fullmatch(r"ca-images-[a-z0-9-]+", fields[3]):
+            buckets.add(fields[3])
+print("\n".join(sorted(buckets)))
+PYBUCKET
+  )
+  for bucket in "${buckets[@]}"; do
+    [[ -n "$bucket" ]] || continue
+    # CA retains publish buckets for reuse; this test owns a fresh state and
+    # removes only its empty bucket. Never recursively delete bucket contents.
+    ALIBABA_CLOUD_REGION_ID="$MATRIX_REAL_REGION" aliyun oss rm "oss://$bucket" -b -f \
+      -e "oss-$MATRIX_REAL_REGION.aliyuncs.com" || cleanup_status=1
+  done
+  return "$cleanup_status"
 }
 
 run_case() {

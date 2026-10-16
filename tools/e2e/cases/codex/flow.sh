@@ -14,7 +14,7 @@ run_case() {
   INIT_OUTPUT_DIR="$(absolute_dir "$INIT_OUTPUT_DIR")"
   CODEX_DIR="$INIT_OUTPUT_DIR/codex"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-  DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
+  DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.8-max}"
   CODEX_REMOTE_PORT="${E2E_CODEX_REMOTE_PORT:-4500}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-Reply with CA_E2E_OK and no other text.}"
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-CA_E2E_OK}"
@@ -57,9 +57,9 @@ run_case() {
     --dashscope-base-url "$DASHSCOPE_BASE_URL"
     --model "$DASHSCOPE_MODEL"
     --codex-app-server-token "$remote_token"
-    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-22.19.0}"
+    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-24.21.0}"
     --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
-    --codex-version "${E2E_CODEX_VERSION:-latest}"
+    --codex-version "${E2E_CODEX_VERSION:-$(ca_software_version codex)}"
   )
   export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
   if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" codex "${init_args[@]}"; then
@@ -71,11 +71,13 @@ run_case() {
   record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
   assert_codex_secret_rendering "$dashscope_key" "$remote_token"
   record "- allowed_cidr: \`$allowed_cidr\`"
-  record "- Codex npm version: \`${E2E_CODEX_VERSION:-latest}\`."
+  record "- Codex npm version: \`${E2E_CODEX_VERSION:-$(ca_software_version codex)}\`."
   record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}\`."
   record "- Codex app-server token generated but not printed."
 
   validate_specs "$STATE_DIR" "$CODEX_DIR/codex.yaml"
+
+  register_destroy_target "$STATE_DIR" codex
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$CODEX_DIR/codex.yaml"
@@ -85,7 +87,6 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$STATE_DIR" codex
     ca_run "$STATE_DIR" deploy --spec "$CODEX_DIR/codex.yaml"
   fi
 

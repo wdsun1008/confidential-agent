@@ -330,6 +330,7 @@ assert_snapshot_lacks_marker() {
 case_cleanup() {
   local status="$1"
   local should_destroy=0
+  local cleanup_status=0
   if [[ "$status" == "0" && "$DESTROY_ON_SUCCESS" == "1" ]]; then
     should_destroy=1
   elif [[ "$status" != "0" && "$DESTROY_ON_FAILURE" == "1" ]]; then
@@ -337,22 +338,23 @@ case_cleanup() {
   fi
   [[ "$should_destroy" == "1" ]] || return 0
   if [[ "$SNAPSHOT_DISK_ATTACHED" == "1" && -n "$SNAPSHOT_DISK_ID" && -n "$BASELINE_ID" ]]; then
-    aliyun_cli ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
-    wait_disk_status "$SNAPSHOT_DISK_ID" Available 300 || true
+    aliyun_cli ecs DetachDisk --RegionId "$REGION" --InstanceId "$BASELINE_ID" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || cleanup_status=1
+    wait_disk_status "$SNAPSHOT_DISK_ID" Available 300 || cleanup_status=1
     SNAPSHOT_DISK_ATTACHED=0
   fi
   if [[ -n "$SNAPSHOT_DISK_ID" ]]; then
-    aliyun_cli ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteDisk --RegionId "$REGION" --DiskId "$SNAPSHOT_DISK_ID" >/dev/null 2>&1 || cleanup_status=1
   fi
   if [[ -n "$SNAPSHOT_ID" ]]; then
-    aliyun_cli ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteSnapshot --RegionId "$REGION" --SnapshotId "$SNAPSHOT_ID" --Force true >/dev/null 2>&1 || cleanup_status=1
   fi
   if [[ -n "$BASELINE_ID" ]]; then
-    aliyun_cli ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteInstance --RegionId "$REGION" --InstanceId "$BASELINE_ID" --Force true >/dev/null 2>&1 || cleanup_status=1
   fi
   if [[ -n "$BASELINE_KEY_NAME" ]]; then
-    aliyun_cli ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || true
+    aliyun_cli ecs DeleteKeyPairs --RegionId "$REGION" --KeyPairNames "[\"$BASELINE_KEY_NAME\"]" >/dev/null 2>&1 || cleanup_status=1
   fi
+  return "$cleanup_status"
 }
 
 run_case() {
@@ -399,6 +401,9 @@ run_case() {
 
   validate_specs "$STATE_DIR" "$CMAAS_DIR/cmaas.yaml" "$AGENT_DIR/agent.yaml"
 
+  register_destroy_target "$STATE_DIR" cmaas-agent
+  register_destroy_target "$STATE_DIR" cmaas
+
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$CMAAS_DIR/cmaas.yaml"
     record_manifest_variants "$STATE_DIR" cmaas
@@ -410,8 +415,6 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$STATE_DIR" cmaas-agent
-    register_destroy_target "$STATE_DIR" cmaas
     ca_run "$STATE_DIR" deploy --spec "$CMAAS_DIR/cmaas.yaml"
     ca_run "$STATE_DIR" deploy --spec "$AGENT_DIR/agent.yaml"
   fi
@@ -437,15 +440,15 @@ run_case() {
   wait_for_ssh "$agent_ip" "$agent_key" 300
   local tng_runtime_check
   # libtdx-verify remains intentional for attestation-challenge-client; TNG itself comes from the 2.8 RPM.
-  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; rpm_nevra=\$(rpm -q trusted-network-gateway); echo tng_rpm=\$rpm_nevra; test \"\$rpm_nevra\" = trusted-network-gateway-2.8.0-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); echo tng_version=\$tng_version; test \"\$tng_version\" = 'tng 2.8.0'; echo tng_hash=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; echo tng_config_schema=2.8; curl -fsS http://127.0.0.1:50000/status/ >/tmp/confidential-agent-tng-status.json; echo tng_status=ok; enabled=\$(systemctl is-enabled trusted-network-gateway.service || true); echo tng_enabled=\$enabled; test \"\$enabled\" = disabled; systemctl is-active trusted-network-gateway.service"
+  tng_runtime_check="set -euo pipefail; test -e /usr/lib64/libsgx_dcap_quoteverify.so.1; echo dcap_quoteverify=present; rpm_nevra=\$(rpm -q trusted-network-gateway); echo tng_rpm=\$rpm_nevra; test \"\$rpm_nevra\" = trusted-network-gateway-2.9.2-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); echo tng_version=\$tng_version; test \"\$tng_version\" = 'tng 2.9.2'; echo tng_hash=\$(sha256sum /usr/bin/tng | cut -d' ' -f1); jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; echo tng_config_schema=2.9.2; curl -fsS http://127.0.0.1:50000/status/ >/tmp/confidential-agent-tng-status.json; echo tng_status=ok; enabled=\$(systemctl is-enabled trusted-network-gateway.service || true); echo tng_enabled=\$enabled; test \"\$enabled\" = disabled; systemctl is-active trusted-network-gateway.service"
   record_cmd "ssh cmaas '<tng runtime check>'"
   ssh_guest "$cmaas_key" "$cmaas_ip" "$tng_runtime_check" >"$WORK_DIR/cmaas-tng-runtime.txt"
   record_file_as_block "CMaaS TNG runtime state:" "$WORK_DIR/cmaas-tng-runtime.txt" text
   grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
-  grep -Fx 'tng_rpm=trusted-network-gateway-2.8.0-1.al8.x86_64' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
-  grep -Fx 'tng_version=tng 2.8.0' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_rpm=trusted-network-gateway-2.9.2-1.al8.x86_64' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_version=tng 2.9.2' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -E '^tng_hash=' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
-  grep -Fx 'tng_config_schema=2.8' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_config_schema=2.9.2' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -Fx 'tng_status=ok' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -Fx 'tng_enabled=disabled' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
   grep -Fx 'active' "$WORK_DIR/cmaas-tng-runtime.txt" >/dev/null
@@ -453,10 +456,10 @@ run_case() {
   ssh_guest "$agent_key" "$agent_ip" "$tng_runtime_check" >"$WORK_DIR/agent-tng-runtime.txt"
   record_file_as_block "Agent TNG runtime state:" "$WORK_DIR/agent-tng-runtime.txt" text
   grep -Fx 'dcap_quoteverify=present' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
-  grep -Fx 'tng_rpm=trusted-network-gateway-2.8.0-1.al8.x86_64' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
-  grep -Fx 'tng_version=tng 2.8.0' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_rpm=trusted-network-gateway-2.9.2-1.al8.x86_64' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_version=tng 2.9.2' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -E '^tng_hash=' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
-  grep -Fx 'tng_config_schema=2.8' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
+  grep -Fx 'tng_config_schema=2.9.2' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -Fx 'tng_status=ok' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -Fx 'tng_enabled=disabled' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null
   grep -Fx 'active' "$WORK_DIR/agent-tng-runtime.txt" >/dev/null

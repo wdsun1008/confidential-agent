@@ -12,12 +12,16 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
 items = data if isinstance(data, list) else [data]
+if not items:
+    raise SystemExit(1)
 required_debug = sys.argv[2] == "1"
 for item in items:
     daemon = item.get("daemon") or {}
-    if daemon.get("app_ready") is not True or daemon.get("mesh_ready") is not True:
+    if daemon.get("mesh_ready") is not True:
         raise SystemExit(1)
     if required_debug and daemon.get("debug_ssh_ready") is not True:
+        raise SystemExit(1)
+    if not required_debug and daemon.get("app_ready") is not True:
         raise SystemExit(1)
 raise SystemExit(0)
 PY
@@ -29,6 +33,24 @@ PY
   done
   record_file_as_block "Live status wait stderr:" "$WORK_DIR/status-live.err" text
   return 1
+}
+
+verify_release_readiness() {
+  wait_status_json_ready 0 7200 || return
+  [[ "$(state_value "$STATE_DIR" openclaw-vllm build.variant)" == release ]] || {
+    echo "expected a deployed release variant" >&2
+    return 1
+  }
+  python3.11 - "$WORK_DIR/status-live.json" <<'PY' || return
+import json, sys
+data = json.load(open(sys.argv[1]))
+items = data if isinstance(data, list) else [data]
+assert len(items) == 1, "expected one live release service"
+daemon = items[0].get("daemon") or {}
+assert daemon.get("mesh_ready") is True and daemon.get("app_ready") is True
+assert not daemon.get("debug_ssh_ready"), "release unexpectedly enabled debug SSH"
+PY
+  record "- Release readiness verified through attested status without debug SSH."
 }
 
 ssh_info() {
@@ -54,7 +76,14 @@ assert_openclaw_vllm_init_output() {
 
   grep -Fq "image_name: openclaw-vllm-agent" "$spec"
   grep -Fq "kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0" "$spec"
-  grep -Fq "packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]" "$spec"
+  local example_packages
+  example_packages="$(awk '
+    /^  packages:/ { reading = 1; next }
+    reading && /^  [^ ]/ { exit }
+    reading && /^    - / { sub(/^    - /, ""); printf "%s%s", separator, $0; separator = ", " }
+  ' "$ROOT_DIR/examples/openclaw-vllm/openclaw-vllm.yaml")"
+  [[ -n "$example_packages" ]]
+  grep -Fq "packages: [$example_packages]" "$spec"
   grep -Fq "source: ./nvidia-persistenced.service" "$spec"
   grep -Fq "source: ./cai-nvidia-cc-stack-install.sh" "$spec"
   grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
@@ -91,8 +120,17 @@ assert_openclaw_vllm_init_output() {
   record "- OpenClaw vLLM init output mirrors the example files and local-vLLM config."
 }
 
+configure_openclaw_vllm_target() {
+  INSTANCE_TYPE="${E2E_GPU_INSTANCE_TYPE:-${E2E_INSTANCE_TYPE:-ecs.gn8v-tee.4xlarge}}"
+  ZONE_ID="${E2E_GPU_ZONE_ID:-$ZONE_ID}"
+  if [[ "$INSTANCE_TYPE" != ecs.gn* ]]; then
+    echo "OpenClaw vLLM requires a GPU instance; set E2E_GPU_INSTANCE_TYPE and E2E_GPU_ZONE_ID" >&2
+    return 1
+  fi
+}
+
 run_case() {
-  INSTANCE_TYPE="${E2E_INSTANCE_TYPE:-ecs.gn8v-tee.4xlarge}"
+  configure_openclaw_vllm_target
   DISK_GB="${E2E_DISK_GB:-512}"
   WORK_DIR="${E2E_WORK_DIR:-$ROOT_DIR/.tmp/e2e/openclaw-vllm-$E2E_RUN_ID}"
   WORK_DIR="$(absolute_dir "$WORK_DIR")"
@@ -121,7 +159,9 @@ run_case() {
   require_cmd node
   require_cmd openssl
   require_cmd python3.11
-  require_cmd ssh
+  if [[ "$VLLM_BUILD_VARIANTS" == *debug* ]]; then
+    require_cmd ssh
+  fi
   require_cmd timeout
   require_cmd aliyun
   require_aliyun_credentials
@@ -145,8 +185,8 @@ run_case() {
   mapfile -d '' init_args < <(init_common_args "$INIT_OUTPUT_DIR" "$DISK_GB")
   init_args+=(
     --gateway-token "$token"
-    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.5.7}"
-    --node-version "${E2E_OPENCLAW_NODE_VERSION:-22.19.0}"
+    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.10.3}"
+    --node-version "${E2E_OPENCLAW_NODE_VERSION:-24.21.0}"
     --npm-registry "${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}"
     --vllm-build-variants "$VLLM_BUILD_VARIANTS"
   )
@@ -164,9 +204,11 @@ run_case() {
   validate_specs "$STATE_DIR" "$VLLM_SPEC"
 
   if [[ "${E2E_OPENCLAW_VLLM_RUN_CLOUD:-0}" != "1" ]]; then
-    record "- OpenClaw vLLM cloud build/deploy skipped: current GPU TEE instance inventory is unavailable. Set E2E_OPENCLAW_VLLM_RUN_CLOUD=1 when inventory is available."
+    record "- OpenClaw vLLM cloud build/deploy NOT VERIFIED: E2E_OPENCLAW_VLLM_RUN_CLOUD is not enabled. Check GPU TEE inventory and set it to 1 for cloud validation."
     return 0
   fi
+
+  register_destroy_target "$STATE_DIR" openclaw-vllm
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$VLLM_SPEC"
@@ -176,22 +218,31 @@ run_case() {
   ensure_operator_peering "$STATE_DIR" ops "$allowed_cidr"
 
   E2E_DEPLOY_ATTEMPTED=1
-  register_destroy_target "$STATE_DIR" openclaw-vllm
   ca_run "$STATE_DIR" deploy --spec "$VLLM_SPEC"
 
-  wait_status_json_ready 1 1800
-  record_file_as_block "Live status after debug SSH readiness:" "$WORK_DIR/status-live.json" json
-  mapfile -t ssh_lines < <(ssh_info)
-  local host="${ssh_lines[0]}"
-  local key="${ssh_lines[1]}"
-  wait_for_ssh "$host" "$key"
-  guest_wait "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi" 1800
-  guest_wait "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service" 1800
-  guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 7200
-  guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:$VLLM_PORT/v1/models" 7200
-  guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 7200
+  if [[ "$VLLM_BUILD_VARIANTS" == *debug* ]]; then
+    wait_status_json_ready 1 1800
+    record_file_as_block "Live status after debug SSH readiness:" "$WORK_DIR/status-live.json" json
+    mapfile -t ssh_lines < <(ssh_info)
+    local host="${ssh_lines[0]}"
+    local key="${ssh_lines[1]}"
+    wait_for_ssh "$host" "$key"
+    local expected_guest_digest actual_guest_digest
+    expected_guest_digest="$(sha256sum /usr/libexec/shelter/cryptpilot-fde-guest | awk '{print $1}')"
+    actual_guest_digest="$(ssh_guest "$key" "$host" 'sha256sum /usr/bin/cryptpilot-fde' | awk '{print $1}')"
+    [[ "$actual_guest_digest" == "$expected_guest_digest" ]] || { echo "GPU guest Cryptpilot differs from fde-guest" >&2; return 1; }
+    record "- GPU guest Cryptpilot matches fde-guest ($actual_guest_digest)."
+    guest_wait "$host" "$key" gpu "test -e /dev/nvidia0 && nvidia-smi" 1800
+    guest_wait "$host" "$key" nvidia-service "systemctl is-active cai-nvidia-cc-bootstrap.service nvidia-persistenced.service" 1800
+    guest_wait "$host" "$key" vllm-service "systemctl is-active cai-modelscope-fetch.service cai-vllm.service" 7200
+    guest_wait "$host" "$key" vllm-models "curl -fsS http://127.0.0.1:$VLLM_PORT/v1/models" 7200
+    guest_wait "$host" "$key" openclaw-http "curl -fsS http://127.0.0.1:18789/openclaw/ >/tmp/openclaw-vllm.html && wc -c /tmp/openclaw-vllm.html" 7200
+  else
+    verify_release_readiness
+  fi
   wait_status_json_ready 0 900
   record_file_as_block "Live status:" "$WORK_DIR/status-live.json" json
+  run_report_probe "$STATE_DIR" "$WORK_DIR/attestation-report.json" openclaw-vllm
 
   local connect_port
   connect_port="$(start_connect_until_http_ready "$STATE_DIR" openclaw-vllm /openclaw/ 4 180 --service openclaw-vllm)"

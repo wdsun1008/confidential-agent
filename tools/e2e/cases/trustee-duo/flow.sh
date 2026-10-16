@@ -37,7 +37,38 @@ case_post_destroy_cleanup() {
     should_destroy=1
   fi
   [[ "$should_destroy" == "1" ]] || return 0
-  destroy_trustee_infra || true
+  # Failed application deletion still needs Trustee to authorize a retry.
+  local service terraform_dir phase
+  for service in openclaw codex; do
+    [[ -f "$STATE_DIR/services/$service/state.json" ]] || continue
+    terraform_dir="$(state_value "$STATE_DIR" "$service" deploy.terraform_dir)" || return 1
+    phase="$(state_value "$STATE_DIR" "$service" phase)" || return 1
+    if [[ "$phase" != deleted ]] && ! python3.11 - "$STATE_DIR/services/$service/state.json" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1]))
+observed = ('terraform_dir', 'image_source', 'bucket', 'instance_id', 'security_group_id',
+            'private_ip', 'public_ip', 'published_image_id', 'instance_ids',
+            'instance_private_ips', 'instance_public_ips', 'slb_vip')
+local_only = (state.get('phase') == 'built' and not (state.get('build') or {}).get('published')
+              and not any((state.get('deploy') or {}).get(name) for name in observed))
+raise SystemExit(0 if local_only else 1)
+PY
+    then
+      log "keeping Trustee available while $service cleanup is incomplete"
+      return 1
+    fi
+  done
+  destroy_trustee_infra || return
+  assert_trustee_cloud_zero || return
+  # The disposable Trustee is now proven absent, including resources uploaded
+  # by a failed first sync. Only then release builds that never launched a VM.
+  for service in openclaw codex; do
+    [[ -f "$STATE_DIR/services/$service/state.json" ]] || continue
+    phase="$(state_value "$STATE_DIR" "$service" phase)" || return 1
+    if [[ "$phase" == built ]]; then
+      ca_run "$STATE_DIR" image rm "$service" --force || return
+    fi
+  done
 }
 
 assert_challenge_mode() {
@@ -83,8 +114,8 @@ prepare_openclaw_fixture() {
     --gateway-token "$OPENCLAW_TOKEN"
     --model "$DASHSCOPE_MODEL"
     --dashscope-base-url "$DASHSCOPE_BASE_URL"
-    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.5.7}"
-    --node-version "${E2E_OPENCLAW_NODE_VERSION:-22.19.0}"
+    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.10.3}"
+    --node-version "${E2E_OPENCLAW_NODE_VERSION:-24.21.0}"
     --npm-registry "${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}"
   )
   if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/openclaw-init.out" "$WORK_DIR/openclaw-init.err" openclaw "${init_args[@]}"; then
@@ -106,9 +137,9 @@ prepare_codex_fixture() {
     --dashscope-base-url "$DASHSCOPE_BASE_URL"
     --model "$DASHSCOPE_MODEL"
     --codex-app-server-token "$CODEX_REMOTE_TOKEN_VALUE"
-    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-22.19.0}"
+    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-24.21.0}"
     --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
-    --codex-version "${E2E_CODEX_VERSION:-latest}"
+    --codex-version "${E2E_CODEX_VERSION:-$(ca_software_version codex)}"
   )
   if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/codex-init.out" "$WORK_DIR/codex-init.err" codex "${init_args[@]}"; then
     record_file_as_block "Codex init stdout:" "$WORK_DIR/codex-init.out" text
@@ -166,6 +197,7 @@ PY
   SERVICE_SECURITY_GROUP_ID["$service"]="$(jq -er '.Instances.Instance[0].SecurityGroupIds.SecurityGroupId[0]' "$describe_out")"
   image_out="$WORK_DIR/$service-image.json"
   trustee_aliyun_cli ecs DescribeImages \
+    --Status ALL \
     --RegionId "$REGION" \
     --ImageOwnerAlias self \
     --ImageName "$image_name" >"$image_out"
@@ -186,7 +218,7 @@ assert_trustee_guest_tng_28() {
   }
   chmod 0600 "$key"
   wait_for_ssh "$host" "$key" 300
-  check="set -euo pipefail; rpm_nevra=\$(rpm -q trusted-network-gateway); test \"\$rpm_nevra\" = trusted-network-gateway-2.8.0-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); test \"\$tng_version\" = 'tng 2.8.0'; jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; curl -fsS http://127.0.0.1:50000/status/ >/dev/null; printf 'tng_rpm=%s\\ntng_version=%s\\ntng_config_schema=2.8\\n' \"\$rpm_nevra\" \"\$tng_version\""
+  check="set -euo pipefail; rpm_nevra=\$(rpm -q trusted-network-gateway); test \"\$rpm_nevra\" = trusted-network-gateway-2.9.2-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); test \"\$tng_version\" = 'tng 2.9.2'; jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; curl -fsS http://127.0.0.1:50000/status/ >/dev/null; printf 'tng_rpm=%s\\ntng_version=%s\\ntng_config_schema=2.9.2\\n' \"\$rpm_nevra\" \"\$tng_version\""
 
   record_cmd "ssh $service '<assert Trustee guest TNG 2.8 config>'"
   ssh_guest "$key" "$host" "$check" >"$output"
@@ -228,7 +260,7 @@ assert_service_cloud_gone() {
     groups="$(trustee_aliyun_cli ecs DescribeSecurityGroups --RegionId "$REGION" --SecurityGroupIds "[\"${SERVICE_SECURITY_GROUP_ID[$service]}\"]" | jq -r '.TotalCount')"
     vpcs="$(trustee_aliyun_cli vpc DescribeVpcs --RegionId "$REGION" --VpcId "${SERVICE_VPC_ID[$service]}" | jq -r '.TotalCount')"
     switches="$(trustee_aliyun_cli vpc DescribeVSwitches --RegionId "$REGION" --VSwitchId "${SERVICE_VSWITCH_ID[$service]}" | jq -r '.TotalCount')"
-    images="$(trustee_aliyun_cli ecs DescribeImages --RegionId "$REGION" --ImageId "${SERVICE_IMAGE_ID[$service]}" | jq -r '.TotalCount')"
+    images="$(trustee_aliyun_cli ecs DescribeImages --Status ALL --RegionId "$REGION" --ImageId "${SERVICE_IMAGE_ID[$service]}" | jq -r '.TotalCount')"
     state_count="$(terraform -chdir="${SERVICE_TERRAFORM_DIR[$service]}" state list | wc -l)"
     if assert_oss_bucket_absent "${SERVICE_BUCKET[$service]}"; then
       bucket_present=0
@@ -340,12 +372,29 @@ run_codex_conversation() {
 
 reboot_openclaw_without_cli_sync() {
   local instance_id="${SERVICE_INSTANCE_ID[openclaw]}"
+  local force_stop="${E2E_REBOOT_FORCE_STOP:-true}"
+  [[ "$force_stop" == true || "$force_stop" == false ]] || {
+    echo "E2E_REBOOT_FORCE_STOP must be true or false" >&2
+    return 1
+  }
   local public_ip
   public_ip="$(state_value "$STATE_DIR" openclaw deploy.public_ip)"
+  local key sentinel before_boot after_boot guest_digest expected_digest
+  key="$(state_value "$STATE_DIR" openclaw build.debug_ssh.private_key)"
+  sentinel="$(openssl rand -hex 24)"
+  wait_for_ssh "$public_ip" "$key" 300
+  before_boot="$(ssh_guest "$key" "$public_ip" 'cat /proc/sys/kernel/random/boot_id')"
+  expected_digest="$(sha256sum /usr/libexec/shelter/cryptpilot-fde-guest | awk '{print $1}')"
+  guest_digest="$(ssh_guest "$key" "$public_ip" "sha256sum /usr/bin/cryptpilot-fde" | awk '{print $1}')"
+  [[ "$guest_digest" == "$expected_digest" ]] || { echo "guest Cryptpilot differs from fde-guest" >&2; return 1; }
+  ssh_guest "$key" "$public_ip" "install -d -m 0700 /var/lib/ca-e2e; printf '%s' '$sentinel' > /var/lib/ca-e2e/reboot-sentinel; sync"
+  record "- OpenClaw reboot ForceStop=$force_stop."
+  # Alibaba Cloud TDX instances do not support in-guest reboot. Both modes
+  # must use the cloud API; boot ID and persistent data are checked below.
   trustee_aliyun_cli ecs RebootInstance \
     --RegionId "$REGION" \
     --InstanceId "$instance_id" \
-    --ForceStop true >"$WORK_DIR/openclaw-reboot.json"
+    --ForceStop "$force_stop" >"$WORK_DIR/openclaw-reboot.json"
   record_file_as_block "OpenClaw reboot request:" "$WORK_DIR/openclaw-reboot.json" json
   local deadline=$((SECONDS + 180)) saw_down=0
   while (( SECONDS < deadline )); do
@@ -366,6 +415,11 @@ reboot_openclaw_without_cli_sync() {
     echo "OpenClaw public IP changed across reboot: $public_ip -> $current_ip" >&2
     return 1
   }
+  wait_for_ssh "$public_ip" "$key" 300
+  after_boot="$(ssh_guest "$key" "$public_ip" 'cat /proc/sys/kernel/random/boot_id')"
+  [[ "$before_boot" != "$after_boot" ]] || { echo "boot ID did not change" >&2; return 1; }
+  [[ "$(ssh_guest "$key" "$public_ip" 'cat /var/lib/ca-e2e/reboot-sentinel')" == "$sentinel" ]] || { echo "encrypted persistent delta lost data across reboot" >&2; return 1; }
+  record "- Guest Cryptpilot matches fde-guest ($guest_digest); boot ID changed and encrypted delta sentinel survived reboot."
   record "- OpenClaw rebooted and recovered from Trustee without any CLI sync/inject."
 }
 
@@ -423,7 +477,7 @@ run_case() {
   CODEX_CHAT_MESSAGE="${E2E_CODEX_CHAT_MESSAGE:-Reply with CA_TRUSTEE_CODEX_OK and no other text.}"
   CODEX_CHAT_EXPECT="${E2E_CODEX_CHAT_EXPECT:-CA_TRUSTEE_CODEX_OK}"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-  DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
+  DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.8-max}"
   export CA_DAEMON_STATUS_WAIT_SEC="${CA_DAEMON_STATUS_WAIT_SEC:-1200}"
 
   validate_modes
@@ -437,9 +491,11 @@ run_case() {
   require_cmd docker
   require_cmd jq
   require_cmd node
+  require_cmd openclaw
   require_cmd openssl
   require_cmd python3.11
   require_cmd scp
+  require_cmd setsid
   require_cmd ssh
   require_cmd ssh-keygen
   require_cmd ssh-keyscan
@@ -475,6 +531,9 @@ run_case() {
   switch_generated_spec_to_trustee "$OPENCLAW_DIR/openclaw.yaml"
   switch_generated_spec_to_trustee "$CODEX_DIR/codex.yaml"
   validate_specs "$STATE_DIR" "$OPENCLAW_DIR/openclaw.yaml" "$CODEX_DIR/codex.yaml"
+
+  register_destroy_target "$STATE_DIR" openclaw
+  register_destroy_target "$STATE_DIR" codex
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$OPENCLAW_DIR/openclaw.yaml"
@@ -542,6 +601,7 @@ run_case() {
   trustee_remove_service_access codex
   assert_service_cloud_gone codex 600
   assert_trustee_status "$STATE_DIR" "openclaw" "after-codex-destroy"
+  wait_for_status_service_ready "$STATE_DIR" openclaw 600
   assert_local_lifecycle_status "openclaw" "codex" "codex-deleted"
   local policy_after_codex_destroy openclaw_generation_after_codex
   policy_after_codex_destroy="$(jq -er '.resource_policy_sha256' "$WORK_DIR/trustee-status-after-codex-destroy.json")"

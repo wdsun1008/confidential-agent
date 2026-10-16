@@ -695,6 +695,20 @@ REMOTE
   trustee_scp "root@$TRUSTEE_PUBLIC_IP:/var/tmp/cai-trustee-e2e-journal.txt" "$journal_out"
   trustee_scp "root@$TRUSTEE_PUBLIC_IP:/var/tmp/cai-trustee-e2e-packets.txt" "$packets_out"
   trustee_scp "root@$TRUSTEE_PUBLIC_IP:/var/tmp/cai-trustee-e2e.pcap" "$pcap_out" || true
+  # Gateway debug logs include administrative bearer tokens. Keep diagnostics
+  # private and remove those headers before embedding the journal in reports.
+  python3.11 - "$journal_out" "$packets_out" "$pcap_out" <<'PY'
+import re
+import sys
+from pathlib import Path
+for name in sys.argv[1:]:
+    path = Path(name)
+    if path.exists():
+        path.chmod(0o600)
+journal = Path(sys.argv[1])
+text = journal.read_text()
+journal.write_text(re.sub(r"(Authorization: Bearer )[A-Za-z0-9_.-]+", r"\1<redacted>", text))
+PY
   TRUSTEE_DIAGNOSTICS_STARTED=0
   record_file_as_block "Trustee component journal ($label):" "$journal_out" text
   record_file_as_block "Trustee port 8081 packet trace ($label):" "$packets_out" text
@@ -976,12 +990,14 @@ PY
 
 stop_background_deploy() {
   local pid="$1"
-  kill "$pid" >/dev/null 2>&1 || true
+  # deploy runs in its own session; Terraform descendants must release locks
+  # before cleanup starts, even when the CLI parent exits on the first signal.
+  kill -- "-$pid" >/dev/null 2>&1 || true
   local deadline=$((SECONDS + 5))
-  while kill -0 "$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
+  while kill -0 -- "-$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
     sleep 1
   done
-  kill -9 "$pid" >/dev/null 2>&1 || true
+  kill -9 -- "-$pid" >/dev/null 2>&1 || true
   wait "$pid" >/dev/null 2>&1 || true
 }
 
@@ -1002,6 +1018,18 @@ capture_service_console() {
   record_file_as_block "$service console ($label):" "$text_out" text
 }
 
+trustee_deploy_result_ip() {
+  local result="$1" expected_name="$2" deployment_id
+  deployment_id="$(jq -er '.deployment_id | strings | select(test("^[0-9a-f]{64}$"))' "$result")" || return 1
+  [[ "$(basename "$(dirname "$result")")" == "$deployment_id" ]] || return 1
+  jq -er --arg name "$expected_name" '
+    select(.deploy.name == $name)
+    | (.deploy.public_ip // .deploy.outputs.public_ip)
+    | if type == "object" then .value else . end
+    | select(type == "string" and length > 0)
+  ' "$result"
+}
+
 deploy_with_trustee_access() {
   local state_dir="$1"
   local service="$2"
@@ -1011,25 +1039,22 @@ deploy_with_trustee_access() {
   local stdout="$WORK_DIR/$service-deploy.out"
   local stderr="$WORK_DIR/$service-deploy.err"
   local manifest="$state_dir/services/$service/manifest.json"
-  local build_id
-  build_id="$(jq -er '.shelter_build_id' "$manifest")"
   touch "$marker"
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$state_dir" "$service"
   record_cmd "$CA_BIN --tools-image $TOOLS_IMAGE --state-dir $(printf '%q' "$state_dir") deploy --spec $(printf '%q' "$spec")"
-  "$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir" deploy --spec "$spec" \
+  setsid "$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir" deploy --spec "$spec" \
     >"$stdout" 2>"$stderr" &
   local pid=$!
   local deadline=$((SECONDS + timeout))
-  local result_path="" result_id="" public_ip=""
+  local result_path="" expected_name="" public_ip=""
   while (( SECONDS < deadline )); do
-    result_id=""
     public_ip=""
+    expected_name="$(state_value "$state_dir" "$service" deploy.resource_name 2>/dev/null || true)"
     result_path="$(jq -r '.deploy_result // empty' "$manifest" 2>/dev/null || true)"
-    if [[ -n "$result_path" && -s "$result_path" && "$result_path" -nt "$marker" ]]; then
-      result_id="$(jq -r '.id // empty' "$result_path" 2>/dev/null || true)"
-      public_ip="$(jq -r '.deploy.public_ip // .deploy.outputs.public_ip // empty' "$result_path" 2>/dev/null || true)"
-      if [[ "$result_id" == "$build_id" && -n "$public_ip" ]]; then
+    if [[ -n "$expected_name" && -n "$result_path" && -s "$result_path" && "$result_path" -nt "$marker" ]]; then
+      public_ip="$(trustee_deploy_result_ip "$result_path" "$expected_name" 2>/dev/null || true)"
+      if [[ -n "$public_ip" ]]; then
         break
       fi
     fi
@@ -1042,7 +1067,7 @@ deploy_with_trustee_access() {
     fi
     sleep 3
   done
-  if [[ "$result_id" != "$build_id" || -z "$public_ip" ]]; then
+  if [[ -z "$public_ip" ]]; then
     stop_background_deploy "$pid"
     capture_service_console "$service" "$result_path" "deploy-result-timeout" || true
     record_file_as_block "$service deploy stdout:" "$stdout" text
@@ -1187,33 +1212,34 @@ destroy_trustee_infra() {
   if [[ "$TRUSTEE_INFRA_CREATED" != "1" && ( -z "$TRUSTEE_IDS_FILE" || ! -f "$TRUSTEE_IDS_FILE" ) ]]; then
     return 0
   fi
-  trustee_recover_infra_ids
+  trustee_recover_infra_ids || return
+  local cleanup_status=0
 
   trustee_delete_until_absent instance "$TRUSTEE_INSTANCE_ID" 600 \
     ecs DeleteInstances \
     --RegionId "$REGION" \
     --InstanceId.1 "$TRUSTEE_INSTANCE_ID" \
     --Force true \
-    --ForceStop true \
-    --ClientToken "$(trustee_client_token delete-instance)"
+    --ClientToken "$(trustee_client_token delete-instance)" || cleanup_status=1
   trustee_delete_until_absent key_pair "$TRUSTEE_KEY_PAIR_NAME" 300 \
     ecs DeleteKeyPairs \
     --RegionId "$REGION" \
-    --KeyPairNames "[\"$TRUSTEE_KEY_PAIR_NAME\"]"
+    --KeyPairNames "[\"$TRUSTEE_KEY_PAIR_NAME\"]" || cleanup_status=1
   trustee_delete_until_absent security_group "$TRUSTEE_SECURITY_GROUP_ID" 300 \
     ecs DeleteSecurityGroup \
     --RegionId "$REGION" \
-    --SecurityGroupId "$TRUSTEE_SECURITY_GROUP_ID"
+    --SecurityGroupId "$TRUSTEE_SECURITY_GROUP_ID" || cleanup_status=1
   trustee_delete_until_absent vswitch "$TRUSTEE_VSWITCH_ID" 300 \
     vpc DeleteVSwitch \
     --RegionId "$REGION" \
-    --VSwitchId "$TRUSTEE_VSWITCH_ID"
+    --VSwitchId "$TRUSTEE_VSWITCH_ID" || cleanup_status=1
   trustee_delete_until_absent vpc "$TRUSTEE_VPC_ID" 300 \
     vpc DeleteVpc \
     --RegionId "$REGION" \
     --VpcId "$TRUSTEE_VPC_ID" \
-    --ClientToken "$(trustee_client_token delete-vpc)"
+    --ClientToken "$(trustee_client_token delete-vpc)" || cleanup_status=1
 
+  [[ "$cleanup_status" == "0" ]] || return "$cleanup_status"
   trustee_infra_record destroyed true
   TRUSTEE_INFRA_CREATED=0
 }

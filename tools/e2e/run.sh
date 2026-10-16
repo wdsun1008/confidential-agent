@@ -14,6 +14,7 @@ cases:
   openclaw-a2a
   a2a-data-collab
   openclaw-vllm
+  openclaw-vllm-release
   cmaas
   hermes-agent
   claude-code
@@ -21,6 +22,11 @@ cases:
   trustee-duo
 EOF
 }
+
+case "${1:-}" in
+  --list|--suite|--case|--jobs|--gpu-jobs|--work-dir|--dry-run)
+    exec python3.11 "$ROOT_DIR/tools/e2e/suite.py" "$@" ;;
+esac
 
 CASE_NAME="${1:-}"
 if [[ -z "$CASE_NAME" || "$CASE_NAME" == "-h" || "$CASE_NAME" == "--help" ]]; then
@@ -30,7 +36,7 @@ fi
 shift
 
 case "$CASE_NAME" in
-  cli-command-matrix | openclaw-bailian | openclaw-bailian-no-pep | openclaw-a2a | a2a-data-collab | openclaw-vllm | cmaas | hermes-agent | claude-code | codex | trustee-duo) ;;
+  cli-command-matrix | openclaw-bailian | openclaw-bailian-no-pep | openclaw-a2a | a2a-data-collab | openclaw-vllm | openclaw-vllm-release | cmaas | hermes-agent | claude-code | codex | trustee-duo) ;;
   *) usage; exit 2 ;;
 esac
 

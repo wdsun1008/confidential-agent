@@ -184,6 +184,9 @@ run_case() {
   validate_specs "$ALPHA_STATE_DIR" "$ALPHA_DIR/openclaw/openclaw.yaml"
   validate_specs "$BETA_STATE_DIR" "$BETA_DIR/openclaw/openclaw.yaml"
 
+  register_destroy_target "$ALPHA_STATE_DIR" openclaw
+  register_destroy_target "$BETA_STATE_DIR" openclaw
+
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$ALPHA_STATE_DIR" build --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
     record_manifest_variants "$ALPHA_STATE_DIR" openclaw
@@ -196,9 +199,7 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$ALPHA_STATE_DIR" openclaw
     ca_run "$ALPHA_STATE_DIR" deploy --spec "$ALPHA_DIR/openclaw/openclaw.yaml"
-    register_destroy_target "$BETA_STATE_DIR" openclaw
     ca_run "$BETA_STATE_DIR" deploy --spec "$BETA_DIR/openclaw/openclaw.yaml"
   fi
 

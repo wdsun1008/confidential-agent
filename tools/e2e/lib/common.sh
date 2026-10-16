@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 
 : "${ROOT_DIR:?ROOT_DIR must be set before sourcing common.sh}"
+source "$ROOT_DIR/common/software-versions.sh"
+# The normal Shelter RPM keeps its Terraform CLI alongside its other tools.
+if [[ -x /usr/libexec/shelter/bin/terraform ]]; then
+  export PATH="$PATH:/usr/libexec/shelter/bin"
+fi
 
-E2E_RUN_ID="${E2E_RUN_ID:-$(date +%Y%m%d%H%M%S)}"
+E2E_RUN_ID="${E2E_RUN_ID:-$(date +%Y%m%d%H%M%S)-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')}"
 CA_BIN="${CA_BIN:-$ROOT_DIR/target/debug/confidential-agent}"
 TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
-BUILD_BACKEND="${E2E_BUILD_BACKEND:-mkosi}"
 REFERENCE_VALUES="${E2E_REFERENCE_VALUES:-rekor}"
-BASE_IMAGE="${E2E_BASE_IMAGE:-/root/images/alinux3.qcow2}"
 REGION="${E2E_REGION:-cn-beijing}"
 
 default_tdx_zone_id() {
@@ -190,10 +193,6 @@ container_pull_with_fallback() {
 }
 
 validate_modes() {
-  case "$BUILD_BACKEND" in
-    mkosi | base-image) ;;
-    *) echo "E2E_BUILD_BACKEND must be mkosi or base-image, got '$BUILD_BACKEND'" >&2; exit 2 ;;
-  esac
   case "$REFERENCE_VALUES" in
     sample | rekor) ;;
     *) echo "E2E_REFERENCE_VALUES must be sample or rekor, got '$REFERENCE_VALUES'" >&2; exit 2 ;;
@@ -226,7 +225,6 @@ init_step_log() {
     printf '%s\n' "- work_dir: \`$WORK_DIR\`"
     printf '%s\n' "- state_dir: \`${STATE_DIR:-multi-state}\`"
     printf '%s\n' "- tools_image: \`$TOOLS_IMAGE\`"
-    printf '%s\n' "- build_backend: \`$BUILD_BACKEND\`"
     printf '%s\n' "- reference_values: \`$REFERENCE_VALUES\`"
     printf '%s\n' "- region: \`$REGION\`"
     printf '%s\n' "- zone_id: \`$ZONE_ID\`"
@@ -236,6 +234,7 @@ init_step_log() {
 }
 
 install_exit_traps() {
+  E2E_TRAP_OWNER_BASHPID="$BASHPID"
   trap 'finish_e2e "$?"' EXIT ERR
   trap 'finish_e2e 130' INT
   trap 'finish_e2e 143' TERM
@@ -245,6 +244,23 @@ register_destroy_target() {
   local state_dir="$1"
   local service="$2"
   E2E_DESTROY_TARGETS+=("$state_dir|$service")
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    python3.11 - "$WORK_DIR/destroy-targets.json" "$state_dir" "$service" <<'PYREGISTRY'
+import json, sys
+from pathlib import Path
+path, state, service = sys.argv[1:]
+path = Path(path)
+path.parent.mkdir(parents=True, exist_ok=True)
+values = json.loads(path.read_text()) if path.exists() else []
+target = {"state_dir": state, "service": service}
+if target not in values:
+    values.append(target)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(values, indent=2) + "\n")
+    temporary.replace(path)
+PYREGISTRY
+  fi
+
 }
 
 cleanup_connects() {
@@ -252,6 +268,13 @@ cleanup_connects() {
   for ready_file in "${E2E_CONNECT_READY_FILES[@]}"; do
     cleanup_connect_ready "$ready_file"
   done
+  # Connect helpers are commonly called through $(...), whose array updates
+  # do not reach the parent shell. Their per-attempt ready files survive.
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    for ready_file in "$WORK_DIR"/*-connect-attempt-*-ready.json; do
+      cleanup_connect_ready "$ready_file"
+    done
+  fi
   E2E_CONNECT_READY_FILES=()
 
   local pid
@@ -267,6 +290,7 @@ cleanup_connects() {
 destroy_registered_resources() {
   local reason="$1"
   local target state_dir service phase
+  local cleanup_status=0
   for target in "${E2E_DESTROY_TARGETS[@]}"; do
     state_dir="${target%%|*}"
     service="${target#*|}"
@@ -280,29 +304,55 @@ destroy_registered_resources() {
       continue
     fi
     log "destroying $service ($reason)"
-    ca_run "$state_dir" destroy "$service" || true
+    ca_run "$state_dir" destroy "$service" || cleanup_status=1
   done
+  return "$cleanup_status"
 }
 
 finish_e2e() {
   local status="$1"
+  # ERR traps are inherited by command substitutions under `set -E`.
+  # Only the shell that installed the traps owns the cloud resources.
+  if [[ -n "${E2E_TRAP_OWNER_BASHPID:-}" && "$BASHPID" != "$E2E_TRAP_OWNER_BASHPID" ]]; then
+    trap - EXIT ERR
+    exit "$status"
+  fi
+  local cleanup_snapshots=0
   if [[ "$E2E_EXIT_CLEANUP_STARTED" == "1" ]]; then
     exit "$status"
   fi
   E2E_EXIT_CLEANUP_STARTED=1
   cleanup_connects || true
   if declare -f case_cleanup >/dev/null 2>&1; then
-    case_cleanup "$status" || true
+    case_cleanup "$status" || status=1
   fi
   if [[ "$E2E_DEPLOY_ATTEMPTED" == "1" ]]; then
     if [[ "$status" == "0" && "$DESTROY_ON_SUCCESS" == "1" ]]; then
-      destroy_registered_resources success || true
+      cleanup_snapshots=1
+      destroy_registered_resources success || status=1
     elif [[ "$status" != "0" && "$DESTROY_ON_FAILURE" == "1" ]]; then
-      destroy_registered_resources failure || true
+      cleanup_snapshots=1
+      destroy_registered_resources failure || status=1
     fi
   fi
+  if [[ "$cleanup_snapshots" == "1" && -n "${WORK_DIR:-}" ]]; then
+    python3.11 "$ROOT_DIR/tools/e2e/cleanup_snapshots.py" cleanup \
+      "$WORK_DIR/cloud-resource-ledger.json" "$REGION" || status=1
+  fi
   if declare -f case_post_destroy_cleanup >/dev/null 2>&1; then
-    case_post_destroy_cleanup "$status" || true
+    case_post_destroy_cleanup "$status" || status=1
+  fi
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    python3.11 - "$WORK_DIR/case-result.json" "$status" "${E2E_SKIP_DEPLOY:-0}" "${DESTROY_ON_SUCCESS:-1}" "${DESTROY_ON_FAILURE:-1}" <<'PYRESULT' || status=1
+import json, sys
+from pathlib import Path
+path, status, skipped, success_cleanup, failure_cleanup = sys.argv[1:]
+status = int(status)
+result = {"schema_version": "confidential-agent/e2e-case/v1", "passed": status == 0 and skipped != "1",
+          "cleanup_complete": success_cleanup == "1" and failure_cleanup == "1" and status == 0,
+          "exit_code": status, "cloud_skipped": skipped == "1"}
+Path(path).write_text(json.dumps(result, indent=2) + "\n")
+PYRESULT
   fi
   record ""
   if [[ "$status" == "0" ]]; then
@@ -321,9 +371,49 @@ ca_args() {
   printf '%s\0' "$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@"
 }
 
+# Keep only resource identifiers, never the secret-bearing Terraform state.
+record_destroy_ledger() {
+  python3.11 - "$1/services/$2" "$WORK_DIR/cloud-resource-ledger.json" <<'PYLEDGER'
+import json
+import sys
+from pathlib import Path
+service, output = map(Path, sys.argv[1:])
+entries = json.loads(output.read_text()) if output.exists() else []
+for state in service.rglob("*.tfstate"):
+    data = json.loads(state.read_text())
+    for resource in data.get("resources", []):
+        kind = resource.get("type", "")
+        if resource.get("mode") != "managed" or not kind.startswith("alicloud_"):
+            continue
+        for instance in resource.get("instances", []):
+            attrs = instance.get("attributes", {})
+            item = {"type": kind, "id": attrs.get("id"), "service": service.name}
+            for key in ["region", "bucket", "key", "image_id", "system_disk_id", "vpc_id"]:
+                if attrs.get(key):
+                    item[key] = attrs[key]
+            if item not in entries:
+                entries.append(item)
+local_state = service / "state.json"
+if local_state.exists():
+    data = json.loads(local_state.read_text())
+    for published in data.get("build", {}).get("published", {}).values():
+        for kind, field in [("alicloud_image", "image_id"), ("alicloud_oss_bucket", "bucket")]:
+            if published.get(field):
+                item = {"type": kind, "id": published[field], "service": service.name}
+                if item not in entries:
+                    entries.append(item)
+output.write_text(json.dumps(entries, indent=2) + "\n")
+PYLEDGER
+  python3.11 "$ROOT_DIR/tools/e2e/cleanup_snapshots.py" record \
+    "$WORK_DIR/cloud-resource-ledger.json" "$REGION"
+}
+
 ca_run() {
   local state_dir="$1"
   shift
+  if [[ "${1:-}" == "destroy" && -n "${2:-}" ]]; then
+    record_destroy_ledger "$state_dir" "$2" || return
+  fi
   local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
   "${cmd[@]}"
@@ -413,11 +503,7 @@ init_common_args() {
     --disk-gb "$disk_gb"
     --reference-values "$REFERENCE_VALUES"
     --slsa-generator "$SLSA_GENERATOR"
-    --build-backend "$BUILD_BACKEND"
   )
-  if [[ "$BUILD_BACKEND" == "base-image" ]]; then
-    args+=(--base-image "$BASE_IMAGE")
-  fi
   if [[ "$REFERENCE_VALUES" == "rekor" ]]; then
     : "${COSIGN_KEY:?COSIGN_KEY must be set before init_common_args when E2E_REFERENCE_VALUES=rekor}"
     args+=(--cosign-key "$COSIGN_KEY")
@@ -541,11 +627,16 @@ install_bundled_shelter_rpm() {
     echo "shelter is missing and neither dnf nor yum is available" >&2
     exit 2
   fi
-  record_cmd "$pm install -y $(printf '%q' "$rpm")"
-  "$pm" install -y "$rpm"
+  record_cmd "$(cmd_string "$pm" install -y "$rpm" libguestfs-tools-c)"
+  "$pm" install -y "$rpm" libguestfs-tools-c
 }
 
 ensure_shelter() {
+  local bundled_rpm=""
+  if [[ -z "${CA_SHELTER_BIN:-}" && "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "${E2E_USE_SOURCE_SHELTER:-0}" != "1" ]]; then
+    bundled_rpm="$(resolve_shelter_rpm)"
+    [[ -n "$bundled_rpm" ]] || { echo "No bundled Shelter RPM was found" >&2; exit 2; }
+  fi
   export CA_SHELTER_BIN="${CA_SHELTER_BIN:-/usr/bin/shelter}"
   if [[ "${E2E_USE_SOURCE_SHELTER:-0}" == "1" ]]; then
     if [[ -x "$SHELTER_DIR/target/release/shelter" ]]; then
@@ -555,13 +646,21 @@ ensure_shelter() {
     fi
   fi
   if [[ "${E2E_SKIP_SHELTER_INSTALL:-0}" != "1" && "${E2E_USE_SOURCE_SHELTER:-0}" != "1" ]] &&
-     ! command -v "$CA_SHELTER_BIN" >/dev/null 2>&1; then
+     { ! "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN" >/dev/null 2>&1 ||
+       { [[ -n "$bundled_rpm" ]] && ! command -v virt-customize >/dev/null 2>&1; } ||
+       { [[ -n "$bundled_rpm" ]] && ! "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$bundled_rpm" >/dev/null 2>&1; }; }; then
     install_bundled_shelter_rpm
+  fi
+  if [[ -n "$bundled_rpm" ]]; then
+    "$ROOT_DIR/hack/check-shelter-rpm.sh" "$CA_SHELTER_BIN" "$bundled_rpm"
   fi
   command -v "$CA_SHELTER_BIN" >/dev/null 2>&1 || {
     echo "Shelter command '$CA_SHELTER_BIN' is not available" >&2
     exit 2
   }
+  "$ROOT_DIR/hack/check-shelter.sh" "$CA_SHELTER_BIN"
+  sha256sum "$(command -v "$CA_SHELTER_BIN")" > "$WORK_DIR/shelter-sha256.txt"
+  record_file_as_block "Shelter binary SHA256:" "$WORK_DIR/shelter-sha256.txt" text
   record_cmd "$CA_SHELTER_BIN --version"
   "$CA_SHELTER_BIN" --version | tee "$WORK_DIR/shelter-version.txt"
   record_file_as_block "Shelter version:" "$WORK_DIR/shelter-version.txt" text
@@ -597,9 +696,9 @@ verify_cai_pep_binary() {
     (cd "$ROOT_DIR" && cargo clean -p cai-pep && cargo build -p cai-pep)
   fi
 
-  local bin="$ROOT_DIR/target/debug/cai-pep"
+  local bin="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
   [[ -x "$bin" ]] || {
-    echo "target/debug/cai-pep is not executable; build it or unset E2E_SKIP_CARGO_BUILD" >&2
+    echo "cai-pep '$bin' is not executable; set CA_PEP_BIN or build it" >&2
     exit 2
   }
 
@@ -649,15 +748,13 @@ render_case() {
   record_cmd "python3.11 tools/e2e/render_case.py --case $CASE_NAME --work-dir $(printf '%q' "$WORK_DIR")"
   ROOT_DIR="$ROOT_DIR" \
   WORK_DIR="$WORK_DIR" \
-  BUILD_BACKEND="$BUILD_BACKEND" \
-  BASE_IMAGE="$BASE_IMAGE" \
   REFERENCE_VALUES="$REFERENCE_VALUES" \
   SLSA_GENERATOR="$SLSA_GENERATOR" \
   REGION="$REGION" \
   ZONE_ID="$ZONE_ID" \
   INSTANCE_TYPE="${INSTANCE_TYPE:-}" \
   DISK_GB="${DISK_GB:-}" \
-  CAI_PEP="$ROOT_DIR/target/debug/cai-pep" \
+  CAI_PEP="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}" \
   DASHSCOPE_KEY="${DASHSCOPE_KEY:-}" \
   python3.11 "$ROOT_DIR/tools/e2e/render_case.py" --case "$CASE_NAME" --work-dir "$WORK_DIR"
 }
@@ -866,6 +963,30 @@ cleanup_connect_pid() {
   wait "$pid" >/dev/null 2>&1 || true
 }
 
+capture_connect_diagnostics() {
+  local ready_json="$1" output="$2" container
+  container="$(python3.11 - "$ready_json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    ready = json.load(f)
+print(ready.get("container_name") or ready.get("container_id") or "")
+PY
+)"
+  [[ -n "$container" ]] || return 0
+  (umask 077; docker logs --tail 200 "$container" >"$output" 2>&1 ||
+    podman logs --tail 200 "$container" >"$output" 2>&1) || true
+  python3.11 - "$output" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(errors="replace")
+text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", text)
+text = re.sub(r"eyJ[A-Za-z0-9_.-]+", "[redacted JWT]", text)
+p.write_text(text)
+p.chmod(0o600)
+PY
+  record_file_as_block "Connect container diagnostics:" "$output" text
+}
+
 start_connect_until_http_ready() {
   local state_dir="$1"
   local path_prefix="$2"
@@ -899,15 +1020,25 @@ start_connect_until_http_ready() {
     record_file_as_block "$path_prefix connect ready:" "$ready_json" json
     record_file_as_block "$path_prefix connect log:" "$log_path" text
 
-    local port
-    while IFS= read -r port; do
-      if [[ -n "$port" ]] && curl -fsS --max-time 5 "http://127.0.0.1:$port$http_path" >/dev/null 2>&1; then
-        printf '%s\n' "$port"
-        return 0
-      fi
-    done < <(connect_ready_ports "$ready_json")
+    local port remaining probe_started=$SECONDS deadline=$((SECONDS + wait_seconds))
+    local http_error="$WORK_DIR/$path_prefix-connect-attempt-$attempt-http.stderr"
+    # A bound local port does not mean the attested upstream is ready yet.
+    while ((SECONDS < deadline)); do
+      while IFS= read -r port; do
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then break; fi
+        if [[ -n "$port" ]] && curl -fsS --max-time "$remaining" "http://127.0.0.1:$port$http_path" >/dev/null 2>"$http_error"; then
+          record "- HTTP endpoint on local port $port became ready after $((SECONDS - probe_started)) seconds."
+          printf '%s\n' "$port"
+          return 0
+        fi
+      done < <(connect_ready_ports "$ready_json")
+      sleep 1
+    done
+    record_file_as_block "$path_prefix HTTP readiness stderr:" "$http_error" text
+    capture_connect_diagnostics "$ready_json" "$WORK_DIR/$path_prefix-connect-attempt-$attempt-container.log"
     cleanup_connect_ready "$ready_json"
-    sleep 10
+    if ((attempt < attempts)); then sleep 10; fi
   done
   echo "connect did not become HTTP-ready after $attempts attempts" >&2
   return 1
@@ -983,6 +1114,13 @@ run_report_probe() {
   local expected_services="$3"
   local expected_a2a_peers="${4:-}"
   local reference_values="${5:-$REFERENCE_VALUES}"
+  # connect can refresh mesh resources; wait for that generation to settle.
+  local service
+  local -a report_services
+  IFS=',' read -r -a report_services <<<"$expected_services"
+  for service in "${report_services[@]}"; do
+    wait_for_status_service_ready "$state_dir" "$service" 600
+  done
   ca_run "$state_dir" report --include-a2a --json --out "$output"
   record_file_as_block "Attestation report:" "$output" json
   python3.11 - "$output" "$expected_services" "$expected_a2a_peers" "$reference_values" <<'PY'

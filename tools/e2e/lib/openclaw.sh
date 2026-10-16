@@ -30,7 +30,7 @@ assert_openclaw_init_output() {
   local spec="$OPENCLAW_DIR/openclaw.yaml"
   local install_script="$OPENCLAW_DIR/install-openclaw.sh"
 
-  grep -Fq "packages: [ca-certificates, curl, dracut, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]" "$spec"
+  grep -Fq "packages: [ca-certificates, curl, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]" "$spec"
   grep -Fq "source: ./files/install-openclaw-runtime.sh" "$spec"
   grep -Fq "target: /usr/local/libexec/confidential-agent/openclaw/install-openclaw-runtime.sh" "$spec"
   grep -Fq "source: ./files/cai-a2a-plugin" "$spec"
@@ -63,16 +63,20 @@ run_openclaw_gateway_token_probe() {
   local connect_port="$1"
   local token="$2"
   require_cmd openclaw
-  install -d -m 0700 "$WORK_DIR/openclaw-state"
+  local valid_state invalid_state client_config
+  valid_state="$(mktemp -d "$WORK_DIR/openclaw-probe-valid.XXXXXX")"
+  invalid_state="$(mktemp -d "$WORK_DIR/openclaw-probe-invalid.XXXXXX")"
+  client_config="$WORK_DIR/openclaw-probe-client.json"
+  printf '%s\n' '{"gateway":{"mode":"local"}}' > "$client_config"
   local openclaw_env=(
     env
-    "OPENCLAW_CONFIG_PATH=$OPENCLAW_DIR/openclaw.json"
-    "OPENCLAW_STATE_DIR=$WORK_DIR/openclaw-state"
+    -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD
+    "OPENCLAW_CONFIG_PATH=$client_config"
   )
   local url="ws://127.0.0.1:$connect_port"
 
-  record_cmd "OPENCLAW_STATE_DIR=$(printf '%q' "$WORK_DIR/openclaw-state") openclaw gateway probe --url $url --token '<redacted>' --json --timeout 10000"
-  "${openclaw_env[@]}" openclaw gateway probe \
+  record_cmd "OPENCLAW_STATE_DIR=$(printf '%q' "$valid_state") OPENCLAW_CONFIG_PATH=$(printf '%q' "$client_config") openclaw gateway probe --url $url --token '<redacted>' --json --timeout 10000"
+  "${openclaw_env[@]}" "OPENCLAW_STATE_DIR=$valid_state" openclaw gateway probe \
     --url "$url" \
     --token "$token" \
     --json \
@@ -86,19 +90,26 @@ run_openclaw_gateway_token_probe() {
   ' \
     "$WORK_DIR/gateway-probe.json" >/dev/null
 
-  record_cmd "OPENCLAW_STATE_DIR=$(printf '%q' "$WORK_DIR/openclaw-state") openclaw gateway probe --url $url --token '<wrong-token>' --json --timeout 10000"
-  if "${openclaw_env[@]}" openclaw gateway probe \
+  record_cmd "OPENCLAW_STATE_DIR=$(printf '%q' "$invalid_state") OPENCLAW_CONFIG_PATH=$(printf '%q' "$client_config") openclaw gateway probe --url $url --token '<wrong-token>' --json --timeout 10000"
+  local wrong_status=0
+  "${openclaw_env[@]}" "OPENCLAW_STATE_DIR=$invalid_state" openclaw gateway probe \
       --url "$url" \
       --token "ca-e2e-wrong-token" \
       --json \
       --timeout 10000 \
-      >"$WORK_DIR/gateway-probe-wrong-token.json" 2>"$WORK_DIR/gateway-probe-wrong-token.err"; then
-    record_file_as_block "OpenClaw wrong-token probe:" "$WORK_DIR/gateway-probe-wrong-token.json" json
-    record_file_as_block "OpenClaw wrong-token probe stderr:" "$WORK_DIR/gateway-probe-wrong-token.err" text
-    echo "OpenClaw gateway probe unexpectedly accepted an invalid token" >&2
-    return 1
-  fi
+      >"$WORK_DIR/gateway-probe-wrong-token.json" 2>"$WORK_DIR/gateway-probe-wrong-token.err" || wrong_status=$?
   record_file_as_block "OpenClaw wrong-token probe:" "$WORK_DIR/gateway-probe-wrong-token.json" json
   record_file_as_block "OpenClaw wrong-token probe stderr:" "$WORK_DIR/gateway-probe-wrong-token.err" text
+  # Recent probes report transport reachability independently of RPC auth and
+  # can exit zero after an authentication close. Require the actual rejection;
+  # a connection error alone is not evidence that token validation worked.
+  if ! jq -e 'any(.targets[]?;
+      .id == "explicit" and .connect.rpcOk != true and .connect.scopeLimited != true and
+      (([.connect.error, .connect.close.reason] | map(select(. != null) | tostring) | join(" "))
+        | test("unauthorized|token.*mismatch|invalid.*token"; "i")))' \
+      "$WORK_DIR/gateway-probe-wrong-token.json" >/dev/null; then
+    echo "OpenClaw wrong-token probe did not prove authentication rejection (exit $wrong_status)" >&2
+    return 1
+  fi
   record "- OpenClaw gateway accepts the configured token and rejects an invalid token."
 }

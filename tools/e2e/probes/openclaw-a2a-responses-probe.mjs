@@ -137,6 +137,11 @@ const A2aChatSchema = {
   },
 };
 
+// Keep the client-side function distinct from the gateway's native a2a_chat
+// tool. Recent OpenClaw versions execute a same-named native tool internally,
+// which cannot satisfy the Responses API's required client function call.
+const ClientA2aFunction = "e2e_a2a_chat";
+
 const baseUrl = normalizeBaseUrl(requireArg("url"));
 const token = requireArg("token");
 const peer = requireArg("peer");
@@ -162,7 +167,7 @@ async function main() {
             {
               type: "input_text",
               text: [
-                "Call the a2a_chat function exactly once.",
+                `Call the ${ClientA2aFunction} function exactly once.`,
                 `peer must be ${JSON.stringify(peer)}.`,
                 `message must be ${JSON.stringify(peerMessage)}.`,
                 "Do not answer directly before calling the function.",
@@ -176,22 +181,22 @@ async function main() {
       tools: [
         {
           type: "function",
-          name: "a2a_chat",
+          name: ClientA2aFunction,
           description:
             "Send a message to a configured peer OpenClaw agent over the confidential A2A channel and return the peer's final reply.",
           parameters: A2aChatSchema,
         },
       ],
-      tool_choice: "required",
+      tool_choice: { type: "function", name: ClientA2aFunction },
       max_output_tokens: 2048,
       stream: false,
     },
     requestTimeoutMs,
   );
 
-  const call = firstFunctionCall(first, "a2a_chat");
+  const call = firstFunctionCall(first, ClientA2aFunction);
   if (!call) {
-    throw new Error(`OpenResponses did not return an a2a_chat function call: ${JSON.stringify(first)}`);
+    throw new Error(`OpenResponses did not return a ${ClientA2aFunction} function call: ${JSON.stringify(first)}`);
   }
   const callArgs = JSON.parse(call.arguments || "{}");
   if (callArgs.peer !== peer) {

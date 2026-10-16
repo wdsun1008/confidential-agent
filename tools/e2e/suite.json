@@ -1,0 +1,536 @@
+{
+  "schema_version": "confidential-agent/e2e-matrix/v1",
+  "cases": [
+    {
+      "id": "cli-command-matrix",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "cli-command-matrix"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "python3.11",
+        "ssh"
+      ]
+    },
+    {
+      "id": "openclaw-bailian",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "openclaw-bailian"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "node",
+        "openclaw",
+        "openssl",
+        "python3.11",
+        "ssh"
+      ]
+    },
+    {
+      "id": "openclaw-bailian-no-pep",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "openclaw-bailian-no-pep"
+      ],
+      "timeout": 14400,
+      "required_commands": []
+    },
+    {
+      "id": "openclaw-a2a",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "openclaw-a2a"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "node",
+        "openssl",
+        "python3.11",
+        "ssh"
+      ]
+    },
+    {
+      "id": "a2a-data-collab",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "a2a-data-collab"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "node",
+        "python3.11",
+        "ssh"
+      ]
+    },
+    {
+      "id": "openclaw-vllm",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "gpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "openclaw-vllm"
+      ],
+      "timeout": 28800,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "node",
+        "openssl",
+        "python3.11",
+        "ssh",
+        "timeout"
+      ]
+    },
+    {
+      "id": "openclaw-vllm-release",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "gpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "openclaw-vllm-release"
+      ],
+      "timeout": 28800,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "node",
+        "openssl",
+        "python3.11",
+        "timeout"
+      ]
+    },
+    {
+      "id": "cmaas",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "cmaas"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "openssl",
+        "python3.11",
+        "ssh",
+        "ssh-keygen"
+      ]
+    },
+    {
+      "id": "hermes-agent",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "hermes-agent"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "jq",
+        "node",
+        "openssl",
+        "python3.11",
+        "ssh",
+        "timeout"
+      ]
+    },
+    {
+      "id": "claude-code",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "claude-code"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "jq",
+        "node",
+        "openssl",
+        "python3.11",
+        "ssh"
+      ]
+    },
+    {
+      "id": "codex",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "codex"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "jq",
+        "node",
+        "openssl",
+        "python3.11",
+        "ssh",
+        "timeout"
+      ]
+    },
+    {
+      "id": "trustee-duo",
+      "groups": [
+        "legacy"
+      ],
+      "pool": "cpu",
+      "command": [
+        "bash",
+        "tools/e2e/run.sh",
+        "trustee-duo"
+      ],
+      "timeout": 14400,
+      "required_commands": [
+        "aliyun",
+        "cargo",
+        "curl",
+        "docker",
+        "jq",
+        "node",
+        "openclaw",
+        "openssl",
+        "python3.11",
+        "scp",
+        "setsid",
+        "ssh",
+        "ssh-keygen",
+        "ssh-keyscan",
+        "terraform",
+        "timeout"
+      ]
+    },
+    {
+      "id": "publish-reuse-images",
+      "groups": [
+        "reuse",
+        "inference"
+      ],
+      "pool": "cpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/publish_fixtures.py"
+      ],
+      "timeout": 28800,
+      "retains_fixtures": true
+    },
+    {
+      "id": "allinone-challenge",
+      "groups": [
+        "reuse"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "command": [
+        "python3.11",
+        "tools/e2e/reuse_case.py"
+      ],
+      "environment": {
+        "E2E_ATTESTATION_MODE": "challenge"
+      },
+      "timeout": 21600
+    },
+    {
+      "id": "allinone-trustee",
+      "groups": [
+        "reuse"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "command": [
+        "python3.11",
+        "tools/e2e/reuse_case.py"
+      ],
+      "environment": {
+        "E2E_ATTESTATION_MODE": "trustee"
+      },
+      "timeout": 21600
+    },
+    {
+      "id": "inference-single",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "1",
+        "E2E_SLB_TYPE": "nlb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "challenge",
+        "E2E_REUSE_IMAGE": "0",
+        "E2E_IMAGE_VARIANT": "release",
+        "E2E_ONECLICK": "1"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-alb",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "2",
+        "E2E_SLB_TYPE": "alb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "challenge",
+        "E2E_REUSE_IMAGE": "0",
+        "E2E_IMAGE_VARIANT": "release"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-nlb-ohttp",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "2",
+        "E2E_SLB_TYPE": "nlb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "challenge",
+        "E2E_REUSE_IMAGE": "0",
+        "E2E_IMAGE_VARIANT": "release"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-nlb-rats",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "2",
+        "E2E_SLB_TYPE": "nlb",
+        "E2E_CONNECT_ENCRYPTION": "rats-tls",
+        "E2E_ATTESTATION_MODE": "challenge",
+        "E2E_REUSE_IMAGE": "0",
+        "E2E_IMAGE_VARIANT": "release"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-reuse-single",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "1",
+        "E2E_SLB_TYPE": "nlb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "trustee",
+        "E2E_REUSE_IMAGE": "1",
+        "E2E_IMAGE_VARIANT": "release"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-reuse-alb",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "2",
+        "E2E_SLB_TYPE": "alb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "trustee",
+        "E2E_REUSE_IMAGE": "1",
+        "E2E_IMAGE_VARIANT": "release"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-reuse-nlb",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "2",
+        "E2E_SLB_TYPE": "nlb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "trustee",
+        "E2E_REUSE_IMAGE": "1",
+        "E2E_IMAGE_VARIANT": "release",
+        "E2E_SERVICE_ISOLATION": "1"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "inference-debug",
+      "groups": [
+        "inference"
+      ],
+      "pool": "gpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_case.py"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "environment": {
+        "E2E_REPLICAS": "1",
+        "E2E_SLB_TYPE": "nlb",
+        "E2E_CONNECT_ENCRYPTION": "ohttp",
+        "E2E_ATTESTATION_MODE": "challenge",
+        "E2E_REUSE_IMAGE": "0",
+        "E2E_IMAGE_VARIANT": "debug"
+      },
+      "timeout": 28800
+    },
+    {
+      "id": "platform-recovery",
+      "groups": [
+        "platform"
+      ],
+      "depends": [
+        "publish-reuse-images"
+      ],
+      "command": [
+        "python3.11",
+        "tools/e2e/platform_case.py"
+      ],
+      "timeout": 14400
+    }
+  ]
+}

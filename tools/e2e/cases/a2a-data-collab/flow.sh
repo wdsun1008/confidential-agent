@@ -171,7 +171,7 @@ assert_a2a_guest_tng_28_config() {
   local check
 
   wait_for_ssh "$host" "$key" 300
-  check="set -euo pipefail; rpm_nevra=\$(rpm -q trusted-network-gateway); test \"\$rpm_nevra\" = trusted-network-gateway-2.8.0-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); test \"\$tng_version\" = 'tng 2.8.0'; jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; printf 'tng_rpm=%s\\ntng_version=%s\\ntng_config_schema=2.8\\n' \"\$rpm_nevra\" \"\$tng_version\""
+  check="set -euo pipefail; rpm_nevra=\$(rpm -q trusted-network-gateway); test \"\$rpm_nevra\" = trusted-network-gateway-2.9.2-1.al8.x86_64; tng_version=\$(/usr/bin/tng --version | sed -n '1p'); test \"\$tng_version\" = 'tng 2.9.2'; jq -e '([(.add_ingress // [])[], (.add_egress // [])[]]) as \$routes | (\$routes | length > 0) and (\$routes | all(.rats_tls.multiplex == true)) and ([\$routes[] | select(.verify? != null)] | length > 0) and ([\$routes[] | select(.verify? != null)] | all(.verify.as_type == \"builtin\" and .verify.attestation_policy.type == \"path\" and ((.verify | has(\"policy\")) | not) and ((.verify | has(\"policy_ids\")) | not)))' /etc/tng/config.json >/dev/null; printf 'tng_rpm=%s\\ntng_version=%s\\ntng_config_schema=2.9.2\\n' \"\$rpm_nevra\" \"\$tng_version\""
 
   record_cmd "ssh $label '<assert TNG 2.8 A2A config>'"
   ssh_guest "$key" "$host" "$check" >"$output"
@@ -259,7 +259,7 @@ run_case() {
   cosign_key="$(resolve_cosign_key)"
   export DASHSCOPE_KEY="$dashscope_key"
   export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-  export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
+  export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.8-max}"
   export COSIGN_KEY="$cosign_key"
   export INSTANCE_TYPE
 
@@ -277,6 +277,9 @@ run_case() {
   validate_specs "$ANALYST_STATE_DIR" "$ANALYST_DIR/analyst/analyst.yaml"
   validate_specs "$DATA_OWNER_STATE_DIR" "$DATA_OWNER_DIR/data-owner/data-owner.yaml"
 
+  register_destroy_target "$ANALYST_STATE_DIR" analyst-agent
+  register_destroy_target "$DATA_OWNER_STATE_DIR" data-owner-agent
+
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     log "building analyst agent image"
     ca_run "$ANALYST_STATE_DIR" build --spec "$ANALYST_DIR/analyst/analyst.yaml"
@@ -291,9 +294,7 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$ANALYST_STATE_DIR" analyst-agent
     ca_run "$ANALYST_STATE_DIR" deploy --spec "$ANALYST_DIR/analyst/analyst.yaml"
-    register_destroy_target "$DATA_OWNER_STATE_DIR" data-owner-agent
     ca_run "$DATA_OWNER_STATE_DIR" deploy --spec "$DATA_OWNER_DIR/data-owner/data-owner.yaml"
   fi
 

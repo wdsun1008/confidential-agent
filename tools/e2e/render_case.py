@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = ROOT / "tools" / "e2e" / "cases"
+PINS = json.loads((ROOT / "software-versions.json").read_text())
 
 
 def yaml_quote(value: str) -> str:
@@ -36,16 +37,6 @@ def render_rekor_block(context):
     )
 
 
-def render_base_image_line(context):
-    if context["BUILD_BACKEND"] == "base-image":
-        return f"  base_image: {yaml_quote(context['BASE_IMAGE'])}"
-    return ""
-
-
-def render_matrix_base_image_line(context):
-    if context["MATRIX_REAL_BUILD_BACKEND"] == "base-image":
-        return f"  base_image: {yaml_quote(context['MATRIX_REAL_BASE_IMAGE'])}"
-    return ""
 
 
 def render_matrix_rekor_block(context):
@@ -62,6 +53,20 @@ def render_matrix_rekor_block(context):
             "    required: true",
         ]
     )
+
+
+def render_matrix_repositories(context):
+    mirror = context.get("E2E_MATRIX_REPO_MIRROR", "").rstrip("/")
+    if not mirror:
+        return ""
+    lines = ["  repos:"]
+    for name in ("os", "updates", "plus", "module", "powertools"):
+        lines.extend([
+            f"    - name: alinux-{name}",
+            f"      baseurl: {yaml_quote(mirror + '/3/' + name + '/$basearch/')}",
+            f"      gpgkey: {yaml_quote(mirror + '/3/RPM-GPG-KEY-ALINUX-3')}",
+        ])
+    return "\n".join(lines)
 
 
 def decode_jwt_payload(token: str) -> dict:
@@ -142,14 +147,12 @@ def context_from_env(work_dir):
 
     default("ROOT_DIR", str(ROOT))
     context["WORK_DIR"] = str(work_dir)
-    default("BUILD_BACKEND", "mkosi")
-    default("BASE_IMAGE", "/root/images/alinux3.qcow2")
     default("REFERENCE_VALUES", "rekor")
     default("SLSA_GENERATOR", "/usr/libexec/shelter/slsa/slsa-generator")
     default("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     default("DASHSCOPE_ANTHROPIC_BASE_URL", "https://dashscope.aliyuncs.com/apps/anthropic")
-    default("DASHSCOPE_MODEL", "qwen3.7-max")
-    default("CLI_AGENT_NODE_VERSION", context.get("E2E_CLI_AGENT_NODE_VERSION", "22.19.0"))
+    default("DASHSCOPE_MODEL", PINS["bailian_model"])
+    default("CLI_AGENT_NODE_VERSION", context.get("E2E_CLI_AGENT_NODE_VERSION", PINS["node"]))
     default(
         "CLI_AGENT_NPM_REGISTRY",
         context.get("E2E_CLI_AGENT_NPM_REGISTRY")
@@ -157,8 +160,8 @@ def context_from_env(work_dir):
         or "https://registry.npmjs.org/",
     )
     default("NPM_REGISTRY", context.get("E2E_NPM_REGISTRY", "https://registry.npmmirror.com/"))
-    default("CLAUDE_CODE_VERSION", context.get("E2E_CLAUDE_CODE_VERSION", "latest"))
-    default("CODEX_VERSION", context.get("E2E_CODEX_VERSION", "latest"))
+    default("CLAUDE_CODE_VERSION", context.get("E2E_CLAUDE_CODE_VERSION", PINS["claude-code"]))
+    default("CODEX_VERSION", context.get("E2E_CODEX_VERSION", PINS["codex"]))
     default("CODEX_REMOTE_PORT", context.get("E2E_CODEX_REMOTE_PORT", "4500"))
     default("HERMES_IMAGE", context.get("E2E_HERMES_IMAGE", "nousresearch/hermes-agent:v2026.6.5"))
     default("HERMES_CONTAINER_RUNTIME", context.get("E2E_HERMES_CONTAINER_RUNTIME", "podman"))
@@ -168,8 +171,6 @@ def context_from_env(work_dir):
     default("INSTANCE_TYPE", default_instance_type(context["REGION"]))
     default("DISK_GB", "200")
     default("MATRIX_REAL_SERVICE_ID", "matrix")
-    default("MATRIX_REAL_BUILD_BACKEND", context["BUILD_BACKEND"])
-    default("MATRIX_REAL_BASE_IMAGE", context["BASE_IMAGE"])
     default("MATRIX_REAL_REFERENCE_VALUES", context["REFERENCE_VALUES"])
     default("MATRIX_REAL_COSIGN_KEY", context.get("COSIGN_KEY", ""))
     default("MATRIX_REAL_SLSA_GENERATOR", context["SLSA_GENERATOR"])
@@ -179,9 +180,8 @@ def context_from_env(work_dir):
     default("MATRIX_REAL_DISK_GB", context["DISK_GB"])
     default("MATRIX_REAL_INSTALL_SCRIPT", str(work_dir / "rendered" / "matrix" / "install-matrix-cloud.sh"))
     default("CAI_PEP", str(ROOT / "target" / "debug" / "cai-pep"))
-    context["BASE_IMAGE_LINE"] = render_base_image_line(context)
-    context["MATRIX_REAL_BASE_IMAGE_LINE"] = render_matrix_base_image_line(context)
     context["MATRIX_REAL_REKOR_BLOCK"] = render_matrix_rekor_block(context)
+    context["MATRIX_REAL_REPOS_BLOCK"] = render_matrix_repositories(context)
     context["REKOR_BLOCK"] = render_rekor_block(context)
     context["DASHSCOPE_KEY"] = (
         context.get("DASHSCOPE_KEY")

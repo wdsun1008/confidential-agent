@@ -9,8 +9,8 @@ service:
 build:
   image_name: {{raw:MATRIX_REAL_SERVICE_ID}}
   resize: 30G
-{{raw:MATRIX_REAL_BASE_IMAGE_LINE}}
-  with_network: true
+{{raw:MATRIX_REAL_REPOS_BLOCK}}
+
   packages: [ca-certificates, python3.11]
   scripts: [{{json:MATRIX_REAL_INSTALL_SCRIPT}}]
   variants:

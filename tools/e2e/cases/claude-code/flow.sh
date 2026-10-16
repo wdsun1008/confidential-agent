@@ -141,7 +141,7 @@ run_case() {
   CLAUDE_CODE_DIR="$INIT_OUTPUT_DIR/claude-code"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
   DASHSCOPE_ANTHROPIC_BASE_URL="${DASHSCOPE_ANTHROPIC_BASE_URL:-https://dashscope.aliyuncs.com/apps/anthropic}"
-  DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
+  DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-qwen3.8-max}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-Please respond with CA_E2E_OK and no other text.}"
   CHAT_EXPECT="${E2E_CHAT_EXPECT:-CA_E2E_OK}"
   TDX_EXPECT="${E2E_TDX_EXPECT:-TDX}"
@@ -177,9 +177,9 @@ run_case() {
     --dashscope-base-url "$DASHSCOPE_BASE_URL"
     --dashscope-anthropic-base-url "$DASHSCOPE_ANTHROPIC_BASE_URL"
     --model "$DASHSCOPE_MODEL"
-    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-22.19.0}"
+    --node-version "${E2E_CLI_AGENT_NODE_VERSION:-24.21.0}"
     --npm-registry "${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}"
-    --claude-code-version "${E2E_CLAUDE_CODE_VERSION:-latest}"
+    --claude-code-version "${E2E_CLAUDE_CODE_VERSION:-$(ca_software_version claude-code)}"
   )
   export CA_PEP_BIN="${CA_PEP_BIN:-$ROOT_DIR/target/debug/cai-pep}"
   if ! ca_init_capture "$STATE_DIR" "$WORK_DIR/init.out" "$WORK_DIR/init.err" claudecode "${init_args[@]}"; then
@@ -191,10 +191,12 @@ run_case() {
   record_file_as_block "init stderr:" "$WORK_DIR/init.err" text
   assert_claude_code_secret_rendering "$dashscope_key"
   record "- allowed_cidr: \`$allowed_cidr\`"
-  record "- Claude Code npm version: \`${E2E_CLAUDE_CODE_VERSION:-latest}\`."
+  record "- Claude Code npm version: \`${E2E_CLAUDE_CODE_VERSION:-$(ca_software_version claude-code)}\`."
   record "- CLI agent npm registry: \`${E2E_CLI_AGENT_NPM_REGISTRY:-${E2E_NPM_REGISTRY:-https://registry.npmjs.org/}}\`."
 
   validate_specs "$STATE_DIR" "$CLAUDE_CODE_DIR/claude-code.yaml"
+
+  register_destroy_target "$STATE_DIR" claude-code
 
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$CLAUDE_CODE_DIR/claude-code.yaml"
@@ -204,7 +206,6 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$STATE_DIR" claude-code
     ca_run "$STATE_DIR" deploy --spec "$CLAUDE_CODE_DIR/claude-code.yaml"
   fi
 

@@ -45,6 +45,11 @@ StandardError=journal+console
 WantedBy=multi-user.target
 EOF_UNIT
 
+# Preserve service diagnostics in ECS console output for release images.
+for unit in trusted-network-gateway attestation-agent confidential-agentd; do
+  mkdir -p "/etc/systemd/system/$unit.service.d"
+  printf '[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n' > "/etc/systemd/system/$unit.service.d/99-e2e-console.conf"
+done
 systemctl daemon-reload || true
 systemctl enable cai-matrix.service
 if command -v yum >/dev/null 2>&1; then

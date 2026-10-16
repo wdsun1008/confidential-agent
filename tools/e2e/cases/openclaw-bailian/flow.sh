@@ -26,6 +26,7 @@ run_case() {
   require_cmd docker
   require_cmd jq
   require_cmd node
+  require_cmd openclaw
   require_cmd openssl
   require_cmd python3.11
   require_cmd ssh
@@ -54,10 +55,10 @@ run_case() {
   init_args+=(
     --dashscope-api-key "$dashscope_key"
     --gateway-token "$token"
-    --model "${DASHSCOPE_MODEL:-qwen3.7-max}"
+    --model "${DASHSCOPE_MODEL:-qwen3.8-max}"
     --dashscope-base-url "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.5.7}"
-    --node-version "${E2E_OPENCLAW_NODE_VERSION:-22.19.0}"
+    --openclaw-version "${E2E_OPENCLAW_VERSION:-2026.10.3}"
+    --node-version "${E2E_OPENCLAW_NODE_VERSION:-24.21.0}"
     --npm-registry "${E2E_NPM_REGISTRY:-https://registry.npmmirror.com/}"
   )
   if [[ "${E2E_OPENCLAW_DISABLE_PEP:-0}" == "1" ]]; then
@@ -81,6 +82,8 @@ run_case() {
 
   validate_specs "$STATE_DIR" "$OPENCLAW_DIR/openclaw.yaml"
 
+  register_destroy_target "$STATE_DIR" openclaw
+
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$OPENCLAW_DIR/openclaw.yaml"
   fi
@@ -89,7 +92,6 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$STATE_DIR" openclaw
     ca_run "$STATE_DIR" deploy --spec "$OPENCLAW_DIR/openclaw.yaml"
   fi
 

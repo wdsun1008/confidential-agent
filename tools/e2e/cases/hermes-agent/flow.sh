@@ -78,7 +78,7 @@ check_file /usr/local/bin/cai-hermes-agent
 check_file /usr/local/bin/hermes
 check_file /usr/local/share/confidential-agent/hermes-install.txt
 test -d /usr/local/lib/hermes-agent/.git
-test -x /usr/local/lib/hermes-agent/venv/bin/python
+runuser -u hermes -- env HERMES_HOME="$DATA" /usr/local/bin/hermes --version
 check_file "$DATA/.env"
 check_file "$DATA/config.yaml"
 
@@ -245,7 +245,7 @@ assert_hermes_secret_rendering() {
   done
 
   grep -Fq "app_service: cai-hermes-agent.service" "$spec"
-  grep -Fq "packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]" "$spec"
+  grep -Fq "packages: [ca-certificates, curl, findutils, git, libatomic, python3.11, shadow-utils, tar, util-linux, xz]" "$spec"
   grep -Fq "source: ./files/install-hermes-agent-runtime.sh" "$spec"
   grep -Fq "target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh" "$spec"
   grep -Fq "source: ./files/cai-hermes-agent" "$spec"
@@ -305,7 +305,7 @@ run_case() {
   HERMES_COMMIT="${E2E_HERMES_COMMIT:-}"
   HERMES_API_SERVER_KEY="${E2E_HERMES_API_SERVER_KEY:-$(openssl rand -hex 32)}"
   DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-  HERMES_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max}"
+  HERMES_MODEL="${DASHSCOPE_MODEL:-qwen3.8-max}"
   CHAT_TIMEOUT_MS="${E2E_CHAT_TIMEOUT_MS:-240000}"
   GATEWAY_READY_TIMEOUT="${E2E_HERMES_GATEWAY_READY_TIMEOUT:-900}"
   CHAT_MESSAGE="${E2E_CHAT_MESSAGE:-Please respond with CA_E2E_OK and no other text.}"
@@ -366,6 +366,8 @@ run_case() {
 
   validate_specs "$STATE_DIR" "$HERMES_DIR/hermes-agent.yaml"
 
+  register_destroy_target "$STATE_DIR" hermes-agent
+
   if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
     ca_run "$STATE_DIR" build --spec "$HERMES_DIR/hermes-agent.yaml"
   fi
@@ -375,7 +377,6 @@ run_case() {
 
   if [[ "${E2E_SKIP_DEPLOY:-0}" != "1" ]]; then
     E2E_DEPLOY_ATTEMPTED=1
-    register_destroy_target "$STATE_DIR" hermes-agent
     ca_run "$STATE_DIR" deploy --spec "$HERMES_DIR/hermes-agent.yaml"
   fi
 
