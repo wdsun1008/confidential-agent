@@ -48,9 +48,6 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
     fs::write(&staged_tng_service, tng_service_unit())
         .with_context(|| format!("failed to write '{}'", staged_tng_service.display()))?;
 
-    let initrd_secret_fetch_module = guest_staging_dir.join("99confidential-agent-secret-fetch");
-    write_secret_fetch_module(&initrd_secret_fetch_module)?;
-
     let policy_default = guest_staging_dir.join("trustee-opa-default.rego");
     fs::write(&policy_default, DEFAULT_POLICY)
         .with_context(|| format!("failed to write '{}'", policy_default.display()))?;
@@ -75,6 +72,26 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         destination: "/opt/confidential-agent/hack/attestation-challenge-client".to_string(),
         executable: true,
     }];
+    for (filename, content, destination) in [
+        (
+            "software-versions.json",
+            confidential_agent_core::software::VERSIONS_JSON,
+            "/usr/local/share/confidential-agent/software-versions.json",
+        ),
+        (
+            "software-versions.sh",
+            include_str!("../../../common/software-versions.sh"),
+            "/usr/local/libexec/confidential-agent/software-versions.sh",
+        ),
+    ] {
+        let source = guest_staging_dir.join(filename);
+        fs::write(&source, content)?;
+        extra_files.push(GuestFileAsset {
+            source,
+            destination: destination.into(),
+            executable: false,
+        });
+    }
     let staged_cosign =
         stage_tools_image_asset(cli, guest_staging_dir, "/usr/bin/cosign", "cosign", 0o755)?;
     extra_files.push(GuestFileAsset {
@@ -89,7 +106,6 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
         gateway_bin: staged_gateway,
         gateway_service: staged_gateway_service,
         tng_service: staged_tng_service,
-        initrd_secret_fetch_module,
         fde_config_file,
         policy_default,
         policy_local_dev,
@@ -171,21 +187,6 @@ pub(super) fn ensure_docker_available() -> Result<()> {
         bail!("docker command is required to run Confidential Agent tools image");
     }
     Ok(())
-}
-
-pub(super) fn write_secret_fetch_module(module_dir: &Path) -> Result<()> {
-    fs::create_dir_all(module_dir)
-        .with_context(|| format!("failed to create '{}'", module_dir.display()))?;
-    write_executable(
-        &module_dir.join("module-setup.sh"),
-        secret_fetch_module_setup(),
-    )?;
-    Ok(())
-}
-
-pub(super) fn write_executable(path: &Path, content: &str) -> Result<()> {
-    fs::write(path, content).with_context(|| format!("failed to write '{}'", path.display()))?;
-    set_mode(path, 0o755)
 }
 
 pub(super) fn find_agentd_binary() -> Result<PathBuf> {
@@ -287,44 +288,15 @@ mod tests {
             config.contains("[cryptpilot]") || config.contains("name =") || config.contains('[')
         );
         assert!(config.contains(
-            "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1"
+            "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/local/bin/confidential-agentd initrd-fetch >/dev/console 2>&1"
         ));
         assert!(!config.contains("initrd-fetch 1>&2"));
-    }
-
-    #[test]
-    fn secret_fetch_module_setup_is_shell_script() {
-        let setup = secret_fetch_module_setup();
-        assert!(setup.starts_with("#!/"));
-        assert!(setup.contains("install"));
-        assert!(setup.contains("rd.retry=300 rd.shell=0 rd.emergency=poweroff"));
-    }
-
-    #[test]
-    fn write_secret_fetch_module_creates_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let module_dir = dir.path().join("99test-module");
-        write_secret_fetch_module(&module_dir).unwrap();
-        assert!(module_dir.join("module-setup.sh").exists());
-        assert!(!module_dir
-            .join("confidential-agent-secret-fetch.service")
-            .exists());
     }
 
     #[test]
     fn stage_guest_setup_script_creates_executable() {
         let dir = tempfile::tempdir().unwrap();
         let path = stage_guest_setup_script(dir.path()).unwrap();
-        assert!(path.exists());
-        let metadata = fs::metadata(&path).unwrap();
-        assert!(metadata.permissions().mode() & 0o111 != 0);
-    }
-
-    #[test]
-    fn write_executable_sets_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test-script.sh");
-        write_executable(&path, "#!/bin/sh\necho hello\n").unwrap();
         assert!(path.exists());
         let metadata = fs::metadata(&path).unwrap();
         assert!(metadata.permissions().mode() & 0o111 != 0);

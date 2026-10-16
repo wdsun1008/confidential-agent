@@ -5,6 +5,7 @@ pub mod agent_card_signing;
 pub mod mesh;
 pub mod peerings;
 pub mod schema;
+pub mod software;
 pub mod spec;
 pub mod trustee;
 pub mod util;
@@ -90,7 +91,10 @@ mod schema_tests {
         assert_eq!(decoded.attestation_mode, "challenge");
         assert_eq!(legacy.attestation_mode, "challenge");
         assert_eq!(decoded.service.ports, vec![18789, 18800]);
-        assert_eq!(decoded.service.connect, vec![crate::spec::ConnectPort::Plain(18789)]);
+        assert_eq!(
+            decoded.service.connect,
+            vec![crate::spec::ConnectPort::Plain(18789)]
+        );
         assert_eq!(decoded.service.mcp_ports, vec![18800]);
         assert_eq!(decoded.gateway_identity.unwrap().public_key, "pub");
         assert_eq!(decoded.deploy.private_mesh_ip(), Some("10.0.0.8"));
@@ -126,7 +130,10 @@ mod schema_tests {
         let decoded: MeshBundle = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(decoded.services["svc-a"].ports, vec![18789, 18800]);
-        assert_eq!(decoded.services["svc-a"].connect, vec![crate::spec::ConnectPort::Plain(18789)]);
+        assert_eq!(
+            decoded.services["svc-a"].connect,
+            vec![crate::spec::ConnectPort::Plain(18789)]
+        );
         assert_eq!(decoded.services["svc-a"].mcp_ports, vec![18800]);
         assert_eq!(
             decoded.services["svc-a"].gateway_public_key.as_deref(),
@@ -137,7 +144,10 @@ mod schema_tests {
     #[test]
     fn confidential_ports_are_ports_minus_connect() {
         assert_eq!(
-            confidential_ports(&[18789, 3001, 3001, 18800], &[crate::spec::ConnectPort::Plain(18789)]),
+            confidential_ports(
+                &[18789, 3001, 3001, 18800],
+                &[crate::spec::ConnectPort::Plain(18789)]
+            ),
             vec![3001, 18800]
         );
         assert!(confidential_ports(&[18789], &[crate::spec::ConnectPort::Plain(18789)]).is_empty());

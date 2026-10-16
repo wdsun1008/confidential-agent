@@ -85,18 +85,13 @@ fn validate_spec_file(spec_path: &Path) -> SpecValidationReport {
     match AgentSpec::from_path(spec_path) {
         Ok(spec) => {
             push_check(&mut checks, "parse", true, "AppSpec parsed");
+            if let Some(image) = &spec.deploy.image {
+                push_path_check(&mut checks, "deploy.image.release", &image.release);
+                push_path_check(&mut checks, "deploy.image.trusted_key", &image.trusted_key);
+            }
             match spec.ensure_mvp_supported() {
                 Ok(()) => push_check(&mut checks, "supported", true, "uses supported features"),
                 Err(err) => push_check(&mut checks, "supported", false, err.to_string()),
-            }
-            if let Some(base_image) = &spec.build.base_image {
-                if !base_image.contains("://") {
-                    push_path_check(
-                        &mut checks,
-                        "build.base_image",
-                        Path::new(base_image.as_str()),
-                    );
-                }
             }
             for (index, file) in spec.build.files.iter().enumerate() {
                 push_path_check(
@@ -275,7 +270,7 @@ const SCRIPT_TOOL_REQUIREMENTS: &[ScriptToolRequirement] = &[
 ];
 
 fn push_script_package_checks(checks: &mut Vec<SpecValidationCheck>, spec: &AgentSpec) {
-    if spec.build.base_image.is_some() || spec.build.scripts.is_empty() {
+    if spec.build.scripts.is_empty() {
         return;
     }
     let packages = spec
@@ -321,7 +316,7 @@ fn push_script_package_checks(checks: &mut Vec<SpecValidationCheck>, spec: &Agen
 }
 
 fn push_script_package_manager_checks(checks: &mut Vec<SpecValidationCheck>, spec: &AgentSpec) {
-    if spec.build.base_image.is_some() || spec.build.scripts.is_empty() {
+    if spec.build.scripts.is_empty() {
         return;
     }
     let mut issues = Vec::new();
@@ -475,18 +470,18 @@ fn docs_topic(topic: DocsTopic) -> MarkdownDoc {
 fn spec_schema_json() -> serde_json::Value {
     serde_json::json!({
         "schema": "confidential-agent/v1",
-        "required_top_level": ["schema", "service", "build", "deploy", "attestation", "resources"],
+        "required_top_level": ["schema", "service", "deploy", "attestation", "resources"],
+        "image_source": "provide build for a local image, or deploy.image for an authenticated published release",
         "service": {
             "id": "stable service name",
             "ports": "guest TCP ports exposed by the workload",
             "connect": "ports to proxy with `confidential-agent connect`",
-            "app_service": "systemd unit that indicates workload readiness"
+            "app_service": "systemd unit that indicates workload readiness",
+            "ssh": "opt in to instance client/host keys delivered through CA; requires an image SSH service using /opt/data/cai-ssh"
         },
         "build": {
             "image_name": "base Shelter image name",
-            "base_image": "optional qcow2/raw disk image path or URL; omit for normal mkosi builds; not a Docker image",
             "resize": "optional target disk size; rendered as Shelter disk.size",
-            "with_network": "allow network during image build",
             "container": "optional Shelter OCI workload payload; supports image/archive, mode, runtime, name, pull, command, env, working_dir, and network",
             "packages": "minimal OS packages installed by Shelter/mkosi",
             "files": "host files copied into the guest image",
@@ -496,6 +491,7 @@ fn spec_schema_json() -> serde_json::Value {
         "deploy": {
             "provider": "aliyun",
             "image_variant": "release or debug",
+            "image": {"release": "signed image release JSON", "trusted_key": "trusted publisher Ed25519 SPKI PEM", "manifest": "pinned sha256 manifest digest", "account_id": "authorized decimal cloud account ID"},
             "region": "Aliyun region",
             "zone_id": "Aliyun zone",
             "instance_type": "TDX-capable ECS instance type",
@@ -518,20 +514,22 @@ Required top-level keys:
 
 - `schema`: currently `confidential-agent/v1`.
 - `service`: workload identity, ports, connect ports, and readiness systemd unit.
-- `build`: image name, packages, copied files, build scripts, and optional variants.
 - `deploy`: cloud provider and Aliyun TDX ECS placement/shape.
 - `attestation`: TDX mode and reference value policy.
 - `resources`: files injected after deploy; use `{}` if no runtime files are needed.
 
 Common optional keys:
 
+- `build`: required for local builds; omit it when `deploy.image` selects a published image.
 - `secrets`: secret inputs, usually local file paths.
 - `mesh` / `peering`: multi-agent networking and trust settings.
 
 Use `confidential-agent spec validate --spec <path> --format json` before build/deploy. Validation checks local file paths, common install-script command/package mismatches, OS package-manager use inside build scripts, and parse error details. If omitted, common commands default to `confidential-agent.yaml` in the current directory.
 
-For normal migrations, omit `build.base_image`. Only use it for a provided qcow2/raw disk image path or URL; it is not a Docker/Podman image name. Use `build.container` for an OCI workload image or archive; it is rendered as Shelter `container:` and is not a replacement for the mkosi base image. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
+CA builds the guest rootfs with mkosi. Use `build.container` for an OCI workload image or archive; it is rendered as Shelter `container:` and is not a replacement for the mkosi base image. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 `build.scripts` entries are local script paths from the controller work directory, usually the same file listed in `build.files[].source`; they are not the guest `build.files[].target` path.
+
+To deploy without producer state or a local disk image, set `deploy.image.release`, `trusted_key`, `manifest` (a full `sha256:` manifest digest), and `account_id`. Omit `build` and run `deploy` directly. CA authenticates the release through Shelter before provisioning or releasing resources; challenge/Trustee resource delivery remains unchanged. `image export <service> --account-id <id> --signing-key <Ed25519 PKCS8 PEM> --output <release.json>` exports an available publication from the producer. Transfer only the release and publisher public key to consumers. Consumer `destroy` preserves the shared image.
 "#;
 
 const OVERVIEW_DOC: &str = r#"
@@ -570,7 +568,7 @@ The AppSpec is the contract between the agent migration workflow and the Confide
 
 Prefer copied scripts and structured resource files over ad hoc shell snippets in prompts. Keep secrets out of the image; inject them as resources or secret files during deploy/ops.
 
-For mkosi builds, omit `build.base_image`; it is only for disk image paths/URLs. Use Alinux/RHEL package names, start minimal, and refine after package-manager errors instead of adding optional tools by default.
+CA builds the guest rootfs with mkosi. Use Alinux/RHEL package names, start minimal, and refine after package-manager errors instead of adding optional tools by default.
 "#;
 
 const OPS_DOC: &str = r#"
@@ -612,7 +610,8 @@ mod self_describe_tests {
             .and_then(|value| value.as_array())
             .unwrap();
         assert!(required.iter().any(|value| value == "service"));
-        assert!(required.iter().any(|value| value == "build"));
+        assert!(!required.iter().any(|value| value == "build"));
+        assert!(schema["deploy"]["image"]["manifest"].is_string());
         assert!(required.iter().any(|value| value == "resources"));
     }
 
@@ -628,7 +627,6 @@ service:
   id: openclaw
   ports: [18789]
 build:
-  base_image: ./missing-base.qcow2
   image_name: openclaw-agent
   container:
     archive: ./missing-container.oci.tar
@@ -666,7 +664,6 @@ resources: {}
             .collect();
 
         assert!(!report.ok);
-        assert!(failed.contains(&"build.base_image"));
         assert!(failed.contains(&"build.container.archive"));
         assert!(failed.contains(&"build.scripts[0]"));
         assert!(failed.contains(&"build.variants.debug.ssh_public_key"));
@@ -735,7 +732,6 @@ service:
   connect: [8080]
 build:
   image_name: sample
-  with_network: true
   packages: [ca-certificates, curl]
   scripts: [./install.sh]
 deploy:
@@ -784,7 +780,6 @@ service:
   connect: [8080]
 build:
   image_name: sample
-  with_network: true
   packages: [ca-certificates, curl, tar]
   scripts: [./install.sh]
 deploy:
@@ -826,7 +821,6 @@ service:
   connect: [8080]
 build:
   image_name: sample
-  with_network: true
   packages: [ca-certificates]
   scripts: [./install.sh]
 deploy:

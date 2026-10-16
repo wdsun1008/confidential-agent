@@ -1,0 +1,138 @@
+#!/usr/bin/python3.11
+"""Image-owned harness selection; CA delivers this configuration as a resource."""
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+CONFIG = Path("/opt/data/allinone/runtime.json")
+HOME = Path("/opt/data/allinone/home")
+WORKSPACE = Path("/opt/data/allinone/workspace")
+RUNTIME_CONTEXT = Path("/run/confidential-agent/application-runtime.json")
+class ConfigurationError(ValueError):
+    """Messages contain static diagnostics, never instance environment values."""
+
+
+COMMANDS = {
+    "openclaw": ["openclaw"],
+    "hermes": ["hermes"],
+    "qodercli": ["qoder"],
+    "opencode": ["opencode"],
+    "codex": ["codex"],
+    "claude-code": ["claude"],
+}
+
+
+def load_configuration(path=CONFIG):
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict) or set(value) - {"harness", "mode", "port", "environment"}:
+        raise ConfigurationError("invalid runtime configuration fields")
+    if value.get("harness") not in COMMANDS:
+        raise ConfigurationError("unknown allinone harness")
+    environment = value.get("environment", {})
+    if not isinstance(environment, dict) or any(
+        not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) or not isinstance(item, str)
+        or "\x00" in item or key in {"HOME", "PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"}
+        for key, item in environment.items()
+    ):
+        raise ConfigurationError("invalid harness environment")
+    harness = value["harness"]
+    mode = value.get("mode", "gateway" if harness in {"openclaw", "hermes"} else "cli")
+    allowed = {"cli"}
+    if harness in {"openclaw", "hermes"}:
+        allowed.add("gateway")
+    if harness == "codex":
+        allowed.add("app-server")
+    if mode not in allowed:
+        raise ConfigurationError("unsupported harness mode")
+    port = value.get("port")
+    if port is not None and (type(port) is not int or not 1 <= port <= 65535 or mode == "cli"):
+        raise ConfigurationError("invalid listening port")
+    if mode == "gateway" and harness == "openclaw":
+        port = port or 18789
+    elif mode == "app-server":
+        port = port or 4500
+    elif mode == "gateway" and harness == "hermes":
+        if port is not None:
+            environment = dict(environment, API_SERVER_ENABLED="true", API_SERVER_HOST="0.0.0.0", API_SERVER_PORT=str(port))
+        elif environment.get("API_SERVER_ENABLED", "").lower() in {"true", "1", "yes"}:
+            port = int(environment.get("API_SERVER_PORT", "8642"))
+            if not 1 <= port <= 65535:
+                raise ConfigurationError("invalid Hermes listening port")
+    return harness, mode, port, environment
+
+
+def validate_declared_ports(port, path=RUNTIME_CONTEXT):
+    bootstrap = json.loads(path.read_text())
+    if bootstrap.get("schema_version") != "confidential-agent/application-runtime/v1":
+        raise ConfigurationError("invalid daemon application runtime context")
+    expected = [] if port is None else [port]
+    if sorted(bootstrap["ports"]) != expected:
+        raise ConfigurationError("runtime listening port does not match CA service.ports")
+
+
+def configure_fixed_release(harness, environment):
+    if harness == "opencode":
+        environment["OPENCODE_DISABLE_AUTOUPDATE"] = "true"
+    elif harness == "qodercli":
+        settings = HOME / ".qoder/settings.json"
+        if not settings.exists():
+            settings.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            settings.write_text(json.dumps({"general": {"enableAutoUpdate": False}}))
+            settings.chmod(0o600)
+        elif json.loads(settings.read_text()).get("general", {}).get("enableAutoUpdate") is not False:
+            raise ConfigurationError("Qoder instance settings must disable general.enableAutoUpdate")
+
+
+def main():
+    harness, mode, port, configured = load_configuration()
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    WORKSPACE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    environment = dict(os.environ, **configured)
+    environment.update(HOME=str(HOME), XDG_CONFIG_HOME=str(HOME / ".config"),
+                       HERMES_HOME="/opt/data/allinone/hermes",
+                       CODEX_HOME=str(HOME / ".codex"),
+                       QODER_CONFIG_DIR=str(HOME / ".qoder"),
+                       PATH="/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin:/sbin")
+    configure_fixed_release(harness, environment)
+    command = COMMANDS[harness].copy()
+    if not shutil.which(command[0], path=environment["PATH"]):
+        raise RuntimeError("selected harness is absent from the image")
+    arguments = sys.argv[1:]
+    if arguments in (["--serve"], ["--check"]):
+        validate_declared_ports(port)
+        if mode == "app-server":
+            token = HOME / ".codex/app-server-token"
+            if not token.is_file() or token.stat().st_mode & 0o077:
+                raise ConfigurationError("Codex app-server requires a private capability token")
+        if arguments == ["--check"]:
+            print(json.dumps({"harness": harness, "mode": mode, "port": port}))
+            return
+        if mode == "gateway" and harness == "openclaw":
+            command += ["gateway", "--port", str(port)]
+        elif mode == "gateway" and harness == "hermes":
+            command += ["gateway", "run"]
+        elif mode == "app-server":
+            command += ["app-server", "--listen", f"ws://0.0.0.0:{port}",
+                        "--ws-auth", "capability-token", "--ws-token-file", str(token)]
+        else:
+            # Interactive CLIs run through `ca ssh <id> -- cai-agent ...`.
+            # Keep the readiness unit alive without starting another harness.
+            command = ["/usr/bin/sleep", "infinity"]
+    else:
+        command += arguments
+    os.chdir(WORKSPACE)
+    os.execvpe(command[0], command, environment)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        # Do not print configuration contents: environment may contain secrets.
+        detail = str(error) if isinstance(error, ConfigurationError) else type(error).__name__
+        print("allinone startup failed: " + detail, file=sys.stderr)
+        sys.exit(1)

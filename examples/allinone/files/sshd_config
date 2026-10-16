@@ -1,0 +1,12 @@
+Port 22
+HostKey /opt/data/cai-ssh/host_key
+AuthorizedKeysFile /opt/data/cai-ssh/authorized_keys
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+AllowUsers root
+AllowTcpForwarding no
+X11Forwarding no
+PermitTunnel no
+Subsystem sftp internal-sftp

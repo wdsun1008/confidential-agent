@@ -93,6 +93,12 @@ struct TrusteeServiceState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingReconcile {
+    service_id: String,
+    service: TrusteeServiceState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct TrusteeState {
     schema: String,
     owner_id: String,
@@ -105,6 +111,8 @@ struct TrusteeState {
     resource_policy_sha256: Option<String>,
     #[serde(default)]
     services: BTreeMap<String, TrusteeServiceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_reconcile: Option<PendingReconcile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +193,7 @@ impl TrusteeState {
             attestation_policy_sha256: None,
             resource_policy_sha256: None,
             services: BTreeMap::new(),
+            pending_reconcile: None,
         }
     }
 
@@ -199,7 +208,11 @@ impl TrusteeState {
         if self.owner_id.len() != 32 || !self.owner_id.chars().all(|ch| ch.is_ascii_hexdigit()) {
             bail!("Trustee owner_id is invalid");
         }
-        for (service_id, service) in &self.services {
+        for (service_id, service) in self.services.iter().chain(
+            self.pending_reconcile
+                .iter()
+                .map(|pending| (&pending.service_id, &pending.service)),
+        ) {
             confidential_agent_core::trustee::validate_trustee_service_id(service_id)?;
             if service.runtime_config_sha384.len() != 96
                 || !service
@@ -449,10 +462,9 @@ fn configure(
 
         if paths.state.exists() {
             let existing = read_trustee_state(&paths)?;
-            if !existing.services.is_empty() {
+            if !existing.services.is_empty() || existing.pending_reconcile.is_some() {
                 bail!(
-                    "cannot replace Trustee configuration while {} managed service(s) remain",
-                    existing.services.len()
+                    "cannot replace Trustee configuration while managed services or an incomplete reconcile remain"
                 );
             }
         }
@@ -553,6 +565,7 @@ fn status(state_dir: &Path, json_output: bool) -> Result<()> {
         "reference_value_cleanup": "append-only; stale RV hashes can remain in Trustee RVPS, while the KBS resource policy pins each service's current UKI",
         "revision": state.revision,
         "services": state.services,
+        "pending_reconcile": state.pending_reconcile,
     });
     if json_output {
         println!("{}", serde_json::to_string_pretty(&view)?);
@@ -594,6 +607,7 @@ fn adopt(state_dir: &Path, expected_as: &str, expected_resource: &str) -> Result
     validate_sha256("--resource-policy-sha256", expected_resource)?;
     with_state_dir_lock(state_dir, || {
         let (paths, config, mut state) = load_trustee(state_dir)?;
+        anyhow::ensure!(state.pending_reconcile.is_none(), "cannot adopt a new Trustee policy baseline while a reconcile is incomplete; resume or destroy that service first");
         let client = TrusteeClient::load(&config, &paths.admin_key)?;
         let snapshot = client.snapshot()?;
         let actual_as = snapshot.attestation_policy_sha256();
@@ -645,9 +659,12 @@ pub(super) fn is_managed_service(state_dir: &Path, service_id: &str) -> Result<b
     if !paths.state.exists() {
         return Ok(false);
     }
-    Ok(read_trustee_state(&paths)?
-        .services
-        .contains_key(service_id))
+    let state = read_trustee_state(&paths)?;
+    Ok(state.services.contains_key(service_id)
+        || state
+            .pending_reconcile
+            .as_ref()
+            .is_some_and(|pending| pending.service_id == service_id))
 }
 
 /// Resolve the provider from durable deployment state without consulting the
@@ -893,6 +910,8 @@ pub(super) fn sync_service(
     }
     let paths = context_paths(state_dir, &spec.service.id);
     ensure_private_context_dirs(&paths)?;
+    let runtime_spec = instance_ssh::runtime_spec(&paths, spec)?;
+    let spec = &runtime_spec;
     let artifacts = materialize_shelter_build_artifacts(&paths, build_result, build_id)?;
     let sample_rv = artifacts.sample_rv.as_ref().with_context(|| {
         format!(
@@ -910,6 +929,10 @@ pub(super) fn sync_service(
     )?;
 
     let mut bootstrap = render_bootstrap(&paths, spec)?;
+    if let Some(state) = read_service_state_file(&paths.service_state)? {
+        bootstrap.tng_peers = state.deploy.instance_private_ips.clone();
+    }
+
     if let Some(source) = rv_source.as_ref() {
         bootstrap.resources.push(GuestResource {
             id: REFERENCE_VALUE_LIST_RESOURCE_ID.to_string(),
@@ -1113,10 +1136,21 @@ fn reconcile_service(
             attestation_binding_changed(state.services.get(service_id), &service_state);
 
         let mut proposed = state.clone();
+        proposed.pending_reconcile = None;
         proposed
             .services
-            .insert(service_id.to_string(), service_state);
+            .insert(service_id.to_string(), service_state.clone());
         proposed.revision += 1;
+
+        // Record custody before the first remote mutation. In particular, the
+        // first sync can upload secrets and then fail registering reference
+        // values before a committed service entry exists. Retain the last
+        // committed revision/digests so the remote transaction remains resumable.
+        state.pending_reconcile = Some(PendingReconcile {
+            service_id: service_id.to_string(),
+            service: service_state,
+        });
+        write_trustee_state(&paths, &state)?;
 
         if claim_required {
             // Establish fail-closed ownership before uploading any secret.
@@ -1178,6 +1212,11 @@ fn ensure_remote_control(
     snapshot: &RemoteSnapshot,
     requested: Option<&PolicyTransaction>,
 ) -> Result<bool> {
+    if let Some(pending) = &state.pending_reconcile {
+        if !requested.is_some_and(|request| request.service_id == pending.service_id) {
+            bail!("Trustee has an incomplete reconcile for service '{}'; resume or destroy that service before other Trustee mutations", pending.service_id);
+        }
+    }
     match resource_policy_owner(&snapshot.resource_policy) {
         Some(owner) if owner == state.owner_id => {
             let desired_as = sha256_bytes(DEFAULT_POLICY.as_bytes());
@@ -1282,14 +1321,56 @@ fn register_reference_values(
         ReferenceValueMode::Rekor => {
             serde_json::from_slice::<serde_json::Value>(&content)
                 .with_context(|| format!("failed to parse '{}'", source.display()))?;
-            client.gateway_post(
-                "/rvps/set_reference_value_list",
-                "application/json",
+            register_rekor_reference_values(
+                client,
                 &content,
+                &desired,
+                3,
+                Duration::from_secs(10),
             )?;
         }
     }
     Ok(())
+}
+
+fn register_rekor_reference_values(
+    client: &TrusteeClient,
+    content: &[u8],
+    desired: &BTreeMap<String, Option<BTreeSet<String>>>,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<()> {
+    for attempt in 1..=attempts {
+        match client.gateway_post(
+            "/rvps/set_reference_value_list",
+            "application/json",
+            content,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let message = format!("{error:#}");
+                let retryable = error.downcast_ref::<ureq::Error>().is_some()
+                    || [500, 502, 503, 504]
+                        .iter()
+                        .any(|status| message.contains(&format!("returned HTTP {status}")))
+                    || (message.contains("returned HTTP 400")
+                        && message.contains("Set reference value list failed"));
+                if !retryable || attempt == attempts {
+                    return Err(error);
+                }
+                // Registration is add-only. A lost response may still have
+                // committed; skip a duplicate only after matching every value.
+                if query_reference_values(client)
+                    .is_ok_and(|remote| reference_values_already_registered(desired, &remote))
+                {
+                    return Ok(());
+                }
+                eprintln!("[ca] Trustee Rekor registration failed on attempt {attempt}/{attempts}; retrying in {}s", retry_delay.as_secs());
+                thread::sleep(retry_delay);
+            }
+        }
+    }
+    bail!("Trustee Rekor registration requires at least one attempt")
 }
 
 fn query_reference_values(client: &TrusteeClient) -> Result<BTreeMap<String, BTreeSet<String>>> {
@@ -1703,6 +1784,13 @@ fn sync_from_local_state(cli: &Cli, service_filter: Option<&str>) -> Result<()> 
             .map(|filter| filter == service.service_id)
             .unwrap_or(true)
     }) {
+        let _operation = lock_service_operation(&cli.state_dir, &service.service_id)?;
+        let Some(service) = read_service_state_file(
+            &context_paths(&cli.state_dir, &service.service_id).service_state,
+        )?
+        else {
+            continue;
+        };
         if service.phase == "deleted" {
             continue;
         }
@@ -1722,11 +1810,12 @@ fn sync_from_local_state(cli: &Cli, service_filter: Option<&str>) -> Result<()> 
         spec.attestation.mode = AttestationMode::Trustee;
         let paths = context_paths(&cli.state_dir, &service.service_id);
         let manifest = read_build_manifest(&paths.manifest)?;
+        let delivery_spec = validated_injection_spec(&service, &manifest, &spec, &paths)?;
         let variant = manifest.variant(&service.build.variant, Some(&service.build.variant))?;
         sync_service(
             cli,
             &cli.state_dir,
-            &spec,
+            &delivery_spec,
             &variant.build_result,
             &variant.shelter_build_id,
             service.deploy.preferred_injection_ip(),
@@ -1741,19 +1830,54 @@ fn sync_from_local_state(cli: &Cli, service_filter: Option<&str>) -> Result<()> 
     Ok(())
 }
 
+pub(super) fn historical_disk_digest(
+    state_dir: &Path,
+    service: &LocalServiceState,
+) -> Result<String> {
+    anyhow::ensure!(service.attestation_mode == "trustee",
+        "legacy challenge state has no historical disk digest; retain the previous host toolchain for resource delivery and back up/export data before upgrading; current files cannot establish the original disk binding");
+    let (paths, config, state) = load_trustee(state_dir)?;
+    let snapshot = TrusteeClient::load(&config, &paths.admin_key)?.snapshot()?;
+    ensure_remote_control(&state, &snapshot, None)?;
+    let recorded = state
+        .services
+        .get(&service.service_id)
+        .context("no historical Trustee service binding")?;
+    anyhow::ensure!(recorded.enabled, "historical Trustee service is revoked");
+    let disk = recorded
+        .resources
+        .get("default/local-resources/disk_passphrase")
+        .context("no historical Trustee disk digest")?;
+    validate_sha256("historical disk digest", disk)?;
+    anyhow::ensure!(
+        recorded
+            .resources
+            .get("default/local-resources/data_passphrase")
+            == Some(disk),
+        "historical disk and data secrets differ; automatic input migration is unsupported"
+    );
+    Ok(disk.clone())
+}
+
 pub(super) fn revoke_service(state_dir: &Path, service_id: &str) -> Result<bool> {
     with_state_dir_lock(state_dir, || {
         let (paths, config, mut state) = load_trustee(state_dir)?;
+        let pending = state
+            .pending_reconcile
+            .as_ref()
+            .filter(|pending| pending.service_id == service_id)
+            .map(|pending| pending.service.clone());
         let Some(enabled) = state
             .services
             .get(service_id)
             .map(|service| service.enabled)
+            .or_else(|| pending.as_ref().map(|_| true))
         else {
             return Ok(false);
         };
         let client = TrusteeClient::load(&config, &paths.admin_key)?;
         let snapshot = client.snapshot()?;
-        let operation = if enabled {
+        let operation = if enabled || pending.is_some() {
             PolicyOperation::Revoke
         } else {
             // A disabled service proceeds directly to cleanup. Checking that
@@ -1763,8 +1887,12 @@ pub(super) fn revoke_service(state_dir: &Path, service_id: &str) -> Result<bool>
         };
         let transaction = PolicyTransaction::new(operation, service_id);
         ensure_remote_control(&state, &snapshot, Some(&transaction))?;
-        if !enabled {
+        if !enabled && pending.is_none() {
             return Ok(true);
+        }
+        if let Some(service) = pending {
+            state.services.insert(service_id.to_string(), service);
+            state.pending_reconcile = None;
         }
         state.services.get_mut(service_id).unwrap().enabled = false;
         state.services.get_mut(service_id).unwrap().updated_at = current_utc_timestamp();
@@ -1877,6 +2005,188 @@ mod tests {
             reference_value_names: BTreeSet::from(["measurement.uki.SHA-384".to_string()]),
             resources: BTreeMap::new(),
             updated_at: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn interrupted_first_sync_retains_custody_for_resume_or_destroy() {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex,
+        };
+
+        for resume in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = TrusteePaths::new(temp.path());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let baseline = b"package policy\nimport rego.v1\ndefault allow := false\n";
+            let policy = Arc::new(Mutex::new(baseline.to_vec()));
+            let resources = Arc::new(Mutex::new(BTreeSet::from([
+                "other/local-resources/untouched".to_string(),
+            ])));
+            let fail_registration = Arc::new(AtomicBool::new(true));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let policy = policy.clone();
+                let resources = resources.clone();
+                let fail_registration = fail_registration.clone();
+                let stop = stop.clone();
+                let state_file = paths.state.clone();
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        let (mut stream, _) = match listener.accept() {
+                            Ok(connection) => connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(error) => panic!("{error}"),
+                        };
+                        let request = read_test_http_request(&mut stream);
+                        let mut parts = request.lines().next().unwrap().split_whitespace();
+                        let method = parts.next().unwrap();
+                        let path = parts.next().unwrap();
+                        let body = request.split_once("\r\n\r\n").unwrap().1;
+                        let mut status = "200 OK";
+                        let response = match (method, path) {
+                            ("GET", "/api/kbs/v0/attestation-policy/default") => URL_SAFE_NO_PAD.encode(DEFAULT_POLICY),
+                            ("GET", "/api/kbs/v0/resource-policy") => URL_SAFE_NO_PAD.encode(&*policy.lock().unwrap()),
+                            ("GET", "/api/kbs/v0/resources") => serde_json::to_string(
+                                &resources.lock().unwrap().iter().map(|path| {
+                                    let parts = path.split('/').collect::<Vec<_>>();
+                                    json!({"repository_name": parts[0], "resource_type": parts[1], "resource_tag": parts[2]})
+                                }).collect::<Vec<_>>()
+                            ).unwrap(),
+                            ("GET", "/api/rvps/query") => "{}".to_string(),
+                            ("POST", "/api/kbs/v0/resource-policy") => {
+                                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                                let decoded = URL_SAFE_NO_PAD.decode(value["policy"].as_str().unwrap()).unwrap();
+                                if String::from_utf8_lossy(&decoded).contains("# cai-transaction: reconcile") {
+                                    let state: TrusteeState = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+                                    assert_eq!(state.pending_reconcile.unwrap().service_id, "agent-a");
+                                }
+                                *policy.lock().unwrap() = decoded;
+                                String::new()
+                            }
+                            ("POST", "/api/rvps/register") => {
+                                if fail_registration.load(Ordering::SeqCst) {
+                                    status = "400 Bad Request";
+                                    "reference registration failed".to_string()
+                                } else { String::new() }
+                            }
+                            ("POST", "/api/kbs/v0/attestation-policy") => String::new(),
+                            ("POST", path) if path.starts_with("/api/kbs/v0/resource/") => {
+                                let state: TrusteeState = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+                                assert_eq!(state.pending_reconcile.unwrap().service_id, "agent-a");
+                                resources.lock().unwrap().insert(path.trim_start_matches("/api/kbs/v0/resource/").to_string());
+                                String::new()
+                            }
+                            ("DELETE", path) if path.starts_with("/api/kbs/v0/resource/") => {
+                                assert!(path.starts_with("/api/kbs/v0/resource/agent-a/"));
+                                resources.lock().unwrap().remove(path.trim_start_matches("/api/kbs/v0/resource/"));
+                                String::new()
+                            }
+                            _ => panic!("unexpected request: {method} {path}"),
+                        };
+                        write_test_http_response(&mut stream, status, &response);
+                    }
+                })
+            };
+            let key = temp.path().join("admin.pem");
+            fs::write(
+                &key,
+                SigningKey::from_bytes(&[7; 32])
+                    .to_pkcs8_pem(Default::default())
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+            configure(
+                temp.path(),
+                &format!("http://{address}/api"),
+                None,
+                &key,
+                None,
+                false,
+            )
+            .unwrap();
+            adopt(
+                temp.path(),
+                &sha256_bytes(DEFAULT_POLICY.as_bytes()),
+                &sha256_bytes(baseline),
+            )
+            .unwrap();
+            let reference = temp.path().join("reference.json");
+            fs::write(
+                &reference,
+                serde_json::to_vec(&json!({"measurement.uki.SHA-384": ["a".repeat(96)]})).unwrap(),
+            )
+            .unwrap();
+            let desired = vec![DesiredResource {
+                logical_path: "default/local-resources/probe".to_string(),
+                content: b"private-test-value".to_vec(),
+            }];
+            let error = reconcile_service(
+                temp.path(),
+                "agent-a",
+                service_state(),
+                &desired,
+                ReferenceValueMode::Sample,
+                &Some(reference.clone()),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("400"));
+            let saved = read_trustee_state(&paths).unwrap();
+            assert!(saved.services.is_empty());
+            assert_eq!(
+                saved.pending_reconcile.as_ref().unwrap().service_id,
+                "agent-a"
+            );
+            assert!(service_uses_trustee(temp.path(), "agent-a", Some("trustee")).unwrap());
+            assert!(resources
+                .lock()
+                .unwrap()
+                .contains("agent-a/local-resources/probe"));
+            let snapshot = RemoteSnapshot {
+                attestation_policy: DEFAULT_POLICY.as_bytes().to_vec(),
+                resource_policy: policy.lock().unwrap().clone(),
+                resources: Vec::new(),
+            };
+            assert!(ensure_remote_control(
+                &saved,
+                &snapshot,
+                Some(&PolicyTransaction::new(PolicyOperation::Reconcile, "other"))
+            )
+            .is_err());
+            if resume {
+                fail_registration.store(false, Ordering::SeqCst);
+                reconcile_service(
+                    temp.path(),
+                    "agent-a",
+                    service_state(),
+                    &desired,
+                    ReferenceValueMode::Sample,
+                    &Some(reference),
+                )
+                .unwrap();
+                let saved = read_trustee_state(&paths).unwrap();
+                assert!(saved.pending_reconcile.is_none());
+                assert!(saved.services["agent-a"].enabled);
+            }
+            assert!(revoke_service(temp.path(), "agent-a").unwrap());
+            cleanup_revoked_service(temp.path(), "agent-a").unwrap();
+            let saved = read_trustee_state(&paths).unwrap();
+            assert!(saved.services.is_empty() && saved.pending_reconcile.is_none());
+            assert_eq!(
+                *resources.lock().unwrap(),
+                BTreeSet::from(["other/local-resources/untouched".to_string()])
+            );
+            stop.store(true, Ordering::SeqCst);
+            worker.join().unwrap();
         }
     }
 
@@ -2308,6 +2618,59 @@ mod tests {
             }]}),
             json!({UKI_REFERENCE_VALUE_NAME: ["A".repeat(96)]}),
         );
+    }
+
+    #[test]
+    fn rekor_retry_requires_exact_remote_coverage_to_skip_registration() {
+        for already_registered in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut request, _) = listener.accept().unwrap();
+                assert_test_request(
+                    &read_test_http_request(&mut request),
+                    "POST",
+                    "/api/rvps/set_reference_value_list",
+                );
+                write_test_http_response(
+                    &mut request,
+                    "400 Bad Request",
+                    "Set reference value list failed",
+                );
+                let (mut query, _) = listener.accept().unwrap();
+                assert_test_request(
+                    &read_test_http_request(&mut query),
+                    "GET",
+                    "/api/rvps/query",
+                );
+                let hash = if already_registered { "a" } else { "b" }.repeat(96);
+                write_test_http_response(
+                    &mut query,
+                    "200 OK",
+                    &json!({UKI_REFERENCE_VALUE_NAME: [hash]}).to_string(),
+                );
+                if !already_registered {
+                    let (mut retry, _) = listener.accept().unwrap();
+                    assert_test_request(
+                        &read_test_http_request(&mut retry),
+                        "POST",
+                        "/api/rvps/set_reference_value_list",
+                    );
+                    write_test_http_response(&mut retry, "200 OK", "");
+                }
+            });
+            let client = TrusteeClient {
+                management_url: format!("http://{address}/api"),
+                agent: ureq::AgentBuilder::new().build(),
+                signing_key: SigningKey::from_bytes(&[7; 32]),
+            };
+            let desired = BTreeMap::from([(
+                UKI_REFERENCE_VALUE_NAME.to_string(),
+                Some(BTreeSet::from(["a".repeat(96)])),
+            )]);
+            register_rekor_reference_values(&client, b"{}", &desired, 2, Duration::ZERO).unwrap();
+            server.join().unwrap();
+        }
     }
 
     #[test]

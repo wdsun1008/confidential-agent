@@ -12,6 +12,7 @@ pub const SCHEMA_VERSION: &str = "confidential-agent/v1";
 pub struct AgentSpec {
     pub schema: String,
     pub service: ServiceSpec,
+    #[serde(default)]
     pub build: BuildSpec,
     pub deploy: DeploySpec,
     pub attestation: AttestationSpec,
@@ -33,6 +34,10 @@ pub struct ServiceSpec {
     pub mcp_ports: Vec<u16>,
     #[serde(default)]
     pub app_service: Option<String>,
+    /// Deliver instance SSH credentials through the attested resource flow.
+    /// The image must provide a service using these credentials.
+    #[serde(default)]
+    pub ssh: bool,
 }
 
 /// Per-port connect configuration. Supports two YAML forms:
@@ -81,22 +86,23 @@ impl Default for EncryptionMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildSpec {
-    #[serde(default)]
-    pub base_image: Option<String>,
     pub image_name: String,
+    /// Image-owned runtime requirements, captured at build time and signed on export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_contract: Option<PathBuf>,
     #[serde(default)]
     pub kernel_cmdline_append: Option<String>,
     #[serde(default)]
     pub resize: Option<String>,
     #[serde(default)]
-    pub with_network: bool,
-    #[serde(default)]
     pub container: Option<BuildContainerSpec>,
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<BuildRepositorySpec>,
     #[serde(default)]
     pub files: Vec<BuildFileSpec>,
     #[serde(default)]
@@ -105,6 +111,15 @@ pub struct BuildSpec {
     pub variants: BuildVariantsSpec,
     #[serde(default, skip_serializing_if = "BuildCleanupSpec::is_empty")]
     pub cleanup: BuildCleanupSpec,
+}
+
+/// Additional signed RPM repositories passed to Shelter's native build input.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildRepositorySpec {
+    pub name: String,
+    pub baseurl: String,
+    pub gpgkey: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -221,6 +236,9 @@ pub struct BuildVariantSpec {
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
     pub provider: DeployProvider,
+    /// A publisher-authenticated cloud image; no local build is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<PublishedImageSpec>,
     pub instance_type: String,
     #[serde(default)]
     pub image_variant: Option<String>,
@@ -266,6 +284,16 @@ fn default_replica_count() -> u32 {
 
 fn default_slb_type() -> SlbType {
     SlbType::Nlb
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedImageSpec {
+    pub release: PathBuf,
+    pub trusted_key: PathBuf,
+    /// Immutable Shelter manifest identity, selected independently of the release.
+    pub manifest: String,
+    pub account_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -437,7 +465,11 @@ impl AgentSpec {
     }
 
     pub fn image_id(&self) -> &str {
-        &self.build.image_name
+        self.deploy
+            .image
+            .as_ref()
+            .map(|image| image.manifest.as_str())
+            .unwrap_or(&self.build.image_name)
     }
 
     pub fn image_variant(&self) -> &str {
@@ -453,11 +485,15 @@ impl AgentSpec {
     }
 
     fn resolve_paths_against(&mut self, base_dir: &Path) {
-        if let Some(base_image) = &mut self.build.base_image {
-            if !looks_like_url(base_image) {
-                let mut path = PathBuf::from(base_image.as_str());
-                resolve_pathbuf(&mut path, base_dir);
-                *base_image = path.to_string_lossy().to_string();
+        if let Some(path) = &mut self.build.runtime_contract {
+            resolve_pathbuf(path, base_dir);
+        }
+        if let Some(image) = &mut self.deploy.image {
+            if !image.release.as_os_str().is_empty() {
+                resolve_pathbuf(&mut image.release, base_dir);
+            }
+            if !image.trusted_key.as_os_str().is_empty() {
+                resolve_pathbuf(&mut image.trusted_key, base_dir);
             }
         }
         for path in &mut self.build.scripts {
@@ -510,7 +546,42 @@ impl AgentSpec {
         {
             bail!("service.app_service must not be empty when set");
         }
-        validate_id("build.image_name", &self.build.image_name)?;
+        if self.service.ssh && self.deploys_debug_image() {
+            bail!("service.ssh requires a release image; debug images use their existing SSH mechanism");
+        }
+        if let Some(image) = &self.deploy.image {
+            if image.release.as_os_str().is_empty() || image.trusted_key.as_os_str().is_empty() {
+                bail!("deploy.image requires release and trusted_key paths");
+            }
+            let digest = image.manifest.strip_prefix("sha256:").unwrap_or_default();
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("deploy.image.manifest must be a full sha256: manifest identity");
+            }
+            if image.account_id.is_empty()
+                || !image.account_id.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                bail!("deploy.image.account_id must be a decimal account ID");
+            }
+            if !self.build.image_name.is_empty()
+                || !self.build.packages.is_empty()
+                || !self.build.files.is_empty()
+                || !self.build.scripts.is_empty()
+                || !self.build.repos.is_empty()
+                || self.build.container.is_some()
+                || self.build.resize.is_some()
+                || self.build.runtime_contract.is_some()
+                || self.build.kernel_cmdline_append.is_some()
+                || self.build.cleanup != BuildCleanupSpec::default()
+                || self.build.variants.debug.is_some()
+            {
+                bail!("deploy.image reuses a published image; omit build inputs");
+            }
+            if self.deploys_debug_image() {
+                bail!("deploy.image cannot reuse build-time debug SSH credentials");
+            }
+        } else {
+            validate_id("build.image_name", &self.build.image_name)?;
+        }
         validate_ports("service.ports", &self.service.ports)?;
         validate_connect_ports(&self.service.ports, &self.service.connect)?;
         validate_mcp_ports(
@@ -518,15 +589,16 @@ impl AgentSpec {
             &self.service.connect,
             &self.service.mcp_ports,
         )?;
-        if self
-            .build
-            .base_image
-            .as_deref()
-            .is_some_and(|base_image| base_image.trim().is_empty())
-        {
-            bail!("build.base_image must not be empty when set");
-        }
         validate_build_packages(&self.build)?;
+        let mut repo_names = BTreeSet::new();
+        for repo in &self.build.repos {
+            validate_id("build.repos.name", &repo.name)?;
+            validate_https_url("build.repos.baseurl", &repo.baseurl)?;
+            validate_https_url("build.repos.gpgkey", &repo.gpgkey)?;
+            if !repo_names.insert(&repo.name) {
+                bail!("duplicate build.repos.name: {}", repo.name);
+            }
+        }
         if let Some(container) = &self.build.container {
             validate_build_container(container)?;
         }
@@ -542,16 +614,31 @@ impl AgentSpec {
         if self.deploy.replicas == 0 {
             bail!("deploy.replicas must be greater than 0");
         }
-        if self.deploy.replicas > 1
-            && self
-                .deploy
-                .slb
-                .as_ref()
-                .map_or(true, |s| !s.enabled)
-        {
+        if self.deploy.replicas > 1 && self.deploy.slb.as_ref().map_or(true, |s| !s.enabled) {
             bail!("deploy.replicas > 1 requires deploy.slb.enabled = true (TNG has no client-side load balancing)");
         }
+        if self.deploy.replicas > 1 {
+            anyhow::ensure!(
+                self.service
+                    .connect
+                    .iter()
+                    .filter(|p| p.encryption() == EncryptionMode::Ohttp)
+                    .count()
+                    <= 1,
+                "service replicas currently support one OHTTP connect port per service"
+            );
+        }
         if let Some(slb) = &self.deploy.slb {
+            if slb.enabled {
+                anyhow::ensure!(
+                    self.deploy.replicas > 1,
+                    "an enabled SLB requires replicas > 1"
+                );
+                anyhow::ensure!(
+                    !self.service.connect.is_empty(),
+                    "SLB requires at least one protected connect port"
+                );
+            }
             if slb.enabled && slb.slb_type == SlbType::Alb {
                 let has_rats_tls = self
                     .service
@@ -592,6 +679,12 @@ impl AgentSpec {
         }
         for (name, resource) in &self.resources {
             validate_id("resources key", name)?;
+            anyhow::ensure!(
+                !matches!(name.as_str(), "disk_passphrase" | "data_passphrase"
+                    | "cagent_bootstrap_config" | "cagent_mesh_bundle"
+                    | "cagent_a2a_bundle" | "cagent_reference_value_list"),
+                "resources.{name} is reserved for CA platform delivery; application resources cannot overwrite instance secrets or control bundles"
+            );
             if resource.source.as_os_str().is_empty() {
                 bail!("resources.{}.source must not be empty", name);
             }
@@ -632,7 +725,12 @@ impl AgentSpec {
                 if interface.port == 0 {
                     bail!("a2a.interfaces[{idx}].port must be greater than 0");
                 }
-                if !self.service.connect.iter().any(|cp| cp.port() == interface.port) {
+                if !self
+                    .service
+                    .connect
+                    .iter()
+                    .any(|cp| cp.port() == interface.port)
+                {
                     bail!("a2a.interfaces[{idx}].port must be listed in service.connect");
                 }
                 if !interface.path.starts_with('/') {
@@ -739,9 +837,6 @@ fn validate_mcp_ports(ports: &[u16], connect: &[ConnectPort], mcp_ports: &[u16])
 }
 
 fn validate_build_packages(build: &BuildSpec) -> Result<()> {
-    if build.base_image.is_some() {
-        return Ok(());
-    }
     for (index, package) in build.packages.iter().enumerate() {
         let package = package.trim();
         if package.is_empty() {
@@ -876,7 +971,7 @@ fn alinux_package_substitution(package: &str) -> Option<&'static str> {
         "xz-utils" => Some("'xz'"),
         "docker-cli" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
         "docker.io" => Some("'podman' only if the workload actually needs a container runtime; otherwise remove it"),
-        "ffmpeg" => Some("a custom base image or repository that provides ffmpeg; otherwise remove it from build.packages"),
+        "ffmpeg" => Some("a repository that provides ffmpeg; otherwise remove it from build.packages"),
         _ => None,
     }
 }
@@ -893,10 +988,6 @@ fn resolve_pathbuf(path: &mut PathBuf, base_dir: &Path) {
         *path = base_dir.join(&*path);
     }
     *path = normalize_path(path);
-}
-
-fn looks_like_url(value: &str) -> bool {
-    value.contains("://")
 }
 
 fn validate_https_url(field: &str, value: &str) -> Result<()> {
@@ -1004,6 +1095,113 @@ fn default_enabled_variant() -> BuildVariantSpec {
 mod tests {
     use super::*;
 
+    fn published_spec() -> serde_yaml::Value {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(SPEC).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("build"));
+        value["deploy"]["image"] = serde_yaml::from_str(&format!(
+            "release: ./image.json\ntrusted_key: ./publisher.pem\nmanifest: sha256:{}\naccount_id: '1234567890'\n",
+            "a".repeat(64)
+        )).unwrap();
+        value
+    }
+
+    #[test]
+    fn application_resources_cannot_overwrite_platform_delivery_slots() {
+        let yaml = "schema: confidential-agent/v1\nservice: {id: app, ports: []}\nbuild: {image_name: app}\ndeploy: {provider: aliyun, region: cn-beijing, zone_id: cn-beijing-i, instance_type: ecs.g9i.xlarge}\nattestation: {tee: tdx, mode: challenge, reference_values: sample}\nresources: {}";
+        let mut spec = AgentSpec::from_yaml(yaml, Path::new("/project")).unwrap();
+        for id in [
+            "disk_passphrase",
+            "data_passphrase",
+            "cagent_bootstrap_config",
+            "cagent_mesh_bundle",
+            "cagent_a2a_bundle",
+            "cagent_reference_value_list",
+        ] {
+            spec.resources.clear();
+            spec.resources.insert(
+                id.into(),
+                ResourceSpec {
+                    source: PathBuf::from("/project/token"),
+                    target: "/opt/data/token".into(),
+                    owner: None,
+                    group: None,
+                    mode: None,
+                    required: true,
+                    mutable: false,
+                },
+            );
+            assert!(spec
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("reserved for CA platform delivery"));
+        }
+        spec.resources.clear();
+        spec.resources.insert(
+            "api_token".into(),
+            ResourceSpec {
+                source: PathBuf::from("/project/token"),
+                target: "/opt/data/token".into(),
+                owner: None,
+                group: None,
+                mode: None,
+                required: true,
+                mutable: false,
+            },
+        );
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn published_image_needs_no_local_build_and_resolves_public_metadata_paths() {
+        let spec = AgentSpec::from_yaml(
+            &serde_yaml::to_string(&published_spec()).unwrap(),
+            Path::new("/project"),
+        )
+        .unwrap();
+        assert!(spec.build.image_name.is_empty());
+        let image = spec.deploy.image.unwrap();
+        assert_eq!(image.release, Path::new("/project/image.json"));
+        assert_eq!(image.trusted_key, Path::new("/project/publisher.pem"));
+    }
+
+    #[test]
+    fn published_image_rejects_ambiguous_builds_unpinned_identity_and_debug_keys() {
+        for field in ["build", "manifest", "account_id", "release", "debug"] {
+            let mut value = published_spec();
+            match field {
+                "build" => {
+                    value["build"] = serde_yaml::from_str("image_name: another-image").unwrap()
+                }
+                "manifest" => value["deploy"]["image"]["manifest"] = "sha256:123".into(),
+                "account_id" => value["deploy"]["image"]["account_id"] = "bad-account".into(),
+                "release" => value["deploy"]["image"]["release"] = "".into(),
+                _ => value["deploy"]["image_variant"] = "debug".into(),
+            }
+            assert!(
+                AgentSpec::from_yaml(
+                    &serde_yaml::to_string(&value).unwrap(),
+                    Path::new("/project")
+                )
+                .is_err(),
+                "accepted {field}"
+            );
+        }
+        let mut value = published_spec();
+        value["deploy"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("image"));
+        assert!(AgentSpec::from_yaml(
+            &serde_yaml::to_string(&value).unwrap(),
+            Path::new("/project")
+        )
+        .is_err());
+    }
+
     const SPEC: &str = r#"
 schema: confidential-agent/v1
 service:
@@ -1013,10 +1211,8 @@ service:
   mcp_ports: [18800]
   app_service: cai-openclaw-gateway.service
 build:
-  base_image: ./base.qcow2
   image_name: openclaw-agent
   resize: 30G
-  with_network: true
   packages:
     - nodejs
   files:
@@ -1066,11 +1262,6 @@ resources:
         assert_eq!(spec.image_id(), "openclaw-agent");
         assert_eq!(spec.image_variant(), "release");
         assert_eq!(
-            spec.build.base_image.as_deref(),
-            Some("/project/base.qcow2")
-        );
-        assert!(spec.build.with_network);
-        assert_eq!(
             spec.build.scripts[0],
             PathBuf::from("/project/image/install-openclaw.sh")
         );
@@ -1115,22 +1306,19 @@ resources:
     }
 
     #[test]
-    fn accepts_mkosi_build_without_base_image() {
-        let spec = AgentSpec::from_yaml(
-            &SPEC.replace("  base_image: ./base.qcow2\n", ""),
-            Path::new("/project"),
-        )
-        .unwrap();
-
-        assert!(spec.build.base_image.is_none());
-        assert_eq!(spec.image_id(), "openclaw-agent");
+    fn rejects_removed_build_fields() {
+        for field in ["base_image: /images/base.qcow2", "with_network: true"] {
+            let yaml = SPEC.replace("build:\n", &format!("build:\n  {field}\n"));
+            let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
+            assert!(format!("{err:#}").contains("unknown field"));
+        }
     }
 
     #[test]
     fn parses_and_resolves_build_container() {
         let yaml = SPEC.replace(
-            "  with_network: true\n",
-            r#"  with_network: true
+            "  image_name: openclaw-agent\n",
+            r#"  image_name: openclaw-agent
   container:
     archive: ./containers/hermes.oci.tar
     mode: runtime
@@ -1224,7 +1412,7 @@ resources:
                 "build.container.mounts is only supported with build.container.mode: runtime",
             ),
         ] {
-            let yaml = SPEC.replace("  with_network: true\n", &format!("  with_network: true\n{snippet}"));
+            let yaml = SPEC.replace("  image_name: openclaw-agent\n", &format!("  image_name: openclaw-agent\n{snippet}"));
             let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
             assert!(
                 err.to_string().contains(expected),
@@ -1235,9 +1423,7 @@ resources:
 
     #[test]
     fn rejects_debian_package_names_for_default_mkosi_builds() {
-        let yaml = SPEC
-            .replace("  base_image: ./base.qcow2\n", "")
-            .replace("    - nodejs", "    - build-essential");
+        let yaml = SPEC.replace("    - nodejs", "    - build-essential");
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
         assert!(err
@@ -1247,9 +1433,7 @@ resources:
 
     #[test]
     fn rejects_whitespace_padded_debian_package_names() {
-        let yaml = SPEC
-            .replace("  base_image: ./base.qcow2\n", "")
-            .replace("    - nodejs", "    - \" libffi-dev \"");
+        let yaml = SPEC.replace("    - nodejs", "    - \" libffi-dev \"");
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
         assert!(err.to_string().contains("use 'libffi-devel' instead"));
@@ -1263,9 +1447,7 @@ resources:
             "libc-dev",
             "docker.io",
         ] {
-            let yaml = SPEC
-                .replace("  base_image: ./base.qcow2\n", "")
-                .replace("    - nodejs", &format!("    - {package}"));
+            let yaml = SPEC.replace("    - nodejs", &format!("    - {package}"));
             let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
             assert!(err
@@ -1276,26 +1458,10 @@ resources:
 
     #[test]
     fn rejects_packages_unavailable_in_default_alinux_repos() {
-        let yaml = SPEC
-            .replace("  base_image: ./base.qcow2\n", "")
-            .replace("    - nodejs", "    - ffmpeg");
+        let yaml = SPEC.replace("    - nodejs", "    - ffmpeg");
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("custom base image or repository that provides ffmpeg"));
-    }
-
-    #[test]
-    fn allows_custom_base_images_to_choose_package_ecosystem() {
-        let yaml = SPEC.replace("    - nodejs", "    - build-essential");
-        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
-
-        assert_eq!(
-            spec.build.base_image.as_deref(),
-            Some("/project/base.qcow2")
-        );
-        assert_eq!(spec.build.packages, vec!["build-essential"]);
+        assert!(err.to_string().contains("repository that provides ffmpeg"));
     }
 
     #[test]
@@ -1898,10 +2064,7 @@ a2a:
 
         let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
 
-        assert_eq!(
-            spec.deploy.slb.as_ref().unwrap().slb_type,
-            SlbType::Nlb
-        );
+        assert_eq!(spec.deploy.slb.as_ref().unwrap().slb_type, SlbType::Nlb);
     }
 
     #[test]
@@ -1960,9 +2123,9 @@ a2a:
 
         let err = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap_err();
 
-        assert!(err.to_string().contains(
-            "deploy.slb.slb_type alb (L7) is incompatible with RATS-TLS"
-        ));
+        assert!(err
+            .to_string()
+            .contains("deploy.slb.slb_type alb (L7) is incompatible with RATS-TLS"));
     }
 
     #[test]

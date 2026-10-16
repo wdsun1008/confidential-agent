@@ -1,0 +1,30 @@
+schema: confidential-agent/v1
+service:
+  id: allinone-codex
+  ports: []
+  ssh: true
+  app_service: cai-allinone.service
+deploy:
+  provider: aliyun
+  region: cn-beijing
+  zone_id: cn-beijing-i
+  instance_type: ecs.g9i.xlarge
+  disk_gb: 120
+  image:
+    release: ./image-release.json
+    trusted_key: ./publisher.pem
+    manifest: sha256:REPLACE_WITH_PUBLISHED_MANIFEST_DIGEST
+    account_id: "REPLACE_WITH_ACCOUNT_ID"
+attestation:
+  tee: tdx
+  mode: challenge
+  reference_values: sample
+resources:
+  runtime:
+    source: ./runtime.json
+    target: /opt/data/allinone/runtime.json
+    mode: "0600"
+  codex_config:
+    source: ./secrets/config.toml
+    target: /opt/data/allinone/home/.codex/config.toml
+    mode: "0600"

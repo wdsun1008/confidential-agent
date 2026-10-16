@@ -187,6 +187,8 @@ pub(crate) enum Commands {
     Peering(PeeringArgs),
     A2a(A2aArgs),
     Migrate(MigrateArgs),
+    /// Check host upgrade compatibility or bind verified legacy deployment inputs.
+    Upgrade(UpgradeArgs),
     Image(ImageArgs),
     Ssh(SshArgs),
     Tui(TuiArgs),
@@ -207,13 +209,6 @@ pub(crate) enum InitTarget {
     Claudecode,
     #[value(name = "vllm-inference")]
     VllmInference,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub(crate) enum InitBuildBackend {
-    Mkosi,
-    #[value(name = "base-image")]
-    BaseImage,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -246,10 +241,6 @@ pub(crate) struct InitArgs {
     /// single-node deploy.
     #[arg(long, default_value_t = 1)]
     pub(crate) replicas: u32,
-    #[arg(long, value_enum, default_value = "mkosi")]
-    pub(crate) build_backend: InitBuildBackend,
-    #[arg(long)]
-    pub(crate) base_image: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub(crate) reference_values: Option<InitReferenceValues>,
     #[arg(long)]
@@ -271,9 +262,9 @@ pub(crate) struct InitArgs {
     pub(crate) gateway_token: Option<String>,
     #[arg(long)]
     pub(crate) disable_pep: bool,
-    #[arg(long, default_value = "2026.5.7")]
+    #[arg(long, default_value_t = confidential_agent_core::software::version("openclaw"))]
     pub(crate) openclaw_version: String,
-    #[arg(long, default_value = "22.19.0")]
+    #[arg(long, default_value_t = confidential_agent_core::software::version("node"))]
     pub(crate) node_version: String,
     #[arg(long, default_value = "https://registry.npmmirror.com/")]
     pub(crate) npm_registry: String,
@@ -283,8 +274,8 @@ pub(crate) struct InitArgs {
     pub(crate) vllm_model_dir: String,
     #[arg(long, default_value = "Qwen3.6-35B-A3B")]
     pub(crate) vllm_served_model_name: String,
-    #[arg(long, default_value_t = 8090)]
-    pub(crate) vllm_port: u16,
+    #[arg(long)]
+    pub(crate) vllm_port: Option<u16>,
     #[arg(long, default_value = "0.28.0")]
     pub(crate) vllm_version: String,
     #[arg(long, default_value = "release")]
@@ -327,6 +318,9 @@ pub(crate) struct BuildArgs {
 pub(crate) struct DeployArgs {
     #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
+    /// Resume resource delivery for an instance whose infrastructure is already deployed
+    #[arg(long, conflicts_with = "render_only")]
+    pub(crate) resume: bool,
     #[arg(long, hide = true)]
     pub(crate) skip_inject: bool,
     #[arg(long, hide = true)]
@@ -489,6 +483,9 @@ pub(crate) enum ConnectCommands {
 
 #[derive(Debug, Args)]
 pub(crate) struct ConnectStartArgs {
+    /// Probe a recorded physical replica through the protected connection.
+    #[arg(long, requires = "service", conflicts_with = "from_card")]
+    pub(crate) instance_id: Option<String>,
     #[arg(long)]
     pub(crate) from_card: Option<String>,
     #[arg(long)]
@@ -590,6 +587,23 @@ pub(crate) struct MigrateArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct UpgradeArgs {
+    #[command(subcommand)]
+    pub(crate) command: UpgradeCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum UpgradeCommands {
+    /// Check existing deployments before replacing the host CLI or rebooting guests.
+    Check,
+    /// Freeze legacy inputs using historical Trustee disk digests and recorded identities.
+    BindInputs {
+        #[arg(long)]
+        service: String,
+    },
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct ImageArgs {
     #[command(subcommand)]
     pub(crate) command: ImageCommands,
@@ -607,6 +621,20 @@ pub(crate) enum ImageCommands {
         force: bool,
     },
     Publish(ImagePublishArgs),
+    /// Export authenticated public metadata for deploying this image elsewhere.
+    Export {
+        service: String,
+        #[arg(long)]
+        account_id: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        region: Option<String>,
+        #[arg(long)]
+        variant: Option<String>,
+    },
     Unpublish(ImageUnpublishArgs),
     Prune(ImagePruneArgs),
 }
@@ -678,6 +706,12 @@ pub(crate) struct TuiArgs {
 #[derive(Debug, Args)]
 pub(crate) struct SshArgs {
     pub(crate) service: String,
+    /// Select a recorded physical replica for management SSH.
+    #[arg(long)]
+    pub(crate) instance_id: Option<String>,
+    /// Allocate a terminal for an interactive remote command; scripts keep no PTY
+    #[arg(short = 't', long)]
+    pub(crate) tty: bool,
     #[arg(last = true)]
     pub(crate) ssh_args: Vec<OsString>,
 }

@@ -144,7 +144,7 @@ pub fn derive_tng_client_config_with_local_ports(
         let local_port = local_port_for(port.port)?;
         ingress.push(json!({
             "rats_tls": {
-                "multiplex": false,
+                "multiplex": true,
             },
             "mapping": {
                 "in": {
@@ -157,6 +157,8 @@ pub fn derive_tng_client_config_with_local_ports(
                 },
             },
             "verify": {
+                "model": "background_check",
+                "as_provider": "coco",
                 "as_type": "builtin",
                 "attestation_policy": {
                     "type": "path",
@@ -554,7 +556,7 @@ mod tests {
         assert_eq!(ingress[0]["mapping"]["out"]["host"], "1.2.3.4");
         assert_eq!(ingress[0]["mapping"]["out"]["port"], 18789);
         assert_eq!(ingress[0]["mapping"]["in"]["host"], "127.0.0.1");
-        assert_eq!(ingress[0]["rats_tls"]["multiplex"], false);
+        assert_eq!(ingress[0]["rats_tls"]["multiplex"], true);
         assert_eq!(
             ingress[0]["verify"]["attestation_policy"]["path"],
             DEFAULT_TNG_POLICY_PATH

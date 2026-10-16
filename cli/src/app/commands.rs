@@ -20,6 +20,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Peering(args) => cmd_peering(cli, args),
         Commands::A2a(args) => cmd_a2a(cli, args),
         Commands::Migrate(args) => cmd_migrate(cli, args),
+        Commands::Upgrade(args) => upgrade::run(cli, args),
         Commands::Image(args) => cmd_image(cli, args),
         Commands::Ssh(args) => cmd_ssh(cli, args),
         Commands::Tui(args) => cmd_tui(cli, args),
@@ -35,10 +36,22 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
 
 pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    let _operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
+    anyhow::ensure!(
+        spec.deploy.image.is_none(),
+        "deploy.image selects a published image; run deploy directly instead of build"
+    );
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let existing_state = read_service_state_file(&paths.service_state)?;
     validate_build_start(existing_state.as_ref())?;
     let run_id = current_build_run_id();
+    let mut nonce = [0u8; 8];
+    OsRng.fill_bytes(&mut nonce);
+    let attempt = paths
+        .service_dir
+        .join("build-attempts")
+        .join(format!("{run_id}-{}", hex_encode(&nonce)));
+    ensure_private_dir(&attempt)?;
     let selected_variant = spec.image_variant().to_string();
     let mut selected_prepared = None;
     let mut selected_manifest = None;
@@ -46,6 +59,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
     let mut variants = BTreeMap::new();
 
     for variant in enabled_build_variants(&spec) {
+        let preparation_dir = attempt.join(&variant);
         let build_id = timestamped_shelter_build_id_for_variant(&spec, &variant, &run_id);
         let mut variant_spec = spec.clone();
         variant_spec.deploy.image_variant = Some(variant.clone());
@@ -54,6 +68,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
             &cli.state_dir,
             &args.spec,
             PrepareOptions {
+                preparation_dir: Some(preparation_dir.clone()),
                 build_id: Some(build_id),
                 image_variant: Some(variant.clone()),
                 resolve_container_images: !args.render_only,
@@ -61,9 +76,10 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
                 ..PrepareOptions::default()
             },
         )?;
-        let prepared_manifest = read_build_manifest(&paths.manifest)?;
+        let prepared_manifest = read_build_manifest(&preparation_dir.join("manifest.json"))?;
         variants.insert(variant.clone(), manifest_variant_from(&prepared_manifest));
         if !args.render_only {
+            verify_shelter_initrd_support(cli, &prepared.rendered_config)?;
             println!("[ca] building {variant} image with Shelter...");
             let mut shelter_args = vec![
                 OsString::from("--work-dir"),
@@ -71,7 +87,7 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
                 OsString::from("build"),
                 OsString::from("--config"),
                 prepared.rendered_config.as_os_str().to_os_string(),
-                OsString::from("--image-id"),
+                OsString::from("--tag"),
                 OsString::from(prepared.shelter_build_id.clone()),
                 OsString::from("--image-type"),
                 OsString::from("disk"),
@@ -94,8 +110,6 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
         format!("build manifest for variant '{selected_variant}' was not prepared")
     })?;
     manifest.variants = variants;
-    fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
-        .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
     fs::write(
         &prepared.rendered_config,
         selected_rendered.with_context(|| {
@@ -109,14 +123,33 @@ pub(super) fn cmd_build(cli: &Cli, args: &BuildArgs) -> Result<()> {
         return Ok(());
     }
 
-    let state = write_service_state(
-        &cli.state_dir,
-        &args.spec,
-        &spec,
-        &DeployObservation::default(),
-        &prepared,
-        "built",
-    )?;
+    // Prepare the state before publishing either binding. A missing resource or
+    // invalid build result must leave the previous successful build intact.
+    let state = with_state_dir_lock(&cli.state_dir, || {
+        let state = build_service_state(
+            &cli.state_dir,
+            &args.spec,
+            &spec,
+            &DeployObservation::default(),
+            &prepared,
+            "built",
+        )?;
+        let previous = paths
+            .manifest
+            .try_exists()?
+            .then(|| read_build_manifest(&paths.manifest))
+            .transpose()?;
+        write_json_atomic(&paths.manifest, &manifest)?;
+        if let Err(error) = write_local_service_state(&cli.state_dir, &state) {
+            match previous {
+                Some(previous) => write_json_atomic(&paths.manifest, &previous)?,
+                None => fs::remove_file(&paths.manifest)?,
+            }
+            return Err(error);
+        }
+        Ok(state)
+    })?;
+    link_committed_config(&paths.rendered_config, &prepared.rendered_config)?;
     if let Ok(image) = latest_built_image(&cli.state_dir, &spec) {
         println!(
             "[ca] build completed: service={} image={}",
@@ -133,7 +166,7 @@ pub(super) fn validate_build_start(existing: Option<&LocalServiceState>) -> Resu
     let Some(state) = existing else {
         return Ok(());
     };
-    if matches!(state.phase.as_str(), "active" | "deployed") {
+    if matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
         bail!(
             "service '{}' is {}; destroy it before building a new local image",
             state.service_id,
@@ -149,7 +182,7 @@ pub(super) fn validate_deploy_start(existing: Option<&LocalServiceState>) -> Res
     };
     match state.phase.as_str() {
         "built" | "deleted" => Ok(()),
-        "active" | "deployed" => bail!(
+        "active" | "deployed" | "deploying" => bail!(
             "service '{}' is {}; destroy it before deploying again",
             state.service_id,
             state.phase
@@ -265,7 +298,9 @@ fn ensure_build_variant_present(
 }
 
 pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
-    let spec = AgentSpec::from_path(&args.spec)?;
+    let mut snapshot = deployment_snapshot(&args.spec)?;
+    let spec = snapshot.spec.clone();
+    let operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
     let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
     if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
         bail!(
@@ -281,52 +316,83 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     }
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let current_state = read_service_state_file(&paths.service_state)?;
-    validate_deploy_start(current_state.as_ref())?;
-    let current_state = current_state.with_context(|| {
-        format!(
-            "deploy requires a local build for service '{}'; run build first",
-            spec.service.id
-        )
-    })?;
-    let current_manifest = read_build_manifest(&paths.manifest).with_context(|| {
-        format!(
-            "deploy requires a local build manifest for service '{}'; run build first",
-            spec.service.id
-        )
-    })?;
+    if args.resume {
+        let state = current_state
+            .as_ref()
+            .context("--resume requires an existing deployed instance")?;
+        anyhow::ensure!(state.phase == "deployed",
+            "--resume requires confirmed deployed infrastructure; service is '{}'. For an interrupted infrastructure operation, inspect its saved Shelter state and destroy it before a new deploy", state.phase);
+        let manifest = read_build_manifest(&paths.manifest)?;
+        let saved = committed_deployment(state, &manifest)?;
+        validate_resume_inputs(&saved, &snapshot, &paths)?;
+        snapshot = saved;
+    } else if current_state.is_some() || spec.deploy.image.is_none() {
+        validate_deploy_start(current_state.as_ref())?;
+    }
+    let current_manifest = if spec.deploy.image.is_some() && !args.resume {
+        images::import(cli, &spec)?
+    } else {
+        read_build_manifest(&paths.manifest).with_context(|| {
+            format!(
+                "deploy requires a local build manifest for service '{}'; run build first",
+                spec.service.id
+            )
+        })?
+    };
     let deploy_variant = spec.image_variant().to_string();
-    let build_variant =
-        current_manifest.variant(&deploy_variant, Some(&current_state.build.variant))?;
-    let published_image_id =
-        publish::published_image_for_deploy(&current_state, &spec, &build_variant);
-    ensure_build_variant_present(
-        &current_state,
-        &deploy_variant,
-        &build_variant,
-        published_image_id.is_some(),
-    )?;
+    validate_shared_guest_ports(&cli.state_dir, &spec, &current_manifest)?;
+    let (build_variant, published_image_id) = if let Some(image) = &current_manifest.image {
+        (
+            current_manifest.fallback_variant(),
+            Some(image.image_id.clone()),
+        )
+    } else {
+        let state = current_state
+            .as_ref()
+            .context("deploy requires a local build; run build first")?;
+        let variant = current_manifest.variant(&deploy_variant, Some(&state.build.variant))?;
+        let published = publish::published_image_for_deploy(state, &spec, &variant);
+        ensure_build_variant_present(state, &deploy_variant, &variant, published.is_some())?;
+        (variant, published)
+    };
     if let Some(image_id) = published_image_id.as_deref() {
         println!("[ca] using published image {image_id} for deploy (skipping upload+import)");
     }
-    validate_mesh_port_conflicts(
-        &read_service_states(&cli.state_dir)?,
-        &spec.service.id,
-        &spec.service.ports,
-    )?;
+    // Keep publication cleanup out of the interval before the consumer's
+    // deployment binding is persisted. Different consumers can deploy together.
+    let image_lease = published_image_id
+        .as_deref()
+        .map(|image_id| lock_image_operation(&cli.state_dir, &spec.deploy.region, image_id, true))
+        .transpose()?;
     if !trustee_mode && !args.render_only && !args.skip_inject {
         verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     }
 
     let existing_services = read_service_states(&cli.state_dir)?;
     let peerings = read_peerings_or_empty(&cli.state_dir)?;
-    let deploy_names = DeployNames::new(&spec);
-    let deploy_user_data = if trustee_mode {
+    let deploy_names = if args.resume {
+        let state = current_state.as_ref().unwrap();
+        DeployNames {
+            run_id: state.deploy.run_id.clone(),
+            resource_name: state.deploy.resource_name.clone(),
+            image_import_name: state.deploy.image_import_name.clone().unwrap_or_default(),
+        }
+    } else {
+        DeployNames::new(&spec)
+    };
+    if !args.resume && !args.render_only {
+        freeze_deployment_inputs(&mut snapshot, &paths, &deploy_names.run_id)?;
+    }
+    let delivery_spec = deployment_delivery_spec(&snapshot)?;
+    let deploy_user_data = if args.resume {
+        committed_deployment(current_state.as_ref().unwrap(), &current_manifest)?.user_data
+    } else if trustee_mode {
         if !args.render_only {
             println!("[ca] synchronizing Trustee boot resources before infrastructure launch...");
             trustee::sync_service(
                 cli,
                 &cli.state_dir,
-                &spec,
+                &delivery_spec,
                 &build_variant.build_result,
                 &build_variant.shelter_build_id,
                 None,
@@ -339,25 +405,35 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     } else {
         None
     };
-    let prepared = prepare(
-        cli,
-        &cli.state_dir,
-        &args.spec,
-        PrepareOptions {
-            build_id: Some(build_variant.shelter_build_id.clone()),
-            image_variant: Some(deploy_variant.clone()),
-            include_deploy: true,
-            resolve_container_images: false,
-            deploy_names: Some(deploy_names.clone()),
-            mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
-            peerings,
-            cloud_image_id: published_image_id.clone(),
-            deploy_user_data,
-            deployer_cidr: std::env::var("CA_DEPLOYER_CIDR").ok(),
-        },
-    )?;
+    let options = PrepareOptions {
+        preparation_dir: None,
+        build_id: Some(build_variant.shelter_build_id.clone()),
+        image_variant: Some(deploy_variant.clone()),
+        include_deploy: true,
+        resolve_container_images: false,
+        deploy_names: Some(deploy_names.clone()),
+        mesh_peer_cidrs: active_peer_public_cidrs(&spec.service.id, &existing_services)?,
+        peerings,
+        cloud_image_id: published_image_id.clone(),
+        deploy_user_data,
+        deployer_cidr: std::env::var("CA_DEPLOYER_CIDR").ok(),
+    };
+    snapshot.user_data = options.deploy_user_data.clone();
+    let mut prepared = if args.resume {
+        prepared_from_state(
+            &cli.state_dir,
+            current_state.as_ref().unwrap(),
+            &current_manifest,
+        )?
+    } else if current_manifest.image.is_some() {
+        images::prepare(&paths, &spec, &current_manifest, &options)?
+    } else {
+        prepare(cli, &cli.state_dir, &args.spec, options)?
+    };
     let mut deploy_manifest = read_build_manifest(&paths.manifest)?;
     deploy_manifest.variants = current_manifest.variants.clone();
+    deploy_manifest.runtime_contract = current_manifest.runtime_contract.clone();
+    deploy_manifest.deployment = Some(snapshot);
     fs::write(
         &paths.manifest,
         serde_json::to_string_pretty(&deploy_manifest)?,
@@ -367,9 +443,24 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         println!("{}", prepared.rendered_config.display());
         return Ok(());
     }
-    println!("[ca] deploying infrastructure with Shelter...");
-    let mut shelter_args = deploy_shelter_args(&prepared);
-    run_shelter(cli, &mut shelter_args)?;
+    // Apply can create resources before it fails. Save the attempt's name first
+    // so Shelter can resolve its recorded directory during destroy.
+    if !args.resume {
+        write_service_state(
+            &cli.state_dir,
+            &args.spec,
+            &delivery_spec,
+            &DeployObservation::default(),
+            &prepared,
+            "deploying",
+        )?;
+        println!("[ca] deploying infrastructure with Shelter...");
+        let mut shelter_args = deploy_shelter_args(&prepared);
+        run_shelter(cli, &mut shelter_args).context("infrastructure deployment did not complete; its attempt is recorded in local state. Inspect Shelter status before destroying it; --resume never replays an unknown infrastructure operation")?;
+        bind_shelter_deployment(cli, &mut prepared)?;
+        deploy_manifest.deploy_result = prepared.deploy_result.clone();
+        write_json_atomic(&paths.manifest, &deploy_manifest)?;
+    }
 
     {
         println!("[ca] Shelter deploy completed; resolving instance outputs...");
@@ -378,11 +469,12 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         write_service_state(
             &cli.state_dir,
             &args.spec,
-            &spec,
+            &delivery_spec,
             &observation,
             &prepared,
             "deployed",
         )?;
+        drop(image_lease);
         if args.skip_inject {
             return Ok(());
         }
@@ -394,7 +486,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             trustee::sync_service(
                 cli,
                 &cli.state_dir,
-                &spec,
+                &delivery_spec,
                 &prepared.build_result,
                 &prepared.shelter_build_id,
                 Some(&injection_ip),
@@ -411,7 +503,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             inject_resources(
                 cli,
                 &cli.state_dir,
-                &spec,
+                &delivery_spec,
                 &prepared.build_result,
                 &prepared.shelter_build_id,
                 &injection_ip,
@@ -445,16 +537,21 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         let mut active_state = build_service_state(
             &cli.state_dir,
             &args.spec,
-            &spec,
+            &delivery_spec,
             &observation,
             &prepared,
             "active",
         )?;
         let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
         active_state.mesh_generation = mesh_generation;
-        write_local_service_state(&cli.state_dir, &active_state)?;
         sync_a2a_bundle(cli, &cli.state_dir)?;
+        if let Err(error) = wait_for_service_ready(&cli.state_dir, &active_state, &delivery_spec) {
+            active_state.phase = "deployed".into();
+            write_json_atomic(&paths.service_state, &active_state)?;
+            return Err(error);
+        }
         let active_services = read_service_states(&cli.state_dir)?;
+        drop(operation);
         println!("[ca] refreshing active Shelter deploys for public mesh rules...");
         refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
         println!(
@@ -472,6 +569,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
 
 pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let spec = AgentSpec::from_path(&args.spec)?;
+    let operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
     let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
     if !trustee_mode && trustee::is_managed_service(&cli.state_dir, &spec.service.id)? {
         bail!(
@@ -485,11 +583,6 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     if !trustee_mode {
         verify_operator_peering_for_direct_injection(&cli.state_dir, args.skip_peering_check)?;
     }
-    validate_mesh_port_conflicts(
-        &read_service_states(&cli.state_dir)?,
-        &spec.service.id,
-        &spec.service.ports,
-    )?;
     let paths = context_paths(&cli.state_dir, &spec.service.id);
     let state = read_service_state_file(&paths.service_state)?.with_context(|| {
         format!(
@@ -509,13 +602,30 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
             spec.service.id
         )
     })?;
+    let target_matches = [
+        state.deploy.public_ip.as_deref(),
+        state.deploy.private_ip.as_deref(),
+    ]
+    .contains(&Some(args.target_ip.as_str()))
+        || state
+            .deploy
+            .instance_public_ips
+            .iter()
+            .chain(&state.deploy.instance_private_ips)
+            .any(|ip| ip == &args.target_ip);
+    anyhow::ensure!(
+        target_matches,
+        "inject target must match a recorded deployment address"
+    );
+    let delivery_spec = validated_injection_spec(&state, &manifest, &spec, &paths)?;
+    validate_shared_guest_ports(&cli.state_dir, &spec, &manifest)?;
     let build_variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
 
     if trustee_mode {
         trustee::sync_service(
             cli,
             &cli.state_dir,
-            &spec,
+            &delivery_spec,
             &build_variant.build_result,
             &build_variant.shelter_build_id,
             Some(&args.target_ip),
@@ -524,7 +634,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
         inject_resources(
             cli,
             &cli.state_dir,
-            &spec,
+            &delivery_spec,
             &build_variant.build_result,
             &build_variant.shelter_build_id,
             &args.target_ip,
@@ -539,9 +649,9 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     }
     let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
     active_state.mesh_generation = mesh_generation;
-    write_local_service_state(&cli.state_dir, &active_state)?;
     sync_a2a_bundle(cli, &cli.state_dir)?;
     let active_services = read_service_states(&cli.state_dir)?;
+    drop(operation);
     refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
     Ok(())
 }
@@ -553,6 +663,14 @@ pub(super) fn cmd_mesh(cli: &Cli, args: &MeshArgs) -> Result<()> {
 }
 
 pub(super) fn cmd_peering(cli: &Cli, args: &PeeringArgs) -> Result<()> {
+    let _mutation = if matches!(
+        args.command,
+        PeeringCommands::Add { .. } | PeeringCommands::Remove { .. }
+    ) {
+        Some(lock_state_dir(&cli.state_dir)?)
+    } else {
+        None
+    };
     match &args.command {
         PeeringCommands::Add {
             role,
@@ -966,7 +1084,21 @@ fn cmd_connect_start(
     if from_card.is_some() && service.is_some() {
         bail!("connect start accepts either --from-card or --service, not both");
     }
-    let config = resolve_connect_config(cli, from_card, service)?;
+    let mut config = resolve_connect_config(cli, from_card, service)?;
+    if let Some(instance_id) = &args.instance_id {
+        let service_id = service.context("--instance-id requires --service")?;
+        let paths = context_paths(&cli.state_dir, service_id);
+        let state = read_service_state_file(&paths.service_state)?
+            .context("service has no recorded deployment")?;
+        let target = recorded_replica_address(&state, instance_id)?;
+        for ingress in config["add_ingress"]
+            .as_array_mut()
+            .context("connect config has no ingress routes")?
+        {
+            ingress["mapping"]["out"]["host"] = target.clone().into();
+        }
+        eprintln!("protected connection targets replica {instance_id} at {target}");
+    }
     let endpoints = connect_client_endpoints(&config)?;
     let tng_config = tng_launch_config(&config);
     let config_content = serde_json::to_string(&tng_config)?;
@@ -1224,7 +1356,7 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
             if let Some(state) = state.as_ref() {
                 match state.phase.as_str() {
                     "built" | "deleted" => {}
-                    "active" | "deployed" => bail!(
+                    "active" | "deployed" | "deploying" => bail!(
                         "service '{}' is {}; destroy it before removing local images",
                         state.service_id,
                         state.phase
@@ -1249,6 +1381,22 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
             Ok(())
         }
         ImageCommands::Publish(args) => publish::cmd_image_publish(cli, args),
+        ImageCommands::Export {
+            service,
+            account_id,
+            signing_key,
+            output,
+            region,
+            variant,
+        } => images::export(
+            cli,
+            service,
+            account_id,
+            signing_key,
+            output,
+            region.as_deref(),
+            variant.as_deref(),
+        ),
         ImageCommands::Unpublish(args) => publish::cmd_image_unpublish(cli, args),
         ImageCommands::Prune(args) => publish::cmd_image_prune(cli, args),
     }
@@ -1533,6 +1681,7 @@ fn status_cloud_view(state: &LocalServiceState, cloud_present: bool) -> StatusCl
             security_group_id: None,
             private_ip: None,
             public_ip: None,
+            management_ip: None,
             tee: None,
         };
     }
@@ -1546,6 +1695,7 @@ fn status_cloud_view(state: &LocalServiceState, cloud_present: bool) -> StatusCl
         security_group_id: state.deploy.security_group_id.clone(),
         private_ip: state.deploy.private_ip.clone(),
         public_ip: state.deploy.public_ip.clone(),
+        management_ip: debug_ssh_target(state).map(str::to_owned),
         tee: Some(state.deploy.tee.clone()),
     }
 }
@@ -1556,63 +1706,165 @@ pub(super) fn collect_live_status(
 ) -> Vec<LiveStatusView> {
     states
         .iter()
-        .cloned()
         .map(|state| {
-            let local = status_view(state_dir, &state);
+            let local = status_view(state_dir, state);
             if !matches!(state.phase.as_str(), "active" | "deployed") {
                 return LiveStatusView {
                     local,
+                    replicas: Vec::new(),
                     daemon: None,
-                    live_error: Some("service is not active or deployed".to_string()),
+                    live_error: Some("service is not active or deployed".into()),
                 };
             }
-            // The daemon status API (port 8088) is per-instance and not fronted
-            // by the ALB, which only forwards the connect listener on 8080. For
-            // multi-node, probe each instance public IP; single-instance falls
-            // back to the recorded public_ip.
-            let hosts: Vec<String> = if !state.deploy.instance_public_ips.is_empty() {
-                state.deploy.instance_public_ips.clone()
-            } else {
-                state
-                    .deploy
-                    .public_ip
-                    .iter()
-                    .filter(|ip| !ip.trim().is_empty())
-                    .cloned()
-                    .collect()
-            };
-            if hosts.is_empty() {
-                return LiveStatusView {
-                    local,
-                    daemon: None,
-                    live_error: Some("service has no public_ip".to_string()),
-                };
+            let replicas = collect_replica_status(state, fetch_daemon_status);
+            let (daemon, live_error) = aggregate_replica_status(&replicas);
+            LiveStatusView {
+                local,
+                replicas,
+                daemon,
+                live_error,
             }
-            let mut last_err = String::new();
-            let mut daemon: Option<DaemonStatus> = None;
-            for host in &hosts {
-                match fetch_daemon_status(host) {
-                    Ok(status) => {
-                        daemon = Some(status);
-                        break;
-                    }
-                    Err(err) => last_err = err.to_string(),
-                }
-            }
-            match daemon {
-                Some(status) => LiveStatusView {
-                    local,
-                    daemon: Some(status),
+        })
+        .collect()
+}
+
+pub(super) fn collect_replica_status(
+    state: &LocalServiceState,
+    mut fetch: impl FnMut(&str) -> Result<DaemonStatus>,
+) -> Vec<ReplicaStatusView> {
+    let addresses = if !state.deploy.instance_public_ips.is_empty() {
+        state.deploy.instance_public_ips.clone()
+    } else if !state.deploy.instance_private_ips.is_empty() {
+        state.deploy.instance_private_ips.clone()
+    } else {
+        state
+            .deploy
+            .preferred_injection_ip()
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    };
+    addresses
+        .into_iter()
+        .enumerate()
+        .map(|(index, address)| {
+            let instance_id = state
+                .deploy
+                .instance_ids
+                .get(index)
+                .cloned()
+                .or_else(|| state.deploy.instance_id.clone());
+            match fetch(&address) {
+                Ok(daemon) => ReplicaStatusView {
+                    instance_id,
+                    address,
+                    daemon: Some(daemon),
                     live_error: None,
                 },
-                None => LiveStatusView {
-                    local,
+                Err(error) => ReplicaStatusView {
+                    instance_id,
+                    address,
                     daemon: None,
-                    live_error: Some(last_err),
+                    live_error: Some(error.to_string()),
                 },
             }
         })
         .collect()
+}
+
+pub(super) fn aggregate_replica_status(
+    replicas: &[ReplicaStatusView],
+) -> (Option<DaemonStatus>, Option<String>) {
+    let mut aggregate = replicas.iter().find_map(|node| node.daemon.clone());
+    let errors = replicas
+        .iter()
+        .filter_map(|node| {
+            node.live_error.as_ref().map(|error| {
+                format!(
+                    "{}: {error}",
+                    node.instance_id.as_deref().unwrap_or(&node.address)
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(status) = aggregate.as_mut() {
+        status.app_ready = replicas
+            .iter()
+            .all(|node| node.daemon.as_ref().is_some_and(|d| d.app_ready));
+        status.mesh_ready = replicas
+            .iter()
+            .all(|node| node.daemon.as_ref().is_some_and(|d| d.mesh_ready));
+        status.debug_ssh_ready = replicas
+            .iter()
+            .all(|node| node.daemon.as_ref().is_some_and(|d| d.debug_ssh_ready));
+        if !errors.is_empty() {
+            status.phase = "degraded".into();
+        }
+    }
+    let error = if replicas.is_empty() {
+        Some("service has no recorded instance address".into())
+    } else if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    };
+    (aggregate, error)
+}
+
+fn wait_for_service_ready(
+    state_dir: &Path,
+    state: &LocalServiceState,
+    spec: &AgentSpec,
+) -> Result<()> {
+    let default_timeout = default_app_ready_wait_sec(
+        spec.service.app_service.as_deref(),
+        &spec.deploy.instance_type,
+    );
+    let timeout = std::env::var("CA_APP_READY_WAIT_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default_timeout);
+    wait_for_service_ready_with_timeout(state_dir, state, spec, timeout)
+}
+
+fn default_app_ready_wait_sec(app_service: Option<&str>, instance_type: &str) -> u64 {
+    if app_service == Some("cai-vllm.service")
+        || instance_type.starts_with("ecs.gn")
+        || instance_type.starts_with("ecs.ebmgn")
+    {
+        7200
+    } else {
+        300
+    }
+}
+
+fn wait_for_service_ready_with_timeout(
+    state_dir: &Path,
+    state: &LocalServiceState,
+    spec: &AgentSpec,
+    timeout: u64,
+) -> Result<()> {
+    let started = Instant::now();
+    let paths = context_paths(state_dir, &state.service_id);
+    loop {
+        let replicas = collect_replica_status(state, fetch_daemon_status);
+        write_json_atomic(&paths.service_dir.join("replica-readiness.json"), &replicas)?;
+        if !replicas.is_empty()
+            && replicas.iter().all(|node| {
+                node.daemon.as_ref().is_some_and(|d| {
+                    d.service_id == state.service_id
+                        && d.mesh_ready
+                        && (spec.service.app_service.is_none() || d.app_ready)
+                })
+            })
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= Duration::from_secs(timeout) {
+            bail!("not all replicas of '{}' became ready within {}s; inspect replica-readiness.json and resume delivery with the committed inputs", state.service_id, timeout);
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
 }
 
 pub(super) fn status_table_columns() -> &'static [&'static str] {
@@ -1648,7 +1900,14 @@ fn print_status_table(states: &[StatusView]) {
     );
     for state in states {
         let ports = join_ports(&state.service.ports);
-        let connect = join_ports(&state.service.connect.iter().map(|cp| cp.port()).collect::<Vec<_>>());
+        let connect = join_ports(
+            &state
+                .service
+                .connect
+                .iter()
+                .map(|cp| cp.port())
+                .collect::<Vec<_>>(),
+        );
         println!(
             "{:<18} {:<9} {:<28} {:<11} {:<7} {:<16} {:<12} {:<12}",
             state.service_id,
@@ -1773,9 +2032,16 @@ fn debug_ssh_hint_from_status(state: &StatusView) -> Option<String> {
     let key = state.build.debug_ssh.as_ref()?;
     let target = state
         .cloud
-        .public_ip
+        .management_ip
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            state
+                .cloud
+                .public_ip
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
         .or_else(|| {
             state
                 .cloud
@@ -1823,18 +2089,7 @@ fn print_debug_ssh_hint(state: &LocalServiceState) {
 
 pub(super) fn debug_ssh_hint(state: &LocalServiceState) -> Option<String> {
     let key = state.build.debug_ssh.as_ref()?;
-    let target = state
-        .deploy
-        .public_ip
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            state
-                .deploy
-                .private_ip
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        });
+    let target = debug_ssh_target(state);
     Some(match target {
         Some(target) => format!(
             "{}: ssh -i {} root@{}",
@@ -1858,7 +2113,25 @@ pub(super) struct DebugSshCommand {
 }
 
 pub(super) fn cmd_ssh(cli: &Cli, args: &SshArgs) -> Result<()> {
-    let command = resolve_debug_ssh_command(&cli.state_dir, &args.service, &args.ssh_args)?;
+    let mut ssh_args = Vec::new();
+    if args.tty {
+        ssh_args.push("-tt".into());
+    }
+    ssh_args.extend(args.ssh_args.iter().cloned());
+    let mut command = resolve_debug_ssh_command(&cli.state_dir, &args.service, &ssh_args)?;
+    if let Some(instance_id) = &args.instance_id {
+        let paths = context_paths(&cli.state_dir, &args.service);
+        let state =
+            read_service_state_file(&paths.service_state)?.context("service has no state")?;
+        let target = recorded_replica_address(&state, instance_id)?;
+        let old = OsString::from(format!("root@{}", command.target));
+        for argument in &mut command.argv {
+            if *argument == old {
+                *argument = format!("root@{target}").into();
+            }
+        }
+        command.target = target;
+    }
     exec_debug_ssh_command(&command)
 }
 
@@ -1875,6 +2148,14 @@ pub(super) fn resolve_debug_ssh_command(
             paths.service_state.display()
         )
     })?;
+    if let Some(ssh) = read_build_manifest(&paths.manifest)
+        .ok()
+        .and_then(|manifest| manifest.ssh)
+    {
+        anyhow::ensure!(state.phase != "deleted", "service is deleted");
+        let target = debug_ssh_target(&state).context("service has no deploy IP")?;
+        return Ok(ssh.command(target, ssh_args));
+    }
     build_debug_ssh_command(&state, ssh_args)
 }
 
@@ -1916,9 +2197,30 @@ pub(super) fn build_debug_ssh_argv(
     argv
 }
 
+pub(super) fn recorded_replica_address(
+    state: &LocalServiceState,
+    instance_id: &str,
+) -> Result<String> {
+    let index = state
+        .deploy
+        .instance_ids
+        .iter()
+        .position(|id| id == instance_id)
+        .context("--instance-id is not a recorded replica of this service")?;
+    let address = state
+        .deploy
+        .instance_public_ips
+        .get(index)
+        .or_else(|| state.deploy.instance_private_ips.get(index))
+        .context("recorded replica has no management address")?;
+    address
+        .parse::<std::net::Ipv4Addr>()
+        .context("recorded replica address is not IPv4")?;
+    Ok(address.clone())
+}
+
 fn debug_ssh_target(state: &LocalServiceState) -> Option<&str> {
-    non_empty_ip(state.deploy.public_ip.as_deref())
-        .or_else(|| non_empty_ip(state.deploy.private_ip.as_deref()))
+    state.deploy.preferred_injection_ip()
 }
 
 fn non_empty_ip(value: Option<&str>) -> Option<&str> {
@@ -2115,8 +2417,20 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
+    let operation = lock_service_operation(&cli.state_dir, &args.service)?;
     let paths = context_paths(&cli.state_dir, &args.service);
     let existing_state = read_service_state_file(&paths.service_state)?;
+    // Formal deletion may remove the last Trustee membership and its state
+    // file. A repeated destroy has no infrastructure left to revoke or delete.
+    if existing_state.as_ref().is_some_and(|state| {
+        state.phase == "deleted" && !deploy_runtime_state_present(&state.deploy)
+    }) {
+        if trustee::is_managed_service(&cli.state_dir, &args.service)? {
+            trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
+        }
+        println!("service '{}' is already deleted", args.service);
+        return Ok(());
+    }
     // The AppSpec is mutable and may have been moved after deployment.
     // Trustee membership is authoritative when present; the immutable mode
     // snapshot prevents a lost Trustee state file from becoming an unsafe
@@ -2128,28 +2442,46 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
             .as_ref()
             .map(|state| state.attestation_mode.as_str()),
     )?;
+    // Trustee may stage boot resources before configuration preparation creates
+    // a manifest. Infrastructure always starts after local state is recorded.
+    if existing_state.is_none() && !paths.manifest.try_exists()? {
+        if trustee_mode {
+            trustee::revoke_service(&cli.state_dir, &args.service)?;
+            trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
+        }
+        println!("service '{}' has no recorded infrastructure", args.service);
+        return Ok(());
+    }
     if let Some(state) = existing_state.as_ref() {
-        if state.phase == "deleted" && !deploy_runtime_state_present(&state.deploy) {
+        if build_has_no_deployment(state) {
             if trustee_mode {
+                trustee::revoke_service(&cli.state_dir, &args.service)?;
                 trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
             }
-            println!("service '{}' is already deleted", args.service);
+            let mut state = state.clone();
+            state.phase = "deleted".to_string();
+            state.generation += 1;
+            clear_deploy_runtime_state(&mut state.deploy);
+            write_local_service_state(&cli.state_dir, &state)?;
+            println!(
+                "service '{}' has no recorded infrastructure; staged resources cleaned",
+                args.service
+            );
             return Ok(());
         }
     }
-    if !paths.rendered_config.exists() {
-        bail!(
-            "no local state or rendered Shelter config for service '{}'",
-            args.service
-        );
-    }
-
     let manifest = read_build_manifest(&paths.manifest)?;
     let mut shelter_args = vec![
         OsString::from("--work-dir"),
         manifest.shelter_work_dir.as_os_str().to_os_string(),
         OsString::from("destroy"),
-        OsString::from(manifest.shelter_build_id.clone()),
+        OsString::from(
+            existing_state
+                .as_ref()
+                .filter(|state| !state.deploy.resource_name.is_empty())
+                .map(|state| &state.deploy.resource_name)
+                .unwrap_or(&manifest.shelter_build_id),
+        ),
     ];
     if let Some(terraform_dir) = existing_state
         .as_ref()
@@ -2158,8 +2490,9 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
         shelter_args.push(OsString::from("--terraform-dir"));
         shelter_args.push(terraform_dir.as_os_str().to_os_string());
     }
-    shelter_args.push(OsString::from("--config"));
-    shelter_args.push(paths.rendered_config.as_os_str().to_os_string());
+    // Destroy uses Shelter's saved deployment plan and Terraform directory.
+    // Re-reading the V2 project without its selected target fails when init
+    // stopped before a plan was saved, although no infrastructure was created.
     shelter_args.push(OsString::from("--auto-approve"));
     if trustee_mode {
         println!("[ca] revoking Trustee resource access before infrastructure deletion...");
@@ -2180,8 +2513,16 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
         state.phase = "deleted".to_string();
         state.generation += 1;
         clear_deploy_runtime_state(&mut state.deploy);
-        write_local_service_state(&cli.state_dir, &state)?;
-        sync_mesh(cli, &cli.state_dir, None)?;
+        with_state_dir_lock(&cli.state_dir, || {
+            write_local_service_state(&cli.state_dir, &state)?;
+            sync_mesh_for_services(
+                cli,
+                &cli.state_dir,
+                read_service_states(&cli.state_dir)?,
+                None,
+            )
+        })?;
+        drop(operation);
         let services = read_service_states(&cli.state_dir)?;
         refresh_active_shelter_deploys(cli, &cli.state_dir, &services)?;
     }
@@ -2203,6 +2544,7 @@ fn clear_deploy_runtime_state(deploy: &mut LocalDeployState) {
     deploy.published_image_id = None;
     deploy.instance_ids.clear();
     deploy.instance_private_ips.clear();
+    deploy.instance_public_ips.clear();
     deploy.slb_vip = None;
 }
 
@@ -2221,23 +2563,69 @@ fn deploy_runtime_state_present(deploy: &LocalDeployState) -> bool {
         || !deploy.tee.is_empty()
         || !deploy.instance_ids.is_empty()
         || !deploy.instance_private_ips.is_empty()
+        || !deploy.instance_public_ips.is_empty()
         || deploy.slb_vip.is_some()
 }
 
+fn build_has_no_deployment(state: &LocalServiceState) -> bool {
+    if state.phase != "built" || !state.build.published.is_empty() {
+        return false;
+    }
+    let mut deploy = state.deploy.clone();
+    // Build allocates planned names before any infrastructure operation.
+    deploy.run_id.clear();
+    deploy.resource_name.clear();
+    deploy.image_import_name = None;
+    deploy.tee.clear();
+    !deploy_runtime_state_present(&deploy)
+}
+
 pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
+    if let Some(image) = &prepared.image {
+        return vec![
+            "--work-dir".into(),
+            prepared.shelter_work_dir.as_os_str().to_os_string(),
+            "deploy-release".into(),
+            image.source.release.as_os_str().to_os_string(),
+            "--trusted-key".into(),
+            image.source.trusted_key.as_os_str().to_os_string(),
+            "--expect-manifest".into(),
+            image.source.manifest.clone().into(),
+            "--runtime-target".into(),
+            prepared.rendered_config.as_os_str().to_os_string(),
+            "--name".into(),
+            prepared
+                .deploy_names
+                .as_ref()
+                .map(|names| names.resource_name.clone())
+                .unwrap_or_else(|| prepared.shelter_build_id.clone())
+                .into(),
+            "--auto-approve".into(),
+        ];
+    }
     let mut args = vec![
         OsString::from("--work-dir"),
         prepared.shelter_work_dir.as_os_str().to_os_string(),
-        OsString::from("deploy"),
+        OsString::from("run"),
         OsString::from(prepared.shelter_build_id.clone()),
     ];
-    if let Some(terraform_dir) = prepared.terraform_dir.as_ref() {
-        args.push(OsString::from("--terraform-dir"));
-        args.push(terraform_dir.as_os_str().to_os_string());
-    }
+    // The explicit project carries deployment-only options such as Trustee
+    // bootstrap and peerings. Reuse requires its build inputs to match the image.
+    args.extend([
+        OsString::from("--no-build"),
+        OsString::from("--target"),
+        OsString::from("deploy"),
+        OsString::from("--name"),
+        OsString::from(
+            prepared
+                .deploy_names
+                .as_ref()
+                .map(|names| &names.resource_name)
+                .unwrap_or(&prepared.shelter_build_id),
+        ),
+    ]);
     args.push(OsString::from("--config"));
     args.push(prepared.rendered_config.as_os_str().to_os_string());
-    args.push(OsString::from("--auto-approve"));
     args
 }
 
@@ -2618,6 +3006,7 @@ mod tests {
             from_card: Some("http://one.example/card.json".to_string()),
             service: None,
             command: Some(ConnectCommands::Start(ConnectStartArgs {
+                instance_id: None,
                 from_card: Some("http://two.example/card.json".to_string()),
                 service: None,
                 ready_json: PathBuf::from("connect-ready.json"),
@@ -2951,4 +3340,23 @@ mod tests {
         assert_eq!(non_empty_ip(Some("   ")), None);
         assert_eq!(non_empty_ip(None), None);
     }
+}
+#[test]
+fn gpu_model_startup_has_a_longer_bounded_readiness_budget() {
+    assert_eq!(
+        default_app_ready_wait_sec(Some("cai-openclaw-gateway.service"), "ecs.gn8v-tee.4xlarge"),
+        7200
+    );
+    assert_eq!(
+        default_app_ready_wait_sec(None, "ecs.ebmgn7.24xlarge"),
+        7200
+    );
+    assert_eq!(
+        default_app_ready_wait_sec(Some("cai-vllm.service"), "ecs.g9i.xlarge"),
+        7200
+    );
+    assert_eq!(
+        default_app_ready_wait_sec(Some("cai-openclaw-gateway.service"), "ecs.g9i.xlarge"),
+        300
+    );
 }

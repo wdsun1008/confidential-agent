@@ -154,8 +154,20 @@ fn peering_scope_isolation() {
 #[test]
 fn mesh_bundle_contains_only_active_services_and_their_reference_values() {
     let states = vec![
-        service_state("alpha", "active", "1.2.3.4", vec![18789], vec![confidential_agent_core::spec::ConnectPort::Plain(18789)]),
-        service_state("beta", "deleted", "5.6.7.8", vec![9090], vec![confidential_agent_core::spec::ConnectPort::Plain(9090)]),
+        service_state(
+            "alpha",
+            "active",
+            "1.2.3.4",
+            vec![18789],
+            vec![confidential_agent_core::spec::ConnectPort::Plain(18789)],
+        ),
+        service_state(
+            "beta",
+            "deleted",
+            "5.6.7.8",
+            vec![9090],
+            vec![confidential_agent_core::spec::ConnectPort::Plain(9090)],
+        ),
         service_state("gamma", "active", "9.9.9.9", vec![18800], vec![]),
     ];
     let sample = BTreeMap::from([
@@ -200,7 +212,10 @@ fn mesh_bundle_contains_only_active_services_and_their_reference_values() {
 
     let alpha = &bundle.services["alpha"];
     assert_eq!(alpha.ports, vec![18789]);
-    assert_eq!(alpha.connect, vec![confidential_agent_core::spec::ConnectPort::Plain(18789)]);
+    assert_eq!(
+        alpha.connect,
+        vec![confidential_agent_core::spec::ConnectPort::Plain(18789)]
+    );
 
     assert!(bundle.reference_values.contains_key("alpha"));
     assert!(!bundle.reference_values.contains_key("beta"));

@@ -18,6 +18,8 @@ pub(super) fn inject_resources(
     let tee = tee_name(spec.attestation.tee);
     let paths = context_paths(state_dir, &spec.service.id);
     ensure_private_context_dirs(&paths)?;
+    let runtime_spec = instance_ssh::runtime_spec(&paths, spec)?;
+    let spec = &runtime_spec;
 
     let artifacts = materialize_shelter_build_artifacts(&paths, build_result, build_id)?;
     prepare_challenge_reference_values(
@@ -101,7 +103,10 @@ pub(super) fn inject_resources(
         paths.bootstrap_file.clone(),
     ));
     if let Some(source) = &guest_rv_source {
-        injections.push((resource_path(REFERENCE_VALUE_LIST_RESOURCE_ID), source.clone()));
+        injections.push((
+            resource_path(REFERENCE_VALUE_LIST_RESOURCE_ID),
+            source.clone(),
+        ));
     }
     injections.push((
         "default/local-resources/disk_passphrase".to_string(),
@@ -128,6 +133,8 @@ pub(super) fn inject_resources(
     // target IP resolved from the deploy observation when no public IPs.
     let targets: Vec<&str> = if !instance_public_ips.is_empty() {
         instance_public_ips.iter().map(|s| s.as_str()).collect()
+    } else if !instance_ips.is_empty() {
+        instance_ips.iter().map(String::as_str).collect()
     } else {
         vec![target_ip]
     };
@@ -206,6 +213,13 @@ pub(super) fn write_service_state(
     phase: &str,
 ) -> Result<LocalServiceState> {
     with_state_dir_lock(state_dir, || {
+        if phase == "deploying" {
+            // Independent services can pass preflight together. Recheck after
+            // acquiring the shared lock, before recording cloud ownership.
+            let manifest =
+                read_build_manifest(&context_paths(state_dir, &spec.service.id).manifest)?;
+            validate_shared_guest_ports(state_dir, spec, &manifest)?;
+        }
         let state = build_service_state(state_dir, spec_path, spec, observation, prepared, phase)?;
         write_local_service_state(state_dir, &state)?;
         Ok(state)
@@ -226,27 +240,44 @@ pub(super) fn build_service_state(
         .as_ref()
         .map(|state| state.generation)
         .unwrap_or(0);
-    let resources = resource_states(spec)?;
+    let resources = resource_states(&instance_ssh::runtime_spec(&paths, spec)?)?;
     let names = prepared
         .deploy_names
         .clone()
         .context("deploy names are required when writing service state")?;
+    let mut artifact_paths = context_paths(state_dir, &spec.service.id);
+    if phase == "built" {
+        artifact_paths.service_dir = prepared
+            .rendered_config
+            .parent()
+            .context("build configuration has no preparation directory")?
+            .to_path_buf();
+    }
     let artifacts = materialize_shelter_build_artifacts(
-        &paths,
+        &artifact_paths,
         &prepared.build_result,
         &prepared.shelter_build_id,
     )?;
     let gateway_identity = ensure_gateway_identity(&paths)?;
+    let deployment = if phase != "built" && paths.manifest.try_exists()? {
+        read_build_manifest(&paths.manifest)?.deployment
+    } else {
+        None
+    };
+    let source = match deployment {
+        Some(snapshot) => snapshot.source,
+        None => LocalSpecState {
+            path: absolute_path(spec_path)?,
+            sha256: sha256_file(spec_path)?,
+        },
+    };
     Ok(LocalServiceState {
         schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
         service_id: spec.service.id.clone(),
         generation: old_generation + 1,
         phase: phase.to_string(),
         attestation_mode: attestation_mode_name(spec.attestation.mode).to_string(),
-        spec: LocalSpecState {
-            path: absolute_path(spec_path)?,
-            sha256: sha256_file(spec_path)?,
-        },
+        spec: source,
         build: LocalBuildState {
             build_id: prepared.shelter_build_id.clone(),
             image_name: spec.image_id().to_string(),
@@ -257,10 +288,11 @@ pub(super) fn build_service_state(
             debug_ssh: prepared.debug_ssh.clone(),
             sample_rv: artifacts.sample_rv,
             rekor_meta: artifacts.rekor_meta,
-            remote: old_state
-                .as_ref()
-                .map(|state| state.build.remote)
-                .unwrap_or(false),
+            remote: prepared.image.is_some()
+                || old_state
+                    .as_ref()
+                    .map(|state| state.build.remote)
+                    .unwrap_or(false),
             published: old_state
                 .as_ref()
                 .map(|state| state.build.published.clone())
@@ -314,25 +346,13 @@ pub(super) fn activate_existing_service_state(
         path: absolute_path(spec_path)?,
         sha256: sha256_file(spec_path)?,
     };
-    state.build = LocalBuildState {
-        build_id: state.build.build_id.clone(),
-        image_name: spec.image_id().to_string(),
-        variant: spec.image_variant().to_string(),
-        image_path: state.build.image_path.clone(),
-        images_dir: state.build.images_dir.clone(),
-        cache_dir: state.build.cache_dir.clone(),
-        debug_ssh: state.build.debug_ssh.clone(),
-        sample_rv: state.build.sample_rv.clone(),
-        rekor_meta: state.build.rekor_meta.clone(),
-        remote: state.build.remote,
-        published: state.build.published.clone(),
-    };
     state.service = LocalServiceNetwork {
         ports: spec.service.ports.clone(),
         connect: spec.service.connect.clone(),
         mcp_ports: spec.service.mcp_ports.clone(),
     };
-    state.resources = resource_states(spec)?;
+    let paths = context_paths(state_dir, &spec.service.id);
+    state.resources = resource_states(&instance_ssh::runtime_spec(&paths, spec)?)?;
     state.reference_values =
         reference_value_mode_name(spec.attestation.reference_values).to_string();
     state.deploy.tee = tee_name(spec.attestation.tee).to_string();
@@ -382,12 +402,27 @@ pub(super) fn sync_mesh_with_candidate(
     state_dir: &Path,
     candidate: LocalServiceState,
 ) -> Result<u64> {
+    commit_mesh_candidate(state_dir, candidate, |services| {
+        sync_mesh_for_services(cli, state_dir, services, None)
+    })
+}
+
+fn commit_mesh_candidate(
+    state_dir: &Path,
+    mut candidate: LocalServiceState,
+    sync: impl FnOnce(Vec<LocalServiceState>) -> Result<u64>,
+) -> Result<u64> {
     with_state_dir_lock(state_dir, || {
         let mut services = read_service_states(state_dir)?;
         services.retain(|service| service.service_id != candidate.service_id);
-        services.push(candidate);
+        services.push(candidate.clone());
         services.sort_by(|left, right| left.service_id.cmp(&right.service_id));
-        sync_mesh_for_services(cli, state_dir, services, None)
+        let generation = sync(services)?;
+        // Publish the candidate before releasing the topology lock. The next
+        // service must see every member of the bundle just delivered.
+        candidate.mesh_generation = generation;
+        write_local_service_state(state_dir, &candidate)?;
+        Ok(generation)
     })
 }
 
@@ -422,32 +457,25 @@ pub(super) fn refresh_active_shelter_deploys(
     services: &[LocalServiceState],
 ) -> Result<()> {
     for service in services.iter().filter(|service| service.phase == "active") {
+        let _operation = lock_service_operation(state_dir, &service.service_id)?;
+        let Some(service) =
+            read_service_state_file(&context_paths(state_dir, &service.service_id).service_state)?
+        else {
+            continue;
+        };
+        if service.phase != "active" {
+            continue;
+        }
         render_service_config_from_state(
             state_dir,
-            service,
-            active_peer_public_cidrs(&service.service_id, services)?,
+            &service,
+            active_peer_public_cidrs(&service.service_id, &read_service_states(state_dir)?)?,
         )?;
         let paths = context_paths(state_dir, &service.service_id);
         let manifest = read_build_manifest(&paths.manifest)?;
-        let variant = manifest.variant(&service.build.variant, Some(&service.build.variant))?;
-        let prepared = PreparedConfig {
-            rendered_config: paths.rendered_config,
-            shelter_build_id: variant.shelter_build_id,
-            shelter_work_dir: manifest.shelter_work_dir,
-            build_result: variant.build_result,
-            deploy_result: manifest.deploy_result,
-            deploy_names: Some(DeployNames {
-                run_id: service.deploy.run_id.clone(),
-                resource_name: service.deploy.resource_name.clone(),
-                image_import_name: service.deploy.image_import_name.clone().unwrap_or_else(|| {
-                    format!("{}-{}", service.build.image_name, service.deploy.run_id)
-                }),
-            }),
-            terraform_dir: service.deploy.terraform_dir.clone(),
-            debug_ssh: variant.debug_ssh,
-            cloud_image_id: service.deploy.published_image_id.clone(),
-        };
+        let prepared = prepared_from_state(state_dir, &service, &manifest)?;
         let mut args = deploy_shelter_args(&prepared);
+        args.push("--network-only".into());
         run_shelter(cli, &mut args)?;
     }
     Ok(())
@@ -458,7 +486,13 @@ pub(super) fn render_service_config_from_state(
     state: &LocalServiceState,
     mesh_peer_cidrs: Vec<String>,
 ) -> Result<()> {
-    let mut spec = AgentSpec::from_path(&state.spec.path)?;
+    let paths = context_paths(state_dir, &state.service_id);
+    let mut manifest = read_build_manifest(&paths.manifest)?;
+    let snapshot = committed_deployment(state, &manifest)?;
+    let mut spec = snapshot.spec.clone();
+    spec.service.ports = state.service.ports.clone();
+    spec.service.connect = state.service.connect.clone();
+    spec.service.mcp_ports = state.service.mcp_ports.clone();
     // Re-rendering an existing deployment must preserve the provider that was
     // committed to durable state. A later AppSpec edit may change desired
     // settings for a future deployment, but it must not remove Trustee
@@ -472,27 +506,46 @@ pub(super) fn render_service_config_from_state(
     } else {
         AttestationMode::Challenge
     };
-    let paths = context_paths(state_dir, &state.service_id);
-    let manifest = read_build_manifest(&paths.manifest)?;
+    // Persist a verified legacy snapshot before any automatic reconciliation.
+    if manifest.deployment.is_none() {
+        manifest.deployment = Some(snapshot.clone());
+        write_json_atomic(&paths.manifest, &manifest)?;
+    }
+    if manifest.image.is_some() {
+        let deploy_user_data = snapshot.user_data.clone();
+        images::prepare(
+            &paths,
+            &spec,
+            &manifest,
+            &PrepareOptions {
+                deploy_names: Some(DeployNames {
+                    run_id: state.deploy.run_id.clone(),
+                    resource_name: state.deploy.resource_name.clone(),
+                    image_import_name: state.deploy.image_import_name.clone().unwrap_or_default(),
+                }),
+                deploy_user_data,
+                mesh_peer_cidrs,
+                peerings: read_peerings_or_empty(state_dir)?,
+                ..PrepareOptions::default()
+            },
+        )?;
+        return Ok(());
+    }
     let variant = manifest.variant(&state.build.variant, Some(&state.build.variant))?;
     if let Some(debug_ssh) = variant.debug_ssh.as_ref() {
         apply_debug_ssh_public_key(&mut spec, &debug_ssh.public_key)?;
     }
-    let deploy_user_data = if spec.attestation.mode == AttestationMode::Trustee {
-        Some(trustee::runtime_user_data(state_dir, &state.service_id)?)
-    } else {
-        None
-    };
+    let deploy_user_data = snapshot.user_data;
     spec.deploy.image_variant = Some(state.build.variant.clone());
     let images_dir = manifest.images_dir.clone();
     let cache_dir = manifest.cache_dir.clone();
+    let rendered_config = manifest.shelter_config.clone();
     let assets = GuestAssets {
         agentd_bin: manifest.agentd_bin,
         agentd_service: manifest.agentd_service,
         gateway_bin: manifest.gateway_bin,
         gateway_service: manifest.gateway_service,
         tng_service: manifest.tng_service,
-        initrd_secret_fetch_module: manifest.initrd_secret_fetch_module,
         fde_config_file: manifest.fde_config_file,
         policy_default: manifest.policy_default,
         policy_local_dev: manifest.policy_local_dev,
@@ -518,8 +571,8 @@ pub(super) fn render_service_config_from_state(
             deployer_cidr: std::env::var("CA_DEPLOYER_CIDR").ok(),
         },
     )?;
-    fs::write(&paths.rendered_config, rendered)
-        .with_context(|| format!("failed to write '{}'", paths.rendered_config.display()))?;
+    fs::write(&rendered_config, rendered)
+        .with_context(|| format!("failed to write '{}'", rendered_config.display()))?;
     Ok(())
 }
 
@@ -546,6 +599,20 @@ pub(super) fn sync_mesh_for_services(
     services: Vec<LocalServiceState>,
     service_filter: Option<&str>,
 ) -> Result<u64> {
+    sync_mesh_for_services_with_delivery(
+        state_dir,
+        services,
+        service_filter,
+        |service, bundle_path| deliver_mesh_bundle(cli, state_dir, service, bundle_path),
+    )
+}
+
+fn sync_mesh_for_services_with_delivery(
+    state_dir: &Path,
+    services: Vec<LocalServiceState>,
+    service_filter: Option<&str>,
+    mut deliver: impl FnMut(&LocalServiceState, &Path) -> Result<()>,
+) -> Result<u64> {
     if let Some(filter) = service_filter {
         let service = services
             .iter()
@@ -566,9 +633,24 @@ pub(super) fn sync_mesh_for_services(
         return Ok(0);
     }
 
+    validate_guest_port_recipients(
+        state_dir,
+        services
+            .iter()
+            .filter(|service| service.phase == "active")
+            .map(|service| {
+                (
+                    service.service_id.as_str(),
+                    service.service.ports.as_slice(),
+                    None,
+                )
+            })
+            .collect(),
+    )?;
     let reference_values = collect_reference_values(&services)?;
     let generation = next_mesh_generation(state_dir, &services);
-    let bundle = render_mesh_bundle(&services, &reference_values, generation);
+    let mut bundle = render_mesh_bundle(&services, &reference_values, generation);
+    resolve_mesh_mapping_hosts(&mut bundle, resolve_host_to_ipv4)?;
     let bundle_path = state_dir.join("mesh-bundle.json");
     write_json_atomic(&bundle_path, &bundle)?;
 
@@ -582,65 +664,80 @@ pub(super) fn sync_mesh_for_services(
                 .unwrap_or(true)
         })
     {
-        if trustee::service_uses_trustee(
-            state_dir,
-            &service.service_id,
-            Some(&service.attestation_mode),
-        )? {
-            // `sync_mesh` and `sync_mesh_with_candidate` hold the global
-            // state lock across bundle generation and delivery.
-            trustee::put_dynamic_resource_with_state_lock(
-                state_dir,
-                &service.service_id,
-                "default/local-resources/cagent_mesh_bundle",
-                &bundle_path,
-            )?;
-        } else {
-            let target_ip = service.deploy.preferred_injection_ip().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "service '{}' has no IP for mesh injection",
-                    service.service_id
-                )
-            })?;
-            // For multi-node the CDH resource-injection port (8006) is not
-            // behind the SLB, so deliver the mesh bundle to each instance's
-            // public IP rather than the (SLB) public_ip. Single-instance
-            // deploys fall back to the resolved target IP.
-            let mesh_targets: Vec<&str> = if !service.deploy.instance_public_ips.is_empty() {
-                service
-                    .deploy
-                    .instance_public_ips
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect()
-            } else {
-                vec![target_ip]
-            };
-            prepare_challenge_reference_values(
-                cli,
-                state_dir,
-                &service.service_id,
-                service.build.sample_rv.as_ref(),
-                service.build.rekor_meta.as_ref(),
-                &service.reference_values,
-            )?;
-            for ip in mesh_targets {
-                challenge_inject(
-                    cli,
-                    state_dir,
-                    ip,
-                    "default/local-resources/cagent_mesh_bundle",
-                    &bundle_path,
-                    &service.deploy.tee,
-                )?;
-            }
-        }
+        deliver(service, &bundle_path)?;
         delivered.push(service.service_id.clone());
     }
 
     update_mesh_generation(state_dir, &delivered, generation)?;
     println!("synced mesh bundle to active services");
     Ok(generation)
+}
+
+fn deliver_mesh_bundle(
+    cli: &Cli,
+    state_dir: &Path,
+    service: &LocalServiceState,
+    bundle_path: &Path,
+) -> Result<()> {
+    if trustee::service_uses_trustee(
+        state_dir,
+        &service.service_id,
+        Some(&service.attestation_mode),
+    )? {
+        // `sync_mesh` and `sync_mesh_with_candidate` hold the global
+        // state lock across bundle generation and delivery.
+        trustee::put_dynamic_resource_with_state_lock(
+            state_dir,
+            &service.service_id,
+            "default/local-resources/cagent_mesh_bundle",
+            bundle_path,
+        )?;
+    } else {
+        let Some(target_ip) = service.deploy.preferred_injection_ip() else {
+            bail!(
+                "service '{}' has no IP for mesh injection",
+                service.service_id
+            );
+        };
+        prepare_challenge_reference_values(
+            cli,
+            state_dir,
+            &service.service_id,
+            service.build.sample_rv.as_ref(),
+            service.build.rekor_meta.as_ref(),
+            &service.reference_values,
+        )?;
+        let targets: Vec<&str> = if service.deploy.instance_public_ips.is_empty() {
+            if service.deploy.instance_private_ips.is_empty() {
+                vec![target_ip]
+            } else {
+                service
+                    .deploy
+                    .instance_private_ips
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            }
+        } else {
+            service
+                .deploy
+                .instance_public_ips
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        for ip in targets {
+            challenge_inject(
+                cli,
+                state_dir,
+                ip,
+                "default/local-resources/cagent_mesh_bundle",
+                bundle_path,
+                &service.deploy.tee,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn next_mesh_generation(state_dir: &Path, services: &[LocalServiceState]) -> u64 {
@@ -688,19 +785,59 @@ fn resolve_host_to_ipv4(host: &str) -> String {
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return host.to_string();
     }
-    let resolved = (host, 0u16)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| {
-            addrs.find_map(|a| match a.ip() {
-                std::net::IpAddr::V4(v4) => Some(v4.to_string()),
-                _ => None,
-            })
-        });
+    let resolved = (host, 0u16).to_socket_addrs().ok().and_then(|mut addrs| {
+        addrs.find_map(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+            _ => None,
+        })
+    });
     match resolved {
         Some(ip) => ip,
         None => host.to_string(),
     }
+}
+
+fn resolve_mesh_mapping_hosts(
+    bundle: &mut MeshBundle,
+    mut resolve: impl FnMut(&str) -> String,
+) -> Result<()> {
+    // TNG mapping targets are IPv4 literals. Keep the authoritative addresses
+    // in local deployment state, and normalize only the bundle sent to guests.
+    // Resolve every target before replacing the committed bundle or delivering
+    // it, so a failed lookup cannot publish an unusable guest configuration.
+    let mut targets = Vec::new();
+    for (id, service) in &bundle.services {
+        let public = service
+            .public_ip
+            .as_deref()
+            .filter(|host| !host.trim().is_empty());
+        let host = public.or_else(|| {
+            service
+                .private_ip
+                .as_deref()
+                .filter(|host| !host.trim().is_empty())
+        });
+        if let Some(host) = host {
+            let address = match host.parse::<std::net::Ipv4Addr>() {
+                Ok(address) => address,
+                Err(_) => resolve(host)
+                    .parse::<std::net::Ipv4Addr>()
+                    .with_context(|| {
+                        format!("mesh target for service '{id}' did not resolve to IPv4: {host}")
+                    })?,
+            };
+            targets.push((id.clone(), public.is_some(), address.to_string()));
+        }
+    }
+    for (id, public, address) in targets {
+        let service = bundle.services.get_mut(&id).expect("recorded mesh service");
+        if public {
+            service.public_ip = Some(address);
+        } else {
+            service.private_ip = Some(address);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn render_connect_config(
@@ -753,23 +890,29 @@ pub(super) fn render_connect_config(
             let mut entry = serde_json::Map::new();
             match encryption {
                 EncryptionMode::RatsTls => {
-                    entry.insert("rats_tls".into(), serde_json::json!({"multiplex": false}));
+                    entry.insert("rats_tls".into(), serde_json::json!({"multiplex": true}));
                 }
                 EncryptionMode::Ohttp => {
                     entry.insert("ohttp".into(), serde_json::json!({}));
                 }
             }
-            entry.insert("mapping".into(), serde_json::json!({
-                "in": {"host": "127.0.0.1", "port": local_port},
-                "out": {"host": host, "port": remote_port}
-            }));
-            entry.insert("verify".into(), serde_json::json!({
-                "model": "background_check",
-                "as_provider": "coco",
-                "as_type": "builtin",
-                "attestation_policy": connect_policy_config(state_dir)?,
-                "reference_values": reference_values,
-            }));
+            entry.insert(
+                "mapping".into(),
+                serde_json::json!({
+                    "in": {"host": "127.0.0.1", "port": local_port},
+                    "out": {"host": host, "port": remote_port}
+                }),
+            );
+            entry.insert(
+                "verify".into(),
+                serde_json::json!({
+                    "model": "background_check",
+                    "as_provider": "coco",
+                    "as_type": "builtin",
+                    "attestation_policy": connect_policy_config(state_dir)?,
+                    "reference_values": reference_values,
+                }),
+            );
             ingress.push(serde_json::Value::Object(entry));
         }
     }
@@ -978,27 +1121,70 @@ pub(super) fn read_service_state_file(path: &Path) -> Result<Option<LocalService
     Ok(Some(state))
 }
 
-pub(super) fn validate_mesh_port_conflicts(
-    states: &[LocalServiceState],
-    incoming_service_id: &str,
-    incoming_ports: &[u16],
+pub(super) fn validate_shared_guest_ports(
+    state_dir: &Path,
+    spec: &AgentSpec,
+    incoming: &BuildManifest,
 ) -> Result<()> {
-    for state in states {
-        if !matches!(state.phase.as_str(), "active" | "deployed") {
-            continue;
-        }
-        if state.service_id == incoming_service_id {
-            continue;
-        }
-        for port in incoming_ports {
-            if state.service.ports.contains(port) {
-                bail!(
-                    "port {} is already used by service {}; choose a different service port",
-                    port,
-                    state.service_id
-                );
+    let recipients = read_service_states(state_dir)?
+        .into_iter()
+        .filter(|state| {
+            state.service_id != spec.service.id
+                && matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
+        })
+        .collect::<Vec<_>>();
+    validate_guest_port_recipients(
+        state_dir,
+        recipients
+            .iter()
+            .map(|state| {
+                (
+                    state.service_id.as_str(),
+                    state.service.ports.as_slice(),
+                    None,
+                )
+            })
+            .chain(std::iter::once((
+                spec.service.id.as_str(),
+                spec.service.ports.as_slice(),
+                Some(incoming),
+            )))
+            .collect(),
+    )
+}
+
+fn validate_guest_port_recipients(
+    state_dir: &Path,
+    recipients: Vec<(&str, &[u16], Option<&BuildManifest>)>,
+) -> Result<()> {
+    let mut ports = BTreeSet::new();
+    let shared = recipients
+        .iter()
+        .map(|(_, ports, _)| *ports)
+        .any(|service_ports| {
+            service_ports
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .any(|port| !ports.insert(port))
+        });
+    if !shared {
+        return Ok(());
+    }
+    // Clients with no service ports receive the same peer bundle and must also
+    // understand independent local endpoints for duplicate remote ports.
+    for (service_id, _, incoming) in recipients {
+        let saved;
+        let peer = match incoming {
+            Some(manifest) => manifest,
+            None => {
+                saved = read_build_manifest(&context_paths(state_dir, service_id).manifest)?;
+                &saved
             }
-        }
+        };
+        anyhow::ensure!(peer.runtime_contract.as_ref().is_some_and(|c| c.supports_shared_ports()),
+            "service {service_id} uses a legacy guest without stable mesh client endpoints; rebuild every mesh recipient before deploying overlapping service ports");
     }
     Ok(())
 }
@@ -1257,6 +1443,286 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn mesh_mapping_hosts_resolve_balancers_without_changing_deployment_state() {
+        let mut group = test_service_state("group", "active", vec![8080], vec![]);
+        group.deploy.public_ip = Some("nlb.example.test".into());
+        group.deploy.private_ip = None;
+        let mut isolated = test_service_state("isolated", "active", vec![8080], vec![]);
+        isolated.deploy.public_ip = Some("198.51.100.20".into());
+        let mut bundle = render_mesh_bundle(
+            &[group.clone(), isolated],
+            &ReferenceValueArtifacts {
+                sample: BTreeMap::new(),
+                rekor: BTreeMap::new(),
+            },
+            7,
+        );
+        let mut lookups = Vec::new();
+        resolve_mesh_mapping_hosts(&mut bundle, |host| {
+            lookups.push(host.to_string());
+            "198.51.100.10".into()
+        })
+        .unwrap();
+        assert_eq!(lookups, ["nlb.example.test"]);
+        assert_eq!(
+            bundle.services["group"].public_ip.as_deref(),
+            Some("198.51.100.10")
+        );
+        assert_eq!(
+            bundle.services["isolated"].public_ip.as_deref(),
+            Some("198.51.100.20")
+        );
+        assert_eq!(group.deploy.public_ip.as_deref(), Some("nlb.example.test"));
+        assert_eq!(bundle.generation, 7);
+    }
+
+    #[test]
+    fn mesh_mapping_hosts_reject_unresolved_targets_without_partial_updates() {
+        let mut first = test_service_state("a", "active", vec![8080], vec![]);
+        first.deploy.public_ip = Some("alb.example.test".into());
+        let mut second = test_service_state("b", "active", vec![8080], vec![]);
+        second.deploy.public_ip = Some("missing.example.test".into());
+        let original = render_mesh_bundle(
+            &[first, second],
+            &ReferenceValueArtifacts {
+                sample: BTreeMap::new(),
+                rekor: BTreeMap::new(),
+            },
+            7,
+        );
+        for unresolved in ["missing.example.test", "::1"] {
+            let mut bundle = original.clone();
+            let error = resolve_mesh_mapping_hosts(&mut bundle, |host| {
+                if host == "alb.example.test" {
+                    "198.51.100.10".into()
+                } else {
+                    unresolved.into()
+                }
+            })
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("service 'b' did not resolve to IPv4"));
+            assert_eq!(bundle, original);
+        }
+    }
+
+    fn shared_port_manifest() -> BuildManifest {
+        BuildManifest {
+            runtime_contract: Some(
+                serde_json::from_value(json!({
+                    "schema_version": "confidential-agent/image-runtime/v1",
+                    "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "mesh-client-ports-v2"],
+                    "rootfs_integrity": true, "writable_layer_encryption": "luks2",
+                    "key_release": "ca-attested", "min_disk_gb": 32, "app_services": [],
+                    "guest_binary_sha256": "e".repeat(64)
+                }))
+                .unwrap(),
+            ),
+            ..BuildManifest::default()
+        }
+    }
+
+    #[test]
+    fn duplicate_mesh_ports_require_capable_client_only_recipients() {
+        let root = tempfile::tempdir().unwrap();
+        let capable = shared_port_manifest();
+        for (id, ports, manifest) in [
+            ("a", vec![18789], capable.clone()),
+            ("c", vec![], BuildManifest::default()),
+        ] {
+            write_local_service_state(
+                root.path(),
+                &test_service_state(id, "active", ports, vec![]),
+            )
+            .unwrap();
+            write_json_atomic(&context_paths(root.path(), id).manifest, &manifest).unwrap();
+        }
+        let yaml = "schema: confidential-agent/v1\nservice: {id: b, ports: [18789]}\nbuild: {image_name: app}\ndeploy: {provider: aliyun, region: cn-beijing, zone_id: cn-beijing-i, instance_type: ecs.g9i.xlarge}\nattestation: {tee: tdx, mode: challenge, reference_values: sample}\nresources: {}";
+        let mut spec = AgentSpec::from_yaml(yaml, root.path()).unwrap();
+        let error = validate_shared_guest_ports(root.path(), &spec, &capable).unwrap_err();
+        assert!(error.to_string().contains("service c uses a legacy guest"));
+        spec.service.ports = vec![18790];
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        spec.service.ports = vec![18789];
+        write_json_atomic(&context_paths(root.path(), "c").manifest, &capable).unwrap();
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        write_local_service_state(
+            root.path(),
+            &test_service_state("b", "active", vec![18789], vec![]),
+        )
+        .unwrap();
+        write_json_atomic(&context_paths(root.path(), "b").manifest, &capable).unwrap();
+        spec.service.id = "d".into();
+        spec.service.ports.clear();
+        assert!(
+            validate_shared_guest_ports(root.path(), &spec, &BuildManifest::default()).is_err()
+        );
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+    }
+
+    #[test]
+    fn shared_ports_are_rechecked_when_recording_an_attempt_and_publishing_a_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let capable = shared_port_manifest();
+        let legacy = test_service_state("c", "active", vec![], vec![]);
+        write_local_service_state(root.path(), &legacy).unwrap();
+        write_json_atomic(
+            &context_paths(root.path(), "c").manifest,
+            &BuildManifest::default(),
+        )
+        .unwrap();
+        let yaml = "schema: confidential-agent/v1\nservice: {id: a, ports: [18789]}\nbuild: {image_name: app}\ndeploy: {provider: aliyun, region: cn-beijing, zone_id: cn-beijing-i, instance_type: ecs.g9i.xlarge}\nattestation: {tee: tdx, mode: challenge, reference_values: sample}\nresources: {}";
+        let mut spec = AgentSpec::from_yaml(yaml, root.path()).unwrap();
+        // Both independent invocations passed before either recorded ownership.
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        spec.service.id = "b".into();
+        validate_shared_guest_ports(root.path(), &spec, &capable).unwrap();
+        write_local_service_state(
+            root.path(),
+            &test_service_state("a", "deploying", vec![18789], vec![]),
+        )
+        .unwrap();
+        for id in ["a", "b"] {
+            write_json_atomic(&context_paths(root.path(), id).manifest, &capable).unwrap();
+        }
+        let prepared = PreparedConfig {
+            image: None,
+            rendered_config: root.path().join("unused.yml"),
+            shelter_build_id: "unused".into(),
+            shelter_work_dir: root.path().join("unused"),
+            build_result: root.path().join("unused.json"),
+            deploy_result: root.path().join("unused-deploy.json"),
+            deploy_names: None,
+            terraform_dir: None,
+            debug_ssh: None,
+            cloud_image_id: None,
+        };
+        let error = write_service_state(
+            root.path(),
+            root.path(),
+            &spec,
+            &DeployObservation::default(),
+            &prepared,
+            "deploying",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("service c uses a legacy guest"));
+        assert!(!context_paths(root.path(), "b").service_state.exists());
+
+        // Also reject an incompatible already-recorded topology before replacing
+        // the committed bundle or delivering it, including filtered mesh sync.
+        for id in ["a", "b"] {
+            write_local_service_state(
+                root.path(),
+                &test_service_state(id, "active", vec![18789], vec![]),
+            )
+            .unwrap();
+        }
+        let bundle = root.path().join("mesh-bundle.json");
+        let original = serde_json::to_vec(&render_mesh_bundle(
+            &[legacy],
+            &ReferenceValueArtifacts {
+                sample: BTreeMap::new(),
+                rekor: BTreeMap::new(),
+            },
+            7,
+        ))
+        .unwrap();
+        fs::write(&bundle, &original).unwrap();
+        let cli = Cli {
+            command: Commands::Version,
+            shelter_bin: "shelter".into(),
+            state_dir: root.path().into(),
+            tools_image: "unused".into(),
+        };
+        let error = sync_mesh(&cli, root.path(), Some("a")).unwrap_err();
+        assert!(error.to_string().contains("service c uses a legacy guest"));
+        assert_eq!(fs::read(bundle).unwrap(), original);
+        assert!(read_service_states(root.path())
+            .unwrap()
+            .iter()
+            .all(|state| state.mesh_generation == 1));
+    }
+
+    #[test]
+    fn concurrent_candidates_commit_state_before_the_next_topology() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let root = tempfile::tempdir().unwrap();
+        let rv = root.path().join("rv.json");
+        fs::write(&rv, "{}").unwrap();
+        let mut candidates = Vec::new();
+        for id in ["a", "b"] {
+            let mut state = test_service_state(id, "deployed", vec![18789], vec![]);
+            state.build.sample_rv = Some(rv.clone());
+            write_local_service_state(root.path(), &state).unwrap();
+            write_json_atomic(
+                &context_paths(root.path(), id).manifest,
+                &shared_port_manifest(),
+            )
+            .unwrap();
+            state.phase = "active".into();
+            state.generation += 1;
+            candidates.push(state);
+        }
+        let deliveries = Arc::new(Mutex::new(BTreeMap::<String, MeshBundle>::new()));
+        let returned = Arc::new(Barrier::new(2));
+        let resume_caller = Arc::new(Barrier::new(2));
+        let a = candidates.remove(0);
+        let directory = root.path().to_path_buf();
+        let received = deliveries.clone();
+        let arrived = returned.clone();
+        let resume = resume_caller.clone();
+        let worker = thread::spawn(move || {
+            let _operation = lock_service_operation(&directory, "a").unwrap();
+            commit_mesh_candidate(&directory, a, |services| {
+                sync_mesh_for_services_with_delivery(&directory, services, None, |service, path| {
+                    received.lock().unwrap().insert(
+                        service.service_id.clone(),
+                        serde_json::from_slice(&fs::read(path)?).unwrap(),
+                    );
+                    Ok(())
+                })
+            })
+            .unwrap();
+            // Deterministically pause at the former gap between mesh return
+            // and the caller's active-state write while B completes activation.
+            arrived.wait();
+            resume.wait();
+        });
+        returned.wait();
+        assert_eq!(read_service_states(root.path()).unwrap()[0].phase, "active");
+        let _operation = lock_service_operation(root.path(), "b").unwrap();
+        let generation = commit_mesh_candidate(root.path(), candidates.remove(0), |services| {
+            sync_mesh_for_services_with_delivery(root.path(), services, None, |service, path| {
+                deliveries.lock().unwrap().insert(
+                    service.service_id.clone(),
+                    serde_json::from_slice(&fs::read(path)?).unwrap(),
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+        resume_caller.wait();
+        worker.join().unwrap();
+        let committed: MeshBundle =
+            serde_json::from_slice(&fs::read(root.path().join("mesh-bundle.json")).unwrap())
+                .unwrap();
+        let states = read_service_states(root.path()).unwrap();
+        assert!(states
+            .iter()
+            .all(|state| state.phase == "active" && state.mesh_generation == generation));
+        assert_eq!(committed.services.len(), 2);
+        for id in ["a", "b"] {
+            assert_eq!(
+                serde_json::to_value(&deliveries.lock().unwrap()[id]).unwrap(),
+                serde_json::to_value(&committed).unwrap()
+            );
+        }
+    }
+
     fn test_service_state(
         id: &str,
         phase: &str,
@@ -1323,36 +1789,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_mesh_port_conflicts_no_conflict() {
-        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
-        assert!(validate_mesh_port_conflicts(&states, "beta", &[9090]).is_ok());
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_detects_conflict() {
-        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
-        let err = validate_mesh_port_conflicts(&states, "beta", &[8080]).unwrap_err();
-        assert!(err.to_string().contains("8080"));
-        assert!(err.to_string().contains("alpha"));
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_skips_inactive() {
-        let states = vec![test_service_state("alpha", "deleted", vec![8080], vec![])];
-        assert!(validate_mesh_port_conflicts(&states, "beta", &[8080]).is_ok());
-    }
-
-    #[test]
-    fn validate_mesh_port_conflicts_skips_same_service() {
-        let states = vec![test_service_state("alpha", "active", vec![8080], vec![])];
-        assert!(validate_mesh_port_conflicts(&states, "alpha", &[8080]).is_ok());
-    }
-
-    #[test]
     fn connect_services_filters_by_id() {
         let states = vec![
-            test_service_state("alpha", "active", vec![8080], vec![(confidential_agent_core::spec::ConnectPort::Plain(8080))]),
-            test_service_state("beta", "active", vec![9090], vec![(confidential_agent_core::spec::ConnectPort::Plain(9090))]),
+            test_service_state(
+                "alpha",
+                "active",
+                vec![8080],
+                vec![(confidential_agent_core::spec::ConnectPort::Plain(8080))],
+            ),
+            test_service_state(
+                "beta",
+                "active",
+                vec![9090],
+                vec![(confidential_agent_core::spec::ConnectPort::Plain(9090))],
+            ),
         ];
         let result = connect_services(&states, Some("alpha")).unwrap();
         assert_eq!(result.len(), 1);
@@ -1378,9 +1828,24 @@ mod tests {
 
     #[test]
     fn connect_services_all_active_when_no_filter() {
-        let alpha = test_service_state("alpha", "active", vec![8080], vec![confidential_agent_core::spec::ConnectPort::Plain(8080)]);
-        let beta = test_service_state("beta", "deployed", vec![9090], vec![confidential_agent_core::spec::ConnectPort::Plain(9090)]);
-        let gamma = test_service_state("gamma", "active", vec![7070], vec![confidential_agent_core::spec::ConnectPort::Plain(7070)]);
+        let alpha = test_service_state(
+            "alpha",
+            "active",
+            vec![8080],
+            vec![confidential_agent_core::spec::ConnectPort::Plain(8080)],
+        );
+        let beta = test_service_state(
+            "beta",
+            "deployed",
+            vec![9090],
+            vec![confidential_agent_core::spec::ConnectPort::Plain(9090)],
+        );
+        let gamma = test_service_state(
+            "gamma",
+            "active",
+            vec![7070],
+            vec![confidential_agent_core::spec::ConnectPort::Plain(7070)],
+        );
         let states = vec![alpha, beta, gamma];
         let result = connect_services(&states, None).unwrap();
         assert_eq!(result.len(), 2);
@@ -1535,7 +2000,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1587,7 +2051,6 @@ service:
   ports: [8080]
   connect: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: test
   variants:
     release:
@@ -1616,7 +2079,6 @@ service:
   id: test
   ports: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: test
   variants:
     release:
@@ -1651,7 +2113,12 @@ resources: {}
     #[test]
     fn render_mesh_bundle_includes_only_active_services() {
         let states = vec![
-            test_service_state("alpha", "active", vec![8080], vec![(confidential_agent_core::spec::ConnectPort::Plain(8080))]),
+            test_service_state(
+                "alpha",
+                "active",
+                vec![8080],
+                vec![(confidential_agent_core::spec::ConnectPort::Plain(8080))],
+            ),
             test_service_state("beta", "deleted", vec![9090], vec![]),
         ];
         let rv = ReferenceValueArtifacts {

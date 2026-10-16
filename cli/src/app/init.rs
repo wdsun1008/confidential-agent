@@ -14,7 +14,6 @@ struct InitProject {
     reference_values: InitReferenceValues,
     cosign_key: Option<PathBuf>,
     slsa_generator: PathBuf,
-    base_image: Option<PathBuf>,
     dashscope_key: Option<String>,
     dashscope_base_url: String,
     dashscope_anthropic_base_url: String,
@@ -126,18 +125,11 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
     let reference_values = args
         .reference_values
         .unwrap_or_else(|| default_reference_values(target));
-    if args.build_backend == InitBuildBackend::BaseImage && args.base_image.is_none() {
-        bail!("init --build-backend base-image requires --base-image");
-    }
-    let base_image = match args.build_backend {
-        InitBuildBackend::Mkosi => None,
-        InitBuildBackend::BaseImage => args.base_image.clone(),
-    };
     let dashscope_key = resolve_dashscope_key(args, target)?;
     let model = args
         .model
         .clone()
-        .unwrap_or_else(|| "qwen3.7-max".to_string());
+        .unwrap_or_else(|| confidential_agent_core::software::version("bailian_model"));
     let gateway_token = match target {
         InitTarget::Openclaw | InitTarget::OpenclawVllm => {
             Some(args.gateway_token.clone().unwrap_or_else(|| random_hex(20)))
@@ -155,21 +147,25 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
         } else {
             (false, None, None)
         };
-    let vllm_build_variants = if matches!(target, InitTarget::OpenclawVllm | InitTarget::VllmInference) {
-        parse_vllm_build_variants(&args.vllm_build_variants)?
-    } else {
-        VllmBuildVariants::default()
-    };
+    let vllm_build_variants =
+        if matches!(target, InitTarget::OpenclawVllm | InitTarget::VllmInference) {
+            parse_vllm_build_variants(&args.vllm_build_variants)?
+        } else {
+            VllmBuildVariants::default()
+        };
     let vllm_model_dir = if target == InitTarget::VllmInference {
         "/tmp/model".to_string()
     } else {
         args.vllm_model_dir.clone()
     };
-    let vllm_port = if target == InitTarget::VllmInference {
-        8080
-    } else {
-        args.vllm_port
-    };
+    let vllm_port = args
+        .vllm_port
+        .unwrap_or(if target == InitTarget::VllmInference {
+            8080
+        } else {
+            8090
+        });
+    anyhow::ensure!(vllm_port > 0, "--vllm-port must be greater than zero");
     let (oss_bucket, model_key_file) = if target == InitTarget::VllmInference {
         (
             args.oss_bucket
@@ -196,7 +192,6 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
         reference_values,
         cosign_key: args.cosign_key.clone(),
         slsa_generator: args.slsa_generator.clone(),
-        base_image,
         dashscope_key,
         dashscope_base_url: args.dashscope_base_url.clone(),
         dashscope_anthropic_base_url: args.dashscope_anthropic_base_url.clone(),
@@ -462,11 +457,7 @@ fn write_openclaw_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> 
     Ok(())
 }
 
-fn write_vllm_inference_project(
-    cli: &Cli,
-    args: &InitArgs,
-    project: &InitProject,
-) -> Result<()> {
+fn write_vllm_inference_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
     let _ = (cli, args);
     let repo = find_repo_root()?;
     // NVIDIA stack reused verbatim from openclaw-vllm
@@ -501,8 +492,11 @@ fn write_vllm_inference_project(
     write_secret_file(&project.dir.join("cai-model.env"), &env)?;
 
     // model-decryption-key resource (secret: copied from operator-provided key file)
-    fs::copy(&project.model_key_file, project.dir.join("model-decryption-key"))
-        .with_context(|| "failed to copy model-decryption-key")?;
+    fs::copy(
+        &project.model_key_file,
+        project.dir.join("model-decryption-key"),
+    )
+    .with_context(|| "failed to copy model-decryption-key")?;
     set_mode(&project.dir.join("model-decryption-key"), 0o600)?;
 
     let spec = vllm_inference_yaml(project)?;
@@ -602,7 +596,8 @@ fn write_codex_project(args: &InitArgs, project: &InitProject) -> Result<()> {
         &repo.join("examples/cli-agents/files"),
         &project.dir.join("files"),
     )?;
-    let codex_version = args.codex_version.as_deref().unwrap_or("latest");
+    let pinned_codex = confidential_agent_core::software::version("codex");
+    let codex_version = args.codex_version.as_deref().unwrap_or(&pinned_codex);
     write_install_script_with_exports(
         &repo.join("examples/codex/install-codex.sh"),
         &project.dir.join("install-codex.sh"),
@@ -645,7 +640,11 @@ fn write_claude_code_project(args: &InitArgs, project: &InitProject) -> Result<(
         &repo.join("examples/cli-agents/files"),
         &project.dir.join("files"),
     )?;
-    let claude_code_version = args.claude_code_version.as_deref().unwrap_or("latest");
+    let pinned_claude = confidential_agent_core::software::version("claude-code");
+    let claude_code_version = args
+        .claude_code_version
+        .as_deref()
+        .unwrap_or(&pinned_claude);
     write_install_script_with_exports(
         &repo.join("examples/claude-code/install-claude-code.sh"),
         &project.dir.join("install-claude-code.sh"),
@@ -669,7 +668,7 @@ fn write_claude_code_project(args: &InitArgs, project: &InitProject) -> Result<(
             "ANTHROPIC_AUTH_TOKEN": api_key,
             "ANTHROPIC_BASE_URL": project.dashscope_anthropic_base_url,
             "ANTHROPIC_MODEL": project.model,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.6-flash",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": project.model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": project.model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": project.model,
             "CLAUDE_CODE_SUBAGENT_MODEL": project.model,
@@ -750,9 +749,10 @@ fn write_hermes_install_script(
     branch: &str,
     commit: Option<&str>,
 ) -> Result<()> {
+    let pinned = confidential_agent_core::software::version("hermes");
     let commit = commit
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("");
+        .unwrap_or(&pinned);
     write_install_script_with_exports(
         src,
         dst,
@@ -916,10 +916,9 @@ service:
   app_service: cai-openclaw-gateway.service
 
 build:
-{base_image}  image_name: openclaw-agent
+  image_name: openclaw-agent
   resize: 30G
-  with_network: true
-  packages: [ca-certificates, curl, dracut, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
+  packages: [ca-certificates, curl, git, jq, kernel, kmod, nodejs, npm, podman, tar, xz]
   files:
 {files}  scripts: [./install-openclaw.sh]
   variants:
@@ -958,7 +957,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         files = files,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
@@ -983,13 +981,16 @@ service:
   app_service: cai-openclaw-gateway.service
 
 build:
-{base_image}  image_name: openclaw-vllm-agent
+  image_name: openclaw-vllm-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
-  resize: 80G
-  with_network: true
+  resize: 160G
   cleanup:
     remove_static_libs: false
-  packages: [binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, gcc, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  repos:
+    - name: epel
+      baseurl: https://mirrors.aliyun.com/epel/8/Everything/$basearch/
+      gpgkey: https://mirrors.aliyun.com/epel/RPM-GPG-KEY-EPEL-8
+  packages: [binutils, ca-certificates, curl, elfutils-libelf-devel, gcc, gcc-c++, git, glibc-devel, jq, kernel, kernel-devel, kernel-headers, kmod, make, nodejs, npm, openssl3, pciutils, pkgconf-pkg-config, podman, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
   files:
 {files}  scripts: [./install-openclaw-vllm.sh]
   variants:
@@ -1027,7 +1028,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         files = files,
         variants = variants,
         deploy_variant = deploy_variant,
@@ -1055,32 +1055,36 @@ fn vllm_inference_yaml(project: &InitProject) -> Result<String> {
     // key (multi-node). --replicas > 1 additionally enables an ALB + replicas;
     // --replicas 1 (default) is a single instance with no ALB, but still
     // OHTTP-encrypted.
-    let connect_line = "[{port: 8080, encryption: ohttp}]";
+    let connect_line = format!("[{{port: {}, encryption: ohttp}}]", project.vllm_port);
     let multinode = if project.replicas > 1 {
         format!(
             "  replicas: {}\n  slb:\n    enabled: true\n    slb_type: alb",
             project.replicas
         )
     } else {
-        "  # Multi-node: pass --replicas N (N>1) to deploy N replicas behind\n  # an ALB.".to_string()
+        "  # Multi-node: pass --replicas N (N>1) to deploy N replicas behind\n  # an ALB."
+            .to_string()
     };
     Ok(format!(
         r#"schema: confidential-agent/v1
 
 service:
   id: vllm-inference
-  ports: [8080]
+  ports: [{vllm_port}]
   connect: {connect_line}
   app_service: cai-vllm.service
 
 build:
-{base_image}  image_name: vllm-inference-agent
+  image_name: vllm-inference-agent
   kernel_cmdline_append: swiotlb=4194304,any rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0
   resize: 80G
-  with_network: true
   cleanup:
     remove_static_libs: false
-  packages: [anolis-epao-release, binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, fuse, fuse-libs, fuse3, fuse3-libs, gocryptfs, gcc, gcc-c++, glibc-devel, git, jq, kernel, kernel-devel, kernel-headers, kmod, mailcap, make, openssl3, pciutils, pkgconf-pkg-config, python3.11, python3.11-devel, python3.11-pip, rpm, tar, wget, xz, zlib-devel]
+  repos:
+    - name: epel
+      baseurl: https://mirrors.aliyun.com/epel/8/Everything/$basearch/
+      gpgkey: https://mirrors.aliyun.com/epel/RPM-GPG-KEY-EPEL-8
+  packages: [anolis-epao-release, binutils, ca-certificates, curl, dracut, elfutils-libelf-devel, fuse, fuse-libs, fuse3, fuse3-libs, gocryptfs, gcc, gcc-c++, glibc-devel, git, jq, kernel, kernel-devel, kernel-headers, kmod, mailcap, make, openssl3, pciutils, pkgconf-pkg-config, python3.11, python3.11-devel, python3.11-pip, rpm, s3fs-fuse, tar, wget, xz, zlib-devel]
   files:
     - source: ./cai-nvidia-cc-stack-install.sh
       target: /usr/local/sbin/cai-nvidia-cc-stack-install.sh
@@ -1115,12 +1119,12 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
         zone_id = yaml_quote(&project.zone_id)?,
         disk_gb = project.disk_gb,
         connect_line = connect_line,
+        vllm_port = project.vllm_port,
         multinode = multinode,
         variants = openclaw_vllm_variants_yaml(project.vllm_build_variants),
         deploy_variant = project.vllm_build_variants.deploy_variant(),
@@ -1140,10 +1144,9 @@ service:
   app_service: cai-hermes-agent.service
 
 build:
-{base_image}  image_name: hermes-agent
+  image_name: hermes-agent
   resize: 30G
-  with_network: true
-  packages: [ca-certificates, curl, git, shadow-utils, tar, util-linux, xz]
+  packages: [ca-certificates, curl, findutils, git, libatomic, python3.11, shadow-utils, tar, util-linux, xz]
   files:
     - source: ./files/install-hermes-agent-runtime.sh
       target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
@@ -1188,7 +1191,6 @@ resources:
     mode: "0600"
     mutable: true
 "#,
-        base_image = base_image_line(project)?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
         zone_id = yaml_quote(&project.zone_id)?,
@@ -1209,9 +1211,8 @@ service:
   app_service: cai-codex-app-server.service
 
 build:
-{base_image}  image_name: codex-agent
+  image_name: codex-agent
   resize: 30G
-  with_network: true
   packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
   files:
     - source: {pep}
@@ -1259,7 +1260,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         pep = yaml_quote(&pep_bin.to_string_lossy())?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
@@ -1280,9 +1280,8 @@ service:
   connect: []
 
 build:
-{base_image}  image_name: claude-code-agent
+  image_name: claude-code-agent
   resize: 30G
-  with_network: true
   packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
   files:
     - source: {pep}
@@ -1325,7 +1324,6 @@ resources:
     mode: "0600"
     required: true
 "#,
-        base_image = base_image_line(project)?,
         pep = yaml_quote(&pep_bin.to_string_lossy())?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
@@ -1377,17 +1375,6 @@ fn openclaw_vllm_files_yaml(pep_bin: &Path) -> Result<String> {
     out.push_str("    - source: ./files/cai-a2a-plugin\n      target: /usr/local/share/confidential-agent/openclaw/cai-a2a-plugin\n");
     out.push_str("    - source: ./files/patch-openclaw-cai-pep.js\n      target: /usr/local/share/confidential-agent/openclaw/patch-openclaw-cai-pep.js\n      executable: true\n");
     Ok(out)
-}
-
-fn base_image_line(project: &InitProject) -> Result<String> {
-    if let Some(path) = &project.base_image {
-        Ok(format!(
-            "  base_image: {}\n",
-            yaml_quote(&path.to_string_lossy())?
-        ))
-    } else {
-        Ok(String::new())
-    }
 }
 
 fn rekor_block(project: &InitProject) -> Result<String> {
@@ -1748,6 +1735,8 @@ mod tests {
 
         let dir = temp.path().join("init/openclaw-vllm");
         let spec = fs::read_to_string(dir.join("openclaw-vllm.yaml")).unwrap();
+        let parsed: AgentSpec = AgentSpec::from_yaml(&spec, &dir).unwrap();
+        assert!(parsed.build.packages.contains(&"gcc-c++".into()));
         assert!(spec.contains("cleanup:\n    remove_static_libs: false"));
         assert!(spec.contains("image_variant: release"));
         assert!(spec.contains("release:\n      enabled: true"));
@@ -1789,12 +1778,11 @@ mod tests {
             reference_values: InitReferenceValues::Sample,
             cosign_key: None,
             slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
-            base_image: None,
             dashscope_key: None,
             dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             dashscope_anthropic_base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
                 .to_string(),
-            model: "qwen3.7-max".to_string(),
+            model: confidential_agent_core::software::version("bailian_model"),
             gateway_token: Some("0123456789abcdef0123456789abcdef".to_string()),
             disable_pep: false,
             enable_dingtalk: false,
@@ -1833,7 +1821,6 @@ mod tests {
             reference_values: InitReferenceValues::Sample,
             cosign_key: None,
             slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
-            base_image: None,
             dashscope_key: None,
             dashscope_base_url: String::new(),
             dashscope_anthropic_base_url: String::new(),
@@ -1888,12 +1875,11 @@ mod tests {
             reference_values: InitReferenceValues::Sample,
             cosign_key: None,
             slsa_generator: PathBuf::from("/usr/libexec/shelter/slsa/slsa-generator"),
-            base_image: None,
             dashscope_key: Some("sk-test".to_string()),
             dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             dashscope_anthropic_base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
                 .to_string(),
-            model: "qwen3.7-max".to_string(),
+            model: confidential_agent_core::software::version("bailian_model"),
             gateway_token: Some("0123456789abcdef0123456789abcdef".to_string()),
             disable_pep: false,
             enable_dingtalk: true,
@@ -1931,7 +1917,14 @@ mod tests {
         let key_file = temp.path().join("model.key");
         fs::write(&key_file, "test-passphrase\n").unwrap();
 
-        for target in ["openclaw", "openclaw-vllm", "hermes", "codex", "claudecode", "vllm-inference"] {
+        for target in [
+            "openclaw",
+            "openclaw-vllm",
+            "hermes",
+            "codex",
+            "claudecode",
+            "vllm-inference",
+        ] {
             let cli = Cli::parse_from([
                 "confidential-agent",
                 "--state-dir",
@@ -1983,7 +1976,10 @@ mod tests {
                 assert!(text.contains("model_decryption_key"));
                 assert!(text.contains("cai_model_env"));
                 let model_env = std::fs::read_to_string(
-                    temp.path().join("init").join("vllm-inference").join("cai-model.env"),
+                    temp.path()
+                        .join("init")
+                        .join("vllm-inference")
+                        .join("cai-model.env"),
                 )
                 .unwrap();
                 assert!(model_env.contains("VLLM_PORT=8080"));

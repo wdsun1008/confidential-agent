@@ -1,9 +1,10 @@
 use super::commands::{
-    a2a_cli_preview_error_kind, build_debug_ssh_command, cmd_a2a, cmd_build, cmd_deploy,
-    cmd_destroy, cmd_image, cmd_inject, collect_image_entries, collect_live_status, debug_ssh_hint,
-    deploy_shelter_args, fetch_daemon_status_from, live_status_table_columns,
-    resolve_debug_ssh_command, status_table_columns, status_views, validate_build_start,
-    validate_deploy_start, wait_for_daemon_status_from,
+    a2a_cli_preview_error_kind, aggregate_replica_status, build_debug_ssh_command, cmd_a2a,
+    cmd_build, cmd_deploy, cmd_destroy, cmd_image, cmd_inject, collect_image_entries,
+    collect_live_status, collect_replica_status, debug_ssh_hint, deploy_shelter_args,
+    fetch_daemon_status_from, live_status_table_columns, resolve_debug_ssh_command,
+    status_table_columns, status_views, validate_build_start, validate_deploy_start,
+    wait_for_daemon_status_from,
 };
 use super::*;
 use crate::cli::{ConnectCommands, ImageArgs, ImageCommands, InitTarget, StatusArgs};
@@ -225,7 +226,11 @@ resources: {}
 
 #[test]
 fn build_start_rejects_active_and_deployed_services() {
-    let active = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let active = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     let mut deployed = active.clone();
     deployed.phase = "deployed".to_string();
     let mut deleted = active.clone();
@@ -239,7 +244,11 @@ fn build_start_rejects_active_and_deployed_services() {
 
 #[test]
 fn deploy_start_only_accepts_built_or_deleted_current_builds() {
-    let mut built = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut built = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     built.phase = "built".to_string();
     let mut deleted = built.clone();
     deleted.phase = "deleted".to_string();
@@ -253,9 +262,98 @@ fn deploy_start_only_accepts_built_or_deleted_current_builds() {
 }
 
 #[test]
+fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    for initial_phase in ["built", "deleted"] {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_bin = write_fake_prepare_tools(temp.path());
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+        );
+        let spec = temp.path().join("openclaw.yaml");
+        fs::write(&spec, "schema: confidential-agent/v1\nservice:\n  id: openclaw\n  ports: [18789]\n  connect: [18789]\nbuild:\n  image_name: openclaw-agent\ndeploy:\n  provider: aliyun\n  image_variant: release\n  instance_type: ecs.g8i.xlarge\n  region: cn-beijing\n  zone_id: cn-beijing-l\nattestation:\n  tee: tdx\n  mode: challenge\n  reference_values: sample\nresources: {}\n").unwrap();
+        let mut state = local_state("openclaw", vec![18789], vec![ConnectPort::Plain(18789)]);
+        state.phase = initial_phase.to_string();
+        state.build.image_path = temp.path().join("image.qcow2");
+        fs::write(&state.build.image_path, "image").unwrap();
+        state.deploy.terraform_dir = Some(temp.path().join("old-terraform"));
+        write_state(temp.path(), &state);
+        write_manifest(temp.path(), "openclaw", &state.build.build_id);
+        let paths = context_paths(temp.path(), "openclaw");
+        write_build_result(
+            &shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id),
+            &state.build.build_id,
+            &state.build.image_path,
+        );
+        let shelter = temp.path().join("shelter");
+        let observed = temp.path().join("state-before-apply.json");
+        let argv = temp.path().join("argv");
+        write_script(&shelter, &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncase \" $* \" in *' deploy '*) cp '{}' '{}'; exit 42;; esac\n",
+            argv.display(), paths.service_state.display(), observed.display()
+        ));
+        let mut cli = test_cli();
+        cli.state_dir = temp.path().to_path_buf();
+        cli.shelter_bin = shelter;
+        let result = cmd_deploy(
+            &cli,
+            &DeployArgs {
+                resume: false,
+                spec,
+                skip_inject: true,
+                render_only: false,
+                skip_peering_check: true,
+            },
+        );
+        std::env::set_var("PATH", old_path);
+        assert!(format!("{:#}", result.unwrap_err()).contains("shelter exited"));
+        let pending: LocalServiceState =
+            serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
+        assert_eq!(pending.phase, "deploying");
+        assert_eq!(pending.deploy.terraform_dir, None);
+        let deploy_args = fs::read_to_string(&argv).unwrap();
+        assert!(deploy_args.contains("--no-build\n"));
+        let rendered: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&paths.rendered_config).unwrap()).unwrap();
+        assert_eq!(
+            rendered["runtime"]["targets"]["deploy"]["provider_options"]["terraform_dir"],
+            serde_yaml::Value::Null
+        );
+        assert!(validate_deploy_start(Some(&pending)).is_err());
+        assert!(validate_build_start(Some(&pending)).is_err());
+        fs::remove_file(&paths.rendered_config).unwrap();
+        cmd_destroy(
+            &cli,
+            &DestroyArgs {
+                service: "openclaw".into(),
+            },
+        )
+        .unwrap();
+        let destroy_args = fs::read_to_string(argv).unwrap();
+        assert!(destroy_args.contains("destroy\n"));
+        assert!(destroy_args.contains(&format!("destroy\n{}\n", pending.deploy.resource_name)));
+        assert!(!destroy_args.contains("--terraform-dir\n"));
+        assert!(!destroy_args.contains("--config\n"));
+        assert_eq!(
+            read_service_state_file(&paths.service_state)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "deleted"
+        );
+    }
+}
+
+#[test]
 fn image_rm_removes_local_service_state_for_deleted_service() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     service.phase = "deleted".to_string();
     write_state(temp.path(), &service);
     let service_dir = temp.path().join("services/openclaw");
@@ -285,7 +383,11 @@ fn image_rm_removes_local_service_state_for_deleted_service() {
 #[test]
 fn image_rm_rejects_active_service_even_with_force() {
     let temp = tempfile::tempdir().unwrap();
-    let service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     write_state(temp.path(), &service);
     let mut cli = test_cli();
     cli.state_dir = temp.path().to_path_buf();
@@ -308,7 +410,11 @@ fn image_rm_rejects_active_service_even_with_force() {
 #[test]
 fn image_rm_rejects_unknown_service_phase() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     service.phase = "failed".to_string();
     write_state(temp.path(), &service);
     let mut cli = test_cli();
@@ -332,7 +438,11 @@ fn image_rm_rejects_unknown_service_phase() {
 #[test]
 fn image_list_marks_current_build_and_local_image_presence() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.build_id = "openclaw-agent-release-20260508123045123".to_string();
     let paths = context_paths(temp.path(), "openclaw");
@@ -370,7 +480,11 @@ fn image_list_marks_current_build_and_local_image_presence() {
 #[test]
 fn image_list_includes_published_image_status() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.build_id = "openclaw-agent-release-20260602112233".to_string();
     let paths = context_paths(temp.path(), "openclaw");
@@ -494,7 +608,11 @@ fn local_state_without_published_fields_deserializes_with_defaults() {
 #[test]
 fn status_view_separates_phase_from_local_image_presence() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "deleted".to_string();
     state.deploy.public_ip = None;
     state.deploy.private_ip = None;
@@ -511,7 +629,11 @@ fn status_view_separates_phase_from_local_image_presence() {
     assert_eq!(views[0].cloud.tee, None);
 }
 
-fn local_state(service_id: &str, ports: Vec<u16>, connect: Vec<ConnectPort>) -> LocalServiceState {
+pub(super) fn local_state(
+    service_id: &str,
+    ports: Vec<u16>,
+    connect: Vec<ConnectPort>,
+) -> LocalServiceState {
     LocalServiceState {
             schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
             service_id: service_id.to_string(),
@@ -588,6 +710,11 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
     fs::create_dir_all(&service_dir).unwrap();
     let shelter_work_dir = service_dir.join("shelter");
     let manifest = BuildManifest {
+        preparation_dir: None,
+        runtime_contract: None,
+        deployment: None,
+        ssh: None,
+        image: None,
         service_id: service_id.to_string(),
         shelter_build_id: build_id.to_string(),
         shelter_work_dir: shelter_work_dir.clone(),
@@ -599,7 +726,6 @@ fn write_manifest(state_dir: &Path, service_id: &str, build_id: &str) {
         gateway_bin: PathBuf::from("/bin/cai-gateway"),
         gateway_service: PathBuf::from("/etc/systemd/system/cai-gateway.service"),
         tng_service: PathBuf::from("/etc/systemd/system/trusted-network-gateway.service"),
-        initrd_secret_fetch_module: PathBuf::from("/build/99confidential-agent-secret-fetch"),
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/default.rego"),
         policy_local_dev: PathBuf::from("/build/local-dev.rego"),
@@ -634,6 +760,7 @@ fn test_published_image(build_id: &str, source_sha256: &str) -> PublishedImage {
         created_at: "2026-06-02T00:00:00Z".to_string(),
         updated_at: "2026-06-02T00:00:00Z".to_string(),
         oss_cleaned: true,
+        exported: false,
         error: None,
     }
 }
@@ -670,6 +797,49 @@ fn state_dir_lock_serializes_concurrent_writers() {
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
     drop(first);
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
+fn service_operation_lock_serializes_one_identity_and_allows_independent_services() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = lock_service_operation(temp.path(), "agent-a").unwrap();
+    let _independent = lock_service_operation(temp.path(), "agent-b").unwrap();
+    let state_dir = temp.path().to_path_buf();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let _second = lock_service_operation(&state_dir, "agent-a").unwrap();
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(first);
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
+fn image_cleanup_waits_for_consumers_to_commit_their_bindings() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = lock_image_operation(temp.path(), "cn-beijing", "m-shared", true).unwrap();
+    let second = lock_image_operation(temp.path(), "cn-beijing", "m-shared", true).unwrap();
+    let _independent = lock_image_operation(temp.path(), "cn-beijing", "m-other", false).unwrap();
+    let state_dir = temp.path().to_path_buf();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let _cleanup = lock_image_operation(&state_dir, "cn-beijing", "m-shared", false).unwrap();
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(first);
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(second);
     done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     waiter.join().unwrap();
 }
@@ -846,9 +1016,13 @@ fn write_fake_shelter(path: &Path, log: &Path) {
             r#"#!/usr/bin/env python3.11
 import json
 import os
+import re
 import sys
 
 args = sys.argv[1:]
+if "plan" in args:
+    print(json.dumps({{"plan": {{"early_boot": {{"binaries": ["/usr/local/bin/confidential-agentd", "/usr/bin/confidential-data-hub"]}}}}}}))
+    sys.exit(0)
 with open("{log}", "a", encoding="utf-8") as fh:
     fh.write(json.dumps(args) + "\n")
 
@@ -860,30 +1034,44 @@ def arg_after(flag):
 
 work_dir = arg_after("--work-dir")
 if "build" in args:
-    image_id = arg_after("--image-id")
-    image_dir = os.path.join(work_dir, "images", image_id)
+    image_id = arg_after("--tag")
+    # Mainline publishes immutable records through images/<id> symlinks.
+    image_dir = os.path.join(work_dir, "records", image_id)
     os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "images"), exist_ok=True)
+    alias = os.path.join(work_dir, "images", image_id)
+    if not os.path.lexists(alias):
+        os.symlink(os.path.join("..", "records", image_id), alias)
     image_path = os.path.join(image_dir, f"image-{{image_id}}.qcow2")
     with open(image_path, "w", encoding="utf-8") as fh:
         fh.write("image")
     with open(os.path.join(image_dir, "build-result.json"), "w", encoding="utf-8") as fh:
         json.dump({{
-            "id": image_id,
+            "tag": image_id,
             "image_path": image_path,
-            "reference_value": {{"measurement.uki.SHA-384": [image_id]}},
+            "reference_value": {{"measurement.uki.SHA-384": ["a" * 96]}},
             "rekor_value": None,
         }}, fh)
     sys.exit(0)
 
-if "deploy" in args:
-    image_id = args[args.index("deploy") + 1]
-    terraform_dir = arg_after("--terraform-dir")
+if "status" in args:
+    with open(os.path.join(work_dir, "test-instance-status.json"), encoding="utf-8") as fh:
+        print(fh.read())
+    sys.exit(0)
+
+if "run" in args:
+    name = arg_after("--name")
+    terraform_dir = os.path.join(work_dir, "deploy", "a" * 64)
+    with open(os.path.join(work_dir, "test-instance-status.json"), "w", encoding="utf-8") as fh:
+        json.dump({{"schema_version": "io.shelter.instance-status/v1", "id": "a" * 64,
+                   "name": name, "location": "remote"}}, fh)
     os.makedirs(terraform_dir, exist_ok=True)
     with open(os.path.join(terraform_dir, "deploy-result.json"), "w", encoding="utf-8") as fh:
         json.dump({{
-            "id": image_id,
+            "deployment_id": "a" * 64,
             "deploy": {{
-                "instance_id": "i-test",
+                "name": name,
+                "provider_instance_id": "i-test",
                 "public_ip": "203.0.113.42",
                 "private_ip": "10.0.1.20",
                 "outputs": {{"security_group_id": "sg-test"}},
@@ -934,10 +1122,8 @@ fn effective_shelter_bin_respects_explicit_env_override() {
 fn write_fake_prepare_tools(temp: &Path) -> PathBuf {
     let current = std::env::current_exe().unwrap();
     let agentd = current.parent().unwrap().join("confidential-agentd");
-    if !agentd.exists() {
-        fs::write(&agentd, "#!/bin/sh\nexit 0\n").unwrap();
-        set_mode(&agentd, 0o755).unwrap();
-    }
+    fs::write(&agentd, "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":\"confidential-agent/guest-runtime/v1\",\"bootstrap_schema\":\"confidential-agent/bootstrap/v1\",\"version\":\"0.1.0\",\"capabilities\":[\"external-fde-v1\",\"resources-v1\",\"mesh-client-ports-v1\",\"mesh-client-ports-v2\"]}'\n").unwrap();
+    set_mode(&agentd, 0o755).unwrap();
     let bin_dir = temp.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let docker = bin_dir.join("docker");
@@ -1070,9 +1256,9 @@ fn cryptpilot_fde_config_matches_current_schema() {
     assert!(config.contains("[delta]"));
     assert!(config.contains("integrity = false"));
     assert!(config.contains("[delta.encrypt.exec]"));
-    assert!(config.contains("command = \"/bin/bash\""));
+    assert!(config.contains("command = \"/bin/sh\""));
     assert!(config.contains(
-        "args = [\"-c\", \"CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /usr/bin/cat /run/cai/secrets/disk_key\"]"
+        "args = [\"-c\", \"CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/local/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /bin/cat /run/cai/secrets/disk_key\"]"
     ));
     assert!(!config.contains("initrd-fetch 1>&2"));
     assert!(!config.contains("rw_overlay"));
@@ -1082,6 +1268,7 @@ fn cryptpilot_fde_config_matches_current_schema() {
 #[test]
 fn deploy_args_use_positional_build_id_without_cloud_image_override() {
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "cai-e2e-agent-release".to_string(),
         shelter_work_dir: PathBuf::from("/state/shelter-work"),
@@ -1101,16 +1288,21 @@ fn deploy_args_use_positional_build_id_without_cloud_image_override() {
 
     assert_eq!(args[0], OsStr::new("--work-dir"));
     assert_eq!(args[1], OsStr::new("/state/shelter-work"));
-    assert_eq!(args[2], OsStr::new("deploy"));
+    assert_eq!(args[2], OsStr::new("run"));
     assert_eq!(args[3], OsStr::new("cai-e2e-agent-release"));
     assert!(!args.iter().any(|arg| arg == OsStr::new("--image-id")));
     assert!(!args.iter().any(|arg| arg == OsStr::new("--cloud-image-id")));
-    assert!(args.iter().any(|arg| arg == OsStr::new("--auto-approve")));
+    assert!(args.iter().any(|arg| arg == OsStr::new("--no-build")));
+    assert!(args.windows(2).any(|pair| pair == ["--target", "deploy"]));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == "--name" && pair[1] == OsStr::new(&prepared.shelter_build_id)));
 }
 
 #[test]
-fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
+fn deploy_args_use_the_project_without_overriding_managed_state() {
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "cai-e2e-agent-debug".to_string(),
         shelter_work_dir: PathBuf::from("/state/shelter-work"),
@@ -1130,16 +1322,10 @@ fn deploy_args_pass_confidential_agent_terraform_dir_to_shelter() {
 
     let args = deploy_shelter_args(&prepared);
 
-    let terraform_dir = args
+    assert!(args
         .windows(2)
-        .find(|window| window[0] == OsStr::new("--terraform-dir"))
-        .map(|window| window[1].as_os_str());
-    assert_eq!(
-        terraform_dir,
-        Some(OsStr::new(
-            "/state/services/openclaw/terraform/20260506130000"
-        ))
-    );
+        .any(|pair| pair == ["--config", "/state/shelter.yaml"]));
+    assert!(!args.iter().any(|arg| arg == "--terraform-dir"));
 }
 
 #[test]
@@ -1159,10 +1345,10 @@ fn build_runs_all_enabled_variants_and_records_manifest_entries() {
 schema: confidential-agent/v1
 service:
   id: openclaw
+  ssh: true
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1198,14 +1384,14 @@ resources: {}
         },
     )
     .unwrap();
-    std::env::set_var("PATH", old_path);
+    std::env::set_var("PATH", &old_path);
 
     let invocations = fs::read_to_string(&log).unwrap();
     assert!(invocations.contains("openclaw-agent-release-"));
     assert!(invocations.contains("openclaw-agent-debug-"));
     let manifest_path = cli.state_dir.join("services/openclaw/manifest.json");
     let manifest: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
     assert!(manifest["variants"]["release"]["shelter_build_id"]
         .as_str()
         .unwrap()
@@ -1214,6 +1400,119 @@ resources: {}
         .as_str()
         .unwrap()
         .starts_with("openclaw-agent-debug-"));
+
+    // Neither preview nor a partially successful multi-variant build may alter
+    // the committed manifest, state, assets, config, or deployable image.
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
+    let paths = context_paths(&cli.state_dir, "openclaw");
+    let committed = [
+        paths.manifest.clone(),
+        paths.service_state.clone(),
+        paths.rendered_config.clone(),
+        PathBuf::from(manifest["agentd_bin"].as_str().unwrap()),
+    ];
+    let contents: Vec<_> = committed
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect();
+    let saved_spec = fs::read_to_string(&spec).unwrap();
+    let image = latest_built_image(&cli.state_dir, &AgentSpec::from_path(&spec).unwrap()).unwrap();
+    fs::write(&spec, saved_spec.replace("18789", "19999")).unwrap();
+    cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: true,
+        },
+    )
+    .unwrap();
+    for (path, content) in committed.iter().zip(&contents) {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            content,
+            "preview changed {}",
+            path.display()
+        );
+    }
+    let script = fs::read_to_string(&cli.shelter_bin).unwrap();
+    fs::write(
+        &cli.shelter_bin,
+        script.replace(
+            "image_id = arg_after(\"--tag\")",
+            "image_id = arg_after(\"--tag\")\n    if '-debug-' in image_id: sys.exit(42)",
+        ),
+    )
+    .unwrap();
+    assert!(cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false
+        }
+    )
+    .is_err());
+    for (path, content) in committed.iter().zip(&contents) {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            content,
+            "failed build changed {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        latest_built_image(&cli.state_dir, &AgentSpec::from_path(&spec).unwrap()).unwrap(),
+        image
+    );
+    fs::write(
+        &cli.shelter_bin,
+        script.replace("\"a\" * 96", "\"invalid\""),
+    )
+    .unwrap();
+    assert!(cmd_build(
+        &cli,
+        &BuildArgs {
+            spec: spec.clone(),
+            render_only: false
+        }
+    )
+    .is_err());
+    for (path, content) in committed.iter().zip(&contents) {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            content,
+            "invalid build result changed {}",
+            path.display()
+        );
+    }
+    fs::write(&spec, saved_spec).unwrap();
+    // Deployment reuses the exact saved guest assets and project directory.
+    let prepared = prepare(
+        &cli,
+        &cli.state_dir,
+        &spec,
+        PrepareOptions {
+            include_deploy: true,
+            build_id: Some(manifest["shelter_build_id"].as_str().unwrap().into()),
+            image_variant: Some("release".into()),
+            ..PrepareOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.rendered_config,
+        PathBuf::from(manifest["shelter_config"].as_str().unwrap())
+    );
+    let deployed = read_build_manifest(&paths.manifest).unwrap();
+    let pinned = deployed.ssh.unwrap().command("192.0.2.1", &[]);
+    assert_eq!(pinned.private_key, paths.secrets_dir.join("ssh_client"));
+    assert_eq!(
+        fs::read(PathBuf::from(manifest["agentd_bin"].as_str().unwrap())).unwrap(),
+        contents[3]
+    );
+    std::env::set_var("PATH", &old_path);
 }
 
 #[test]
@@ -1236,7 +1535,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -1284,8 +1582,15 @@ resources: {}
     .unwrap();
     std::env::set_var("PATH", old_path);
 
-    let rendered =
-        fs::read_to_string(cli.state_dir.join("services/openclaw/shelter.yaml")).unwrap();
+    let service = cli.state_dir.join("services/openclaw");
+    assert!(!service.join("manifest.json").exists());
+    let attempt = fs::read_dir(service.join("build-attempts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rendered = fs::read_to_string(attempt.join("release/shelter.yaml")).unwrap();
     assert!(!rendered.contains("variants:"));
     assert!(!rendered.contains("resize:"));
     assert!(!rendered.contains("deploy:"));
@@ -1350,6 +1655,7 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec: spec.clone(),
             skip_inject: false,
             render_only: false,
@@ -1377,6 +1683,7 @@ resources: {}
     cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: true,
             render_only: true,
@@ -1431,7 +1738,12 @@ resources: {}
 "#,
     )
     .unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
+    state.spec.sha256 = sha256_file(&spec_path).unwrap();
     state.spec.path = spec_path;
     state.deploy.terraform_dir = Some(
         state_dir
@@ -1464,6 +1776,13 @@ resources: {}
     assert!(rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(rendered.contains("connect_18789_peer_203_0_113_10_32"));
 
+    // Editing the source is a future deployment request, not a mesh update.
+    let source = fs::read_to_string(&state.spec.path).unwrap();
+    fs::write(
+        &state.spec.path,
+        source.replace("ecs.g8i.xlarge", "ecs.g8i.2xlarge"),
+    )
+    .unwrap();
     PeeringsFile::empty()
         .write_to_path(&state_dir.join("peerings.yaml"))
         .unwrap();
@@ -1472,6 +1791,10 @@ resources: {}
     assert!(rendered.contains("deploy:"));
     assert!(!rendered.contains("control_8006_peer_203_0_113_10_32"));
     assert!(!rendered.contains("connect_18789_peer_203_0_113_10_32"));
+    assert!(rendered.contains("ecs.g8i.xlarge"));
+    assert!(!rendered.contains("ecs.g8i.2xlarge"));
+    fs::remove_file(&state.spec.path).unwrap();
+    render_service_config_from_state(&state_dir, &state, Vec::new()).unwrap();
 }
 
 #[test]
@@ -1547,14 +1870,18 @@ resources: {}
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": id,
                 "image_path": image,
-                "reference_value": {"measurement.uki.SHA-384": [id]},
+                "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
                 "rekor_value": null
             }))
             .unwrap(),
         )
         .unwrap();
     }
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.build_id = release_id.to_string();
     state.build.variant = "release".to_string();
@@ -1575,7 +1902,6 @@ resources: {}
             "gateway_bin": "/bin/cai-gateway",
             "gateway_service": "/etc/systemd/system/cai-gateway.service",
             "tng_service": "/etc/systemd/system/trusted-network-gateway.service",
-            "initrd_secret_fetch_module": "/build/99confidential-agent-secret-fetch",
             "fde_config_file": "/build/fde.toml",
             "policy_default": "/build/default.rego",
             "policy_local_dev": "/build/local-dev.rego",
@@ -1607,6 +1933,7 @@ resources: {}
     cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: true,
             render_only: false,
@@ -1617,14 +1944,21 @@ resources: {}
     std::env::set_var("PATH", old_path);
 
     let invocations = fs::read_to_string(log).unwrap();
-    assert!(invocations.contains(&format!("\"deploy\", \"{debug_id}\"")));
-    assert!(!invocations.contains(&format!("\"deploy\", \"{release_id}\"")));
+    assert!(invocations.contains(&format!("\"run\", \"{debug_id}\"")));
+    assert!(!invocations.contains(&format!("\"run\", \"{release_id}\"")));
     let deployed = read_service_state_file(&service_dir.join("state.json"))
         .unwrap()
         .unwrap();
     assert_eq!(deployed.build.build_id, debug_id);
     assert_eq!(deployed.build.variant, "debug");
     assert_eq!(deployed.build.image_path, debug_image);
+    let terraform_dir = shelter_dir.join("deploy").join("a".repeat(64));
+    assert_eq!(deployed.deploy.terraform_dir.as_ref(), Some(&terraform_dir));
+    let manifest = read_build_manifest(&service_dir.join("manifest.json")).unwrap();
+    assert_eq!(
+        manifest.deploy_result,
+        shelter_deploy_result_path(&terraform_dir)
+    );
 }
 
 #[test]
@@ -1638,7 +1972,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1664,7 +1997,7 @@ resources: {}
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": build_id,
                 "image_path": "/state/shelter/images/openclaw-agent-release/image-openclaw-agent-release.qcow2",
-                "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+                "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
                 "rekor_value": null
             }))
             .unwrap(),
@@ -1693,7 +2026,6 @@ service:
   connect: [18789]
   app_service: cai-openclaw-gateway.service
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1731,7 +2063,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1811,7 +2142,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1927,7 +2257,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -1946,7 +2275,11 @@ resources: {}
     .unwrap();
     let build_id = "openclaw-agent-release-20260508123045123";
     let paths = context_paths(temp.path(), "openclaw");
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.build_id = build_id.to_string();
     state.build.image_path =
@@ -1959,7 +2292,7 @@ resources: {}
         serde_json::to_string_pretty(&serde_json::json!({
             "id": build_id,
             "image_path": state.build.image_path,
-            "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+            "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
             "rekor_value": null
         }))
         .unwrap(),
@@ -1984,7 +2317,7 @@ fn materialize_build_artifacts_reads_manifest_result_path() {
         serde_json::to_string_pretty(&serde_json::json!({
             "id": "openclaw-agent-release",
             "image_path": "/shelter/images/openclaw-agent-release/image.qcow2",
-            "reference_value": {"measurement.uki.SHA-384": ["abc"]},
+            "reference_value": {"measurement.uki.SHA-384": ["a".repeat(96)]},
             "rekor_value": null
         }))
         .unwrap(),
@@ -2006,19 +2339,76 @@ fn materialize_build_artifacts_reads_manifest_result_path() {
 }
 
 #[test]
+fn bind_shelter_deployment_rejects_mismatched_or_unsafe_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "a".repeat(64);
+    let terraform_dir = temp.path().join("deploy").join(&id);
+    fs::create_dir_all(&terraform_dir).unwrap();
+    let result_path = shelter_deploy_result_path(&terraform_dir);
+    let valid_status = serde_json::json!({
+        "schema_version": "io.shelter.instance-status/v1",
+        "id": id,
+        "name": "openclaw",
+        "location": "remote"
+    });
+    let valid_result = serde_json::json!({
+        "deployment_id": id,
+        "deploy": {"name": "openclaw"}
+    });
+    let shelter = temp.path().join("fake-shelter");
+    let mut cli = test_cli();
+    cli.shelter_bin = shelter.clone();
+    for (status_key, status_value, result_key, result_value) in [
+        ("name", "other", "deployment_id", id.as_str()),
+        ("location", "local", "deployment_id", id.as_str()),
+        ("schema_version", "unknown", "deployment_id", id.as_str()),
+        ("id", "../other", "deployment_id", id.as_str()),
+        ("id", id.as_str(), "deployment_id", "wrong-id"),
+    ] {
+        let mut status = valid_status.clone();
+        status[status_key] = status_value.into();
+        let mut result = valid_result.clone();
+        result[result_key] = result_value.into();
+        fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        write_script(
+            &shelter,
+            &format!("#!/bin/sh\ncat <<'JSON'\n{status}\nJSON\n"),
+        );
+        let mut prepared = PreparedConfig {
+            image: None,
+            rendered_config: temp.path().join("shelter.yaml"),
+            shelter_build_id: "openclaw".into(),
+            shelter_work_dir: temp.path().to_path_buf(),
+            build_result: temp.path().join("build-result.json"),
+            deploy_result: temp.path().join("unresolved-result.json"),
+            deploy_names: None,
+            terraform_dir: None,
+            debug_ssh: None,
+            cloud_image_id: None,
+        };
+        assert!(bind_shelter_deployment(&cli, &mut prepared).is_err());
+        assert_eq!(prepared.terraform_dir, None);
+        assert_eq!(
+            prepared.deploy_result,
+            temp.path().join("unresolved-result.json")
+        );
+    }
+}
+
+#[test]
 fn resolve_deploy_observation_reads_shelter_deploy_result_json() {
     let temp = tempfile::tempdir().unwrap();
     let deploy_result = temp.path().join("deploy-result.json");
     fs::write(
         &deploy_result,
         serde_json::to_string_pretty(&serde_json::json!({
-            "id": "openclaw-agent-release",
+            "deployment_id": "a".repeat(64),
             "image_path": "/image.qcow2",
             "reference_value": null,
             "rekor_value": null,
             "deploy": {
-                "name": "openclaw-20260429103011",
-                "instance_id": {"value": "i-test"},
+                "name": "openclaw-agent-release",
+                "provider_instance_id": {"value": "i-test"},
                 "public_ip": {"value": "39.0.0.1"},
                 "private_ip": {"value": "10.0.0.8"},
                 "components": null,
@@ -2030,7 +2420,8 @@ fn resolve_deploy_observation_reads_shelter_deploy_result_json() {
         .unwrap(),
     )
     .unwrap();
-    let prepared = PreparedConfig {
+    let mut prepared = PreparedConfig {
+        image: None,
         rendered_config: PathBuf::from("/state/shelter.yaml"),
         shelter_build_id: "openclaw-agent-release".to_string(),
         shelter_work_dir: temp.path().join("shelter"),
@@ -2051,7 +2442,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2075,6 +2465,43 @@ resources: {}
     assert_eq!(observation.security_group_id.as_deref(), Some("sg-test"));
     assert_eq!(observation.public_ip.as_deref(), Some("39.0.0.1"));
     assert_eq!(observation.private_ip.as_deref(), Some("10.0.0.8"));
+
+    // A published-image alias is bound by status; provider resource names can
+    // differ. Accept only the result carrying that exact bound deployment ID.
+    let id = "a".repeat(64);
+    prepared.image = Some(images::ImageDeployment {
+        source: confidential_agent_core::spec::PublishedImageSpec {
+            release: temp.path().join("release.json"),
+            trusted_key: temp.path().join("publisher.pem"),
+            manifest: format!("sha256:{}", "0".repeat(64)),
+            account_id: "1234567890".into(),
+        },
+        image_id: "m-shared".into(),
+    });
+    prepared.terraform_dir = Some(temp.path().join("deploy").join(&id));
+    let mut result: serde_json::Value =
+        serde_json::from_slice(&fs::read(&prepared.deploy_result).unwrap()).unwrap();
+    result["deploy"]["name"] = format!("shelter-{id}").into();
+    fs::write(
+        &prepared.deploy_result,
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_deploy_observation(&prepared, &spec)
+            .unwrap()
+            .instance_id,
+        observation.instance_id
+    );
+    result["deployment_id"] = "b".repeat(64).into();
+    fs::write(
+        &prepared.deploy_result,
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    assert!(resolve_deploy_observation(&prepared, &spec).is_err());
+    prepared.terraform_dir = None;
+    assert!(resolve_deploy_observation(&prepared, &spec).is_err());
 }
 
 #[test]
@@ -2116,6 +2543,7 @@ fn resolve_deploy_observation_reads_multi_instance_outputs() {
         terraform_dir: None,
         debug_ssh: None,
         cloud_image_id: None,
+        image: None,
     };
     let spec = AgentSpec::from_yaml(
         r#"
@@ -2125,7 +2553,6 @@ service:
   ports: [8080]
   connect: [8080]
 build:
-  base_image: /images/base.qcow2
   image_name: vllm-inference-agent
 deploy:
   provider: aliyun
@@ -2237,6 +2664,7 @@ resources: {}
         )
         .unwrap();
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: paths.rendered_config.clone(),
         shelter_build_id: build_id,
         shelter_work_dir: paths.shelter_work_dir.clone(),
@@ -2300,6 +2728,7 @@ resources: {}
     write_build_result(&build_result, &build_id, &image_path);
     fs::write(&image_path, "image").unwrap();
     let prepared = PreparedConfig {
+        image: None,
         rendered_config: paths.rendered_config.clone(),
         shelter_build_id: build_id,
         shelter_work_dir: paths.shelter_work_dir.clone(),
@@ -2340,7 +2769,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2356,8 +2784,13 @@ resources: {}
 "#,
     )
     .unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "active".to_string();
+    state.spec.sha256 = sha256_file(&spec_path).unwrap();
     state.spec.path = spec_path;
     state.deploy.published_image_id = Some("m-2ze123abc".to_string());
     write_state(temp.path(), &state);
@@ -2373,51 +2806,6 @@ resources: {}
 }
 
 #[test]
-fn deploy_terraform_dir_is_scoped_by_resource_name() {
-    let spec = AgentSpec::from_yaml(
-        r#"
-schema: confidential-agent/v1
-service:
-  id: openclaw
-  ports: [18789]
-  connect: [18789]
-build:
-  base_image: /images/base.qcow2
-  image_name: openclaw-agent
-deploy:
-  provider: aliyun
-  image_variant: release
-  instance_type: ecs.g8i.xlarge
-  region: cn-beijing
-  zone_id: cn-beijing-l
-attestation:
-  tee: tdx
-  mode: challenge
-  reference_values: sample
-resources: {}
-"#,
-        Path::new("/project"),
-    )
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let paths = context_paths(temp.path(), "openclaw");
-    let names = DeployNames::from_run_id(&spec, "20260429103011");
-
-    assert_eq!(
-        deploy_terraform_dir(&paths, Some(&PathBuf::from("/terraform")), Some(&names)).unwrap(),
-        PathBuf::from("/terraform/openclaw-20260429103011")
-    );
-    assert_eq!(
-        deploy_terraform_dir(&paths, None, Some(&names)).unwrap(),
-        paths.service_dir.join("terraform/20260429103011")
-    );
-    assert_eq!(
-        deploy_terraform_dir(&paths, Some(&PathBuf::from("/terraform")), None).unwrap(),
-        PathBuf::from("/terraform")
-    );
-}
-
-#[test]
 fn debug_deploy_without_configured_key_generates_stable_key_paths() {
     let temp = tempfile::tempdir().unwrap();
     let spec_yaml = r#"
@@ -2427,7 +2815,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   variants:
     release:
@@ -2505,9 +2892,6 @@ fn mkosi_debug_deploy_stages_authorized_keys() {
         tng_service: paths
             .guest_staging_dir
             .join("trusted-network-gateway.service"),
-        initrd_secret_fetch_module: paths
-            .guest_staging_dir
-            .join("99confidential-agent-secret-fetch"),
         fde_config_file: paths.guest_staging_dir.join("fde.toml"),
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
@@ -2552,9 +2936,6 @@ fn mkosi_debug_deploy_stages_configured_authorized_keys() {
         tng_service: paths
             .guest_staging_dir
             .join("trusted-network-gateway.service"),
-        initrd_secret_fetch_module: paths
-            .guest_staging_dir
-            .join("99confidential-agent-secret-fetch"),
         fde_config_file: paths.guest_staging_dir.join("fde.toml"),
         policy_default: paths.guest_staging_dir.join("default.rego"),
         policy_local_dev: paths.guest_staging_dir.join("local-dev.rego"),
@@ -2629,7 +3010,11 @@ fn debug_ssh_key_generator_output_is_accepted_by_ssh_keygen_when_available() {
 
 #[test]
 fn debug_ssh_hint_uses_generated_private_key_and_public_ip() {
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.build.variant = "debug".to_string();
     state.build.debug_ssh = Some(confidential_agent_core::schema::LocalDebugSshKey {
         private_key: PathBuf::from("/state/services/openclaw/secrets/debug_ssh"),
@@ -2642,6 +3027,11 @@ fn debug_ssh_hint_uses_generated_private_key_and_public_ip() {
         hint,
         "openclaw: ssh -i /state/services/openclaw/secrets/debug_ssh root@39.0.0.1"
     );
+    state.deploy.public_ip = Some("replicas.example.invalid".into());
+    state.deploy.instance_public_ips = vec!["39.0.0.1".into(), "39.0.0.2".into()];
+    assert_eq!(debug_ssh_hint(&state).unwrap(), hint);
+    let view = status_views(Path::new("/state"), &[state]).remove(0);
+    assert_eq!(view.cloud.management_ip.as_deref(), Some("39.0.0.1"));
 }
 
 #[test]
@@ -2657,7 +3047,11 @@ fn debug_ssh_command_errors_when_state_missing() {
 #[test]
 fn debug_ssh_command_errors_without_debug_key() {
     let temp = tempfile::tempdir().unwrap();
-    let state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     write_state(temp.path(), &state);
 
     let err = resolve_debug_ssh_command(temp.path(), "openclaw", &[]).unwrap_err();
@@ -2753,7 +3147,11 @@ fn debug_ssh_command_treats_empty_public_ip_as_absent() {
 }
 
 fn debug_ssh_state(service_id: &str) -> LocalServiceState {
-    let mut state = local_state(service_id, vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        service_id,
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.build.variant = "debug".to_string();
     state.build.debug_ssh = Some(LocalDebugSshKey {
         private_key: PathBuf::from(format!("/state/services/{service_id}/secrets/debug_ssh")),
@@ -2774,7 +3172,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -2804,7 +3201,11 @@ resources: {}
 #[test]
 fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     service.deploy.terraform_dir = Some(temp.path().join("services/openclaw/terraform/active"));
     write_state(temp.path(), &service);
     write_manifest(temp.path(), "openclaw", &service.build.build_id);
@@ -2838,7 +3239,7 @@ fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
     assert!(err.to_string().contains("shelter exited with status"));
     let recorded = fs::read_to_string(argv).unwrap();
     assert!(recorded.contains("--work-dir\n"));
-    assert!(recorded.contains("destroy\nopenclaw-agent-release\n"));
+    assert!(recorded.contains(&format!("destroy\n{}\n", service.deploy.resource_name)));
     assert!(recorded.contains("--terraform-dir\n"));
     assert!(recorded.contains("services/openclaw/terraform/active\n"));
     let state = read_service_state_file(&service_dir.join("state.json"))
@@ -2850,7 +3251,11 @@ fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
 #[test]
 fn destroy_keeps_local_build_artifacts_after_shelter_destroy_succeeds() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     let service_dir = temp.path().join("services/openclaw");
     service.deploy.terraform_dir = Some(service_dir.join("terraform/active"));
     service.deploy.instance_id = Some("i-test".to_string());
@@ -2962,39 +3367,124 @@ fn destroy_keeps_local_build_artifacts_after_shelter_destroy_succeeds() {
 
 #[test]
 fn destroy_is_idempotent_for_deleted_service_without_cloud_state() {
+    for mode in ["challenge", "trustee"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = local_state(
+            "openclaw",
+            vec![18789],
+            vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+        );
+        service.phase = "deleted".to_string();
+        service.attestation_mode = mode.to_string();
+        service.deploy.run_id.clear();
+        service.deploy.resource_name.clear();
+        service.deploy.terraform_dir = None;
+        service.deploy.image_source = None;
+        service.deploy.image_import_name = None;
+        service.deploy.bucket = None;
+        service.deploy.instance_id = None;
+        service.deploy.security_group_id = None;
+        service.deploy.private_ip = None;
+        service.deploy.public_ip = None;
+        service.deploy.tee.clear();
+        write_state(temp.path(), &service);
+        let shelter = temp.path().join("shelter-should-not-run");
+        write_script(&shelter, "#!/bin/sh\nexit 42\n");
+        let mut cli = test_cli();
+        cli.state_dir = temp.path().to_path_buf();
+        cli.shelter_bin = shelter;
+
+        cmd_destroy(
+            &cli,
+            &DestroyArgs {
+                service: "openclaw".to_string(),
+            },
+        )
+        .unwrap();
+
+        if mode == "trustee" {
+            service.deploy.instance_id = Some("i-still-recorded".to_string());
+            write_state(temp.path(), &service);
+            let error = cmd_destroy(
+                &cli,
+                &DestroyArgs {
+                    service: "openclaw".to_string(),
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("Trustee state entry is missing"));
+            assert_eq!(
+                read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
+                    .unwrap()
+                    .unwrap()
+                    .deploy
+                    .instance_id,
+                Some("i-still-recorded".to_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn destroy_before_an_infrastructure_attempt_does_not_invoke_shelter() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
-    service.phase = "deleted".to_string();
-    service.deploy.run_id.clear();
-    service.deploy.resource_name.clear();
-    service.deploy.terraform_dir = None;
-    service.deploy.image_source = None;
-    service.deploy.image_import_name = None;
-    service.deploy.bucket = None;
-    service.deploy.instance_id = None;
-    service.deploy.security_group_id = None;
-    service.deploy.private_ip = None;
-    service.deploy.public_ip = None;
-    service.deploy.tee.clear();
-    write_state(temp.path(), &service);
     let shelter = temp.path().join("shelter-should-not-run");
     write_script(&shelter, "#!/bin/sh\nexit 42\n");
     let mut cli = test_cli();
-    cli.state_dir = temp.path().to_path_buf();
+    cli.state_dir = temp.path().join("state");
     cli.shelter_bin = shelter;
-
     cmd_destroy(
         &cli,
         &DestroyArgs {
-            service: "openclaw".to_string(),
+            service: "not-started".into(),
         },
     )
     .unwrap();
+    let paths = context_paths(&cli.state_dir, "not-started");
+    assert!(!paths.service_state.exists());
+    assert!(!paths.manifest.exists());
+    let mut built = local_state("not-started", Vec::new(), Vec::new());
+    built.phase = "built".into();
+    built.deploy = serde_json::from_value(serde_json::json!({
+        "provider": "aliyun", "run_id": "planned", "resource_name": "planned",
+        "image_import_name": "planned-image", "tee": "tdx"
+    }))
+    .unwrap();
+    write_state(&cli.state_dir, &built);
+    cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "not-started".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        read_service_state_file(&paths.service_state)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "deleted"
+    );
+    // A recorded attempt with a lost manifest must still fail closed.
+    let mut state = local_state("not-started", Vec::new(), Vec::new());
+    state.phase = "deploying".into();
+    write_state(&cli.state_dir, &state);
+    assert!(cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "not-started".into()
+        }
+    )
+    .is_err());
 }
 
 #[test]
 fn live_status_skips_deleted_services() {
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     service.phase = "deleted".to_string();
     service.deploy.public_ip = Some("127.0.0.1".to_string());
 
@@ -3044,7 +3534,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3089,7 +3578,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3111,6 +3599,7 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: false,
             render_only: false,
@@ -3135,7 +3624,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3151,7 +3639,11 @@ resources: {}
 "#,
     )
     .unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.image_path = temp.path().join("missing.qcow2");
     write_state(temp.path(), &state);
@@ -3178,6 +3670,7 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: false,
             render_only: false,
@@ -3192,7 +3685,14 @@ resources: {}
 
 #[test]
 fn deploy_render_only_uses_published_image_without_local_qcow2() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
+    let fake_bin = write_fake_prepare_tools(temp.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+    );
     let spec = temp.path().join("openclaw.yaml");
     fs::write(
         &spec,
@@ -3203,7 +3703,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3219,7 +3718,11 @@ resources: {}
 "#,
     )
     .unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.spec.path = spec.clone();
     state.build.image_path = temp.path().join("missing.qcow2");
@@ -3242,16 +3745,18 @@ resources: {}
     let mut cli = test_cli();
     cli.state_dir = temp.path().to_path_buf();
 
-    cmd_deploy(
+    let deploy_result = cmd_deploy(
         &cli,
         &DeployArgs {
+            resume: false,
             spec,
             skip_inject: false,
             render_only: true,
             skip_peering_check: true,
         },
-    )
-    .unwrap();
+    );
+    std::env::set_var("PATH", old_path);
+    deploy_result.unwrap();
 
     let rendered =
         fs::read_to_string(context_paths(temp.path(), "openclaw").rendered_config).unwrap();
@@ -3264,7 +3769,11 @@ resources: {}
 #[test]
 fn published_image_requires_build_result_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.image_path = temp.path().join("missing.qcow2");
     state.build.published.insert(
@@ -3299,6 +3808,7 @@ resources: {}
     )
     .unwrap();
     let variant = BuildManifestVariant {
+        preparation_dir: None,
         shelter_build_id: state.build.build_id.clone(),
         build_result: temp.path().join("missing-build-result.json"),
         extra_files: Vec::new(),
@@ -3313,7 +3823,11 @@ resources: {}
 #[test]
 fn published_image_for_deploy_skips_stale_entry_and_uses_valid_one() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "built".to_string();
     state.build.image_path = temp.path().join("image.qcow2");
     fs::write(&state.build.image_path, "image").unwrap();
@@ -3362,6 +3876,7 @@ resources: {}
     )
     .unwrap();
     let variant = BuildManifestVariant {
+        preparation_dir: None,
         shelter_build_id: state.build.build_id.clone(),
         build_result,
         extra_files: Vec::new(),
@@ -3386,7 +3901,6 @@ service:
   ports: [18789, 18800]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3403,7 +3917,11 @@ resources: {}
     )
     .unwrap();
     let spec = AgentSpec::from_path(&spec_path).unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.phase = "deployed".to_string();
     state.deploy.run_id = "20260429110011".to_string();
     state.deploy.resource_name = "openclaw-20260429110011".to_string();
@@ -3432,7 +3950,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
 deploy:
   provider: aliyun
@@ -3449,7 +3966,11 @@ resources: {}
     )
     .unwrap();
     let spec = AgentSpec::from_path(&spec_path).unwrap();
-    let mut state = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut state = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     state.gateway_identity = None;
 
     let activated = activate_existing_service_state(temp.path(), &spec_path, &spec, state).unwrap();
@@ -3481,23 +4002,6 @@ fn ensure_gateway_identity_rejects_mismatched_public_key() {
 }
 
 #[test]
-fn mesh_port_conflict_is_rejected() {
-    let states = vec![local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))])];
-    let err = validate_mesh_port_conflicts(&states, "mcp", &[18789]).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("port 18789 is already used by service openclaw"));
-}
-
-#[test]
-fn built_services_do_not_reserve_mesh_ports() {
-    let mut built = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
-    built.phase = "built".to_string();
-
-    validate_mesh_port_conflicts(&[built], "mcp", &[18789]).unwrap();
-}
-
-#[test]
 fn filtered_mesh_sync_requires_active_local_state() {
     let cli = test_cli();
     let temp = tempfile::tempdir().unwrap();
@@ -3513,7 +4017,11 @@ fn filtered_mesh_sync_requires_active_local_state() {
 
 #[test]
 fn render_mesh_bundle_includes_service_ports_and_sample_reference_values() {
-    let services = vec![local_state("cai-e2e", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))])];
+    let services = vec![local_state(
+        "cai-e2e",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    )];
     let mut sample = BTreeMap::new();
     sample.insert(
         "cai-e2e".to_string(),
@@ -3530,7 +4038,10 @@ fn render_mesh_bundle_includes_service_ports_and_sample_reference_values() {
 
     assert_eq!(bundle.generation, 7);
     assert_eq!(bundle.services["cai-e2e"].ports, vec![18789]);
-    assert_eq!(bundle.services["cai-e2e"].connect, vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    assert_eq!(
+        bundle.services["cai-e2e"].connect,
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]
+    );
     assert_eq!(
         bundle.reference_values["cai-e2e"]["measurement.uki.SHA-384"][0],
         "abc123"
@@ -3539,7 +4050,11 @@ fn render_mesh_bundle_includes_service_ports_and_sample_reference_values() {
 
 #[test]
 fn render_mesh_bundle_omits_deleted_services() {
-    let mut openclaw = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut openclaw = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     let mut mcp = local_state("mcp", vec![3001], Vec::new());
     mcp.phase = "deleted".to_string();
     let mut sample = BTreeMap::new();
@@ -3565,7 +4080,11 @@ fn render_mesh_bundle_omits_deleted_services() {
 #[test]
 fn connect_requires_public_ip() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state("openclaw", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "openclaw",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     service.deploy.public_ip = None;
     write_state(temp.path(), &service);
 
@@ -3599,8 +4118,16 @@ fn connect_ignores_services_without_connect_ports() {
 #[test]
 fn connect_renders_all_connect_services() {
     let temp = tempfile::tempdir().unwrap();
-    let openclaw = local_state("openclaw", vec![49152], vec![(confidential_agent_core::spec::ConnectPort::Plain(49152))]);
-    let worker = local_state("worker", vec![49153], vec![(confidential_agent_core::spec::ConnectPort::Plain(49153))]);
+    let openclaw = local_state(
+        "openclaw",
+        vec![49152],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(49152))],
+    );
+    let worker = local_state(
+        "worker",
+        vec![49153],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(49153))],
+    );
     let mcp = local_state("mcp", vec![3001], Vec::new());
     write_state(temp.path(), &openclaw);
     write_state(temp.path(), &worker);
@@ -3622,7 +4149,7 @@ fn connect_renders_all_connect_services() {
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
     assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 49152);
     assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 49153);
-    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], false);
+    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], true);
     assert_eq!(
         config["add_ingress"][0]["verify"]["attestation_policy"]["type"],
         "path"
@@ -3648,8 +4175,16 @@ fn connect_renders_all_connect_services() {
 #[test]
 fn connect_service_filter_renders_only_requested_service() {
     let temp = tempfile::tempdir().unwrap();
-    let openclaw = local_state("openclaw", vec![49152], vec![(confidential_agent_core::spec::ConnectPort::Plain(49152))]);
-    let worker = local_state("worker", vec![49153], vec![(confidential_agent_core::spec::ConnectPort::Plain(49153))]);
+    let openclaw = local_state(
+        "openclaw",
+        vec![49152],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(49152))],
+    );
+    let worker = local_state(
+        "worker",
+        vec![49153],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(49153))],
+    );
     write_state(temp.path(), &openclaw);
     write_state(temp.path(), &worker);
 
@@ -3675,7 +4210,11 @@ fn connect_service_filter_renders_only_requested_service() {
 #[test]
 fn connect_service_filter_rejects_unknown_service() {
     let temp = tempfile::tempdir().unwrap();
-    let openclaw = local_state("openclaw", vec![49152], vec![(confidential_agent_core::spec::ConnectPort::Plain(49152))]);
+    let openclaw = local_state(
+        "openclaw",
+        vec![49152],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(49152))],
+    );
     write_state(temp.path(), &openclaw);
     write_mesh_bundle(
         temp.path(),
@@ -3696,11 +4235,7 @@ fn connect_service_filter_rejects_unknown_service() {
 #[test]
 fn render_connect_config_uses_slb_vip_when_set() {
     let temp = tempfile::tempdir().unwrap();
-    let mut service = local_state(
-        "vllm-inference",
-        vec![8080],
-        vec![ConnectPort::Plain(8080)],
-    );
+    let mut service = local_state("vllm-inference", vec![8080], vec![ConnectPort::Plain(8080)]);
     service.deploy.slb_vip = Some("10.0.1.100".to_string());
     write_state(temp.path(), &service);
 
@@ -3722,11 +4257,7 @@ fn render_connect_config_uses_slb_vip_when_set() {
 #[test]
 fn render_connect_config_falls_back_to_public_ip_when_no_slb_vip() {
     let temp = tempfile::tempdir().unwrap();
-    let service = local_state(
-        "vllm-inference",
-        vec![8080],
-        vec![ConnectPort::Plain(8080)],
-    );
+    let service = local_state("vllm-inference", vec![8080], vec![ConnectPort::Plain(8080)]);
     write_state(temp.path(), &service);
 
     let mut sample = BTreeMap::new();
@@ -3849,7 +4380,7 @@ fn from_card_connect_allocates_available_local_ports() {
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 2);
     assert_eq!(config["add_ingress"][0]["mapping"]["in"]["port"], 18790);
     assert_eq!(config["add_ingress"][0]["mapping"]["out"]["port"], 18789);
-    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], false);
+    assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], true);
     assert_eq!(
         config["add_ingress"][0]["verify"]["attestation_policy"]["type"],
         "path"
@@ -3935,7 +4466,11 @@ fn collect_sample_reference_values_uses_state_reference_value_path() {
         r#"{"measurement.uki.SHA-384":["from-build-result"]}"#,
     )
     .unwrap();
-    let mut service = local_state("cai-e2e", vec![18789], vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))]);
+    let mut service = local_state(
+        "cai-e2e",
+        vec![18789],
+        vec![(confidential_agent_core::spec::ConnectPort::Plain(18789))],
+    );
     service.build.sample_rv = Some(sample);
     let services = vec![service];
     let values = collect_reference_values_from_dir(temp.path(), &services).unwrap();
@@ -4186,18 +4721,47 @@ fn no_proxy_with_target_trims_whitespace_in_existing_entries() {
 }
 
 #[test]
-fn secret_fetch_initrd_loads_tdx_guest_module() {
-    let setup = secret_fetch_module_setup();
-    assert!(setup.contains("instmods tdx_guest"));
-    assert!(setup.contains("usr/lib/modprobe.d"));
-    assert!(setup.contains("options tdx_guest tsm_api=0"));
-    assert!(setup.contains("shelter-tdx-guest.conf"));
-    assert!(setup.contains("usr/lib/modules-load.d"));
-    assert!(setup.contains("confidential-agent-tdx.conf"));
-    assert!(setup.contains("confidential-agent-configfs-mount.service"));
-    assert!(setup.contains("mount -t configfs configfs /sys/kernel/config"));
-    assert!(setup.contains("Before=trustiflux-api-server-initrd.service"));
-    assert!(setup.contains("sysinit.target.wants"));
-    assert!(setup.contains("rd.retry=300 rd.shell=0 rd.emergency=poweroff"));
-    assert!(setup.contains("36-confidential-agent-fail-closed.conf"));
+fn build_preflight_rejects_silently_ignored_initrd_binaries() {
+    let config = serde_yaml::from_str("initrd:\n  binaries: [/usr/local/bin/confidential-agentd, /usr/bin/confidential-data-hub]\n").unwrap();
+    for plan in [
+        serde_json::json!({"plan": {"early_boot": {}}}),
+        serde_json::json!({"plan": {"early_boot": {"binaries": ["/usr/local/bin/confidential-agentd"]}}}),
+    ] {
+        assert!(verify_initrd_binaries_in_plan(&config, &plan).is_err());
+    }
+    let plan = serde_json::json!({"plan": {"early_boot": {"binaries": ["/usr/local/bin/confidential-agentd", "/usr/bin/confidential-data-hub"]}}});
+    verify_initrd_binaries_in_plan(&config, &plan).unwrap();
+}
+
+#[test]
+fn replica_status_checks_every_node_and_reports_partial_failure() {
+    let mut state = local_state("openclaw", vec![], vec![]);
+    state.deploy.instance_ids = vec!["i-a".into(), "i-b".into()];
+    state.deploy.instance_public_ips = vec!["192.0.2.1".into(), "192.0.2.2".into()];
+    state.deploy.public_ip = Some("lb.example.invalid".into());
+    let status: DaemonStatus = serde_json::from_value(serde_json::json!({
+        "schema": "confidential-agent/daemon-status/v1", "service_id": "openclaw",
+        "phase": "ready", "bootstrap_generation": 1, "mesh_generation": 1,
+        "app_ready": true, "mesh_ready": true, "debug_ssh_ready": true,
+        "resources": {}, "peers": {}, "mesh_client_ports": {}, "a2a_peers": {},
+        "timestamp_unix": 1
+    }))
+    .unwrap();
+    let mut called = Vec::new();
+    let nodes = collect_replica_status(&state, |host| {
+        called.push(host.to_owned());
+        if host.ends_with(".2") {
+            bail!("unreachable")
+        }
+        Ok(status.clone())
+    });
+    assert_eq!(called, state.deploy.instance_public_ips);
+    assert_eq!(nodes[1].instance_id.as_deref(), Some("i-b"));
+    let (aggregate, error) = aggregate_replica_status(&nodes);
+    let aggregate = aggregate.unwrap();
+    assert!(!aggregate.app_ready);
+    assert!(!aggregate.mesh_ready);
+    assert_eq!(aggregate.phase, "degraded");
+    assert!(error.unwrap().contains("i-b"));
+    assert_eq!(state.deploy.preferred_injection_ip(), Some("192.0.2.1"));
 }

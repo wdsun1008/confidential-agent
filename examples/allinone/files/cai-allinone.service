@@ -1,0 +1,13 @@
+[Unit]
+Description=Selected allinone agent harness
+After=network-online.target confidential-agentd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cai-agent --serve
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+

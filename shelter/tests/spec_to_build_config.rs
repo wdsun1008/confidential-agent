@@ -13,7 +13,6 @@ service:
   ports: [18789]
   connect: [18789]
 build:
-  base_image: /images/base.qcow2
   image_name: openclaw-agent
   resize: 30G
   packages:
@@ -51,7 +50,6 @@ fn assets() -> GuestAssets {
         gateway_bin: PathBuf::from("/build/cai-gateway"),
         gateway_service: PathBuf::from("/build/cai-gateway.service"),
         tng_service: PathBuf::from("/build/trusted-network-gateway.service"),
-        initrd_secret_fetch_module: PathBuf::from("/build/99confidential-agent-secret-fetch"),
         fde_config_file: PathBuf::from("/build/fde.toml"),
         policy_default: PathBuf::from("/build/trustee-opa-default.rego"),
         policy_local_dev: PathBuf::from("/build/trustee-opa-local-dev.rego"),
@@ -122,8 +120,12 @@ fn spec_to_build_config_produces_valid_yaml() {
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
     assert!(parsed.as_mapping().is_some());
-    assert!(config.contains("base_image") || config.contains("packages"));
+    assert!(config.contains("packages"));
     assert!(config.contains("confidential-agentd"));
+    assert_eq!(
+        parsed["cleanup"]["trim_udev_helpers"].as_bool(),
+        Some(false)
+    );
 }
 
 #[test]
@@ -145,10 +147,7 @@ fn spec_to_build_config_renders_release_and_debug_variant_matrix() {
         let parsed = render_yaml(&spec, ShelterRenderOptions::default());
         let root = parsed.as_mapping().unwrap();
 
-        assert_eq!(
-            mapping_get(root, "from").as_str(),
-            Some("/images/base.qcow2")
-        );
+        assert!(!mapping_contains(root, "from"));
         assert!(!mapping_contains(root, "resize"));
         assert!(!mapping_contains(root, "variants"));
 
@@ -199,11 +198,7 @@ fn spec_to_build_config_renders_release_and_debug_variant_matrix() {
 
 #[test]
 fn spec_to_build_config_mkosi_path_omits_from_and_variants_but_keeps_payload() {
-    let spec = AgentSpec::from_yaml(
-        &SPEC.replace("  base_image: /images/base.qcow2\n", ""),
-        Path::new("/project"),
-    )
-    .unwrap();
+    let spec = AgentSpec::from_yaml(SPEC, Path::new("/project")).unwrap();
     let parsed = render_yaml(&spec, ShelterRenderOptions::default());
     let root = parsed.as_mapping().unwrap();
 
@@ -253,6 +248,10 @@ fn spec_to_build_config_renders_cleanup_passthrough() {
     let cleanup = mapping_get(root, "cleanup").as_mapping().unwrap();
     assert_eq!(
         mapping_get(cleanup, "remove_static_libs").as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        mapping_get(cleanup, "trim_udev_helpers").as_bool(),
         Some(false)
     );
 }
@@ -364,7 +363,10 @@ fn spec_to_build_config_rekor_explicit_artifact_id_takes_precedence() {
         Some("/project/slsa-generator")
     );
     assert_eq!(mapping_get(rekor, "required").as_bool(), Some(false));
-    assert!(!mapping_contains(rekor, "rv_name"));
+    assert_eq!(
+        mapping_get(rekor, "rv_name").as_str(),
+        Some("measurement.uki.SHA-384")
+    );
 }
 
 #[test]
@@ -456,7 +458,10 @@ fn spec_to_build_config_with_deploy_includes_terraform() {
 
     let parsed: Value = serde_yaml::from_str(&config).unwrap();
     let root = parsed.as_mapping().unwrap();
-    let deploy = mapping_get(root, "deploy").as_mapping().unwrap();
+    assert!(!root.contains_key(Value::String("deploy".to_string())));
+    let deploy = parsed["runtime"]["targets"]["deploy"]["provider_options"]
+        .as_mapping()
+        .unwrap();
 
     assert_eq!(mapping_get(deploy, "backend").as_str(), Some("terraform"));
     assert_eq!(mapping_get(deploy, "cloud").as_str(), Some("alicloud"));

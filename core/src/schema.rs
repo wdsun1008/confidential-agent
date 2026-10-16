@@ -89,6 +89,10 @@ pub struct PublishedImage {
     pub updated_at: String,
     #[serde(default)]
     pub oss_cleaned: bool,
+    /// A signed release may have consumers outside this workspace. Automatic
+    /// pruning must retain it until the operator explicitly retires the release.
+    #[serde(default)]
+    pub exported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -129,13 +133,20 @@ pub struct LocalDeployState {
 
 impl LocalDeployState {
     pub fn preferred_injection_ip(&self) -> Option<&str> {
-        self.public_ip
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
+        self.instance_public_ips
+            .first()
+            .or_else(|| self.instance_private_ips.first())
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
             .or_else(|| {
-                self.private_ip
+                self.public_ip
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        self.private_ip
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                    })
             })
     }
 
@@ -548,12 +559,18 @@ mod tests {
 
     #[test]
     fn confidential_ports_excludes_connect_ports() {
-        assert_eq!(confidential_ports(&[18789, 18800], &[crate::spec::ConnectPort::Plain(18789)]), vec![18800]);
+        assert_eq!(
+            confidential_ports(&[18789, 18800], &[crate::spec::ConnectPort::Plain(18789)]),
+            vec![18800]
+        );
     }
 
     #[test]
     fn confidential_ports_returns_empty_when_all_are_connect() {
-        assert_eq!(confidential_ports(&[18789], &[crate::spec::ConnectPort::Plain(18789)]), Vec::<u16>::new());
+        assert_eq!(
+            confidential_ports(&[18789], &[crate::spec::ConnectPort::Plain(18789)]),
+            Vec::<u16>::new()
+        );
     }
 
     #[test]
@@ -774,8 +791,7 @@ mod tests {
 
     #[test]
     fn local_deploy_state_deserializes_without_multi_instance_fields() {
-        let json =
-            r#"{"provider":"aliyun","run_id":"run","resource_name":"res","tee":"tdx"}"#;
+        let json = r#"{"provider":"aliyun","run_id":"run","resource_name":"res","tee":"tdx"}"#;
         let state: LocalDeployState = serde_json::from_str(json).unwrap();
 
         assert!(state.instance_ids.is_empty());

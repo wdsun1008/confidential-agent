@@ -623,7 +623,7 @@ fn collect_rekor_report(
 
     let mut entries = Vec::new();
     let roots = rekor_artifact_roots(&paths, state);
-    let local_uuids = local_rekor_entry_uuids(&roots);
+    let local_uuids = rekor_entry_uuids_for_state(&paths, state);
     if !local_uuids.is_empty() {
         entries = fetch_rekor_entries_by_uuids(rekor_url, &local_uuids, errors);
     }
@@ -737,7 +737,7 @@ fn rekor_artifact_roots(paths: &ContextPaths, state: &LocalServiceState) -> Vec<
     roots
 }
 
-fn local_rekor_entry_uuids(roots: &[PathBuf]) -> Vec<String> {
+pub(super) fn local_rekor_entry_uuids(roots: &[PathBuf]) -> Vec<String> {
     let mut uuids = BTreeSet::new();
     for root in roots {
         for path in find_files_named(root, "rekor-v1-upload.txt", 6) {
@@ -749,12 +749,26 @@ fn local_rekor_entry_uuids(roots: &[PathBuf]) -> Vec<String> {
     uuids.into_iter().collect()
 }
 
+fn rekor_entry_uuids_for_state(paths: &ContextPaths, state: &LocalServiceState) -> Vec<String> {
+    let mut uuids: BTreeSet<_> = local_rekor_entry_uuids(&rekor_artifact_roots(paths, state))
+        .into_iter()
+        .collect();
+    if let Ok(manifest) = read_build_manifest(&paths.manifest) {
+        if manifest.image.is_some() {
+            if let Some(contract) = &manifest.runtime_contract {
+                uuids.extend(contract.rekor_entry_uuids());
+            }
+        }
+    }
+    uuids.into_iter().collect()
+}
+
 pub(super) fn local_rekor_entry_uuid_for_state(
     state_dir: &Path,
     state: &LocalServiceState,
 ) -> Option<String> {
     let paths = context_paths(state_dir, &state.service_id);
-    local_rekor_entry_uuids(&rekor_artifact_roots(&paths, state))
+    rekor_entry_uuids_for_state(&paths, state)
         .into_iter()
         .next()
 }
@@ -1253,13 +1267,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn service_report_skips_non_active() {
-        let state = LocalServiceState {
+    fn test_service_state(phase: &str) -> LocalServiceState {
+        LocalServiceState {
             schema: LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string(),
             service_id: "test".to_string(),
             generation: 1,
-            phase: "deleted".to_string(),
+            phase: phase.to_string(),
             attestation_mode: "challenge".to_string(),
             spec: LocalSpecState {
                 path: PathBuf::from("/spec.yaml"),
@@ -1306,7 +1319,12 @@ mod tests {
             resources: BTreeMap::new(),
             mesh_generation: 0,
             reference_values: "sample".to_string(),
-        };
+        }
+    }
+
+    #[test]
+    fn service_report_skips_non_active() {
+        let state = test_service_state("deleted");
         let report = collect_service_report(
             Path::new("/state"),
             &state,
@@ -1315,6 +1333,91 @@ mod tests {
         assert_eq!(report.collect_status, "skipped");
         assert!(report.build.is_none());
         assert!(report.attestation.is_none());
+    }
+
+    #[test]
+    fn published_consumer_fetches_rekor_without_producer_upload_files() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let (mut socket, _) = loop {
+                if let Ok(connection) = listener.accept() {
+                    break connection;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "consumer did not fetch its signed Rekor entry"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .starts_with("GET /api/v1/log/entries/abc123 "));
+            let response = serde_json::json!({"abc123": {
+                "logIndex": 42, "integratedTime": 100,
+                "body": BASE64_STANDARD.encode(br#"{"kind":"intoto"}"#),
+                "verification": {"inclusionProof": {"treeSize": 43}}
+            }})
+            .to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+        let mut state = test_service_state("active");
+        state.build.image_path = PathBuf::new();
+        state.build.rekor_meta = Some(root.path().join("rekor.json"));
+        write_json_atomic(
+            state.build.rekor_meta.as_ref().unwrap(),
+            &serde_json::json!({"rekor_url": url}),
+        )
+        .unwrap();
+        let paths = context_paths(root.path(), &state.service_id);
+        fs::create_dir_all(&paths.service_dir).unwrap();
+        let manifest = BuildManifest {
+            image: Some(serde_json::from_value(serde_json::json!({
+                "source": {"release": "/public/release.json", "trusted_key": "/public/publisher.pem",
+                           "manifest": format!("sha256:{}", "a".repeat(64)), "account_id": "123"},
+                "image_id": "m-published"
+            })).unwrap()),
+            runtime_contract: Some(serde_json::from_value(serde_json::json!({
+                "schema_version": "confidential-agent/image-runtime/v1", "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
+                "capabilities": [], "rootfs_integrity": true, "writable_layer_encryption": "luks2",
+                "key_release": "ca-attested", "min_disk_gb": 32, "app_services": [],
+                "rekor_entry_uuids": ["abc123"]
+            })).unwrap()),
+            ..BuildManifest::default()
+        };
+        write_json_atomic(&paths.manifest, &manifest).unwrap();
+        let mut errors = Vec::new();
+        let report = collect_rekor_report(root.path(), &state, &mut errors);
+        server.join().unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(report.status, "found");
+        assert_eq!(report.entries[0].uuid, "abc123");
+        assert_eq!(report.entries[0].log_index, Some(42));
+        assert_eq!(
+            local_rekor_entry_uuid_for_state(root.path(), &state).as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]

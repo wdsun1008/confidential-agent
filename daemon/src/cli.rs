@@ -17,6 +17,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Report guest protocol capabilities without starting services or reading secrets
+    DescribeRuntime,
     Run(RunArgs),
     ApplyOnce(RunArgs),
     InitrdFetch(InitrdFetchArgs),

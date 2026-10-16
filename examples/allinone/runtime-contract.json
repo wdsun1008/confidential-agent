@@ -1,0 +1,30 @@
+{
+  "schema_version": "confidential-agent/image-runtime/v1",
+  "bootstrap_schema": "confidential-agent/bootstrap/v1",
+  "capabilities": [
+    "external-fde-v1",
+    "resources-v1",
+    "mesh-client-ports-v1",
+    "instance-ssh-v1",
+    "allinone-runtime-v1",
+    "application-runtime-v1",
+    "instance-ssh-credentials-v1",
+    "mesh-client-ports-v2"
+  ],
+  "rootfs_integrity": true,
+  "writable_layer_encryption": "luks2",
+  "key_release": "ca-attested",
+  "min_disk_gb": 120,
+  "app_services": [
+    "cai-allinone.service"
+  ],
+  "configuration_schema": "confidential-agent/allinone-runtime/v1",
+  "software_versions": {
+    "openclaw": "2026.10.3",
+    "codex": "0.162.1",
+    "claude-code": "2.1.299",
+    "qodercli": "1.1.70",
+    "opencode": "1.19.0",
+    "hermes": "e06df9c2eae6901f4c88f464e0ae6e753c0428b8"
+  }
+}

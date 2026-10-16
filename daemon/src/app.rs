@@ -42,6 +42,7 @@ const DEFAULT_GATEWAY_CONFIG_PATH: &str = "/etc/cai/gateway.json";
 const TNG_EGRESS_PORT_BASE: u16 = 39000;
 const GATEWAY_SERVER_PORT_BASE: u16 = 39200;
 const TNG_INGRESS_PORT_BASE: u16 = 39400;
+const GATEWAY_CLIENT_PORT_BASE: u16 = 39600;
 const DEFAULT_TNG_SO_MARK: u32 = 565;
 const TNG_SERF_PORT: u16 = 8301;
 const TNG_KEY_ROTATION_INTERVAL: u32 = 300;
@@ -134,6 +135,10 @@ struct DaemonState {
     bootstrap_generation: u64,
     #[serde(default)]
     mesh_generation: u64,
+    #[serde(default)]
+    mesh_client_owner: Option<String>,
+    #[serde(default)]
+    mesh_client_ports: BTreeMap<String, BTreeMap<u16, u16>>,
     applied_resources: BTreeMap<String, AppliedResourceState>,
     mesh_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,9 +227,22 @@ fn daemon_cache_dir() -> PathBuf {
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::DescribeRuntime => {
+            println!(
+                "{}",
+                json!({
+                    "schema_version": "confidential-agent/guest-runtime/v1",
+                    "bootstrap_schema": BOOTSTRAP_SCHEMA_VERSION,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "capabilities": ["external-fde-v1", "resources-v1", "mesh-client-ports-v1", "mesh-client-ports-v2", "application-runtime-v1", "instance-ssh-credentials-v1", "connect-ohttp-v1", "replica-peer-sharing-v1"]
+                })
+            );
+            Ok(())
+        }
         Commands::Run(args) => run_daemon(args),
         Commands::InitrdFetch(args) => initrd_fetch(args),
         Commands::ApplyOnce(mut args) => {
+            let mut state = read_daemon_state()?;
             let trustee_runtime = trustee::load_rootfs_runtime()?;
             let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
                 // The rootfs Attestation Agent is a different service
@@ -258,7 +276,6 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
                 refresh_trustee_bootstrap_resources(runtime, &args, &bootstrap);
                 refresh_trustee_dynamic_resources(runtime, &args);
             }
-            let mut state = read_daemon_state().unwrap_or_default();
             if apply_bootstrap(&args, &bootstrap, &mut state, true)? {
                 sync_mesh(&args, &bootstrap, &mut state)?;
             }
@@ -433,6 +450,7 @@ fn initrd_poweroff_enabled() -> bool {
 }
 
 fn run_daemon(mut args: RunArgs) -> Result<()> {
+    let initial_state = read_daemon_state();
     println!("confidential-agentd starting");
     let trustee_runtime = trustee::load_rootfs_runtime()?;
     let runtime_mode = if let Some(runtime) = trustee_runtime.as_ref() {
@@ -465,6 +483,10 @@ fn run_daemon(mut args: RunArgs) -> Result<()> {
         HttpServerKind::AgentCard,
         http_limits,
     )?;
+    let mut state = match initial_state {
+        Ok(state) => state,
+        Err(error) => recover_daemon_state(&args, runtime_mode, trustee_runtime.as_ref(), error)?,
+    };
     let mut resource_watcher = ResourceWatcher::new(
         &args.cdh_root,
         [
@@ -473,7 +495,6 @@ fn run_daemon(mut args: RunArgs) -> Result<()> {
             Path::new(&args.a2a_bundle_resource),
         ],
     )?;
-    let mut state = read_daemon_state().unwrap_or_default();
     let mut active_bootstrap: Option<BootstrapConfig> = None;
     loop {
         if let Some(runtime) = trustee_runtime.as_ref() {
@@ -555,6 +576,116 @@ fn run_daemon(mut args: RunArgs) -> Result<()> {
             ResourceWatcherWait::Event | ResourceWatcherWait::Timeout => {}
         }
     }
+}
+
+// Persistent endpoint reservations are authoritative. Recovery only installs
+// independently attested management credentials; it never creates business
+// state or assigns endpoints. Restoring the original state resumes normal work.
+fn recover_daemon_state(
+    args: &RunArgs,
+    mode: RuntimeMode,
+    trustee: Option<&TrusteeRuntime>,
+    initial_error: anyhow::Error,
+) -> Result<DaemonState> {
+    if let Err(error) = stop_recovery_services(None) {
+        eprintln!("failed to stop mesh during management recovery: {error:#}");
+    }
+    let mut error = initial_error;
+    loop {
+        eprintln!("daemon state recovery required: {error:#}");
+        if let Some(runtime) = trustee {
+            if let Err(error) =
+                runtime.fetch_to_trusted_root(&args.cdh_root, &args.bootstrap_resource)
+            {
+                eprintln!("management bootstrap refresh failed: {error:#}");
+            }
+        }
+        let recovery = (|| {
+            let Some(bootstrap) = read_bootstrap(args, mode)? else {
+                return Ok(());
+            };
+            if let Some(runtime) = trustee {
+                let mut management = bootstrap.clone();
+                management
+                    .resources
+                    .retain(|resource| is_management_credential(&resource.id));
+                refresh_trustee_bootstrap_resources(runtime, args, &management);
+            }
+            apply_management_recovery(args, &bootstrap, &error, Path::new("/opt/data/cai-ssh"))
+        })();
+        if let Err(error) = recovery {
+            eprintln!("management recovery failed: {error:#}");
+        }
+        std::thread::sleep(Duration::from_secs(args.poll_interval_sec.max(1)));
+        match read_daemon_state() {
+            Ok(state) => return Ok(state),
+            Err(next) => error = next,
+        }
+    }
+}
+
+fn apply_management_recovery(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    error: &anyhow::Error,
+    directory: &Path,
+) -> Result<()> {
+    let applied = install_management_credentials(args, bootstrap, directory)?;
+    // Management remains available even when a broken business unit cannot be
+    // stopped. Report the failure, but never withhold authenticated SSH for it.
+    let stop_error = stop_recovery_services(bootstrap.app_service.as_deref()).err();
+    let mut diagnostic = format!("management recovery only: {error:#}");
+    if let Some(error) = stop_error {
+        diagnostic.push_str(&format!("; {error:#}"));
+    }
+    let status_state = DaemonState {
+        applied_resources: applied,
+        last_error: Some(diagnostic),
+        ..Default::default()
+    };
+    write_status(status_for(
+        bootstrap,
+        &status_state,
+        "management-recovery",
+        RuntimeReadiness {
+            app_ready: false,
+            mesh_ready: false,
+            debug_ssh_ready: false,
+        },
+    ))
+}
+
+fn stop_recovery_services(app: Option<&str>) -> Result<()> {
+    // Stop existing listeners as well as preventing a cold-boot start. Their
+    // on-disk configurations and the damaged state remain untouched.
+    if std::env::var_os("CA_SKIP_SYSTEMCTL").is_none() {
+        let mut failures = Vec::new();
+        let mut services = vec![TNG_SERVICE, GATEWAY_SERVICE];
+        if let Some(app) = app {
+            services.push(app);
+        }
+        for service in services {
+            match Command::new("systemctl").args(["stop", service]).output() {
+                Ok(output)
+                    if output.status.success()
+                        || systemctl_reports_missing_unit(
+                            &output.status,
+                            &String::from_utf8_lossy(&output.stderr),
+                        ) => {}
+                _ => failures.push(service),
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "failed to stop {} during management recovery",
+            failures.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn is_management_credential(id: &str) -> bool {
+    matches!(id, "cai_ssh_authorized_keys" | "cai_ssh_host_key")
 }
 
 fn next_resource_refresh_timeout(
@@ -1412,6 +1543,15 @@ fn validate_bootstrap(bootstrap: &BootstrapConfig, runtime_mode: RuntimeMode) ->
     if bootstrap.service_id.trim().is_empty() {
         bail!("bootstrap service_id must not be empty");
     }
+    for peer in &bootstrap.tng_peers {
+        let address = peer
+            .parse::<std::net::Ipv4Addr>()
+            .context("invalid replica peer address")?;
+        anyhow::ensure!(
+            !address.is_unspecified() && !address.is_multicast(),
+            "replica peer must be a unicast IPv4 address"
+        );
+    }
     let expected_mode = match runtime_mode {
         RuntimeMode::Challenge => "challenge",
         RuntimeMode::Trustee => "trustee",
@@ -1431,6 +1571,22 @@ fn apply_bootstrap(
     bootstrap: &BootstrapConfig,
     state: &mut DaemonState,
     fail_missing: bool,
+) -> Result<bool> {
+    apply_bootstrap_resources(
+        args,
+        bootstrap,
+        state,
+        fail_missing,
+        Path::new("/opt/data/cai-ssh"),
+    )
+}
+
+fn apply_bootstrap_resources(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    state: &mut DaemonState,
+    fail_missing: bool,
+    management_directory: &Path,
 ) -> Result<bool> {
     struct PlannedResource<'a> {
         resource: &'a GuestResource,
@@ -1456,65 +1612,15 @@ fn apply_bootstrap(
     state
         .applied_resources
         .retain(|resource_id, _| resource_ids.contains(resource_id));
+    apply_management_credentials(args, bootstrap, state, management_directory)?;
+    validate_mesh_client_reservations(bootstrap, state)?;
     for resource in &bootstrap.resources {
-        let source = args.cdh_root.join(&resource.resource_path);
-        let metadata = match source.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if fail_missing || resource.required {
-                    missing_required.push(resource.id.clone());
-                }
-                eprintln!(
-                    "waiting for resource '{}' at '{}'",
-                    resource.id,
-                    source.display()
-                );
-                continue;
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to stat resource '{}'", source.display()));
-            }
-        };
-        if !metadata.is_file() {
-            bail!(
-                "resource '{}' at '{}' is not a regular file",
-                resource.id,
-                source.display()
-            );
-        }
-        if metadata.len() == 0 {
+        let Some((source, digest)) = verified_resource_source(args, resource)? else {
             if fail_missing || resource.required {
                 missing_required.push(resource.id.clone());
             }
-            eprintln!(
-                "waiting for resource '{}' at '{}'",
-                resource.id,
-                source.display()
-            );
             continue;
-        }
-        if metadata.len() > MAX_RESOURCE_BYTES {
-            bail!(
-                "resource '{}' at '{}' is {} bytes, exceeding maximum {} bytes",
-                resource.id,
-                source.display(),
-                metadata.len(),
-                MAX_RESOURCE_BYTES
-            );
-        }
-
-        let digest = sha256_file(&source)?;
-        if let Some(expected) = &resource.sha256 {
-            if expected != &digest {
-                bail!(
-                    "resource '{}' digest mismatch: expected {}, got {}",
-                    resource.id,
-                    expected,
-                    digest
-                );
-            }
-        }
+        };
         let update = if resource.mutable {
             match state.applied_resources.get(&resource.id) {
                 None => ResourceUpdate::WriteContent,
@@ -1621,6 +1727,7 @@ fn apply_bootstrap(
         return Err(err);
     }
 
+    write_application_runtime_context(bootstrap)?;
     state.bootstrap_generation = bootstrap.generation;
     let readiness = ensure_runtime_ready(bootstrap, false);
     write_status(status_for(bootstrap, state, "resources-applied", readiness))?;
@@ -1638,6 +1745,149 @@ fn apply_bootstrap(
     }
 
     Ok(true)
+}
+
+fn validate_mesh_client_reservations(
+    bootstrap: &BootstrapConfig,
+    state: &DaemonState,
+) -> Result<()> {
+    anyhow::ensure!(
+        state
+            .mesh_client_owner
+            .as_deref()
+            .map_or(true, |owner| owner == bootstrap.service_id),
+        "persisted mesh client endpoints belong to a different guest service"
+    );
+    for port in state
+        .mesh_client_ports
+        .values()
+        .flat_map(|ports| ports.values())
+    {
+        anyhow::ensure!(!bootstrap.ports.contains(port),
+            "application port {port} is reserved for an existing mesh client endpoint; choose a different application port");
+    }
+    Ok(())
+}
+
+/// Project only verified bootstrap data; applications never select a provider cache.
+fn write_application_runtime_context(bootstrap: &BootstrapConfig) -> Result<()> {
+    write_json_atomic(
+        &daemon_status_path().with_file_name("application-runtime.json"),
+        &json!({
+            "schema_version": "confidential-agent/application-runtime/v1",
+            "service_id": bootstrap.service_id,
+            "ports": bootstrap.ports,
+            "app_service": bootstrap.app_service,
+        }),
+    )
+}
+
+fn verified_resource_source(
+    args: &RunArgs,
+    resource: &GuestResource,
+) -> Result<Option<(PathBuf, String)>> {
+    let source = args.cdh_root.join(&resource.resource_path);
+    let metadata = match source.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "waiting for resource '{}' at '{}'",
+                resource.id,
+                source.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to stat resource '{}'", source.display()))
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "resource '{}' at '{}' is not a regular file",
+        resource.id,
+        source.display()
+    );
+    if metadata.len() == 0 {
+        eprintln!(
+            "waiting for resource '{}' at '{}'",
+            resource.id,
+            source.display()
+        );
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        metadata.len() <= MAX_RESOURCE_BYTES,
+        "resource '{}' at '{}' is {} bytes, exceeding maximum {} bytes",
+        resource.id,
+        source.display(),
+        metadata.len(),
+        MAX_RESOURCE_BYTES
+    );
+    let digest = sha256_file(&source)?;
+    if let Some(expected) = &resource.sha256 {
+        anyhow::ensure!(
+            expected == &digest,
+            "resource '{}' digest mismatch: expected {}, got {}",
+            resource.id,
+            expected,
+            digest
+        );
+    }
+    Ok(Some((source, digest)))
+}
+
+/// Management credentials can become ready even when a business resource is missing
+/// or invalid. Verify both first, then publish the image's SSH readiness trigger.
+fn apply_management_credentials(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    state: &mut DaemonState,
+    directory: &Path,
+) -> Result<()> {
+    state
+        .applied_resources
+        .extend(install_management_credentials(args, bootstrap, directory)?);
+    Ok(())
+}
+
+fn install_management_credentials(
+    args: &RunArgs,
+    bootstrap: &BootstrapConfig,
+    directory: &Path,
+) -> Result<BTreeMap<String, AppliedResourceState>> {
+    let mut credentials = Vec::new();
+    for (id, file) in [
+        ("cai_ssh_authorized_keys", "authorized_keys"),
+        ("cai_ssh_host_key", "host_key"),
+    ] {
+        let Some(resource) = bootstrap
+            .resources
+            .iter()
+            .find(|resource| resource.id == id)
+        else {
+            return Ok(BTreeMap::new());
+        };
+        anyhow::ensure!(resource.target == directory.join(file) && resource.required && !resource.mutable && resource.sha256.is_some(),
+            "instance SSH credentials must be required, immutable and bound to their management paths");
+        let Some((source, digest)) = verified_resource_source(args, resource)? else {
+            return Ok(BTreeMap::new());
+        };
+        credentials.push((resource, source, digest));
+    }
+    let mut applied = BTreeMap::new();
+    for (resource, source, digest) in credentials {
+        apply_resource_once(resource, &source, &digest)?;
+        applied.insert(
+            resource.id.clone(),
+            applied_resource_state(resource, &digest),
+        );
+    }
+    write_file_atomic(
+        &daemon_status_path().with_file_name("instance-ssh.ready"),
+        b"ready\n",
+    )?;
+    Ok(applied)
 }
 
 fn applied_resource_state(resource: &GuestResource, digest: &str) -> AppliedResourceState {
@@ -1994,7 +2244,15 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
             cache_dir.join("mesh-bundle.json"),
             serde_json::to_string_pretty(&bundle)?,
         )?;
-        let plan = runtime_port_plan(&bundle, &bootstrap.service_id)?;
+        validate_mesh_client_reservations(bootstrap, state)?;
+        let mut client_ports = state.mesh_client_ports.clone();
+        let plan =
+            runtime_port_plan_with_registry(&bundle, &bootstrap.service_id, &mut client_ports)?;
+        // Persist reservations before replacing listeners. Even a failed restart
+        // must never give a previously published endpoint to a different peer.
+        state.mesh_client_owner = Some(bootstrap.service_id.clone());
+        state.mesh_client_ports = client_ports;
+        write_daemon_state(state)?;
         let dir = service_directory(&bundle, &bootstrap.service_id, &plan);
         let cfg = tng_config(&bundle, &bootstrap.service_id, &plan, &bootstrap.tng_peers)?;
         let gateway_cfg = gateway_config(&bundle, &bootstrap.service_id, bootstrap, &plan)?;
@@ -2006,6 +2264,15 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
         let confidential_port_set = confidential_ports(&bootstrap.ports, &bootstrap.connect)
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let mut used = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+        used.extend(bootstrap.ports.iter().copied());
+        used.extend(
+            state
+                .mesh_client_ports
+                .values()
+                .flat_map(|ports| ports.values())
+                .copied(),
+        );
         let connect_encryption: BTreeMap<u16, EncryptionMode> = bootstrap
             .connect
             .iter()
@@ -2014,26 +2281,28 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
         let egress = bootstrap
             .ports
             .iter()
-            .enumerate()
-            .map(|(idx, port)| {
+            .map(|port| -> Result<Value> {
                 let encryption = connect_encryption
                     .get(port)
                     .cloned()
                     .unwrap_or(EncryptionMode::RatsTls);
-                let mut route = tng_egress_protocol(encryption, &bootstrap.tng_peers);
+                let mut route = tng_egress_protocol(encryption, &[]);
                 let obj = route.as_object_mut().expect("protocol config is an object");
-                obj.insert("netfilter".into(), json!({
-                    "capture_dst": { "port": port },
-                    "capture_local_traffic": false,
-                    "listen_port": 39000 + idx as u16,
-                }));
+                obj.insert(
+                    "netfilter".into(),
+                    json!({
+                        "capture_dst": { "port": port },
+                        "capture_local_traffic": false,
+                        "listen_port": allocate_internal_port(TNG_EGRESS_PORT_BASE, &mut used)?,
+                    }),
+                );
                 obj.insert("attest".into(), tng_attest_config());
                 if confidential_port_set.contains(port) {
                     obj.insert("verify".into(), tng_verify_config(Value::Array(Vec::new())));
                 }
-                route
+                Ok(route)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut cfg = empty_tng_config();
         cfg["add_egress"] = Value::Array(egress);
         let dir = ServiceDirectory {
@@ -2044,10 +2313,18 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
     };
 
     if let Some(a2a_bundle) = a2a_bundle.as_ref() {
+        let mut reserved_ports = bootstrap.ports.clone();
+        reserved_ports.extend(
+            state
+                .mesh_client_ports
+                .values()
+                .flat_map(|ports| ports.values())
+                .copied(),
+        );
         let (peer_ingress, peer_directory) = a2a_tng_ingress(
             a2a_bundle,
             &bootstrap.service_id,
-            &bootstrap.ports,
+            &reserved_ports,
             &directory,
             state,
         );
@@ -2061,6 +2338,7 @@ fn sync_mesh(args: &RunArgs, bootstrap: &BootstrapConfig, state: &mut DaemonStat
 
     write_service_directory(&directory)?;
     sync_gateway_service(&gateway_cfg, state)?;
+    sync_replica_firewall(bootstrap)?;
     let mesh_ready = sync_tng_service(&config, state, &service_directory_local_ports(&directory))?;
 
     let readiness = ensure_runtime_ready(bootstrap, mesh_ready);
@@ -2140,7 +2418,16 @@ struct PeerGatewayRoute {
     connect_mode: bool,
 }
 
+#[cfg(test)]
 fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPlan> {
+    runtime_port_plan_with_registry(bundle, self_id, &mut BTreeMap::new())
+}
+
+fn runtime_port_plan_with_registry(
+    bundle: &MeshBundle,
+    self_id: &str,
+    registry: &mut BTreeMap<String, BTreeMap<u16, u16>>,
+) -> Result<RuntimePortPlan> {
     let service = bundle
         .services
         .get(self_id)
@@ -2149,7 +2436,19 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
         bail!("service '{self_id}' is not active in mesh bundle");
     }
 
+    let mut reserved = BTreeSet::new();
+    for port in registry.values().flat_map(|ports| ports.values()) {
+        anyhow::ensure!(
+            reserved.insert(*port),
+            "persisted mesh client endpoint reservations overlap"
+        );
+        anyhow::ensure!(
+            !service.ports.contains(port),
+            "application port {port} overlaps a reserved mesh client endpoint"
+        );
+    }
     let mut used = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+    used.extend(reserved.iter().copied());
     for service in bundle
         .services
         .values()
@@ -2177,6 +2476,8 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
     }
 
     let mut peer_routes = Vec::new();
+    let mut client_ports = BTreeSet::from([TNG_CONTROL_PORT, DAEMON_STATUS_PORT, AGENT_CARD_PORT]);
+    client_ports.extend(service.ports.iter().copied());
     let mut peers = bundle
         .services
         .iter()
@@ -2196,18 +2497,59 @@ fn runtime_port_plan(bundle: &MeshBundle, self_id: &str) -> Result<RuntimePortPl
             })
             .with_context(|| format!("active peer service '{service_id}' has no reachable IP"))?
             .to_string();
-        let connect_ports = service.connect.iter().map(|cp| cp.port()).collect::<BTreeSet<_>>();
+        let connect_ports = service
+            .connect
+            .iter()
+            .map(|cp| cp.port())
+            .collect::<BTreeSet<_>>();
         let mcp_ports = service.mcp_ports.iter().copied().collect::<BTreeSet<_>>();
         let mut ports = service.ports.clone();
         ports.sort_unstable();
         ports.dedup();
         for port in ports {
+            // Guest endpoints belong to service identities. Allocate a distinct
+            // local gateway when an endpoint overlaps self or another peer.
+            let local_port = match registry
+                .get(service_id.as_str())
+                .and_then(|ports| ports.get(&port))
+                .copied()
+            {
+                Some(local) => {
+                    anyhow::ensure!(
+                        client_ports.insert(local),
+                        "reserved mesh client endpoint {local} overlaps a guest listener"
+                    );
+                    local
+                }
+                None => {
+                    let local = if !reserved.contains(&port) && client_ports.insert(port) {
+                        port
+                    } else {
+                        let local = allocate_internal_port(GATEWAY_CLIENT_PORT_BASE, &mut used)?;
+                        client_ports.insert(local);
+                        local
+                    };
+                    registry
+                        .entry(service_id.to_string())
+                        .or_default()
+                        .insert(port, local);
+                    reserved.insert(local);
+                    used.insert(local);
+                    local
+                }
+            };
             peer_routes.push(PeerGatewayRoute {
                 service_id: service_id.clone(),
                 host: host.clone(),
                 remote_port: port,
-                local_port: port,
-                tng_ingress_port: allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used)?,
+                local_port,
+                // Connect routes expose the TNG listener directly; that public
+                // endpoint must use the same persistent reservation as mesh.
+                tng_ingress_port: if connect_ports.contains(&port) {
+                    local_port
+                } else {
+                    allocate_internal_port(TNG_INGRESS_PORT_BASE, &mut used)?
+                },
                 protocol: if mcp_ports.contains(&port) {
                     "mcp".to_string()
                 } else {
@@ -2249,11 +2591,7 @@ fn service_directory(
             .filter(|route| route.service_id == *id)
             .map(|route| ServiceDirectoryPort {
                 address: "127.0.0.1".to_string(),
-                port: if route.connect_mode {
-                    route.tng_ingress_port
-                } else {
-                    route.local_port
-                },
+                port: route.local_port,
                 mode: Some(if route.connect_mode {
                     "connect".to_string()
                 } else {
@@ -2302,9 +2640,87 @@ fn tng_attest_config() -> Value {
 /// When `peers` is non-empty and the encryption is OHTTP, the key source is
 /// `peer_shared` with a serf gossip cluster so that all instances share OHTTP
 /// keys.  When `peers` is empty, falls back to `self_generated`.
+fn replica_firewall_rules(peers: &[String]) -> Result<String> {
+    let mut addresses = BTreeSet::new();
+    for peer in peers {
+        let address = peer
+            .parse::<std::net::Ipv4Addr>()
+            .context("invalid replica peer address")?;
+        anyhow::ensure!(
+            !address.is_unspecified() && !address.is_multicast(),
+            "replica peer must be unicast"
+        );
+        addresses.insert(address);
+    }
+    let mut rules = "*filter\n:CAI_OHTTP_PEERS - [0:0]\n-F CAI_OHTTP_PEERS\n".to_string();
+    for address in addresses {
+        rules.push_str(&format!(
+            "-A CAI_OHTTP_PEERS -p udp --dport {TNG_SERF_PORT} -s {address}/32 -j ACCEPT\n"
+        ));
+    }
+    rules.push_str(&format!(
+        "-A CAI_OHTTP_PEERS -p udp --dport {TNG_SERF_PORT} -j DROP\nCOMMIT\n"
+    ));
+    Ok(rules)
+}
+
+fn sync_replica_firewall(bootstrap: &BootstrapConfig) -> Result<()> {
+    if bootstrap.tng_peers.is_empty()
+        || !bootstrap
+            .connect
+            .iter()
+            .any(|p| p.encryption() == EncryptionMode::Ohttp)
+    {
+        return Ok(());
+    }
+    let rules = replica_firewall_rules(&bootstrap.tng_peers)?;
+    let digest = sha256_bytes(rules.as_bytes());
+    let marker = Path::new("/run/confidential-agent/replica-firewall.sha256");
+    let present = Command::new("iptables")
+        .args(["-w", "-C", "INPUT", "-j", "CAI_OHTTP_PEERS"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if present && fs::read_to_string(marker).ok().as_deref() == Some(digest.as_str()) {
+        return Ok(());
+    }
+    let mut child = Command::new("iptables-restore")
+        .args(["--wait", "--noflush"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start the replica firewall transaction")?;
+    child
+        .stdin
+        .take()
+        .context("firewall has no input")?
+        .write_all(rules.as_bytes())?;
+    anyhow::ensure!(
+        child.wait()?.success(),
+        "failed to restrict replica key sharing to recorded members"
+    );
+    if !present {
+        anyhow::ensure!(
+            Command::new("iptables")
+                .args(["-w", "-I", "INPUT", "1", "-j", "CAI_OHTTP_PEERS"])
+                .status()?
+                .success(),
+            "failed to attach replica firewall"
+        );
+    }
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(marker, digest)?;
+    Ok(())
+}
+
 fn tng_egress_protocol(encryption: EncryptionMode, peers: &[String]) -> Value {
     match encryption {
-        EncryptionMode::RatsTls => json!({"rats_tls": {"multiplex": false}}),
+        EncryptionMode::RatsTls => json!({"rats_tls": {"multiplex": true}}),
         EncryptionMode::Ohttp => {
             if peers.is_empty() {
                 json!({"ohttp": {"key": {"source": "self_generated", "rotation_interval": TNG_KEY_ROTATION_INTERVAL}}})
@@ -2334,6 +2750,8 @@ fn tng_egress_protocol(encryption: EncryptionMode, peers: &[String]) -> Value {
 
 fn tng_verify_config(reference_values: Value) -> Value {
     json!({
+        "model": "background_check",
+        "as_provider": "coco",
         "as_type": "builtin",
         "attestation_policy": {
             "type": "path",
@@ -2394,22 +2812,34 @@ fn tng_config(
             .get(&route_plan.port)
             .cloned()
             .unwrap_or(EncryptionMode::RatsTls);
+        let shared_ohttp = encryption == EncryptionMode::Ohttp && !tng_peers.is_empty();
         let mut route = tng_egress_protocol(encryption, tng_peers);
+        if shared_ohttp {
+            route["ohttp"]["key"]["attest"] = tng_attest_config();
+            route["ohttp"]["key"]["verify"] =
+                tng_verify_config(tng_reference_values(bundle, self_id)?);
+        }
         let obj = route.as_object_mut().expect("protocol config is an object");
-        obj.insert("netfilter".into(), json!({
-            "capture_dst": {"port": route_plan.port},
-            "capture_local_traffic": false,
-            "listen_port": route_plan.tng_egress_port,
-            "so_mark": DEFAULT_TNG_SO_MARK,
-        }));
+        obj.insert(
+            "netfilter".into(),
+            json!({
+                "capture_dst": {"port": route_plan.port},
+                "capture_local_traffic": false,
+                "listen_port": route_plan.tng_egress_port,
+                "so_mark": DEFAULT_TNG_SO_MARK,
+            }),
+        );
         obj.insert("attest".into(), tng_attest_config());
         if confidential_port_set.contains(&route_plan.port) {
-            obj.insert("verify".into(), tng_verify_config(
-                peer_reference_values
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new())),
-            ));
+            obj.insert(
+                "verify".into(),
+                tng_verify_config(
+                    peer_reference_values
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new())),
+                ),
+            );
         }
         egress.push(route);
     }
@@ -2719,14 +3149,7 @@ fn a2a_tng_ingress(
                                 "port": port.remote,
                             },
                         },
-                        "verify": {
-                            "as_type": "builtin",
-                            "attestation_policy": {
-                                "type": "path",
-                                "path": DEFAULT_POLICY_PATH,
-                            },
-                            "reference_values": resolved.reference_values,
-                        },
+                        "verify": tng_verify_config(resolved.reference_values.clone()),
                     }));
                     dir_ports.push(ServiceDirectoryPort {
                         address: "127.0.0.1".to_string(),
@@ -3069,19 +3492,84 @@ fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
     Ok(true)
 }
 
+fn daemon_state_initialized_path() -> PathBuf {
+    daemon_state_path().with_extension("initialized")
+}
+
+fn mark_daemon_state_initialized() -> Result<()> {
+    let path = daemon_state_initialized_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(b"confidential-agent/state/v1\n")?;
+            file.sync_all()?;
+            fs::File::open(path.parent().context("state marker has no parent")?)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(
+                fs::read(&path)? == b"confidential-agent/state/v1\n",
+                "invalid daemon state initialization marker: {}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to initialize {}", path.display()))
+        }
+    }
+    Ok(())
+}
+
 fn read_daemon_state() -> Result<DaemonState> {
     let path = daemon_state_path();
-    if !path.exists() {
-        return Ok(DaemonState::default());
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let state = serde_json::from_str(&content).with_context(|| {
+                format!(
+                    "failed to parse daemon state {}; restore the saved state before restarting",
+                    path.display()
+                )
+            })?;
+            // Upgrade an existing valid state before it can publish endpoints.
+            mark_daemon_state_initialized()?;
+            Ok(state)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A marker survives restarts and deletion of state.json. Existing
+            // mesh outputs also identify guests initialized by older versions.
+            let initialized = daemon_state_initialized_path().try_exists()?
+                || service_directory_path().try_exists()?
+                || daemon_cache_dir().join("mesh-bundle.json").try_exists()?;
+            anyhow::ensure!(!initialized && fs::symlink_metadata(&path).is_err(),
+                "daemon state {} is missing on an initialized guest; restore it before restarting to preserve endpoint identities", path.display());
+            let state = DaemonState::default();
+            write_daemon_state(&state)?;
+            Ok(state)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read daemon state {}; restore it before restarting",
+                path.display()
+            )
+        }),
     }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&content).context("failed to parse daemon state")
 }
 
 fn write_daemon_state(state: &DaemonState) -> Result<()> {
     let path = daemon_state_path();
-    write_json_atomic(&path, state)
+    // Reserve initialization before the first state write. If interrupted,
+    // missing state must fail closed rather than publish a new endpoint table.
+    mark_daemon_state_initialized()?;
+    write_json_atomic(&path, state)?;
+    fs::File::open(&path)?.sync_all()?;
+    fs::File::open(path.parent().context("daemon state has no parent")?)?.sync_all()?;
+    Ok(())
 }
 
 fn write_status(status: DaemonStatus) -> Result<()> {

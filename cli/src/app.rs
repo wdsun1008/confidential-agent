@@ -1,10 +1,10 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
-    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitBuildBackend,
-    InitReferenceValues, InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands,
-    MigrateArgs, OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands,
-    SshArgs, StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs,
+    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitReferenceValues,
+    InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands, MigrateArgs,
+    OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands, SshArgs,
+    StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs, UpgradeArgs, UpgradeCommands,
 };
 use anyhow::{bail, Context, Result};
 use base64::{
@@ -79,8 +79,18 @@ struct ContextPaths {
     agent_card: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuildManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_contract: Option<image_runtime::ImageRuntimeContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<DeploymentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh: Option<instance_ssh::InstanceSsh>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<images::ImageDeployment>,
     service_id: String,
     shelter_build_id: String,
     shelter_work_dir: PathBuf,
@@ -92,7 +102,6 @@ struct BuildManifest {
     gateway_bin: PathBuf,
     gateway_service: PathBuf,
     tng_service: PathBuf,
-    initrd_secret_fetch_module: PathBuf,
     fde_config_file: PathBuf,
     policy_default: PathBuf,
     policy_local_dev: PathBuf,
@@ -109,7 +118,26 @@ struct BuildManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeploymentSnapshot {
+    source: LocalSpecState,
+    spec: AgentSpec,
+    user_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<BTreeMap<String, DeploymentInput>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeploymentInput {
+    source: PathBuf,
+    sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BuildManifestVariant {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_dir: Option<PathBuf>,
     shelter_build_id: String,
     build_result: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,6 +147,7 @@ struct BuildManifestVariant {
 }
 
 struct PreparedConfig {
+    image: Option<images::ImageDeployment>,
     rendered_config: PathBuf,
     shelter_build_id: String,
     shelter_work_dir: PathBuf,
@@ -132,6 +161,7 @@ struct PreparedConfig {
 
 #[derive(Debug, Clone, Default)]
 struct PrepareOptions {
+    preparation_dir: Option<PathBuf>,
     build_id: Option<String>,
     image_variant: Option<String>,
     include_deploy: bool,
@@ -147,10 +177,26 @@ struct PrepareOptions {
 impl BuildManifest {
     fn fallback_variant(&self) -> BuildManifestVariant {
         BuildManifestVariant {
+            preparation_dir: self.preparation_dir.clone(),
             shelter_build_id: self.shelter_build_id.clone(),
             build_result: self.build_result.clone(),
             extra_files: self.extra_files.clone(),
             debug_ssh: self.debug_ssh.clone(),
+        }
+    }
+
+    fn guest_assets(&self) -> GuestAssets {
+        GuestAssets {
+            agentd_bin: self.agentd_bin.clone(),
+            agentd_service: self.agentd_service.clone(),
+            gateway_bin: self.gateway_bin.clone(),
+            gateway_service: self.gateway_service.clone(),
+            tng_service: self.tng_service.clone(),
+            fde_config_file: self.fde_config_file.clone(),
+            policy_default: self.policy_default.clone(),
+            policy_local_dev: self.policy_local_dev.clone(),
+            guest_setup_script: self.guest_setup_script.clone(),
+            extra_files: self.extra_files.clone(),
         }
     }
 
@@ -181,6 +227,7 @@ struct StateDirLock {
 }
 
 const LOCK_EX: i32 = 2;
+const LOCK_SH: i32 = 1;
 const LOCK_UN: i32 = 8;
 
 extern "C" {
@@ -201,17 +248,56 @@ fn with_state_dir_lock<T>(state_dir: &Path, action: impl FnOnce() -> Result<T>) 
 }
 
 fn lock_state_dir(state_dir: &Path) -> Result<StateDirLock> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
-    let lock_path = state_dir.join(".lock");
+    lock_operation_file(&state_dir.join(".lock"))
+}
+
+fn lock_service_operation(state_dir: &Path, service_id: &str) -> Result<StateDirLock> {
+    anyhow::ensure!(
+        !service_id.is_empty()
+            && !matches!(service_id, "." | "..")
+            && !service_id.contains(['/', '\0']),
+        "invalid service ID for operation lock"
+    );
+    lock_operation_file(
+        &context_paths(state_dir, service_id)
+            .service_dir
+            .join(".operation.lock"),
+    )
+}
+
+fn lock_operation_file(lock_path: &Path) -> Result<StateDirLock> {
+    lock_operation_file_with_mode(lock_path, LOCK_EX)
+}
+
+fn lock_image_operation(
+    state_dir: &Path,
+    region: &str,
+    image_id: &str,
+    shared: bool,
+) -> Result<StateDirLock> {
+    let digest = hex_encode(&Sha256::digest(format!("{region}\0{image_id}").as_bytes()));
+    lock_operation_file_with_mode(
+        &absolute_path_for_state(state_dir)
+            .join("image-locks")
+            .join(digest),
+        if shared { LOCK_SH } else { LOCK_EX },
+    )
+}
+
+fn lock_operation_file_with_mode(lock_path: &Path, mode: i32) -> Result<StateDirLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = lock_path.parent().context("operation lock has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create '{}'", parent.display()))?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .open(&lock_path)
+        .mode(0o600)
+        .open(lock_path)
         .with_context(|| format!("failed to open '{}'", lock_path.display()))?;
     loop {
-        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        let rc = unsafe { flock(file.as_raw_fd(), mode) };
         if rc == 0 {
             break;
         }
@@ -249,7 +335,12 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 impl DeployNames {
     fn new(spec: &AgentSpec) -> Self {
-        Self::from_run_id(spec, &current_run_id())
+        let mut nonce = [0u8; 8];
+        OsRng.fill_bytes(&mut nonce);
+        Self::from_run_id(
+            spec,
+            &format!("{}-{}", current_run_id(), hex_encode(&nonce)),
+        )
     }
 
     fn from_run_id(spec: &AgentSpec, run_id: &str) -> Self {
@@ -314,6 +405,7 @@ struct DeployObservation {
 
 #[derive(Debug, Deserialize)]
 struct ShelterBuildResult {
+    #[serde(rename = "tag", alias = "id")]
     id: String,
     image_path: PathBuf,
     reference_value: Option<serde_json::Value>,
@@ -323,12 +415,16 @@ struct ShelterBuildResult {
 
 #[derive(Debug, Deserialize)]
 struct ShelterDeployResult {
+    #[serde(rename = "deployment_id", alias = "id")]
     id: String,
     deploy: ShelterDeployResultInfo,
 }
 
 #[derive(Debug, Deserialize)]
 struct ShelterDeployResultInfo {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "provider_instance_id", alias = "instance_id")]
     instance_id: Option<serde_json::Value>,
     public_ip: Option<serde_json::Value>,
     private_ip: Option<serde_json::Value>,
@@ -347,8 +443,20 @@ struct ShelterBuildArtifacts {
 }
 
 #[derive(Debug, Serialize)]
+struct ReplicaStatusView {
+    instance_id: Option<String>,
+    address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<DaemonStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct LiveStatusView {
     local: StatusView,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    replicas: Vec<ReplicaStatusView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon: Option<DaemonStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,6 +515,8 @@ struct StatusCloudView {
     #[serde(skip_serializing_if = "Option::is_none")]
     public_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    management_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tee: Option<String>,
 }
 
@@ -434,13 +544,20 @@ const GUEST_REFERENCE_VALUE_LIST_PATH: &str = "/opt/confidential-agent/reference
 
 impl DeployObservation {
     fn preferred_injection_ip(&self) -> Option<String> {
-        self.public_ip
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
+        self.instance_public_ips
+            .first()
+            .or_else(|| self.instance_private_ips.first())
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
             .or_else(|| {
-                self.private_ip
+                self.public_ip
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        self.private_ip
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                    })
             })
             .map(ToOwned::to_owned)
     }
@@ -481,22 +598,74 @@ fn prepare(
     }
     spec.ensure_mvp_supported()?;
 
-    let paths = context_paths(state_dir, &spec.service.id);
+    let mut paths = context_paths(state_dir, &spec.service.id);
+    let config_alias = paths.rendered_config.clone();
+    let existing = if options.include_deploy && paths.manifest.try_exists()? {
+        let manifest = read_build_manifest(&paths.manifest)?;
+        let variant = manifest.variant(spec.image_variant(), Some(spec.image_variant()))?;
+        Some(match variant.preparation_dir {
+            Some(directory) => read_build_manifest(&directory.join("manifest.json"))?,
+            None => manifest,
+        })
+    } else {
+        None
+    };
+    let preparation_dir = options.preparation_dir.clone().or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|manifest| manifest.preparation_dir.clone())
+    });
+    if let Some(directory) = &preparation_dir {
+        paths.guest_staging_dir = directory.join("guest");
+        paths.secrets_dir = directory.join("secrets");
+        paths.rendered_config = directory.join("shelter.yaml");
+        paths.bootstrap_file = directory.join("bootstrap.json");
+        if !options.include_deploy {
+            paths.manifest = directory.join("manifest.json");
+        }
+    }
     fs::create_dir_all(&paths.guest_staging_dir)
         .with_context(|| format!("failed to create '{}'", paths.guest_staging_dir.display()))?;
     fs::create_dir_all(&paths.shelter_work_dir)
         .with_context(|| format!("failed to create '{}'", paths.shelter_work_dir.display()))?;
-    let debug_ssh = ensure_debug_ssh_key(&paths, &mut spec)?;
-
-    let mut assets = prepare_guest_assets(cli, &paths.guest_staging_dir)?;
-    assets
-        .extra_files
-        .extend(spec.build.files.iter().map(|file| GuestFileAsset {
-            source: file.source.clone(),
-            destination: file.target.clone(),
-            executable: file.executable,
-        }));
-    if spec.build.base_image.is_none() {
+    let debug_ssh = if let Some(manifest) = &existing {
+        if let Some(key) = &manifest.debug_ssh {
+            apply_debug_ssh_public_key(&mut spec, &key.public_key)?;
+        }
+        manifest.debug_ssh.clone()
+    } else {
+        ensure_debug_ssh_key(&paths, &mut spec)?
+    };
+    let mut assets = if let Some(manifest) = &existing {
+        manifest.guest_assets()
+    } else {
+        prepare_guest_assets(cli, &paths.guest_staging_dir)?
+    };
+    let runtime_contract = if let Some(manifest) = &existing {
+        manifest.runtime_contract.clone()
+    } else {
+        Some(image_runtime::ImageRuntimeContract::for_build(
+            &spec,
+            &assets.agentd_bin,
+        )?)
+    };
+    if existing.is_none() {
+        if let Some(contract) = &runtime_contract {
+            let contract_file = paths.guest_staging_dir.join("image-runtime.json");
+            write_json_atomic(&contract_file, contract)?;
+            assets.extra_files.push(GuestFileAsset {
+                source: contract_file,
+                destination: "/usr/local/share/confidential-agent/image-runtime.json".into(),
+                executable: false,
+            });
+        }
+        assets
+            .extra_files
+            .extend(spec.build.files.iter().map(|file| GuestFileAsset {
+                source: file.source.clone(),
+                destination: file.target.clone(),
+                executable: file.executable,
+            }));
         stage_mkosi_debug_ssh_authorized_keys(
             &mut assets,
             &paths,
@@ -508,7 +677,8 @@ fn prepare(
         )?;
     }
     let deploy_names = options.deploy_names.clone();
-    let terraform_dir = deploy_terraform_dir(&paths, None, deploy_names.as_ref());
+    // Managed runs allocate their own deployment ID and Terraform directory.
+    let terraform_dir = None;
     let build_id = options
         .build_id
         .clone()
@@ -545,12 +715,18 @@ fn prepare(
         .with_context(|| format!("failed to write '{}'", paths.rendered_config.display()))?;
 
     let build_result = shelter_build_result_path(&paths.shelter_work_dir, &build_id);
-    let deploy_result =
-        shelter_deploy_result_path(terraform_dir.as_deref().context(
-            "deploy terraform dir is required when preparing Shelter deploy result path",
-        )?);
+    let deploy_result = shelter_deploy_result_path(&paths.shelter_work_dir);
 
     let manifest = BuildManifest {
+        preparation_dir,
+        runtime_contract,
+        deployment: None,
+        ssh: if options.include_deploy {
+            instance_ssh::identity(&context_paths(state_dir, &spec.service.id), &spec)?
+        } else {
+            None
+        },
+        image: None,
         service_id: spec.service.id.clone(),
         shelter_build_id: build_id.clone(),
         shelter_work_dir: paths.shelter_work_dir.clone(),
@@ -562,7 +738,6 @@ fn prepare(
         gateway_bin: assets.gateway_bin,
         gateway_service: assets.gateway_service,
         tng_service: assets.tng_service,
-        initrd_secret_fetch_module: assets.initrd_secret_fetch_module,
         fde_config_file: assets.fde_config_file,
         policy_default: assets.policy_default,
         policy_local_dev: assets.policy_local_dev,
@@ -575,8 +750,12 @@ fn prepare(
     };
     fs::write(&paths.manifest, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("failed to write '{}'", paths.manifest.display()))?;
+    if options.include_deploy {
+        link_committed_config(&config_alias, &paths.rendered_config)?;
+    }
 
     Ok(PreparedConfig {
+        image: None,
         rendered_config: paths.rendered_config,
         shelter_build_id: build_id,
         shelter_work_dir: paths.shelter_work_dir,
@@ -694,19 +873,6 @@ fn current_utc_timestamp() -> String {
 
 mod debug_ssh;
 use debug_ssh::*;
-fn deploy_terraform_dir(
-    paths: &ContextPaths,
-    user_dir: Option<&PathBuf>,
-    deploy_names: Option<&DeployNames>,
-) -> Option<PathBuf> {
-    deploy_names
-        .map(|names| match user_dir {
-            Some(dir) => dir.join(&names.resource_name),
-            None => paths.service_dir.join("terraform").join(&names.run_id),
-        })
-        .or_else(|| user_dir.cloned())
-}
-
 mod guest_assets;
 use guest_assets::*;
 
@@ -716,7 +882,11 @@ use state::*;
 mod workflows;
 use workflows::*;
 
+mod image_runtime;
+mod images;
+mod instance_ssh;
 mod publish;
+mod upgrade;
 
 mod report;
 use report::*;
@@ -834,6 +1004,8 @@ fn timestamped_resource_name(service: &str, run_id: &str) -> String {
 }
 
 fn render_bootstrap(paths: &ContextPaths, spec: &AgentSpec) -> Result<BootstrapConfig> {
+    let runtime_spec = instance_ssh::runtime_spec(paths, spec)?;
+    let spec = &runtime_spec;
     let gateway_identity = ensure_gateway_identity(paths)?;
     let resources = spec
         .resources
@@ -1171,6 +1343,16 @@ install_attestation_challenge_client() {
     fi
 }
 install_attestation_challenge_client
+# Application logs stay inside the guest. Volatile storage also avoids writing
+# business output to an unprotected log partition supplied by a base image.
+install -d -m 0755 /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-confidential-agent.conf <<'EOF'
+[Journal]
+Storage=volatile
+ForwardToConsole=no
+ForwardToKMsg=no
+ForwardToSyslog=no
+EOF
 expected_tng_nevra='trusted-network-gateway-2.9.2-1.al8.x86_64'
 installed_tng_nevra="$(rpm -q trusted-network-gateway 2>/dev/null || true)"
 if [ "$installed_tng_nevra" != "$expected_tng_nevra" ]; then
@@ -1227,71 +1409,8 @@ delta_backend = "dm-snapshot"
 integrity = false
 
 [delta.encrypt.exec]
-command = "/bin/bash"
-args = ["-c", "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /usr/bin/cat /run/cai/secrets/disk_key"]
-"#
-}
-
-fn secret_fetch_module_setup() -> &'static str {
-    r#"#!/bin/bash
-
-check() { return 0; }
-
-depends() {
-    echo systemd
-    echo shelter-initrd-network
-    echo confidential-computing-attestation
-    echo cryptpilot
-}
-
-install() {
-    if [ ! -x /usr/local/bin/confidential-agentd ]; then
-        dfatal "confidential-agentd not found at /usr/local/bin/confidential-agentd"
-        return 1
-    fi
-
-    inst_binary /usr/local/bin/confidential-agentd /usr/bin/confidential-agentd
-    inst_multiple bash cat mkdir sleep systemctl mountpoint
-    hostonly='' instmods tdx_guest || true
-    mkdir -p "$initdir/usr/lib/modprobe.d"
-    printf 'options tdx_guest tsm_api=0\n' > "$initdir/usr/lib/modprobe.d/confidential-agent-tdx.conf"
-    # The shelter RPM sets options tdx-guest tsm_api=1 in
-    # /etc/modprobe.d/shelter-tdx-guest.conf.  tsm_api=1 disables the
-    # /dev/tdx_guest ioctl quote interface, leaving only the TSM configfs
-    # report path (/sys/kernel/config/tsm/report).  That path requires
-    # configfs to be mounted AND the tsm+tdx-guest modules to register a
-    # configfs provider — which is fragile in the initrd.  Override with
-    # tsm_api=0 so the attestation-agent can fall back to the robust ioctl
-    # interface for TDX quote generation.
-    mkdir -p "$initdir/etc/modprobe.d"
-    printf 'options tdx-guest tsm_api=0\n' > "$initdir/etc/modprobe.d/shelter-tdx-guest.conf"
-    mkdir -p "$initdir/usr/lib/modules-load.d"
-    printf 'tdx_guest\n' > "$initdir/usr/lib/modules-load.d/confidential-agent-tdx.conf"
-    # Best-effort: also mount configfs early so the TSM report path is
-    # available if the ioctl fallback is later removed in favour of TSM.
-    mkdir -p "$initdir/etc/systemd/system"
-    cat > "$initdir/etc/systemd/system/confidential-agent-configfs-mount.service" <<'CONFCS'
-[Unit]
-Description=Mount configfs for TSM attestation reports
-DefaultDependencies=no
-After=systemd-modules-load.service
-Before=trustiflux-api-server-initrd.service confidential-data-hub-daemon-initrd.service
-Before=sysinit.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'mkdir -p /sys/kernel/config && mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config'
-RemainAfterExit=yes
-
-[Install]
-WantedBy=sysinit.target
-CONFCS
-    mkdir -p "$initdir/etc/systemd/system/sysinit.target.wants"
-    ln -s /etc/systemd/system/confidential-agent-configfs-mount.service \
-        "$initdir/etc/systemd/system/sysinit.target.wants/confidential-agent-configfs-mount.service"
-    mkdir -p "$initdir/etc/cmdline.d"
-    printf '%s\n' 'rd.retry=300 rd.shell=0 rd.emergency=poweroff' > "$initdir/etc/cmdline.d/36-confidential-agent-fail-closed.conf"
-}
+command = "/bin/sh"
+args = ["-c", "CA_SECRET_WAIT_TIMEOUT_SEC=210 /usr/local/bin/confidential-agentd initrd-fetch >/dev/console 2>&1 && /bin/cat /run/cai/secrets/disk_key"]
 "#
 }
 

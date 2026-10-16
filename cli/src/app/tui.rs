@@ -1277,7 +1277,15 @@ fn draw_services(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect) {
             &agent.local.service.ports,
             &agent.local.service.connect,
         ));
-        let connect_ports = join_tui_ports(&agent.local.service.connect.iter().map(|cp| cp.port()).collect::<Vec<_>>());
+        let connect_ports = join_tui_ports(
+            &agent
+                .local
+                .service
+                .connect
+                .iter()
+                .map(|cp| cp.port())
+                .collect::<Vec<_>>(),
+        );
         let address = preferred_display_address(agent);
         let evidence_label = if agent.attestation_target().is_none() {
             "n/a"
@@ -1565,7 +1573,18 @@ fn draw_service_network(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Connect ports  ", muted()),
-            Span::styled(join_tui_ports(&agent.local.service.connect.iter().map(|cp| cp.port()).collect::<Vec<_>>()), accent_bold()),
+            Span::styled(
+                join_tui_ports(
+                    &agent
+                        .local
+                        .service
+                        .connect
+                        .iter()
+                        .map(|cp| cp.port())
+                        .collect::<Vec<_>>(),
+                ),
+                accent_bold(),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Mesh ports     ", muted()),

@@ -532,6 +532,11 @@ fn sigstore_tool_wrapper_script(cli: &Cli, tool: &str) -> Result<String> {
 set -euo pipefail
 
 tool={tool}
+# CA-generated signing keys use an empty password. Preserve an explicitly
+# supplied password for imported keys without prompting in the build process.
+if [[ "$tool" == cosign ]]; then
+  export COSIGN_PASSWORD="${{COSIGN_PASSWORD-}}"
+fi
 image="${{CA_TOOLS_IMAGE:-}}"
 if [[ -z "$image" ]]; then
   image={image}
@@ -886,6 +891,44 @@ mod tests {
             shelter_bin: PathBuf::from("shelter"),
             state_dir: PathBuf::from("/work/.confidential-agent"),
             tools_image: "confidential-agent-tools:test".to_string(),
+        }
+    }
+
+    #[test]
+    fn cosign_wrapper_defaults_to_empty_password_and_preserves_explicit_password() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cli = test_cli();
+        cli.state_dir = root.path().join("state");
+        let bin = ensure_sigstore_tool_wrappers(&cli).unwrap();
+        let docker = bin.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/bash\nprintf '%s' \"${COSIGN_PASSWORD-unset}\"\n",
+        )
+        .unwrap();
+        set_mode(&docker, 0o755).unwrap();
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(std::env::split_paths(&inherited_path)),
+        )
+        .unwrap();
+        for password in [None, Some("explicit-test-password")] {
+            let mut command = Command::new(bin.join("cosign"));
+            command.env("PATH", &path);
+            command.env_remove("COSIGN_PASSWORD");
+            if let Some(password) = password {
+                command.env("COSIGN_PASSWORD", password);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                password.unwrap_or("")
+            );
         }
     }
 

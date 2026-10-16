@@ -414,6 +414,177 @@ fn rejects_excessive_octal_modes() {
 }
 
 #[test]
+fn stable_client_endpoints_survive_topology_changes_and_state_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let mut bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION, "generation": 1, "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [], "connect": []},
+            "beta": {"phase": "active", "public_ip": "192.0.2.10", "ports": [18789], "connect": []},
+            "gamma": {"phase": "active", "public_ip": "192.0.2.11", "ports": [18789], "connect": []}
+        }, "reference_values": {"measurement.uki.SHA-384": ["a"]}
+    }))
+    .unwrap();
+    let mut registry = BTreeMap::new();
+    let before = runtime_port_plan_with_registry(&bundle, "self", &mut registry).unwrap();
+    let ports = |plan: &RuntimePortPlan| {
+        plan.peer_routes
+            .iter()
+            .map(|route| (route.service_id.clone(), route.local_port))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = ports(&before);
+    assert_eq!(before["beta"], 18789);
+    assert_eq!(before["gamma"], 39600);
+    let state = DaemonState {
+        mesh_client_owner: Some("self".into()),
+        mesh_client_ports: registry,
+        ..DaemonState::default()
+    };
+    write_daemon_state(&state).unwrap();
+    let mut restored = read_daemon_state().unwrap();
+    bundle
+        .services
+        .insert("alpha".into(), bundle.services["beta"].clone());
+    let after =
+        runtime_port_plan_with_registry(&bundle, "self", &mut restored.mesh_client_ports).unwrap();
+    let after = ports(&after);
+    assert_eq!(after["beta"], before["beta"]);
+    assert_eq!(after["gamma"], before["gamma"]);
+    assert_eq!(after["alpha"], 39601);
+    bundle.services.remove("beta");
+    bundle
+        .services
+        .insert("delta".into(), bundle.services["gamma"].clone());
+    let next =
+        runtime_port_plan_with_registry(&bundle, "self", &mut restored.mesh_client_ports).unwrap();
+    let next = ports(&next);
+    assert_eq!(next["gamma"], before["gamma"]);
+    assert_ne!(
+        next["delta"], before["beta"],
+        "a removed peer endpoint was recycled"
+    );
+    let mut bootstrap = test_bootstrap_config("self");
+    bootstrap.ports = vec![before["gamma"]];
+    assert!(validate_mesh_client_reservations(&bootstrap, &restored).is_err());
+    bootstrap.ports.clear();
+    bootstrap.service_id = "different-owner".into();
+    assert!(validate_mesh_client_reservations(&bootstrap, &restored).is_err());
+}
+
+#[test]
+fn connect_directory_and_tng_listeners_keep_their_reserved_endpoints() {
+    let mut bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": MESH_SCHEMA_VERSION, "generation": 1, "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [], "connect": []},
+            "beta": {"phase": "active", "public_ip": "192.0.2.10", "ports": [18789], "connect": [18789]},
+            "gamma": {"phase": "active", "public_ip": "192.0.2.11", "ports": [18789], "connect": [18789]}
+        }, "reference_values": {"alpha": {"measurement.uki.SHA-384": ["a"]}, "beta": {"measurement.uki.SHA-384": ["a"]}, "gamma": {"measurement.uki.SHA-384": ["a"]}}
+    })).unwrap();
+    let mut registry = BTreeMap::new();
+    let first = runtime_port_plan_with_registry(&bundle, "self", &mut registry).unwrap();
+    let before = service_directory(&bundle, "self", &first);
+    bundle
+        .services
+        .insert("alpha".into(), bundle.services["beta"].clone());
+    let next = runtime_port_plan_with_registry(&bundle, "self", &mut registry).unwrap();
+    let after = service_directory(&bundle, "self", &next);
+    let config = tng_config(&bundle, "self", &next, &[]).unwrap();
+    for id in ["beta", "gamma"] {
+        let port = after.services[id].ports[0].port;
+        assert_eq!(port, before.services[id].ports[0].port);
+        let route = next
+            .peer_routes
+            .iter()
+            .find(|route| route.service_id == id)
+            .unwrap();
+        assert_eq!(route.tng_ingress_port, port);
+        assert!(config["add_ingress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["mapping"]["in"]["port"] == port));
+    }
+}
+
+#[test]
+fn application_port_conflicts_are_rejected_before_applying_business_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = no_tee_test_env(&temp);
+    let args = test_run_args(temp.path().join("cdh"));
+    let mut bootstrap = test_bootstrap_config("self");
+    bootstrap.ports = vec![39600];
+    let source = args.cdh_root.join("default/local-resources/config");
+    let target = temp.path().join("runtime.json");
+    write_test_file(&source, b"new-config");
+    write_test_file(&target, b"committed-config");
+    bootstrap.resources.push(GuestResource {
+        id: "config".into(),
+        resource_path: "default/local-resources/config".into(),
+        target: target.clone(),
+        owner: None,
+        group: None,
+        mode: "0600".into(),
+        required: true,
+        mutable: false,
+        sha256: Some(sha256_file(&source).unwrap()),
+    });
+    let mut state = DaemonState {
+        mesh_client_owner: Some("self".into()),
+        mesh_client_ports: BTreeMap::from([("peer".into(), BTreeMap::from([(18789, 39600)]))]),
+        ..DaemonState::default()
+    };
+    assert!(apply_bootstrap(&args, &bootstrap, &mut state, false).is_err());
+    assert_eq!(fs::read(target).unwrap(), b"committed-config");
+}
+
+#[test]
+fn duplicate_guest_endpoints_get_distinct_client_routes_and_service_directory_entries() {
+    let bundle: MeshBundle = serde_json::from_value(json!({
+        "schema": "confidential-agent/mesh-bundle/v1", "generation": 1, "updated_at": 0,
+        "services": {
+            "self": {"phase": "active", "ports": [18789], "connect": []},
+            "agent-a": {"phase": "active", "public_ip": "192.0.2.10", "ports": [18789], "connect": []},
+            "agent-b": {"phase": "active", "public_ip": "192.0.2.11", "ports": [18789], "connect": []},
+            "other": {"phase": "active", "public_ip": "192.0.2.12", "ports": [3001], "connect": []}
+        }, "reference_values": {"measurement.uki.SHA-384": ["a"]}
+    })).unwrap();
+    let plan = runtime_port_plan(&bundle, "self").unwrap();
+    let local_ports = plan
+        .peer_routes
+        .iter()
+        .map(|route| route.local_port)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(local_ports.len(), 3);
+    assert!(!local_ports.contains(&18789));
+    assert!(local_ports.contains(&3001));
+    let directory = service_directory(&bundle, "self", &plan);
+    for id in ["agent-a", "agent-b"] {
+        let route = plan
+            .peer_routes
+            .iter()
+            .find(|route| route.service_id == id)
+            .unwrap();
+        assert_eq!(route.remote_port, 18789);
+        assert_eq!(directory.services[id].ports[0].port, route.local_port);
+    }
+    let repeated = runtime_port_plan(&bundle, "self").unwrap();
+    assert_eq!(
+        plan.peer_routes
+            .iter()
+            .map(|r| r.local_port)
+            .collect::<Vec<_>>(),
+        repeated
+            .peer_routes
+            .iter()
+            .map(|r| r.local_port)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn service_directory_includes_peer_connect_and_mesh_ports() {
     let bundle: MeshBundle = serde_json::from_value(json!({
         "schema": "confidential-agent/mesh-bundle/v1",
@@ -456,7 +627,7 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     assert!(directory["services"].get("old").is_none());
     assert_eq!(
         directory["services"]["connect-only"]["ports"][0]["port"],
-        39400
+        4001
     );
     assert_eq!(
         directory["services"]["connect-only"]["ports"][0]["mode"],
@@ -475,7 +646,7 @@ fn service_directory_includes_peer_connect_and_mesh_ports() {
     assert_eq!(directory["services"]["peer"]["ports"][0]["port"], 3001);
     assert_eq!(directory["services"]["peer"]["ports"][0]["mode"], "mesh");
     assert_eq!(directory["services"]["peer"]["ports"][0]["protocol"], "mcp");
-    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 39402);
+    assert_eq!(directory["services"]["peer"]["ports"][1]["port"], 3002);
     assert_eq!(directory["services"]["peer"]["ports"][1]["mode"], "connect");
     assert!(directory["services"]["peer"]["ports"][1]
         .get("protocol")
@@ -773,7 +944,7 @@ fn tng_config_adds_egress_for_self_ports() {
     );
     assert_eq!(config["add_egress"][0]["netfilter"]["listen_port"], 39000);
     assert_eq!(config["add_egress"][0]["attest"]["aa_type"], "uds");
-    assert_eq!(config["add_egress"][0]["rats_tls"]["multiplex"], false);
+    assert_eq!(config["add_egress"][0]["rats_tls"]["multiplex"], true);
     assert!(config["add_egress"][0].get("verify").is_none());
     assert_eq!(config["add_ingress"].as_array().unwrap().len(), 0);
 }
@@ -932,17 +1103,17 @@ fn tng_config_adds_mode_specific_ingress_for_peer_ports() {
         .get("policy_ids")
         .is_none());
     assert_eq!(config["add_ingress"][0]["rats_tls"]["multiplex"], true);
-    assert_eq!(config["add_egress"][0]["rats_tls"]["multiplex"], false);
+    assert_eq!(config["add_egress"][0]["rats_tls"]["multiplex"], true);
     assert_eq!(
         config["add_ingress"][0]["verify"]["reference_values"][0]["type"],
         "sample"
     );
     assert_eq!(config["add_ingress"][0]["attest"]["aa_type"], "uds");
-    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 39401);
+    assert_eq!(config["add_ingress"][1]["mapping"]["in"]["port"], 3002);
     assert_eq!(config["add_ingress"][1]["mapping"]["out"]["port"], 3002);
     assert_eq!(config["add_ingress"][1]["verify"]["as_type"], "builtin");
     assert!(config["add_ingress"][1].get("attest").is_none());
-    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 39402);
+    assert_eq!(config["add_ingress"][2]["mapping"]["in"]["port"], 4001);
     assert_eq!(config["add_ingress"][2]["mapping"]["out"]["port"], 4001);
     assert_eq!(config["add_ingress"][2]["verify"]["as_type"], "builtin");
     assert!(config["add_ingress"][2].get("attest").is_none());
@@ -979,7 +1150,7 @@ fn tng_egress_protocol_uses_self_generated_without_peers() {
 fn tng_egress_protocol_rats_tls_ignores_peers() {
     let peers = vec!["10.0.1.1".to_string()];
     let route = tng_egress_protocol(EncryptionMode::RatsTls, &peers);
-    assert_eq!(route["rats_tls"]["multiplex"], false);
+    assert_eq!(route["rats_tls"]["multiplex"], true);
     assert!(route.get("ohttp").is_none());
 }
 
@@ -996,7 +1167,7 @@ fn tng_config_uses_peer_shared_egress_when_bootstrap_has_peers() {
                 "connect": [{"port": 8080, "encryption": "ohttp"}]
             }
         },
-        "reference_values": {},
+        "reference_values": {"self": {"mrtd": "self-image"}},
         "rekor_reference_values": {}
     }))
     .unwrap();
@@ -1014,6 +1185,18 @@ fn tng_config_uses_peer_shared_egress_when_bootstrap_has_peers() {
         .unwrap();
     assert_eq!(peer_list.len(), 2);
     assert_eq!(peer_list[0], "10.0.1.1:8301");
+    assert_eq!(
+        config["add_egress"][0]["ohttp"]["key"]["verify"]["as_type"],
+        "builtin"
+    );
+    assert_eq!(
+        config["add_egress"][0]["ohttp"]["key"]["verify"]["reference_values"][0]["payload"]
+            ["content"]["mrtd"],
+        "self-image"
+    );
+    let mut missing = bundle.clone();
+    missing.reference_values.clear();
+    assert!(tng_config(&missing, "self", &plan, &peers).is_err());
 }
 
 #[test]
@@ -1073,10 +1256,10 @@ fn gateway_config_routes_only_confidential_mesh_ports() {
     assert_eq!(client_routes.len(), 2);
     assert_eq!(client_routes[0]["listen_port"], 3001);
     assert_eq!(client_routes[0]["target_port"], 3001);
-    assert_eq!(client_routes[0]["tng_port"], 39401);
+    assert_eq!(client_routes[0]["tng_port"], 39400);
     assert_eq!(client_routes[1]["listen_port"], 3003);
     assert_eq!(client_routes[1]["target_port"], 3003);
-    assert_eq!(client_routes[1]["tng_port"], 39403);
+    assert_eq!(client_routes[1]["tng_port"], 39401);
     assert_eq!(config["trusted_services"]["peer"]["public_key"], "peer-pub");
     assert_eq!(
         config["trusted_services"]["connect-only"]["public_key"],
@@ -1315,6 +1498,98 @@ fn resource_apply_supports_numeric_owner_and_group() {
     let metadata = fs::metadata(target).unwrap();
     assert_eq!(metadata.uid(), 65534);
     assert_eq!(metadata.gid(), 65534);
+}
+
+#[test]
+fn management_credentials_and_runtime_context_use_only_the_selected_provider() {
+    for provider in ["challenge", "trustee"] {
+        let temp = tempfile::tempdir().unwrap();
+        let env = no_tee_test_env(&temp);
+        let args = test_run_args(temp.path().join(provider));
+        let management = temp.path().join("management");
+        let mut bootstrap = test_bootstrap_config("test-app");
+        bootstrap.mode = provider.into();
+        bootstrap.ports = vec![18789];
+        for (id, file) in [
+            ("cai_ssh_authorized_keys", "authorized_keys"),
+            ("cai_ssh_host_key", "host_key"),
+        ] {
+            let resource_path = format!("default/local-resources/{id}");
+            // A foreign cache exists, but must never supply the current provider.
+            write_test_file(
+                &temp.path().join("foreign").join(&resource_path),
+                b"foreign-credential",
+            );
+            bootstrap.resources.push(GuestResource {
+                id: id.into(),
+                resource_path,
+                target: management.join(file),
+                owner: None,
+                group: None,
+                mode: "0600".into(),
+                required: true,
+                mutable: false,
+                sha256: Some(hex_encode(&Sha256::digest(b"verified-credential"))),
+            });
+        }
+        let business = GuestResource {
+            id: "business".into(),
+            resource_path: "default/local-resources/business".into(),
+            target: temp.path().join("business"),
+            owner: None,
+            group: None,
+            mode: "0600".into(),
+            required: true,
+            mutable: false,
+            sha256: Some(hex_encode(&Sha256::digest(b"valid-config"))),
+        };
+        bootstrap.resources.push(business.clone());
+        let ready = env.status.with_file_name("instance-ssh.ready");
+        let context = env.status.with_file_name("application-runtime.json");
+        let mut state = DaemonState::default();
+        assert!(
+            !apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).unwrap()
+        );
+        assert!(!ready.exists());
+        assert!(!management.exists());
+        for resource in &bootstrap.resources[..2] {
+            write_test_file(
+                &args.cdh_root.join(&resource.resource_path),
+                b"verified-credential",
+            );
+        }
+        assert!(
+            !apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).unwrap()
+        );
+        assert!(ready.exists());
+        assert!(!context.exists());
+        assert_eq!(
+            fs::read(management.join("host_key")).unwrap(),
+            b"verified-credential"
+        );
+        write_test_file(
+            &args.cdh_root.join(&business.resource_path),
+            b"corrupt-config",
+        );
+        assert!(
+            apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).is_err()
+        );
+        assert!(ready.exists());
+        write_test_file(
+            &args.cdh_root.join(&business.resource_path),
+            b"valid-config",
+        );
+        assert!(
+            apply_bootstrap_resources(&args, &bootstrap, &mut state, false, &management).unwrap()
+        );
+        let value: Value = read_json_file(&context);
+        assert_eq!(
+            value["schema_version"],
+            "confidential-agent/application-runtime/v1"
+        );
+        assert_eq!(value["ports"], json!([18789]));
+        assert!(!fs::read_to_string(&context).unwrap().contains("priv"));
+    }
 }
 
 #[test]
@@ -3808,6 +4083,156 @@ fn gateway_config_listen_ports_deduplicates_and_ignores_invalid_values() {
 }
 
 #[test]
+fn daemon_state_errors_do_not_rebuild_or_overwrite_endpoint_reservations() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    let mut state = read_daemon_state().unwrap();
+    state.mesh_client_owner = Some("self".into());
+    state.mesh_client_ports = BTreeMap::from([
+        ("beta".into(), BTreeMap::from([(18789, 18789)])),
+        ("gamma".into(), BTreeMap::from([(18789, 39600)])),
+    ]);
+    write_daemon_state(&state).unwrap();
+    let original = fs::read(&env.state).unwrap();
+    for damaged in [b"{invalid".as_slice(), b"\xff".as_slice()] {
+        fs::write(&env.state, damaged).unwrap();
+        assert!(read_daemon_state().is_err());
+        assert_eq!(fs::read(&env.state).unwrap(), damaged);
+        // ApplyOnce must propagate the failure. The long-running daemon has
+        // a separate management-only recovery path tested below.
+        let args = test_run_args(temp.path().join("cdh"));
+        assert!(run(Cli {
+            command: Commands::ApplyOnce(args)
+        })
+        .is_err());
+        assert_eq!(fs::read(&env.state).unwrap(), damaged);
+        assert!(!env.service_directory.exists());
+        assert!(!env.status.exists());
+    }
+    fs::remove_file(&env.state).unwrap();
+    let error = read_daemon_state().unwrap_err();
+    assert!(error.to_string().contains("initialized guest"));
+    assert!(!env.state.exists());
+    fs::create_dir(&env.state).unwrap();
+    assert!(read_daemon_state().is_err());
+    fs::remove_dir(&env.state).unwrap();
+    fs::write(&env.state, &original).unwrap();
+    let restored = read_daemon_state().unwrap();
+    assert_eq!(restored.mesh_client_ports, state.mesh_client_ports);
+}
+
+#[test]
+fn cold_boot_recovery_authenticates_management_without_rebuilding_business_state() {
+    for provider in ["challenge", "trustee"] {
+        let temp = tempfile::tempdir().unwrap();
+        let env = no_tee_test_env(&temp);
+        let mut original = read_daemon_state().unwrap();
+        original.mesh_client_owner = Some("self".into());
+        original.mesh_client_ports =
+            BTreeMap::from([("gamma".into(), BTreeMap::from([(18789, 39600)]))]);
+        write_daemon_state(&original).unwrap();
+        let saved = fs::read(&env.state).unwrap();
+        fs::write(&env.state, "{damaged").unwrap();
+        let args = test_run_args(temp.path().join(provider));
+        let management = temp.path().join("management");
+        let mut bootstrap = test_bootstrap_config("broken-app");
+        bootstrap.app_service = Some("broken-app.service".into());
+        bootstrap.mode = provider.into();
+        for (id, file) in [
+            ("cai_ssh_authorized_keys", "authorized_keys"),
+            ("cai_ssh_host_key", "host_key"),
+        ] {
+            let resource_path = format!("default/local-resources/{id}");
+            write_test_file(
+                &temp.path().join("foreign").join(&resource_path),
+                b"credential",
+            );
+            bootstrap.resources.push(GuestResource {
+                id: id.into(),
+                resource_path,
+                target: management.join(file),
+                owner: None,
+                group: None,
+                mode: "0600".into(),
+                required: true,
+                mutable: false,
+                sha256: Some(hex_encode(&Sha256::digest(b"credential"))),
+            });
+        }
+        let ready = env.status.with_file_name("instance-ssh.ready");
+        assert!(!ready.exists()); // /run starts empty, unlike a daemon restart.
+        let error = read_daemon_state().unwrap_err();
+        apply_management_recovery(&args, &bootstrap, &error, &management).unwrap();
+        assert!(!ready.exists());
+        for resource in &bootstrap.resources {
+            write_test_file(&args.cdh_root.join(&resource.resource_path), b"credential");
+        }
+        let key = args
+            .cdh_root
+            .join(&bootstrap.resources.last().unwrap().resource_path);
+        fs::write(&key, b"forged").unwrap();
+        assert!(apply_management_recovery(&args, &bootstrap, &error, &management).is_err());
+        assert!(!ready.exists());
+        assert!(!management.exists());
+        fs::write(&key, b"credential").unwrap();
+        apply_management_recovery(&args, &bootstrap, &error, &management).unwrap();
+        assert!(ready.exists());
+        let status: DaemonStatus = serde_json::from_slice(&fs::read(&env.status).unwrap()).unwrap();
+        assert_eq!(status.phase, "management-recovery");
+        assert!(!status.app_ready && !status.mesh_ready);
+        assert_eq!(status.applied_resources.len(), 2);
+        assert!(!env.service_directory.exists());
+        assert!(!env
+            .status
+            .with_file_name("application-runtime.json")
+            .exists());
+        // A service-manager failure must not hide the authenticated repair
+        // path. Recreate the volatile marker even when every stop fails.
+        fs::remove_file(&ready).unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let systemctl = bin.join("systemctl");
+        fs::write(&systemctl, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        env._guard.remove("CA_SKIP_SYSTEMCTL");
+        env._guard.set_path("PATH", &bin);
+        apply_management_recovery(&args, &bootstrap, &error, &management).unwrap();
+        assert!(ready.exists());
+        let status: DaemonStatus = serde_json::from_slice(&fs::read(&env.status).unwrap()).unwrap();
+        assert!(!status.app_ready && !status.mesh_ready);
+        assert!(status.last_error.unwrap().contains("broken-app.service"));
+        assert_eq!(fs::read(&env.state).unwrap(), b"{damaged");
+        fs::write(&env.state, saved).unwrap();
+        assert_eq!(
+            read_daemon_state().unwrap().mesh_client_ports,
+            original.mesh_client_ports
+        );
+    }
+}
+
+#[test]
+fn daemon_state_initialization_distinguishes_new_and_legacy_guests() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = no_tee_test_env(&temp);
+    assert!(!env.state.exists());
+    assert_eq!(read_daemon_state().unwrap().mesh_client_ports.len(), 0);
+    assert!(env.state.exists());
+    assert!(daemon_state_initialized_path().exists());
+    // A valid legacy state is accepted and gains a durable marker.
+    fs::remove_file(daemon_state_initialized_path()).unwrap();
+    assert!(read_daemon_state().is_ok());
+    assert!(daemon_state_initialized_path().exists());
+    fs::remove_file(daemon_state_initialized_path()).unwrap();
+    fs::remove_file(&env.state).unwrap();
+    // Legacy mesh output is initialization evidence even without a marker.
+    fs::create_dir_all(env.service_directory.parent().unwrap()).unwrap();
+    fs::write(&env.service_directory, "existing directory").unwrap();
+    assert!(read_daemon_state().is_err());
+    assert!(!env.state.exists());
+    assert!(!daemon_state_initialized_path().exists());
+}
+
+#[test]
 fn daemon_state_round_trips_through_configured_path() {
     let temp = tempfile::tempdir().unwrap();
     let env = no_tee_test_env(&temp);
@@ -4264,4 +4689,14 @@ fn empty_service_directory() -> ServiceDirectory {
         schema: SERVICE_DIRECTORY_SCHEMA_VERSION.to_string(),
         services: BTreeMap::new(),
     }
+}
+
+#[test]
+fn replica_key_sharing_rejects_wide_and_invalid_sources() {
+    assert!(replica_firewall_rules(&["10.0.0.0/16".into()]).is_err());
+    assert!(replica_firewall_rules(&["0.0.0.0".into()]).is_err());
+    let rules = replica_firewall_rules(&["10.0.1.1".into(), "10.0.1.2".into()]).unwrap();
+    assert!(rules.contains("-s 10.0.1.1/32 -j ACCEPT"));
+    assert!(rules.contains("-s 10.0.1.2/32 -j ACCEPT"));
+    assert!(rules.contains("--dport 8301 -j DROP"));
 }

@@ -1,0 +1,13 @@
+[Unit]
+Description=SSH with CA instance credentials
+After=network-online.target
+ConditionPathExists=/opt/data/cai-ssh/host_key
+ConditionPathExists=/opt/data/cai-ssh/authorized_keys
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/sshd
+ExecStart=/usr/sbin/sshd -D -e -f /usr/local/libexec/confidential-agent/allinone/sshd_config
+Restart=on-failure
+RestartSec=5
+

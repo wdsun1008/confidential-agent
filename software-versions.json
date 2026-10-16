@@ -1,0 +1,12 @@
+{
+  "openclaw": "2026.10.3",
+  "hermes": "e06df9c2eae6901f4c88f464e0ae6e753c0428b8",
+  "hermes_release": "v0.22.0",
+  "qodercli": "1.1.70",
+  "opencode": "1.19.0",
+  "codex": "0.162.1",
+  "claude-code": "2.1.299",
+  "node": "24.21.0",
+  "bailian_model": "qwen3.8-max",
+  "vllm": "0.28.0"
+}
