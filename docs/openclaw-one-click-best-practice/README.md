@@ -116,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
   --zone-id cn-beijing-i \
   --instance-type ecs.g9i.xlarge \
   --disk-gb 200 \
-  --bailian-model qwen3.7-max
+  --bailian-model qwen3.8-max
 ```
 
 百炼 API 场景默认启用 PEP。如只验证 OpenClaw、百炼、远程证明资源注入、TNG connect 和 Gateway Token 基础链路，可显式禁用 PEP：

@@ -239,9 +239,11 @@ default/local-resources/<resource-id>
 6. switch_root 后，rootfs Attestation Agent 再登记一次相同 AAEL；重复事件安全且能覆盖 initrd event log 未被继承的情况。
 7. daemon 从 Trustee 刷新 bootstrap、应用资源、mesh 和 A2A bundle。
 
+CDH 的 KBS URL 不会传递给共享 AA 的 `GetToken` RPC。因此 CA 为每次 Trustee 取密启动私有 socket 的临时 AA，只负责向运行时指定的 KBS 地址取 token，并使用同一份 KBS CA 证书。该 helper 禁用 event-log 初始化和 heartbeat，TDX evidence 仍读取共享 CCEL/AAEL；不重启共享 AA，不重置度量日志。helper 启动与 CDH 调用共用 deadline，调用结束或失败均终止并回收子进程及临时文件。
+
 `confidential-agentd initrd-fetch` 的 `CA_SECRET_WAIT_TIMEOUT_SEC` 通用默认值是 600 秒（0 表示无限等待），但 CLI 生成的镜像会在 CryptPilot `exec` provider 中显式设置为 210 秒，因此 Guest 的有效截止时间是 210 秒。这是覆盖 AAEL 登记、bootstrap 和磁盘密钥全部取回操作的单一全局 deadline，不是按资源分别计时；每次 CDH one-shot 还受 `CA_CDH_ONESHOT_TIMEOUT_SEC`（默认 120 秒）与剩余 deadline 中较小值的限制。
 
-超时后 `initrd-fetch` 会通过 `systemctl --no-block poweroff` fail closed。该动作有双重门控：仅当未设置 `CA_SKIP_INITRD_POWEROFF`，且检测到 `/etc/initrd-release`（真实 initrd）或显式设置了 `CA_FORCE_INITRD_POWEROFF` 时才执行；`CA_SKIP_INITRD_POWEROFF` 优先级最高，设置后即使在真实 initrd 中也不触发 poweroff。因此普通 rootfs 手工运行默认不会关机，单测仍显式设置 `CA_SKIP_INITRD_POWEROFF=1` 作为双保险。无论是否触发 poweroff，失败原因都会先写入 stderr 并以错误退出。镜像的 dracut 命令行还固化了 `rd.retry=300 rd.shell=0 rd.emergency=poweroff` 作为独立的第二层 fail-closed；210 秒的取密 deadline 刻意早于该 300 秒上限，让失败先通过 `initrd-fetch` 的 console 日志暴露，而不是落入 dracut emergency。
+超时后 `initrd-fetch` 会通过 `systemctl --no-block poweroff` fail closed。该动作有双重门控：仅当未设置 `CA_SKIP_INITRD_POWEROFF`，且检测到 `/etc/initrd-release`（真实 initrd）或显式设置了 `CA_FORCE_INITRD_POWEROFF` 时才执行；`CA_SKIP_INITRD_POWEROFF` 优先级最高，设置后即使在真实 initrd 中也不触发 poweroff。因此普通 rootfs 手工运行默认不会关机，单测仍显式设置 `CA_SKIP_INITRD_POWEROFF=1` 作为双保险。无论是否触发 poweroff，失败原因都会先写入 stderr 并以错误退出。原生 initramfs 没有 systemctl；`initrd-fetch` 返回错误后，cryptpilot exec provider 失败，Shelter 的 PID 1 对根激活失败执行 `poweroff -f`，不进入可交互 emergency shell。取密 deadline 保持 210 秒，日志写入 console，只有成功时才通过 `/bin/cat` 把原始密钥交给 cryptpilot。
 
 challenge mode 在重启后仍会等待 challenge 注入方重新提供 initrd 资源；Trustee mode 因服务持久化，可以在 CLI 不在线时自行完成重启。
 
@@ -255,6 +257,8 @@ challenge mode 在重启后仍会等待 challenge 注入方重新提供 initrd �
 
 任一步骤中断后可重跑。policy 中的 owner、revision、transaction marker 和本地 digest 用于识别“远端已经提交、但本地 state 尚未落盘”的单步崩溃。恢复窗口只允许同一 service 完成原操作，或按 `reconcile → revoke → cleanup` 单向收紧；mesh/A2A、prune 和其他 service 的变更会停止并提示应重跑的命令，避免消耗 revision 或用旧 state 重新放行 binding。检测到缺失 marker 或其他无法解释的策略漂移时不会自动覆盖。
 
-若首次 `deploy` 在 Trustee sync 已写远端、但本地 service state 尚未创建时中断，应重跑原 `deploy` 命令，而不是单独运行 `trustee sync --service`。若升级前的旧版本恰好中断在一个没有 transaction marker 的窗口，新版本无法安全推断原事务；先用 `trustee doctor` 核对，再由管理员人工确认或恢复策略/state 备份。
+首次同步在写入远端前，会把服务和待同步资源的摘要记录为本地 `pending_reconcile`。即使参考值注册或后续策略写入失败，也能重跑原 `deploy`，或用 `destroy <service>` 撤权并清理已经上传的资源；尚未启动基础设施时不会调用 Shelter 删除不存在的部署。未完成的同步会阻止替换 Trustee 配置、重新 adopt 和修改其他服务。Rekor 注册遇到临时后端或网络错误时最多尝试三次；跳过重复注册前必须核对全部预期参考值。
+
+若首次 `deploy` 在本地 service state 尚未创建时中断，应重跑原 `deploy` 命令，而不是单独运行 `trustee sync --service`。升级前的旧版本若缺少持久化待同步记录或 transaction marker，新版本不会猜测已上传资源的归属；先用 `trustee doctor` 核对，再由管理员确认或恢复策略/state 备份。
 
 `<state-dir>/trustee/state.json`（尤其是 `owner_id`）必须和管理私钥一起备份。若 service 快照记录为 Trustee、但该 entry 丢失，CLI 会拒绝删除基础设施；应先恢复 state 备份，或由管理员在 Trustee 侧人工 revoke，再恢复一致的本地状态。

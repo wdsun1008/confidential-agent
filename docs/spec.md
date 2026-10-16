@@ -5,7 +5,7 @@
 ```yaml
 schema: confidential-agent/v1   # 必填，固定字符串
 service:        { ... }         # 必填
-build:          { ... }         # 必填
+build:          { ... }         # 本地构建必填；deploy.image 模式省略
 deploy:         { ... }         # 必填
 attestation:    { ... }         # 必填
 secrets:        { ... }         # 可选，默认空
@@ -19,7 +19,7 @@ a2a:            { ... }         # 可选，跨组织 Agent 发现
 |---|---|:-:|---|
 | `schema` | string | ✅ | 必须等于 `confidential-agent/v1` |
 | `service` | object | ✅ | 见 §2 |
-| `build` | object | ✅ | 见 §3 |
+| `build` | object | 条件 | 本地构建必填；与 `deploy.image` 互斥，见 §3 |
 | `deploy` | object | ✅ | 见 §4 |
 | `attestation` | object | ✅ | 见 §5 |
 | `secrets` | object | ❌ | 默认 `{}`，见 §6 |
@@ -37,6 +37,7 @@ service:
   connect: [18789]              # ports 子集；允许 host connect / A2A 单向 RA 接入
   mcp_ports: []                 # mesh_ports 子集；按 MCP 协议做 gateway 审计和 virtual tools 注入
   app_service: cai-openclaw-gateway.service  # 可选；daemon 用它判断应用 systemd unit + 端口是否 ready
+  ssh: false                   # 可选；release 镜像的独立实例 SSH 身份
 ```
 
 | 字段 | 类型 | 必填 | 校验 |
@@ -46,8 +47,11 @@ service:
 | `connect` | `[u16]` | ❌ | 默认 `[]`；每个端口必须出现在 `ports` 中；不能重复 |
 | `mcp_ports` | `[u16]` | ❌ | 默认 `[]`；每个端口必须属于 `service.ports - service.connect`（即 `mesh_ports`）；不能重复 |
 | `app_service` | string | ❌ | 可选；设置后不能为空；应为 guest 内的 systemd unit 名，例如 `cai-openclaw-gateway.service` |
+| `ssh` | bool | ❌ | 默认 false；使用 release 镜像，镜像必须支持下述 SSH 文件契约 |
 
 `app_service` 会写入 daemon bootstrap。若设置，`confidential-agentd` 会启动并检查该 systemd unit，同时确认 `service.ports` 都在 guest 本地可连接；`status --live` 中的 `app_ready` 才会变成 ready。若不设置，`app_ready` 只表示资源和 TNG 层就绪，不证明用户应用已经启动。
+
+`service.ssh: true` 在部署端生成每个实例独立的 Ed25519 client/host 密钥。CA 通过现有 challenge/Trustee 资源流程下发 `/opt/data/cai-ssh/authorized_keys` 和 `/opt/data/cai-ssh/host_key`，并仅向 peering 的 `ssh` scope 放行 22 端口；SSH 不属于应用 `service.ports`。镜像自行提供使用这两个文件的 SSH 服务，并在资源就绪后启动它（参见 allinone 示例）。`confidential-agent ssh <service> -- <command>` 使用私钥及固定的 host 公钥校验连接。私钥不进入共享镜像或发布元数据，且该模式与 debug 镜像的原有 SSH 机制互斥。
 
 端口语义固定为：`service.ports` 是应用在 Guest 内真实监听的业务端口集合，也是 TNG 对外建立 ingress/egress 的端口全集；gateway 和 MCP 不会引入新的业务端口。`service.ports: []` 表示该 workload 是 client-only/job，不暴露入站业务端口，但仍会获得 gateway identity、进入 mesh bundle，并可通过 `/etc/cai/service-directory.json` 访问其他 active 服务。`service.connect` 是其中允许 host connect 和跨组织 A2A 以单向 RA 访问的子集，调用方只验证服务端 TEE。`mesh_ports = service.ports - service.connect` 是同 state-dir confidential-only mesh 端口，调用双方都会做 RA。敏感的 confidential-only API 只能放在 `mesh_ports` 上，不应暴露在 `connect` 端口上。
 
@@ -59,12 +63,12 @@ service:
 
 ## 3. `build` — 镜像构建
 
+CA 使用 Shelter 主线的 mkosi 构建流程；普通构建允许安装脚本访问网络。`build.base_image` 和 `build.with_network` 已移除，旧配置需要删除这两个字段，CLI 会拒绝它们。rootfs 与 initrd 的网络由 CA 显式启用。
+
 ```yaml
 build:
-  base_image: ./base.qcow2                    # 可选，存在则走 "convert/enhance" 模式；不写则走 mkosi 模式
   image_name: openclaw-agent                  # 必填，构建产物名 + cloud 镜像名 prefix
   resize: 30G                                 # 可选，渲染为 Shelter disk.size
-  with_network: true                          # 可选，允许构建阶段访问网络
   kernel_cmdline_append: "swiotlb=4194304,any" # 可选，UKI cmdline 追加项
   cleanup:                                    # 可选，透传给 Shelter cleanup
     remove_static_libs: false                 # 可选，保留 *.a 静态库
@@ -96,16 +100,15 @@ build:
 
 | 字段 | 类型 | 必填 | 默认 | 校验 |
 |---|---|:-:|---|---|
-| `base_image` | string (path 或 URL) | ❌ | `None` | 设了则不能为空；存在 `://` 视为 URL，否则按相对路径解析。**不写时**，Shelter 走 mkosi 流程 |
 | `image_name` | string | ✅ | — | 仅 `[A-Za-z0-9_-]` |
 | `resize` | string | ❌ | `None` | 例如 `30G`，渲染为 Shelter `disk.size` |
-| `with_network` | bool | ❌ | `false` | 透传给 Shelter/mkosi 的 with-network；需要在 build/post-install/finalize 阶段执行 npm/pip/model 下载等网络安装时设为 `true` |
 | `kernel_cmdline_append` | string | ❌ | `None` | 透传到 `security.disk.cryptpilot.uki_append_cmdline` |
 | `cleanup.remove_static_libs` | bool | ❌ | Shelter 默认值 | 透传给 Shelter 顶层 `cleanup.remove_static_libs`；vLLM 等需要在运行期编译 Python 扩展的镜像可设为 `false` 保留静态库 |
-| `container` | object | ❌ | `None` | 原样渲染为 Shelter 顶层 `container:`；用于 OCI workload，不是 `base_image` |
+| `container` | object | ❌ | `None` | 原样渲染为 Shelter 顶层 `container:`；用于 OCI workload |
+| `repos` | `[object]` | ❌ | `[]` | 透传 Shelter `repos`；每项含唯一 `name`、HTTPS `baseurl` 和 HTTPS `gpgkey`，保持 RPM 签名校验 |
 | `packages` | `[string]` | ❌ | `[]` | 透传给 Shelter `packages` |
 | `files` | `[BuildFileSpec]` | ❌ | `[]` | 见下表 |
-| `scripts` | `[path]` | ❌ | `[]` | 一律在 `post-install` 阶段执行，**早于** mkosi 模式下的 `confidential-agent-guest-setup.sh` 之后 |
+| `scripts` | `[path]` | ❌ | `[]` | 一律在 `post-install` 阶段执行，在 `confidential-agent-guest-setup.sh` 之后 |
 | `variants.release` | `BuildVariantSpec` | ❌ | `enabled=true` | 见下 |
 | `variants.debug` | `BuildVariantSpec` | ❌ | `None` | 见下 |
 
@@ -138,7 +141,7 @@ container:
       read_only: false                 # 默认 false
 ```
 
-`container` 是 workload payload。CA 仍然以 `mkosi + cryptpilot` 生成 TDX guest/rootfs，并把 OCI payload 交给 Shelter master 的 `container:` 机制处理；不要把 Docker/OCI image 写到 `build.base_image`。
+`container` 是 workload payload。CA 仍然以 `mkosi + cryptpilot` 生成 TDX guest/rootfs，并把 OCI payload 交给 Shelter master 的 `container:` 机制处理。
 `container.mounts` 只描述 runtime 容器的 bind mount；如果文件来自 CA runtime `resources`，仍然需要在顶层 `resources` 中显式声明资源注入到 guest 上的 `source` 路径，再把该 guest 路径 mount 到容器。
 
 #### 3.3 `BuildVariantSpec`
@@ -190,6 +193,26 @@ deploy:
 `deploy` 不再包含 `security.allowed_cidr` / `security.a2a_peer_cidrs`。所有入向安全组规则都从 `<state-dir>/peerings.yaml` 派生，由 `confidential-agent peering ...` 管理；旧字段会被严格模式拒绝，可用 `confidential-agent migrate <spec>` 迁移。`build` 阶段只产出镜像和 build artifact，不读取 `peerings.yaml`；operator peering 应在 build 完成后、首次 deploy 前添加。
 
 若先执行 `confidential-agent image publish <service> --spec <path>`，CLI 会在本地 service state 中记录 published image。后续 `deploy` 仅在 provider、region、variant、build id 和镜像内容 hash 均匹配，且本地发布状态为 `available` 时复用该 `image_id`，并在 Shelter deploy 配置中跳过本地镜像上传和 ImportImage。Published image 不由 `destroy` 统一删除；使用 `image unpublish` 删除指定服务的发布镜像，或使用 `image prune --dry-run --all` 审计后清理旧 build/failed 发布记录。
+
+清理会检查当前工作区所有服务的部署和导入引用，不只检查发布者自身。`image export` 会记录保留标记，自动 `prune`（包括 `--all`）不再删除该镜像；旧版本已经导出的 release 没有此标记，升级后应重新 export 以登记保留。跨主机消费者无法由本地 state 自动发现。发布者应停止分发、遵守已公布的保留期并确认消费者不再依赖创建或恢复后，才通过 `image unpublish --image-id <id> --force` 显式退役。部分云删除失败会返回非零退出码，并保留失败记录供重试。
+
+独立部署端可以省略 `build`，通过 `deploy.image` 选择发布者签名的镜像：
+
+```yaml
+deploy:
+  provider: aliyun
+  region: cn-beijing
+  zone_id: cn-beijing-i
+  instance_type: ecs.g9i.xlarge
+  disk_gb: 80
+  image:
+    release: ./image-release.json
+    trusted_key: ./publisher.pem
+    manifest: sha256:<完整的64位manifest摘要>
+    account_id: "<云账号ID>"
+```
+
+发布端先运行 `image publish`，再运行 `image export <service> --account-id <id> --signing-key <Ed25519 PKCS8 PEM> --output image-release.json`。消费者仅需要 release、独立认可的发布者公钥以及自己的 AppSpec 和资源文件，不需要生产端 state、构建输入或 QCOW2。CA 在创建资源前验证签名、固定摘要和账号/地域映射，将验证过的参考值交给现有 challenge/Trustee 流程。每个 service 使用自己的身份、磁盘口令和 Terraform state；`destroy` 不删除共享镜像。该模式只允许 release 变体；需要内置调试密钥的 debug 镜像不能作为共享发布镜像。
 
 当前 E2E 默认示例使用 `cn-beijing-i + ecs.g9i.xlarge`。香港 region 的 TDX 默认组合为 `cn-hongkong-d + ecs.g8i.xlarge`；实际可用性仍可能受账号库存和可用区限制影响，必要时显式覆盖 `region`、`zone_id` 和 `instance_type`。
 
@@ -302,6 +325,8 @@ resources:
 4. Daemon 校验失败会拒绝写文件并把状态停在 `waiting-resources`。
 
 `mutable: true` 用于应用会在启动后迁移或改写的初始化文件。daemon 仍会校验注入源文件的 sha256，并在首次缺失时写入 `target`；写入成功后只维护目标路径、mode、owner、group，不再因为目标内容被应用改写而覆盖文件或重启 `app_service`。如果应用删除了目标文件，daemon 会按原始注入内容重新 seed。不要把长期必须强一致的 secret 标成 mutable。
+
+这是内容所有权，不是更新开关：默认 `mutable: false` 为“操作者托管”，guest 中的改写会被校正回已交付的内容；`mutable: true` 为“guest 自主管理”，操作者修改 source 并再次注入也不会覆盖已经存在的目标内容。`runtime.json` 通常应由操作者托管；使用原生配置向导维护的文件按需要选择 guest 自主管理。
 
 约束：
 - `target` 必须绝对路径。
@@ -436,12 +461,11 @@ OpenClaw A2A 插件不再从配置里读取对端 URL/端口，而是从 `/etc/c
 
 ## 10. 路径解析规则
 
-所有路径字段（`build.base_image`, `build.scripts[]`, `build.files[].source`, `build.variants.debug.ssh_public_key`, `secrets.disk_passphrase`, `resources.*.source`, `attestation.rekor.cosign_key`, `attestation.rekor.slsa_generator`）都遵循：
+所有路径字段（`build.scripts[]`, `build.files[].source`, `build.variants.debug.ssh_public_key`, `secrets.disk_passphrase`, `resources.*.source`, `attestation.rekor.cosign_key`, `attestation.rekor.slsa_generator`）都遵循：
 
 1. 如果是绝对路径 → 直接使用。
 2. 如果是相对路径 → 相对于 **spec YAML 所在目录** 解析。
 3. `..` 与 `.` 会被规范化（[`normalize_path`](../core/src/spec.rs)）。
-4. URL（含 `://`）只对 `base_image` 生效，原样透传给 Shelter。
 
 ---
 
@@ -514,3 +538,49 @@ resources:
 | `confidential-agent/agent-card/v1` | AgentCard | CLI → BootstrapConfig → Guest daemon `:8089` | 跨组织 peer agent |
 
 如果手动编辑了 state 文件，注意保持 schema 字符串完全匹配——CLI 会显式校验，不一致直接拒绝。
+
+Published CA images carry an authenticated `confidential-agent/image-runtime/v1`
+contract. CA checks guest/bootstrap capabilities, root integrity, encrypted
+writable storage with CA key release, minimum disk size, application service and
+instance SSH support before creating infrastructure. `build.runtime_contract`
+optionally selects an image-owned JSON contract; it is captured at build time.
+The guest binary reports its protocol capabilities through `describe-runtime`.
+Older image exports without this contract require rebuilding before using the
+published-image entry point; ordinary local artifact deployment remains available.
+
+`ca deploy --resume` resumes resource delivery only for confirmed `deployed`
+infrastructure with the original configuration at its canonical path. Deployment
+records canonical resource paths and digests and delivers private snapshots of
+user resources and the disk secret. Resume rejects changed resource contents,
+retargeted paths, or changed instance credentials; restore the original inputs
+before resuming. Run the candidate host CLI's `upgrade check` against the existing
+state directory before upgrading or rebooting; one-click performs this check
+before replacing installed binaries. Legacy deployments without frozen inputs
+require explicit `upgrade bind-inputs --service SERVICE`. This reads unchanged
+committed configuration, verifies disk bytes against historical Trustee disk/data
+digests, verifies recorded gateway and SSH identities, and saves a private input
+snapshot without changing remote resources. A missing or conflicting historical
+binding is not replaced by current files. Legacy challenge deployments without
+disk evidence must retain the previous host toolchain for resource delivery and
+back up/export data before migration; destroying data-bearing instances is not
+an upgrade procedure. Resume does not apply Terraform or
+replay an interrupted infrastructure operation. Same-service build/deploy/inject/
+destroy operations are mutually exclusive; independent services may proceed in
+parallel. `ca ssh --tty SERVICE -- COMMAND` explicitly allocates a terminal;
+script execution retains its existing output and exit-code behavior.
+
+Ordinary `inject` permits moving unchanged secret files and project directories.
+It compares secret contents and instance identity, uses saved release/public-key
+authorization and the committed disk copy, and never applies build or infrastructure
+changes. Supplied release/key files that still exist must match saved copies;
+their original download locations need not remain available. `--resume` retains
+its stricter original-path requirement.
+
+If persistent guest daemon state is unreadable, the daemon enters
+`management-recovery`: it stops business and mesh services, leaves endpoint state
+untouched, and only installs provider-specific, hash-verified management credentials.
+Failed stop requests are reported without withholding authenticated SSH. The daemon
+does not start or reconfigure business services during recovery. Instance SSH can
+restore the original state after a cold boot.
+Status reports both application and mesh unready. Restoring valid state lets the
+daemon resume with the saved endpoint reservations.

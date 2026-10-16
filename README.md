@@ -135,6 +135,8 @@ curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-a
 curl -fsSL https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh | sh -s -- install-only
 ```
 
+升级 host 组件前，请等待正在运行的构建、部署和连接操作结束，升级期间不要启动新操作。安装器在替换 Shelter RPM 前检查已安装的 Shelter 可执行文件是否仍被进程使用；若存在活动进程，会保留原包并报出对应 PID。相同版本的重复安装会复用已验证的 RPM。
+
 部署完成后，脚本会输出本地 connect 地址：
 
 ```text

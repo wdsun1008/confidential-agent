@@ -107,7 +107,7 @@ confidential-agent image publish openclaw \
 confidential-agent image list
 ```
 
-`image publish` 会把本地 build 产物上传到 OSS，导入为阿里云自定义镜像，并把发布状态写入本地 service state。第一次用 `--no-wait` 时命令会在导入任务创建后返回，状态通常是 `importing`；后续不带 `--no-wait` 重跑会接续等待同一个导入任务，直到镜像 `available`，并清理临时 OSS 对象。直接不带 `--no-wait` 运行也可以一次性等待完成；等待时长可用 `CA_IMAGE_IMPORT_TIMEOUT_SEC` 调整。
+`image publish` 会把本地 build 产物上传到 OSS，导入为阿里云自定义镜像，并把发布状态写入本地 service state。第一次用 `--no-wait` 时命令会在导入任务创建后返回，状态通常是 `importing`；后续不带 `--no-wait` 重跑会接续等待同一个导入任务，直到镜像 `available`，并清理临时 OSS 对象。直接不带 `--no-wait` 运行也可以一次性等待完成；默认等待云端导入最多两小时，可用 `CA_IMAGE_IMPORT_TIMEOUT_SEC` 调整。
 
 发布记录按 provider、region、variant、build id 和镜像内容 hash 匹配。后续 `deploy` 只有在这些字段匹配且本地发布状态为 `available` 时才复用 `image_id`，从而跳过 Shelter 的上传和 ImportImage 步骤。
 
