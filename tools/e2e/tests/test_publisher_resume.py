@@ -90,6 +90,19 @@ class PublisherResumeTest(unittest.TestCase):
             self.assertFalse(self.verify())
             run.assert_not_called()
 
+    def test_cleaned_deployment_reverifies_retained_local_build_before_reuse(self):
+        self.state['phase'] = 'deleted'
+        self.save()
+        with patch.object(publish_fixtures, 'run') as run:
+            self.assertTrue(self.verify())
+            self.assertEqual(run.call_count, 2)
+        self.state['deploy'] = {'instance_ids': ['i-not-cleaned']}
+        self.save()
+        with patch.object(publish_fixtures, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'deployed service'):
+                self.verify()
+            run.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

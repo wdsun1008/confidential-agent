@@ -89,6 +89,7 @@ fn required_cloud_credential(name_a: &str, name_b: &str) -> Result<String> {
 
 struct TempOssutilConfig {
     path: PathBuf,
+    endpoint: String,
 }
 
 impl Drop for TempOssutilConfig {
@@ -117,7 +118,9 @@ fn ossutil_config(cli: &Cli, region: &str) -> Result<TempOssutilConfig> {
         std::process::id(),
         current_nanos()
     ));
-    let endpoint = format!("https://oss-{region}.aliyuncs.com");
+    let setting = std::env::var("CA_IMAGE_OSS_ENDPOINT").ok();
+    let endpoint = super::oss_endpoint::resolve(region, setting.as_deref())?;
+    println!("[ca] image OSS endpoint: {endpoint}");
 
     let mut content = format!(
         "[Credentials]\nlanguage=EN\nendpoint={endpoint}\naccessKeyID={access_key}\naccessKeySecret={secret_key}\n"
@@ -134,7 +137,15 @@ fn ossutil_config(cli: &Cli, region: &str) -> Result<TempOssutilConfig> {
         .with_context(|| format!("failed to create '{}'", path.display()))?;
     file.write_all(content.as_bytes())
         .with_context(|| format!("failed to write '{}'", path.display()))?;
-    Ok(TempOssutilConfig { path })
+    Ok(TempOssutilConfig { path, endpoint })
+}
+
+fn image_transfer_env(endpoint: &str) -> Vec<(String, String)> {
+    let mut environment = inherited_proxy_envs(None);
+    let overrides = super::oss_endpoint::proxy_overrides(endpoint);
+    environment.retain(|(name, _)| !overrides.iter().any(|(key, _)| key == name));
+    environment.extend(overrides);
+    environment
 }
 
 fn current_nanos() -> u128 {
@@ -199,7 +210,7 @@ fn run_ossutil(
         OsString::from("-c"),
         config.path.as_os_str().to_os_string(),
         OsString::from("-e"),
-        OsString::from(format!("https://oss-{region}.aliyuncs.com")),
+        OsString::from(&config.endpoint),
     ];
     tool_args.extend(args.into_iter().map(OsString::from));
     let mut mounts = file_mounts;
@@ -209,7 +220,7 @@ fn run_ossutil(
         "ossutil64",
         tool_args,
         mounts,
-        inherited_proxy_envs(None),
+        image_transfer_env(&config.endpoint),
         true,
     )
 }
@@ -225,7 +236,7 @@ fn run_ossutil_capture(
         OsString::from("-c"),
         config.path.as_os_str().to_os_string(),
         OsString::from("-e"),
-        OsString::from(format!("https://oss-{region}.aliyuncs.com")),
+        OsString::from(&config.endpoint),
     ];
     tool_args.extend(args.into_iter().map(OsString::from));
 
@@ -244,7 +255,7 @@ fn run_ossutil_capture(
             tool: "ossutil64",
             tool_args,
             mounts,
-            envs: inherited_proxy_envs(None),
+            envs: image_transfer_env(&config.endpoint),
             workdir: Some(workdir),
             container_name: None,
         },
@@ -698,8 +709,21 @@ fn wait_for_image_available_with_ops(
     let timeout = ops.image_import_timeout();
     let interval = ops.image_import_poll_interval();
     let started = Instant::now();
+    let mut transient_failures = 0;
     loop {
-        match ops.describe_image_status(cli, region, image_id)?.as_deref() {
+        let status = match ops.describe_image_status(cli, region, image_id) {
+            Ok(status) => {
+                transient_failures = 0;
+                status
+            }
+            Err(error) if transient_failures < 2 && transient_image_status_error(&error) => {
+                transient_failures += 1;
+                eprintln!("[ca] image status query had a transient failure; retrying ({transient_failures}/2)");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        match status.as_deref() {
             Some("Available") => return Ok(()),
             Some("Creating" | "Waiting") | None => {}
             Some("CreateFailed") => bail!("ECS image import failed for {image_id}"),
@@ -715,6 +739,23 @@ fn wait_for_image_available_with_ops(
             thread::sleep(interval);
         }
     }
+}
+
+fn transient_image_status_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "context deadline exceeded",
+        "client.timeout",
+        "connection reset",
+        "tls handshake timeout",
+        "temporary failure in name resolution",
+        "i/o timeout",
+        "request timed out",
+        "serviceunavailable",
+        "throttling",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1804,6 +1845,37 @@ mod tests {
     }
 
     #[test]
+    fn import_wait_recovers_from_transient_reads_without_reimporting() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        let ops = FakePublishCloudOps {
+            describe_errors: RefCell::new(VecDeque::from([
+                "context deadline exceeded".to_string(),
+                "Client.Timeout exceeded while awaiting headers".to_string(),
+            ])),
+            ..FakePublishCloudOps::default()
+        };
+        wait_for_image_available_with_ops(&cli, &ops, "cn-beijing", "m-imported").unwrap();
+        assert_eq!(ops.calls(), vec!["describe:m-imported"; 3]);
+    }
+
+    #[test]
+    fn import_wait_bounds_retries_and_rejects_permanent_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = test_cli(temp.path());
+        for (error, attempts) in [("context deadline exceeded", 3), ("Forbidden.RAM", 1)] {
+            let ops = FakePublishCloudOps {
+                describe_errors: RefCell::new(VecDeque::from(vec![error.to_string(); 4])),
+                ..FakePublishCloudOps::default()
+            };
+            let failure = wait_for_image_available_with_ops(&cli, &ops, "cn-beijing", "m-imported")
+                .unwrap_err();
+            assert!(failure.to_string().contains(error));
+            assert_eq!(ops.calls(), vec!["describe:m-imported"; attempts]);
+        }
+    }
+
+    #[test]
     fn publish_uploaded_retry_skips_upload_and_imports_again() {
         let temp = tempfile::tempdir().unwrap();
         let cli = test_cli(temp.path());
@@ -2258,6 +2330,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         existing_image: RefCell<Option<String>>,
         statuses: RefCell<VecDeque<Option<String>>>,
+        describe_errors: RefCell<VecDeque<String>>,
         timeout: Duration,
         poll_interval: Duration,
         upload_error: Option<String>,
@@ -2272,6 +2345,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 existing_image: RefCell::new(None),
                 statuses: RefCell::new(VecDeque::new()),
+                describe_errors: RefCell::new(VecDeque::new()),
                 timeout: Duration::from_secs(60),
                 poll_interval: Duration::ZERO,
                 upload_error: None,
@@ -2326,6 +2400,9 @@ mod tests {
             image_id: &str,
         ) -> Result<Option<String>> {
             self.record(format!("describe:{image_id}"));
+            if let Some(error) = self.describe_errors.borrow_mut().pop_front() {
+                bail!(error);
+            }
             Ok(self
                 .statuses
                 .borrow_mut()

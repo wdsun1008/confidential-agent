@@ -24,7 +24,7 @@ EOF
 }
 
 case "${1:-}" in
-  --list|--suite|--case|--jobs|--gpu-jobs|--work-dir|--dry-run)
+  --list|--suite|--case|--jobs|--gpu-jobs|--build-jobs|--fixture-consumer-lease|--work-dir|--dry-run)
     exec python3.11 "$ROOT_DIR/tools/e2e/suite.py" "$@" ;;
 esac
 

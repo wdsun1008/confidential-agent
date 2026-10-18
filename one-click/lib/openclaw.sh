@@ -141,6 +141,25 @@ append_vllm_inference_args() {
 
 prepare_vllm_inference_specs() {
   ensure_gateway_token
+  if [[ -n "${CA_IMAGE_SPEC:-}" ]]; then
+    CA_SPEC_PATH="$(python3.11 - "$CA_IMAGE_SPEC" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1]).resolve()
+spec = json.loads(path.read_text())
+if (spec.get('service', {}).get('id') != 'vllm-inference'
+        or not spec.get('deploy', {}).get('image', {}).get('release')):
+    raise SystemExit('--image-spec requires a signed-image AppSpec for service vllm-inference')
+print(path)
+PY
+)" || return
+    ca_cmd spec validate --spec "$CA_SPEC_PATH" || return
+    CA_PROJECT_DIR="$(dirname "$CA_SPEC_PATH")"
+    CA_SKIP_BUILD=1
+    log "using signed-image spec at $CA_SPEC_PATH"
+    return
+  fi
   ensure_cosign_key
   local args=()
   append_init_common_args args

@@ -38,3 +38,11 @@ if (( comparison < 0 )); then
   echo "Shelter RPM upgrade required: shelter >= $required_epoch:$required_version-$required_release (installed $installed_epoch:$installed_version-$installed_release)" >&2
   exit 1
 fi
+if (( comparison == 0 )); then
+  required_payload="$(rpm -qp --qf '%{PAYLOADDIGEST}' "$bundled_rpm")"
+  installed_payload="$(rpm -qf --qf '%{PAYLOADDIGEST}' "$shelter_bin")"
+  if [[ ! "$required_payload" =~ ^[0-9a-f]+$ || "$required_payload" != "$installed_payload" ]]; then
+    echo "Shelter RPM reinstall required: installed package content differs from the bundled $required_version-$required_release" >&2
+    exit 1
+  fi
+fi

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from rekor_fixture import rekor_url
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +31,7 @@ def render_rekor_block(context):
     return "\n".join(
         [
             "  rekor:",
+            f"    rekor_url: {yaml_quote(rekor_url(context.get('E2E_REKOR_URL')))}",
             f"    cosign_key: {yaml_quote(cosign_key)}",
             f"    slsa_generator: {yaml_quote(context['SLSA_GENERATOR'])}",
             "    required: true",
@@ -48,6 +50,7 @@ def render_matrix_rekor_block(context):
     return "\n".join(
         [
             "  rekor:",
+            f"    rekor_url: {yaml_quote(rekor_url(context.get('E2E_REKOR_URL')))}",
             f"    cosign_key: {yaml_quote(cosign_key)}",
             f"    slsa_generator: {yaml_quote(context['MATRIX_REAL_SLSA_GENERATOR'])}",
             "    required: true",

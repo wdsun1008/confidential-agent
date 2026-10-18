@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from rekor_fixture import rekor_url
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = Path(__file__).with_name("suite.json")
@@ -233,7 +234,7 @@ class Suite:
             cleaned = result.get("cleanup_complete") is True
             if not cleaned and not deferred:
                 cleaned = recover_cleanup(work, environment, log)
-            if cleaned and not deferred:
+            if cleaned and not deferred and not case.get("retains_local_images"):
                 remove_local_images(work, environment, log)
             passed = code == 0 and result.get("passed") is True and (cleaned or deferred) and not timed_out
             result.update(status="passed" if passed else "failed", exit_code=code,
@@ -241,6 +242,25 @@ class Suite:
                           timed_out=timed_out, cleanup_complete=cleaned)
             write_json(work / "case-result.json", result)
             return result
+
+    def producers_entered_builds(self):
+        # Start every shared producer before unrelated cases can take the build
+        # slots. A producer's STS/init work may finish later than an ordinary
+        # case's setup, so submitting its future first is not sufficient.
+        for name, case in self.cases.items():
+            if not case.get("retains_fixtures") or case.get("depends") or name in self.results:
+                continue
+            entered = False
+            for evidence in (self.work / name).glob("*slot*.timing.json"):
+                try:
+                    entered = json.loads(evidence.read_text()).get("stage") == "build-slot-wait"
+                except (OSError, ValueError):
+                    continue
+                if entered:
+                    break
+            if not entered:
+                return False
+        return True
 
     def run(self):
         pending = dict(self.cases)
@@ -259,6 +279,8 @@ class Suite:
                         self.results[name] = {"status": "blocked", "reason": "suite interrupted", "cleanup_complete": True}
                         del pending[name]
                     elif all(dependency in self.results for dependency in dependencies):
+                        if not case.get("retains_fixtures") and not self.producers_entered_builds():
+                            continue
                         pool = self.pools[case.get("pool", "cpu")]
                         running[pool.submit(self.execute, name, case)] = name
                         del pending[name]
@@ -279,29 +301,48 @@ class Suite:
         finally:
             for pool in self.pools.values():
                 pool.shutdown(wait=True)
-        producer = self.results.get("publish-reuse-images")
-        if producer and producer.get("cleanup_deferred"):
+        producers = {name: result for name, result in self.results.items()
+                     if self.cases[name].get("retains_fixtures") and
+                     (result.get("cleanup_deferred") or result.get("cleanup_complete") is False)}
+        if producers:
             lease = self.environment.get("E2E_FIXTURE_CONSUMER_LEASE")
             deadline = time.monotonic() + int(self.environment.get("E2E_FIXTURE_LEASE_TIMEOUT_SEC", "28800"))
             if lease and Path(lease).exists():
                 print("Waiting for the independent signed-image consumers to finish", flush=True)
-                producer["external_consumers_pending"] = True
+                for producer in producers.values():
+                    producer["external_consumers_pending"] = True
                 write_json(self.work / "results.json", self.results)
                 while Path(lease).exists():
                     if self.stop.is_set() or time.monotonic() >= deadline:
-                        producer.update(status="failed", cleanup_complete=False,
-                                        reason="independent consumers still retain the signed fixtures")
+                        for producer in producers.values():
+                            producer.update(status="failed", cleanup_complete=False,
+                                            reason="independent consumers still retain the signed fixtures")
                         write_json(self.work / "results.json", self.results)
                         return False
                     self.stop.wait(1)
-                producer["external_consumers_pending"] = False
-            environment = dict(self.environment, E2E_WORK_DIR=str(self.work / "publish-reuse-images"),
-                               E2E_STATE_DIR=str(self.work / "publish-reuse-images" / "state"))
-            with (self.work / "fixture-cleanup.private.log").open("wb") as log:
+                for producer in producers.values():
+                    producer["external_consumers_pending"] = False
+        for name, producer in producers.items():
+            # A failed consumer may still need its image for cleanup/recovery.
+            # Keep only that producer's fixtures; unrelated producers can clean.
+            def depends_on(candidate, dependency):
+                return any(parent == dependency or depends_on(parent, dependency)
+                           for parent in self.cases[candidate].get("depends", []))
+            if any(result.get("cleanup_complete") is not True and depends_on(consumer, name)
+                   for consumer, result in self.results.items() if consumer != name):
+                producer.update(status="failed", cleanup_complete=False,
+                                reason="consumer cleanup is incomplete; shared fixtures retained")
+                continue
+            environment = dict(self.environment, E2E_WORK_DIR=str(self.work / name),
+                               E2E_STATE_DIR=str(self.work / name / "state"))
+            command = self.cases[name].get("cleanup_command", [sys.executable, "tools/e2e/publish_fixtures.py", "--cleanup"])
+            command = [str(ROOT / part) if part.startswith("tools/") else part for part in command]
+            with (self.work / name / "fixture-cleanup.private.log").open("wb") as log:
                 try:
-                    result = subprocess.run([sys.executable, str(ROOT / "tools/e2e/publish_fixtures.py"), "--cleanup"],
+                    result = subprocess.run(command,
                                             env=environment, stdout=log, stderr=log, timeout=7200)
                     producer["cleanup_complete"] = result.returncode == 0
+                    producer["cleanup_deferred"] = False
                     if result.returncode:
                         producer["status"] = "failed"
                 except (OSError, subprocess.TimeoutExpired):
@@ -321,12 +362,14 @@ def main():
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--gpu-jobs", type=int, default=2)
+    parser.add_argument("--build-jobs", type=int, default=2,
+                        help="Maximum concurrent image builds on this runner, independent of cloud case jobs")
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fixture-consumer-lease", type=Path,
                         help="Retain publisher images until this independent consumer lease is removed")
     args = parser.parse_args()
-    if args.jobs < 1 or args.gpu_jobs < 1:
+    if args.jobs < 1 or args.gpu_jobs < 1 or args.build_jobs < 1:
         parser.error("concurrency must be positive")
     cases = select_cases(registered_cases(), [args.suite], args.case)
     if args.list or args.dry_run:
@@ -337,6 +380,8 @@ def main():
     os.umask(0o077)
     pins = json.loads((ROOT / "software-versions.json").read_text())
     environment = dict(os.environ)
+    environment.setdefault("E2E_BUILD_SLOT_DIR", str(work / "build-slots"))
+    environment["E2E_BUILD_JOBS"] = str(args.build_jobs)
     if Path("/usr/libexec/shelter/bin/terraform").is_file():
         environment["PATH"] = environment.get("PATH", os.defpath) + os.pathsep + "/usr/libexec/shelter/bin"
     if args.fixture_consumer_lease:
@@ -345,9 +390,12 @@ def main():
                        E2E_OPENCLAW_NODE_VERSION=pins["node"], E2E_CLI_AGENT_NODE_VERSION=pins["node"],
                        E2E_CODEX_VERSION=pins["codex"], E2E_CLAUDE_CODE_VERSION=pins["claude-code"],
                        E2E_HERMES_COMMIT=pins["hermes"], E2E_OPENCLAW_VLLM_RUN_CLOUD="1",
-                       E2E_MATRIX_REAL_CLOUD="1", E2E_OPENCLAW_VLLM_BUILD_VARIANTS="release,debug")
+                       E2E_MATRIX_REAL_CLOUD="1")
     metadata = {"schema_version": "confidential-agent/e2e-suite/v1", "software_versions": pins,
-                "cases": list(cases), "started_at": time.time(), "binary_digests": {}}
+                "cases": list(cases), "started_at": time.time(), "binary_digests": {},
+                "fixture_cases": [name for name, case in cases.items() if case.get("kind") == "fixture"],
+                "rekor_url": rekor_url(),
+                "build_jobs": args.build_jobs, "build_slot_dir": environment["E2E_BUILD_SLOT_DIR"]}
     for name in ["CA_BIN", "CA_AGENTD_BIN", "CA_GATEWAY_BIN", "CA_SHELTER_BIN"]:
         path = Path(environment.get(name, "/missing"))
         if path.is_file():
@@ -357,8 +405,12 @@ def main():
     signal.signal(signal.SIGINT, suite.terminate)
     signal.signal(signal.SIGTERM, suite.terminate)
     passed = suite.run()
-    rows = ["| Case | Result | Cleanup |", "|---|---|---|"]
-    rows += [f"| {name} | {result['status']} | {result['cleanup_complete']} |"
+    metadata.update(finished_at=time.time())
+    metadata["elapsed_seconds"] = round(metadata["finished_at"] - metadata["started_at"], 2)
+    write_json(work / "metadata.json", metadata)
+    rows = [f"Suite elapsed: {metadata['elapsed_seconds']} seconds (includes fixture cleanup).", "",
+            "| Case | Kind | Result | Seconds | Cleanup |", "|---|---|---|---|---|"]
+    rows += [f"| {name} | {cases[name].get('kind', 'test')} | {result['status']} | {result.get('elapsed_seconds', '')} | {result['cleanup_complete']} |"
              for name, result in suite.results.items()]
     (work / "report.md").write_text("\n".join(rows) + "\n")
     print("E2E suite " + ("passed" if passed else "incomplete") + "; results: " + str(work))

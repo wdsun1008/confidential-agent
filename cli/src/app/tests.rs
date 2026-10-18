@@ -31,6 +31,30 @@ fn test_cli() -> Cli {
 }
 
 #[test]
+fn a2a_data_collaboration_templates_only_enable_the_deployed_debug_variant() {
+    for role in ["analyst", "data-owner"] {
+        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tools/e2e/cases/a2a-data-collab/templates")
+            .join(format!("{role}.yaml.tmpl"));
+        let mut yaml = fs::read_to_string(template).unwrap();
+        for (placeholder, value) in [
+            ("{{yaml:INSTANCE_TYPE}}", "ecs.g9i.xlarge"),
+            ("{{raw:DISK_GB}}", "80"),
+            ("{{yaml:REGION}}", "cn-beijing"),
+            ("{{yaml:ZONE_ID}}", "cn-beijing-i"),
+            ("{{yaml:REFERENCE_VALUES}}", "rekor"),
+            ("{{raw:REKOR_BLOCK}}", "  rekor:\n    cosign_key: /project/cosign.key\n    slsa_generator: /project/slsa-generator"),
+            ("{{raw:A2A_SIGNING_BLOCK}}", ""),
+        ] {
+            yaml = yaml.replace(placeholder, value);
+        }
+        let spec = AgentSpec::from_yaml(&yaml, Path::new("/project")).unwrap();
+        assert_eq!(spec.image_variant(), "debug");
+        assert_eq!(enabled_build_variants(&spec), vec!["debug"], "{role}");
+    }
+}
+
+#[test]
 fn common_commands_default_to_confidential_agent_yaml() {
     let build = Cli::parse_from(["confidential-agent", "build"]);
     match build.command {

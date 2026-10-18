@@ -10,8 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from cloud_case import Case, ROOT, eventually, release_selection, run, write_json
-
-MODEL = "Qwen3.8-27B"
+from inference_fixtures import MODEL
 
 
 def request(base, path, body=None):
@@ -100,16 +99,21 @@ def prepare(case, service, replicas, kind, transport, mode, reuse, variant):
         raise RuntimeError("the encrypted Qwen3.8-27B fixture and model key are required")
     init = case.work / (service + "-init")
     cosign = case.work / "cosign.key"
-    if not cosign.exists():
-        case.command("cosign-key", "key", "generate-cosign", "--output-key-prefix", cosign.with_suffix(""))
+    reference = ["--reference-values", "sample"]
+    if not reuse:
+        if not cosign.exists():
+            case.command("cosign-key", "key", "generate-cosign", "--output-key-prefix", cosign.with_suffix(""))
+        reference = ["--reference-values", "rekor", "--cosign-key", cosign]
+    # Init supplies model delivery files only for consumers. Their actual JSON
+    # spec below requires Rekor authenticated by the producer's signed release.
     case.command("init", "init", "vllm-inference", "--non-interactive", "--output-dir", init,
                  "--region", case.region, "--zone-id", os.environ.get("E2E_GPU_ZONE_ID", "cn-beijing-l"),
                  "--replicas", replicas, "--vllm-build-variants", variant, "--model-key-file", key,
-                 "--oss-bucket", oss, "--reference-values", "rekor", "--cosign-key", cosign,
+                 "--oss-bucket", oss, *reference,
                  "--vllm-served-model-name", MODEL)
     project = init / "vllm-inference"
     if reuse:
-        image = release_selection(case.suite / "publish-reuse-images" / ("inference-"+variant), case.region)
+        image = release_selection(case.suite / "prepare-inference-images" / ("inference-"+variant), case.region)
         spec = {"schema": "confidential-agent/v1", "service": {"id": service, "ports": [8080],
                 "connect": [{"port": 8080, "encryption": transport}], "app_service": "cai-vllm.service"},
                 "deploy": {"provider": "aliyun", "region": case.region,
@@ -162,7 +166,7 @@ def validate_debug_gpu(case, service, instance_id=None):
         assert re.fullmatch(expected, diagnostic.stdout.strip(), re.IGNORECASE), label + " did not match the required GPU runtime state"
 
 
-def oneclick(case, replicas, variant):
+def oneclick(case, replicas, variant, reuse=False, kind="alb", transport="ohttp", mode="challenge"):
     service = "vllm-inference"
     case.register(service)
     work = case.work / "oneclick"
@@ -172,10 +176,14 @@ def oneclick(case, replicas, variant):
                "--allowed-cidr", case.operator_cidr, "--model-key-file", os.environ["E2E_MODEL_KEY_FILE"],
                "--oss-bucket", os.environ["E2E_MODEL_OSS_BUCKET"], "--vllm-served-model-name", MODEL,
                "--vllm-build-variants", variant, "--no-start-connect", "--skip-cargo-build", "--skip-deps"]
+    spec = work / "vllm-inference/vllm-inference.yaml"
+    if reuse:
+        spec = prepare(case, service, replicas, kind, transport, mode, True, variant)
+        command += ["--image-spec", spec]
     environment = dict(os.environ, CA_INSTALL_CLI="0", CA_STATUS_TIMEOUT_SEC="7200")
     run(command, case.work / "oneclick-deploy", timeout=28800, environment=environment)
     case.checks["oneclick_entrypoint"] = True
-    return service, work / "vllm-inference/vllm-inference.yaml"
+    return service, spec
 
 
 def connect_node(case, service, instance):
@@ -307,11 +315,21 @@ def main():
     variant = os.environ.get("E2E_IMAGE_VARIANT", "release")
     service = os.environ.get("E2E_CASE_ID", "inference")
     with Case() as case:
+        prepared_debug = None
+        if os.environ.get("E2E_USE_PREPARED_DEBUG") == "1":
+            from inference_fixtures import debug_build
+            prepared_debug = debug_build(case)
+        # Operator peerings and any Trustee must belong to the state that will
+        # actually deploy, including the original prepared debug build.
         case.operator()
         if mode == "trustee":
             case.trustee()
-        if (not reuse and kind == "alb") or os.environ.get("E2E_ONECLICK") == "1":
-            service, spec = oneclick(case, replicas, variant)
+        if prepared_debug:
+            service, spec = prepared_debug
+            case.deploy(service, spec)
+            case.checks["original_debug_build_reused"] = True
+        elif (not reuse and kind == "alb") or os.environ.get("E2E_ONECLICK") == "1":
+            service, spec = oneclick(case, replicas, variant, reuse, kind, transport, mode)
         else:
             spec = prepare(case, service, replicas, kind, transport, mode, reuse, variant)
             case.command("validate", "spec", "validate", "--spec", spec)

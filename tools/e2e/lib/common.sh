@@ -416,7 +416,7 @@ ca_run() {
   fi
   local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
-  "${cmd[@]}"
+  E2E_WORK_DIR="$WORK_DIR" python3.11 "$ROOT_DIR/tools/e2e/command_runner.py" "${1:-command}" -- "${cmd[@]}"
 }
 
 ca_capture() {
@@ -426,7 +426,7 @@ ca_capture() {
   shift 3
   local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
-  "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"
+  E2E_WORK_DIR="$WORK_DIR" python3.11 "$ROOT_DIR/tools/e2e/command_runner.py" "${1:-command}" -- "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"
 }
 
 redacted_cmd_string() {
@@ -627,8 +627,13 @@ install_bundled_shelter_rpm() {
     echo "shelter is missing and neither dnf nor yum is available" >&2
     exit 2
   fi
-  record_cmd "$(cmd_string "$pm" install -y "$rpm" libguestfs-tools-c)"
-  "$pm" install -y "$rpm" libguestfs-tools-c
+  local required installed operation=install
+  required="$(rpm -qp --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' "$rpm")"
+  installed="$(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' shelter 2>/dev/null || true)"
+  [[ "$required" != "$installed" ]] || operation=reinstall
+  record_cmd "$(cmd_string "$pm" "$operation" -y "$rpm")"
+  "$pm" "$operation" -y "$rpm"
+  "$pm" install -y libguestfs-tools-c
 }
 
 ensure_shelter() {

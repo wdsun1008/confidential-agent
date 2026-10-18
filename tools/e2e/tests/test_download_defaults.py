@@ -1,11 +1,13 @@
 import importlib.util
 import os
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 
 
 PATH = Path(__file__).resolve().parents[1] / "render_case.py"
+sys.path.insert(0, str(PATH.parent))
 SPEC = importlib.util.spec_from_file_location("render_download_defaults", PATH)
 RENDER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RENDER)

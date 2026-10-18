@@ -18,6 +18,61 @@ spec.loader.exec_module(suite)
 
 
 class SuiteTest(unittest.TestCase):
+    def test_slow_producer_setup_gets_build_slots_before_unrelated_cases(self):
+        worker = r"""
+import json,os,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from command_runner import build_slot
+work=Path(os.environ['E2E_WORK_DIR'])
+name=os.environ['E2E_CASE_ID']
+(work/'worker-started.json').write_text(json.dumps(time.monotonic()))
+if name.startswith('producer'):
+ time.sleep(0.2 if name=='producer-fast' else 0.6)
+with build_slot(work/'build-slot.timing.json'):
+ (work/'build-started.json').write_text(json.dumps(time.monotonic()))
+ time.sleep(2.5 if name.startswith('producer') else 0.05)
+(work/'build-finished.json').write_text(json.dumps(time.monotonic()))
+(work/'case-result.json').write_text(json.dumps({'passed':True,'cleanup_complete':True}))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            command = [sys.executable, '-c', worker, str(suite.ROOT / 'tools/e2e')]
+            cases = {name: {'command': command, 'retains_fixtures': name.startswith('producer')}
+                     for name in ['ordinary', 'producer-fast', 'producer-slow']}
+            environment = dict(os.environ, E2E_BUILD_SLOT_DIR=str(work / 'slots'), E2E_BUILD_JOBS='2')
+            runner = suite.Suite(work, cases, environment, 4, 1)
+            self.assertTrue(runner.run())
+            read = lambda name, stage: json.loads((work/name/(stage+'.json')).read_text())
+            producer_starts = [read(name, 'build-started') for name in cases if name.startswith('producer')]
+            producer_finishes = [read(name, 'build-finished') for name in cases if name.startswith('producer')]
+            self.assertGreaterEqual(read('ordinary', 'worker-started'), max(producer_starts))
+            self.assertLess(read('ordinary', 'worker-started'), min(producer_finishes))
+            self.assertGreaterEqual(read('ordinary', 'build-started'), min(producer_finishes))
+
+    def test_cli_preserves_a_shared_build_budget_for_concurrent_suites(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = root / 'shared-build-slots'
+            for name in ['first', 'second']:
+                runner = Mock(results={}, run=Mock(return_value=True))
+                environment = {'E2E_BUILD_SLOT_DIR': str(shared)}
+                arguments = ['suite.py', '--suite', 'full', '--build-jobs', '2',
+                             '--work-dir', str(root / name)]
+                with patch.dict(os.environ, environment), patch.object(sys, 'argv', arguments), \
+                        patch.object(suite, 'Suite', return_value=runner) as constructor, \
+                        patch.object(suite.signal, 'signal'):
+                    with self.assertRaises(SystemExit) as result:
+                        suite.main()
+                self.assertEqual(result.exception.code, 0)
+                effective = constructor.call_args.args[2]
+                self.assertEqual(effective['E2E_BUILD_SLOT_DIR'], str(shared))
+                self.assertEqual(effective['E2E_BUILD_JOBS'], '2')
+                metadata = json.loads((root / name / 'metadata.json').read_text())
+                self.assertEqual(metadata['build_slot_dir'], str(shared))
+                self.assertEqual(metadata['build_jobs'], 2)
+
     def test_termination_keeps_cleaning_up_when_a_case_exits_during_signal(self):
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as directory:
@@ -121,7 +176,7 @@ trustee_client_token vpc
             work = Path(directory)
             writer = "import os,json,pathlib; pathlib.Path(os.environ['E2E_WORK_DIR'],'case-result.json').write_text(json.dumps({'passed':False,'cleanup_complete':True}))"
             consumer = "import pathlib; pathlib.Path(" + repr(str(work / 'unexpected-consumer')) + ").touch()"
-            cases = {'publish': {'command': [sys.executable, '-c', writer]},
+            cases = {'publish': {'retains_fixtures': True, 'command': [sys.executable, '-c', writer]},
                      'consumer': {'depends': ['publish'], 'command': [sys.executable, '-c', consumer]}}
             runner = suite.Suite(work, cases, dict(os.environ), 1, 1)
             self.assertFalse(runner.run())
@@ -240,8 +295,8 @@ trustee_client_token vpc
             lease = work / 'independent-consumer.lease'
             lease.touch()
             writer = "import os,json,pathlib; pathlib.Path(os.environ['E2E_WORK_DIR'],'case-result.json').write_text(json.dumps({'passed':True,'cleanup_deferred':True}))"
-            cases = {'publish-reuse-images': {'retains_fixtures': True,
-                                              'command': [sys.executable, '-c', writer]}}
+            cases = {name: {'retains_fixtures': True, 'command': [sys.executable, '-c', writer]}
+                     for name in ['publish-reuse-images', 'prepare-inference-images']}
             environment = dict(os.environ, E2E_FIXTURE_CONSUMER_LEASE=str(lease),
                                E2E_FIXTURE_LEASE_TIMEOUT_SEC='0')
             runner = suite.Suite(work, cases, environment, 1, 1)
@@ -250,6 +305,37 @@ trustee_client_token vpc
                 cleanup.assert_not_called()
             self.assertTrue(lease.exists())
             self.assertFalse(runner.results['publish-reuse-images']['cleanup_complete'])
+            self.assertFalse(runner.results['prepare-inference-images']['cleanup_complete'])
+
+    def test_consumer_cleanup_failure_retains_only_its_shared_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            producer = "import os,json,pathlib; pathlib.Path(os.environ['E2E_WORK_DIR'],'case-result.json').write_text(json.dumps({'passed':True,'cleanup_deferred':True}))"
+            consumer = "import os,json,pathlib; pathlib.Path(os.environ['E2E_WORK_DIR'],'case-result.json').write_text(json.dumps({'passed':False,'cleanup_complete':False}))"
+            cases = {name: {'retains_fixtures': True, 'command': [sys.executable, '-c', producer],
+                            'cleanup_command': ['fake-cleanup', name]} for name in ['images', 'unrelated']}
+            cases['consumer'] = {'depends': ['images'], 'command': [sys.executable, '-c', consumer]}
+            runner = suite.Suite(work, cases, dict(os.environ), 2, 1)
+            with patch.object(suite, 'recover_cleanup', return_value=False), \
+                    patch.object(suite.subprocess, 'run') as cleanup:
+                cleanup.return_value.returncode = 0
+                self.assertFalse(runner.run())
+            self.assertEqual(cleanup.call_count, 1)
+            self.assertEqual(cleanup.call_args.args[0], ['fake-cleanup', 'unrelated'])
+            self.assertFalse(runner.results['images']['cleanup_complete'])
+
+    def test_fixture_cleanup_continues_after_another_producer_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = "import os,json,pathlib; pathlib.Path(os.environ['E2E_WORK_DIR'],'case-result.json').write_text(json.dumps({'passed':True,'cleanup_deferred':True}))"
+            cases = {name: {'retains_fixtures': True, 'command': [sys.executable, '-c', producer],
+                            'cleanup_command': ['fake-cleanup', name]} for name in ['first', 'second']}
+            runner = suite.Suite(Path(directory), cases, dict(os.environ), 1, 1)
+            with patch.object(suite.subprocess, 'run') as cleanup:
+                from types import SimpleNamespace
+                cleanup.side_effect = [SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]
+                self.assertFalse(runner.run())
+            self.assertEqual(cleanup.call_count, 2)
+            self.assertEqual(sum(r['cleanup_complete'] for r in runner.results.values()), 1)
 
     def test_missing_host_command_blocks_before_case_launch(self):
         with tempfile.TemporaryDirectory() as directory:

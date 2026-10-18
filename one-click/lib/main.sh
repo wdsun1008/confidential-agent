@@ -111,7 +111,8 @@ Deploy options:
   --vllm-build-variants LIST     vLLM image variants: release or debug; default: release
   --vllm-served-model-name NAME  vLLM served model name; default: Qwen3.8-27B
   --oss-bucket NAME              OSS bucket holding the encrypted model artifact (required)
-  --oss-endpoint URL             OSS endpoint; default: https://oss-cn-beijing-internal.aliyuncs.com
+  --oss-endpoint URL             Model download endpoint; default: https://oss-cn-beijing-internal.aliyuncs.com
+  --image-spec PATH              Deploy an existing signed-image AppSpec (JSON), without rebuilding
   --model-key-file PATH          Local gocryptfs model key file (required, must exist)
   --reference-values MODE        rekor or sample; default: rekor
   --cosign-key PATH              Existing cosign private key for rekor mode
@@ -200,6 +201,7 @@ init_defaults() {
   CA_SKIP_RUSTUP="${CA_SKIP_RUSTUP:-1}"
   CA_SKIP_CARGO_BUILD="${CA_SKIP_CARGO_BUILD:-0}"
   CA_SKIP_BUILD="${CA_SKIP_BUILD:-0}"
+  CA_IMAGE_SPEC="${CA_IMAGE_SPEC:-}"
   CA_SKIP_DEPLOY="${CA_SKIP_DEPLOY:-0}"
   CA_SKIP_HOST_OPENCLAW="${CA_SKIP_HOST_OPENCLAW:-0}"
   CA_REBUILD_TOOLS_IMAGE="${CA_REBUILD_TOOLS_IMAGE:-0}"
@@ -327,6 +329,7 @@ parse_args() {
       --cosign-key) CA_COSIGN_KEY="${2:?missing value for --cosign-key}"; shift 2 ;;
       --slsa-generator) CA_SLSA_GENERATOR="${2:?missing value for --slsa-generator}"; shift 2 ;;
       --skip-build) CA_SKIP_BUILD=1; shift ;;
+      --image-spec) CA_IMAGE_SPEC="${2:?missing value for --image-spec}"; shift 2 ;;
       --skip-deploy) CA_SKIP_DEPLOY=1; shift ;;
       --no-start-connect) CA_START_CONNECT=0; shift ;;
       --shelter-bin) CA_SHELTER_BIN="${2:?missing value for --shelter-bin}"; shift 2 ;;
@@ -412,6 +415,10 @@ apply_target_defaults() {
 }
 
 validate_options() {
+  if [[ -n "$CA_IMAGE_SPEC" ]]; then
+    [[ "$CA_MODE" == deploy-vllm-inference ]] || die "--image-spec is supported by vllm-inference deploy only"
+    [[ -f "$CA_IMAGE_SPEC" ]] || die "--image-spec must be an existing JSON AppSpec"
+  fi
   case "$CA_REFERENCE_VALUES" in
     sample|rekor) ;;
     *) die "--reference-values must be sample or rekor" ;;
@@ -431,8 +438,10 @@ validate_options() {
     die "deploy-openclaw-vllm requires PEP because the TDX attestation skill uses cai-pep attest"
   fi
   if [[ "$CA_MODE" == "deploy-vllm-inference" ]]; then
-    [[ -n "$CA_OSS_BUCKET" ]] || die "--oss-bucket is required for vllm-inference"
-    [[ -n "$CA_MODEL_KEY_FILE" && -f "$CA_MODEL_KEY_FILE" ]] || die "--model-key-file (existing file) is required for vllm-inference"
+    if [[ -z "$CA_IMAGE_SPEC" ]]; then
+      [[ -n "$CA_OSS_BUCKET" ]] || die "--oss-bucket is required for vllm-inference"
+      [[ -n "$CA_MODEL_KEY_FILE" && -f "$CA_MODEL_KEY_FILE" ]] || die "--model-key-file (existing file) is required for vllm-inference"
+    fi
     [[ "$CA_VLLM_INFERENCE_PORT" =~ ^[0-9]+$ ]] || die "--vllm-port must be an integer"
   fi
 }

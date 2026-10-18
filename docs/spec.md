@@ -196,6 +196,8 @@ deploy:
 
 清理会检查当前工作区所有服务的部署和导入引用，不只检查发布者自身。`image export` 会记录保留标记，自动 `prune`（包括 `--all`）不再删除该镜像；旧版本已经导出的 release 没有此标记，升级后应重新 export 以登记保留。跨主机消费者无法由本地 state 自动发现。发布者应停止分发、遵守已公布的保留期并确认消费者不再依赖创建或恢复后，才通过 `image unpublish --image-id <id> --force` 显式退役。部分云删除失败会返回非零退出码，并保留失败记录供重试。
 
+镜像上传的端点由 `CA_IMAGE_OSS_ENDPOINT` 控制，默认 `auto`：只有带 token 的 ECS 元数据确认同地域且内网 HTTPS 探测成功时使用内网，否则使用公网。可显式设置 `public`、`internal` 或 HTTPS 端点；显式配置不自动回退。CA 的 `image publish` 和新版 Shelter 的本地镜像部署上传都支持该设置。模型下载使用的 `CA_OSS_ENDPOINT` / `--oss-endpoint` 与镜像上传独立。
+
 独立部署端可以省略 `build`，通过 `deploy.image` 选择发布者签名的镜像：
 
 ```yaml

@@ -436,7 +436,7 @@ confidential-agent status --live
 
 - **模型密文可以公开访问**：OSS 里存的是加密后的模型，即使 Bucket 设为公共读，没有解密密钥也无法还原。解密密钥只在实例通过远程证明后才会注入。
 
-- **实例拉不到模型**：确认 OSS Bucket 和实例在同一个地域；`--oss-bucket` 参数格式为 `<bucket>:<path>`，指向加密模型的根目录；`--oss-endpoint` 使用内网域名（默认值即可）。
+- **实例拉不到模型**：确认 OSS Bucket 和实例在同一个地域；`--oss-bucket` 参数格式为 `<bucket>:<path>`，指向加密模型的根目录；`--oss-endpoint` 使用内网域名（默认值即可）。该参数用于实例下载模型；构建机上传系统镜像使用独立的 `CA_IMAGE_OSS_ENDPOINT=auto`，也可设置 `public`、`internal` 或 HTTPS 地址。
 
 - **模型解密失败**：`--model-key-file` 指定的密钥文件必须和加密模型时用的密码完全一致；确认 OSS 里的模型是用 gocryptfs 加密的（目录下应有 `gocryptfs.conf` 文件）。
 

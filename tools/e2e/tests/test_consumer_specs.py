@@ -58,7 +58,7 @@ class ConsumerSpecTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for variant in ['release', 'debug']:
-                published = root / 'publish-reuse-images' / ('inference-' + variant)
+                published = root / 'prepare-inference-images' / ('inference-' + variant)
                 published.mkdir(parents=True)
                 self.selection(published)
             model_key = root / 'model-key'
@@ -67,9 +67,9 @@ class ConsumerSpecTest(unittest.TestCase):
                     'E2E_MODEL_OSS_BUCKET': 'fixture:/encrypted-model/'}):
                 for variant in ['release', 'debug']:
                     for mode in ['challenge', 'trustee']:
-                        for replicas, kind in [(1, 'nlb'), (2, 'alb')]:
-                            with self.subTest(variant=variant, mode=mode, replicas=replicas):
-                                work = root / f'{variant}-{mode}-{replicas}'
+                        for replicas, kind, transport in [(1, 'nlb', 'ohttp'), (2, 'alb', 'ohttp'), (2, 'nlb', 'rats-tls')]:
+                            with self.subTest(variant=variant, mode=mode, replicas=replicas, transport=transport):
+                                work = root / f'{variant}-{mode}-{replicas}-{kind}'
                                 work.mkdir()
                                 class LocalCase:
                                     region = 'cn-beijing'
@@ -79,7 +79,8 @@ class ConsumerSpecTest(unittest.TestCase):
                                 case = LocalCase()
                                 case.work = work
                                 spec = inference.prepare(case, 'schema-probe', replicas, kind,
-                                                         'ohttp', mode, True, variant)
+                                                         transport, mode, True, variant)
+                                self.assertFalse((work / 'cosign.key').exists())
                                 if variant == 'release':
                                     self.command('spec', 'validate', '--spec', spec)
                                 else:

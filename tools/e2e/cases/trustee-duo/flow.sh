@@ -552,7 +552,9 @@ run_case() {
     return 2
   fi
 
-  local deploy_timeout="${E2E_TRUSTEE_DEPLOY_TIMEOUT:-1200}"
+  # Deployment includes upload and ECS image import, which can exceed 20 minutes.
+  # Keep the separate application readiness checks below at their existing budget.
+  local deploy_timeout="${E2E_TRUSTEE_DEPLOY_TIMEOUT:-3600}"
   deploy_with_trustee_access "$STATE_DIR" openclaw "$OPENCLAW_DIR/openclaw.yaml" "$deploy_timeout"
   wait_for_status_service_ready "$STATE_DIR" openclaw 1200
   capture_service_cloud openclaw

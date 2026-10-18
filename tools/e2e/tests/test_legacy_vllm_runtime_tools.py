@@ -17,6 +17,41 @@ def executable(path, body):
 
 
 class LegacyVllmRuntimeToolsTest(unittest.TestCase):
+    def test_dependency_install_creates_home_in_minimal_image(self):
+        for installer in [INSTALLER, ROOT / 'examples/vllm-inference/install-vllm-inference.sh']:
+            with self.subTest(installer=installer.name), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                home = work / 'root'
+                headers = work / 'include'
+                (headers / 'python3.11').mkdir(parents=True)
+                (headers / 'python3.11/Python.h').touch()
+                (headers / 'stdio.h').touch()
+                script = installer.read_text().split(
+                    "cat >/usr/local/bin/cai-vllm-install-deps.sh <<'EOF'\n", 1)[1].split('\nEOF', 1)[0]
+                script = script.replace('/root', str(home)).replace('/usr/include', str(headers))
+                script = script.replace('/etc/uv', str(work / 'etc/uv'))
+                script = script.replace('export PATH=', 'export PATH=' + shlex.quote(str(work / 'bin')) + ':', 1)
+                executable(work / 'bin/python3.11', 'exit 0')
+                executable(work / 'bin/uv', '''
+test "$PWD" = "$TEST_HOME"
+case "$1" in
+  venv) mkdir -p .venv/bin ;;
+  pip) test -d .venv/bin ;;
+  *) exit 1 ;;
+esac
+printf '%s:%s\\n' "$1" "$PWD" >> "$TEST_UV_LOG"
+''')
+                environment = dict(os.environ, TEST_HOME=str(home), TEST_UV_LOG=str(work / 'uv.log'),
+                                   PIP_CACHE_DIR=str(work / 'cache/pip'),
+                                   UV_CACHE_DIR=str(work / 'cache/uv'), XDG_CACHE_HOME=str(work / 'cache/xdg'))
+                self.assertFalse(home.exists())
+                result = subprocess.run(['bash', '-c', script], env=environment,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((work / 'uv.log').read_text().splitlines(),
+                                 ['venv:' + str(home), 'pip:' + str(home)])
+
     def test_existing_venv_without_ninja_is_not_ready(self):
         script = INSTALLER.read_text()
         start = script.index('vllm_deps_ready() {')

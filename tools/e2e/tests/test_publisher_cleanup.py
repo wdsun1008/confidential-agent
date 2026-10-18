@@ -51,6 +51,17 @@ class PublisherCleanupTest(unittest.TestCase):
         self.case.command.assert_not_called()
         self.assertFalse(self.result()['cleanup_complete'])
 
+    def test_cleanup_uses_each_owned_publications_recorded_region(self):
+        state_path = self.case.state / 'services/builder/state.json'
+        state = json.loads(state_path.read_text())
+        state['build']['published']['another-region'] = {
+            'image_id': 'm-other-owned', 'region': 'another-region', 'variant': 'release'}
+        state_path.write_text(json.dumps(state))
+        with patch.object(publish_fixtures, 'run', side_effect=self.snapshot_command):
+            publish_fixtures.cleanup(self.case)
+        regions = {call.args[call.args.index('--region') + 1] for call in self.case.command.call_args_list}
+        self.assertEqual(regions, {'test-region', 'another-region'})
+
     def test_snapshot_cleanup_failure_is_not_reported_as_success(self):
         def run(command, *args, **kwargs):
             self.snapshot_command(command)

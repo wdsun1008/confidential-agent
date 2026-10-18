@@ -9,13 +9,39 @@ import shutil
 import time
 from cloud_case import Case, ROOT, release_selection, run, write_json
 
+# Inference has its own producer; all-in-one consumers need only this image.
+REQUIRED_PUBLICATIONS = {("allinone-builder", "release")}
+SIGNED_FIXTURE_DIRECTORIES = ("allinone",)
+
+
+def publish_variant(case, service, spec, variant, directory, account, records):
+    """Publish once and durably record ownership before exporting the envelope."""
+    case.command("publish-"+service+"-"+variant, "image", "publish", service,
+                 "--spec", spec, "--region", case.region, "--variant", variant, timeout=14400)
+    state = case.local_state(service)
+    entry = next(image for image in state["build"]["published"].values()
+                 if image["region"] == case.region and image["variant"] == variant)
+    records[:] = [record for record in records
+                  if (record.get("region", case.region), record["service"], record["variant"])
+                  != (case.region, service, variant)]
+    records.append({"service": service, "variant": variant, "region": case.region, "image_id": entry["image_id"],
+                    "release_dir": str(directory)})
+    write_json(case.work / "published-images.json", records)
+    record_publication_snapshots(case)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    case.command("export-"+service+"-"+variant, "image", "export", service,
+                 "--account-id", account, "--signing-key", case.work / "publisher.key",
+                 "--output", directory / "image-release.json", "--region", case.region,
+                 "--variant", variant)
+    shutil.copyfile(case.work / "publisher.pem", directory / "publisher.pem")
+
 
 def verify_resumable_build(case, service, spec, variants):
     directory = case.state / "services" / service
     if not (directory / "state.json").exists():
         return False
     state = case.local_state(service)
-    if (state["service_id"] != service or state["phase"] != "built"
+    if (state["service_id"] != service or state["phase"] not in ["built", "deleted"]
             or Path(state["spec"]["path"]).resolve() != spec.resolve()
             or state["spec"]["sha256"] != hashlib.sha256(spec.read_bytes()).hexdigest()):
         raise RuntimeError("publisher resume requires the original specification and completed local build")
@@ -69,8 +95,9 @@ def cleanup(case):
     for path in (case.state / "services").glob("*/state.json"):
         state = json.loads(path.read_text())
         for image in (state.get("build") or {}).get("published", {}).values():
-            record = {"service": state["service_id"], "variant": image["variant"]}
-            if not any(item["service"] == record["service"] and item["variant"] == record["variant"] for item in records):
+            record = {"service": state["service_id"], "variant": image["variant"], "region": image["region"]}
+            if not any(item["service"] == record["service"] and item["variant"] == record["variant"]
+                       and item.get("region", case.region) == record["region"] for item in records):
                 records.append(record)
     errors = []
     try:
@@ -83,7 +110,7 @@ def cleanup(case):
         for record in reversed(records):
             try:
                 case.command("unpublish-"+record["service"]+"-"+record["variant"], "image", "unpublish",
-                             record["service"], "--region", case.region, "--variant", record["variant"],
+                             record["service"], "--region", record.get("region", case.region), "--variant", record["variant"],
                              "--force", timeout=3600)
             except RuntimeError as error:
                 errors.append(str(error))
@@ -99,6 +126,23 @@ def cleanup(case):
     write_json(case.work / "case-result.json", result)
     if errors:
         raise RuntimeError("publication cleanup failed; private diagnostics retained")
+
+
+def resume_producer(case):
+    previous = json.loads((case.work / "case-result.json").read_text())
+    if previous.get("passed") is not False:
+        raise RuntimeError("only a failed producer attempt can be resumed")
+    for name in ["publisher.key", "publisher.pem", "cosign.key"]:
+        if not (case.work / name).is_file():
+            raise RuntimeError("publisher resume is missing its original signing material")
+    archive = case.work / "attempts" / str(time.time_ns())
+    archive.mkdir(parents=True, mode=0o700)
+    for path in case.work.iterdir():
+        if path.is_file() and (path.suffix in [".out", ".err", ".log"]
+                              or path.name.endswith(".timing.json")
+                              or path.name in ["case-result.json", "published-images.json"]):
+            shutil.copy2(path, archive / path.name)
+    case.checks["prior_attempt_evidence"] = str(archive.relative_to(case.work))
 
 
 def main():
@@ -118,25 +162,13 @@ def main():
     if args.resume:
         if external:
             raise RuntimeError("external signed fixtures cannot resume a producer build")
-        previous = json.loads((case.work / "case-result.json").read_text())
-        if previous.get("passed") is not False:
-            raise RuntimeError("only a failed producer attempt can be resumed")
-        archive = case.work / "attempts" / str(time.time_ns())
-        archive.mkdir(parents=True, mode=0o700)
-        for path in case.work.iterdir():
-            if path.is_file() and (path.suffix in [".out", ".err", ".log"]
-                                  or path.name in ["case-result.json", "published-images.json"]):
-                shutil.copy2(path, archive / path.name)
-        for name in ["publisher.key", "publisher.pem", "cosign.key"]:
-            if not (case.work / name).is_file():
-                raise RuntimeError("publisher resume is missing its original signing material")
-        case.checks["prior_attempt_evidence"] = str(archive.relative_to(case.work))
+        resume_producer(case)
     if external:
         # A clean runner imports only signed envelopes and public keys. The
         # originating producer retains ownership of images and their cleanup.
         with case:
             source = Path(external).resolve()
-            for name in ["allinone", "inference-release", "inference-debug"]:
+            for name in SIGNED_FIXTURE_DIRECTORIES:
                 release_selection(source / name, case.region)
                 destination = case.work / name
                 destination.mkdir(mode=0o700)
@@ -168,42 +200,17 @@ def main():
                 yaml = allinone.read_text().replace("region: cn-beijing", "region: "+case.region)
                 yaml = yaml.replace("reference_values: sample", "reference_values: rekor\n  rekor:\n    cosign_key: "+str(cosign)+"\n    slsa_generator: /usr/libexec/shelter/slsa/slsa-generator")
                 allinone.write_text(yaml)
-            model_key = os.environ.get("E2E_MODEL_KEY_FILE")
-            model_oss = os.environ.get("E2E_MODEL_OSS_BUCKET")
-            if not model_key or not model_oss:
-                raise RuntimeError("encrypted model fixture and key are required")
-            init = case.work / "inference-init"
-            if not args.resume:
-                case.command("inference-init", "init", "vllm-inference", "--non-interactive", "--output-dir", init,
-                             "--region", case.region, "--zone-id", os.environ.get("E2E_GPU_ZONE_ID", "cn-beijing-l"),
-                             "--vllm-build-variants", "release,debug", "--model-key-file", model_key,
-                             "--oss-bucket", model_oss, "--reference-values", "rekor", "--cosign-key", cosign)
-            inference = init / "vllm-inference" / "vllm-inference.yaml"
-            builds = [("vllm-inference", inference, ["release", "debug"]),
-                      ("allinone-builder", allinone, ["release"])]
+            builds = [("allinone-builder", allinone, ["release"])]
             for service, spec, variants in builds:
                 if not (args.resume and verify_resumable_build(case, service, spec, variants)):
                     case.command("build-"+service, "build", "--spec", spec, timeout=28800)
                 for variant in variants:
-                    case.command("publish-"+service+"-"+variant, "image", "publish", service,
-                                 "--spec", spec, "--region", case.region, "--variant", variant, timeout=14400)
-                    directory = case.work / ("allinone" if service == "allinone-builder" else "inference-"+variant)
-                    directory.mkdir(mode=0o700, exist_ok=args.resume)
-                    case.command("export-"+service+"-"+variant, "image", "export", service,
-                                 "--account-id", account, "--signing-key", case.work / "publisher.key",
-                                 "--output", directory / "image-release.json", "--region", case.region,
-                                 "--variant", variant)
-                    shutil.copyfile(case.work / "publisher.pem", directory / "publisher.pem")
-                    state = case.local_state(service)
-                    entry = next(image for image in state["build"]["published"].values()
-                                 if image["region"] == case.region and image["variant"] == variant)
-                    records = [record for record in records
-                               if (record["service"], record["variant"]) != (service, variant)]
-                    records.append({"service": service, "variant": variant, "image_id": entry["image_id"],
-                                    "release_dir": str(directory)})
-                    write_json(case.work / "published-images.json", records)
-                    record_publication_snapshots(case)
-            case.checks["signed_images_published"] = len(records) == 3
+                    publish_variant(case, service, spec, variant, case.work / "allinone", account, records)
+            # Older producers may own inference publications too. Retain every
+            # owned entry for cleanup when resuming, without rebuilding them.
+            case.checks["signed_images_published"] = REQUIRED_PUBLICATIONS <= {
+                (record["service"], record["variant"]) for record in records
+            }
     except BaseException:
         try:
             cleanup(case)

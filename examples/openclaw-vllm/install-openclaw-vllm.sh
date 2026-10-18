@@ -14,7 +14,7 @@ NVIDIA_DRIVER_REFERER="${NVIDIA_DRIVER_REFERER:-https://www.nvidia.cn/}"
 NVIDIA_DRIVER_SHA256="${NVIDIA_DRIVER_SHA256:-}"
 CUDA_TOOLKIT_VERSION="${OPENCLAW_VLLM_CUDA_TOOLKIT_VERSION:-13.0.1}"
 CUDA_BUNDLED_DRIVER_VERSION="${OPENCLAW_VLLM_CUDA_BUNDLED_DRIVER_VERSION:-580.82.07}"
-CUDA_TOOLKIT_URL="${OPENCLAW_VLLM_CUDA_TOOLKIT_URL:-https://developer.download.nvidia.com/compute/cuda/${CUDA_TOOLKIT_VERSION}/local_installers/cuda_${CUDA_TOOLKIT_VERSION}_${CUDA_BUNDLED_DRIVER_VERSION}_linux.run}"
+CUDA_TOOLKIT_URL="${OPENCLAW_VLLM_CUDA_TOOLKIT_URL:-https://developer.download.nvidia.cn/compute/cuda/${CUDA_TOOLKIT_VERSION}/local_installers/cuda_${CUDA_TOOLKIT_VERSION}_${CUDA_BUNDLED_DRIVER_VERSION}_linux.run}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 BUILD_POSTINSTALL_MARKER=/var/lib/cai/openclaw-vllm/build-postinstall.done
 
@@ -72,6 +72,21 @@ verify_nvidia_driver_checksum() {
   fi
 }
 
+download_installer() {
+  local url="$1" destination="$2" referer="${3:-}"
+  local extra=()
+  [[ -z "$referer" ]] || extra+=(--referer "$referer")
+  # Bound TLS setup and stalled reads as well as the total transfer. A failed
+  # request must never become a reusable installer, including HTTP error pages.
+  if ! curl --fail --location --retry 3 --retry-delay 2 --retry-connrefused \
+      --connect-timeout 20 --max-time 1800 --speed-time 60 --speed-limit 1024 \
+      "${extra[@]}" --output "$destination.tmp" --url "$url"; then
+    rm -f "$destination.tmp"
+    return 1
+  fi
+  mv "$destination.tmp" "$destination"
+}
+
 download_nvidia_driver() {
   local state_dir runfile
   state_dir=/var/lib/cai/nvidia-cc
@@ -84,11 +99,7 @@ download_nvidia_driver() {
     return
   fi
   echo "downloading NVIDIA driver $NVIDIA_DRIVER_VERSION" >&2
-  if ! wget --referer="$NVIDIA_DRIVER_REFERER" -O "$runfile.tmp" "$NVIDIA_DRIVER_URL"; then
-    rm -f "$runfile.tmp"
-    return 1
-  fi
-  mv "$runfile.tmp" "$runfile"
+  download_installer "$NVIDIA_DRIVER_URL" "$runfile" "$NVIDIA_DRIVER_REFERER" || return 1
   verify_nvidia_driver_checksum "$runfile" || { rm -f "$runfile"; return 1; }
   chmod 0755 "$runfile"
   printf '%s\n' "$runfile"
@@ -145,11 +156,7 @@ preinstall_cuda_toolkit() {
   mkdir -p "$state_dir"
   if [[ ! -s "$runfile" ]]; then
     echo "downloading CUDA toolkit $CUDA_TOOLKIT_VERSION"
-    if ! wget -O "$runfile.tmp" "$CUDA_TOOLKIT_URL"; then
-      rm -f "$runfile.tmp"
-      return 1
-    fi
-    mv "$runfile.tmp" "$runfile"
+    download_installer "$CUDA_TOOLKIT_URL" "$runfile" || return 1
     chmod 0755 "$runfile"
   fi
   bash "$runfile" --silent --toolkit
@@ -280,6 +287,7 @@ cat >/etc/uv/uv.toml <<UV
 url = "$PYPI_INDEX_URL"
 default = true
 UV
+install -d -m 0700 /root
 cd /root
 if [[ ! -d .venv ]]; then
   uv venv --python 3.11

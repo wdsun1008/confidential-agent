@@ -9,6 +9,8 @@ import threading
 import ipaddress
 import time
 from resource_ledger import merge_ledgers, read_ledger, record_service
+from command_runner import build_slot
+from rekor_fixture import configure_spec
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,9 +29,12 @@ def run(command, evidence, timeout=1800, check=True, environment=None):
     process = subprocess.Popen([str(value) for value in command], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                env=environment, start_new_session=True)
+    started_at, started = time.time(), time.monotonic()
+    timed_out = False
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         os.killpg(process.pid, signal.SIGTERM)
         try:
             stdout, stderr = process.communicate(timeout=60)
@@ -50,6 +55,13 @@ def run(command, evidence, timeout=1800, check=True, environment=None):
             evidence.with_suffix(".out").write_bytes(stdout)
             evidence.with_suffix(".err").write_bytes(stderr)
         raise
+    finally:
+        # Only the evidence label and timings are public-safe; command arguments
+        # and environment can contain credentials and stay in private evidence.
+        write_json(evidence.with_suffix(".timing.json"), {
+            "label": evidence.name, "started_at": started_at,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "exit_code": process.returncode, "timed_out": timed_out})
     evidence.with_suffix(".out").write_bytes(stdout)
     evidence.with_suffix(".err").write_bytes(stderr)
     result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -100,6 +112,11 @@ class Case:
         self.defer_cleanup = False
 
     def command(self, label, *arguments, state=None, **options):
+        if arguments and arguments[0] in {"build", "deploy"} and "--spec" in arguments:
+            configure_spec(arguments[arguments.index("--spec") + 1])
+        if arguments and arguments[0] == "build":
+            with build_slot(self.work / (label + "-slot.timing.json")):
+                return run([self.ca, "--state-dir", state or self.state, *arguments], self.work / label, **options)
         return run([self.ca, "--state-dir", state or self.state, *arguments], self.work / label, **options)
 
     def api(self, product, action, **parameters):

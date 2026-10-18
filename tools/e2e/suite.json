@@ -132,7 +132,10 @@
         "python3.11",
         "ssh",
         "timeout"
-      ]
+      ],
+      "environment": {
+        "E2E_OPENCLAW_VLLM_BUILD_VARIANTS": "debug"
+      }
     },
     {
       "id": "openclaw-vllm-release",
@@ -156,7 +159,10 @@
         "openssl",
         "python3.11",
         "timeout"
-      ]
+      ],
+      "environment": {
+        "E2E_OPENCLAW_VLLM_BUILD_VARIANTS": "release"
+      }
     },
     {
       "id": "cmaas",
@@ -287,8 +293,7 @@
     {
       "id": "publish-reuse-images",
       "groups": [
-        "reuse",
-        "inference"
+        "reuse"
       ],
       "pool": "cpu",
       "command": [
@@ -296,7 +301,32 @@
         "tools/e2e/publish_fixtures.py"
       ],
       "timeout": 28800,
-      "retains_fixtures": true
+      "retains_fixtures": true,
+      "kind": "fixture",
+      "cleanup_command": [
+        "python3.11",
+        "tools/e2e/publish_fixtures.py",
+        "--cleanup"
+      ]
+    },
+    {
+      "id": "prepare-inference-images",
+      "kind": "fixture",
+      "groups": [
+        "inference"
+      ],
+      "pool": "cpu",
+      "command": [
+        "python3.11",
+        "tools/e2e/inference_fixtures.py"
+      ],
+      "timeout": 28800,
+      "retains_fixtures": true,
+      "cleanup_command": [
+        "python3.11",
+        "tools/e2e/inference_fixtures.py",
+        "--cleanup"
+      ]
     },
     {
       "id": "allinone-challenge",
@@ -342,19 +372,19 @@
         "python3.11",
         "tools/e2e/inference_case.py"
       ],
-      "depends": [
-        "publish-reuse-images"
-      ],
       "environment": {
         "E2E_REPLICAS": "1",
         "E2E_SLB_TYPE": "nlb",
         "E2E_CONNECT_ENCRYPTION": "ohttp",
         "E2E_ATTESTATION_MODE": "challenge",
-        "E2E_REUSE_IMAGE": "0",
+        "E2E_REUSE_IMAGE": "1",
         "E2E_IMAGE_VARIANT": "release",
         "E2E_ONECLICK": "1"
       },
-      "timeout": 28800
+      "timeout": 28800,
+      "depends": [
+        "prepare-inference-images"
+      ]
     },
     {
       "id": "inference-alb",
@@ -366,18 +396,19 @@
         "python3.11",
         "tools/e2e/inference_case.py"
       ],
-      "depends": [
-        "publish-reuse-images"
-      ],
       "environment": {
         "E2E_REPLICAS": "2",
         "E2E_SLB_TYPE": "alb",
         "E2E_CONNECT_ENCRYPTION": "ohttp",
         "E2E_ATTESTATION_MODE": "challenge",
-        "E2E_REUSE_IMAGE": "0",
-        "E2E_IMAGE_VARIANT": "release"
+        "E2E_REUSE_IMAGE": "1",
+        "E2E_IMAGE_VARIANT": "release",
+        "E2E_ONECLICK": "1"
       },
-      "timeout": 28800
+      "timeout": 28800,
+      "depends": [
+        "prepare-inference-images"
+      ]
     },
     {
       "id": "inference-nlb-ohttp",
@@ -389,18 +420,18 @@
         "python3.11",
         "tools/e2e/inference_case.py"
       ],
-      "depends": [
-        "publish-reuse-images"
-      ],
       "environment": {
         "E2E_REPLICAS": "2",
         "E2E_SLB_TYPE": "nlb",
         "E2E_CONNECT_ENCRYPTION": "ohttp",
         "E2E_ATTESTATION_MODE": "challenge",
-        "E2E_REUSE_IMAGE": "0",
+        "E2E_REUSE_IMAGE": "1",
         "E2E_IMAGE_VARIANT": "release"
       },
-      "timeout": 28800
+      "timeout": 28800,
+      "depends": [
+        "prepare-inference-images"
+      ]
     },
     {
       "id": "inference-nlb-rats",
@@ -412,18 +443,18 @@
         "python3.11",
         "tools/e2e/inference_case.py"
       ],
-      "depends": [
-        "publish-reuse-images"
-      ],
       "environment": {
         "E2E_REPLICAS": "2",
         "E2E_SLB_TYPE": "nlb",
         "E2E_CONNECT_ENCRYPTION": "rats-tls",
         "E2E_ATTESTATION_MODE": "challenge",
-        "E2E_REUSE_IMAGE": "0",
+        "E2E_REUSE_IMAGE": "1",
         "E2E_IMAGE_VARIANT": "release"
       },
-      "timeout": 28800
+      "timeout": 28800,
+      "depends": [
+        "prepare-inference-images"
+      ]
     },
     {
       "id": "inference-reuse-single",
@@ -436,7 +467,7 @@
         "tools/e2e/inference_case.py"
       ],
       "depends": [
-        "publish-reuse-images"
+        "prepare-inference-images"
       ],
       "environment": {
         "E2E_REPLICAS": "1",
@@ -459,7 +490,7 @@
         "tools/e2e/inference_case.py"
       ],
       "depends": [
-        "publish-reuse-images"
+        "prepare-inference-images"
       ],
       "environment": {
         "E2E_REPLICAS": "2",
@@ -482,7 +513,7 @@
         "tools/e2e/inference_case.py"
       ],
       "depends": [
-        "publish-reuse-images"
+        "prepare-inference-images"
       ],
       "environment": {
         "E2E_REPLICAS": "2",
@@ -505,18 +536,20 @@
         "python3.11",
         "tools/e2e/inference_case.py"
       ],
-      "depends": [
-        "publish-reuse-images"
-      ],
       "environment": {
         "E2E_REPLICAS": "1",
         "E2E_SLB_TYPE": "nlb",
         "E2E_CONNECT_ENCRYPTION": "ohttp",
         "E2E_ATTESTATION_MODE": "challenge",
         "E2E_REUSE_IMAGE": "0",
-        "E2E_IMAGE_VARIANT": "debug"
+        "E2E_IMAGE_VARIANT": "debug",
+        "E2E_USE_PREPARED_DEBUG": "1"
       },
-      "timeout": 28800
+      "timeout": 28800,
+      "depends": [
+        "prepare-inference-images"
+      ],
+      "retains_local_images": true
     },
     {
       "id": "platform-recovery",

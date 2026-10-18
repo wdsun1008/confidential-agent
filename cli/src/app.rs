@@ -885,6 +885,7 @@ use workflows::*;
 mod image_runtime;
 mod images;
 mod instance_ssh;
+mod oss_endpoint;
 mod publish;
 mod upgrade;
 

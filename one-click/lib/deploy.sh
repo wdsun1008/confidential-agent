@@ -65,7 +65,12 @@ install_shelter_rpm() {
   pm="$(package_manager)" || die "yum or dnf is required to install the Shelter RPM"
   assert_shelter_upgrade_idle /usr/bin/shelter /usr/bin/shelter-slim
   log "installing Shelter RPM: $rpm"
-  "$pm" install -y "$rpm" libguestfs-tools-c
+  local required installed operation=install
+  required="$(rpm -qp --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' "$rpm")"
+  installed="$(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' shelter 2>/dev/null || true)"
+  [[ "$required" != "$installed" ]] || operation=reinstall
+  "$pm" "$operation" -y "$rpm"
+  "$pm" install -y libguestfs-tools-c
 }
 
 build_confidential_agent() {

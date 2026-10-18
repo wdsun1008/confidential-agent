@@ -218,7 +218,7 @@ and separates CPU and GPU concurrency:
 
 ```bash
 tools/e2e/run.sh --list
-tools/e2e/run.sh --suite full --jobs 3 --gpu-jobs 3
+tools/e2e/run.sh --suite full --jobs 3 --gpu-jobs 3 --build-jobs 2
 # Focused execution includes the required image producer automatically:
 tools/e2e/run.sh --case inference-reuse-nlb --gpu-jobs 1
 ```
@@ -226,10 +226,48 @@ tools/e2e/run.sh --case inference-reuse-nlb --gpu-jobs 1
 Groups are `legacy`, `reuse`, `inference`, and `platform`. The full matrix runs
 all eleven original cases, signed all-in-one image reuse with six harnesses under
 both attestation modes, encrypted Qwen3.8-27B inference through single instances,
-ALB/OHTTP and NLB/OHTTP or RATS-TLS, fresh and published images, and release/debug
+ALB/OHTTP and NLB/OHTTP or RATS-TLS, and release/debug
 variants. Platform coverage includes simultaneous deployment, interrupted
 infrastructure, delivery resume, frozen inputs, application failure, console
 isolation, PTYs, and stable peer endpoints.
+
+Image preparation is separate from deployment scenarios. `publish-reuse-images`
+builds and publishes only all-in-one release. `prepare-inference-images` is the
+only task building both release and debug in one invocation; it verifies both
+artifacts and publishes/imports release once for all seven release inference
+lanes. These lanes keep their topology, transport, attestation, one-click and
+recovery checks. The debug lane deploys the original local build using its
+original state and SSH key; it does not distribute debug keys or a signed debug
+image. Only that lane mutates the prepared build's deployment state, and its
+local images remain until all consumers finish. OpenClaw-vLLM builds debug in
+its debug lane and release in its release lane. A2A data collaboration builds
+only debug for each of its two different services.
+
+The full matrix has 23 functional lanes and two fixture tasks. Metadata labels
+fixture tasks separately. `--build-jobs` bounds image builds across both case
+pools (default two); deploying, loading models and running assertions keep the
+CPU/GPU case concurrency. Command timings are saved as `*.timing.json` or
+`command-timings.jsonl`, without command arguments or environment values. Build
+slot waits have separate timings, and Shelter reports native disk lock waits.
+The suite report also records total elapsed time including final cleanup.
+Concurrent suites on the same host can share their build budget by setting the
+same `E2E_BUILD_SLOT_DIR` and `--build-jobs` value. The selected directory and
+limit are recorded in suite metadata.
+
+Image uploads default to `CA_IMAGE_OSS_ENDPOINT=auto`. Same-region ECS metadata
+and a successful internal HTTPS probe select the internal endpoint; off-cloud,
+cross-region, disabled metadata or an unreachable internal endpoint select
+public. Selection uses bounded probes, bypasses proxies for metadata/internal
+traffic and never sends cloud credentials to the probe. To override routing:
+
+```bash
+export CA_IMAGE_OSS_ENDPOINT=public    # or internal, auto, or an HTTPS endpoint
+```
+
+This applies to CA image publication and, with the updated Shelter, direct
+deployment uploads. Standalone Shelter also supports `SHELTER_OSS_ENDPOINT` and
+`deploy.oss_endpoint` (the explicit spec wins). Model download configuration
+(`--oss-endpoint` / `CA_OSS_ENDPOINT`) is independent of image upload routing.
 
 Prepare a fresh installed runner as above. Export `CA_BIN`, `CA_AGENTD_BIN`,
 `CA_GATEWAY_BIN`, and `CA_PEP_BIN` for its installed executables. Supply
@@ -286,6 +324,9 @@ A failed image producer can continue in its original private work directory:
 ```bash
 E2E_WORK_DIR=/path/to/failed-suite/publish-reuse-images \
   python3.11 tools/e2e/publish_fixtures.py --resume
+# Retry inference publication while keeping its already verified local builds:
+E2E_WORK_DIR=/path/to/failed-suite/prepare-inference-images \
+  python3.11 tools/e2e/inference_fixtures.py --resume
 ```
 
 The producer keeps prior results and logs under `attempts/`, preserves the
@@ -317,15 +358,31 @@ ALB requires OHTTP, NLB supports both protocols, and the current OHTTP replica
 group supports one connect port. Release inference checks use protected business
 and management interfaces; debug SSH is used only for the debug variant.
 
-For an independent clean consumer host, set `E2E_PUBLISHED_FIXTURES` to a
-directory containing the three signed release directories (`allinone`,
-`inference-release`, `inference-debug`) and `allinone-publisher-state.json`.
+For an independent clean consumer host, set `E2E_PUBLISHED_FIXTURES` to the
+all-in-one producer directory containing `allinone/` and
+`allinone-publisher-state.json`. Set `E2E_INFERENCE_FIXTURES` to the inference
+producer directory containing `inference-release/`. The former combined export
+directory is also accepted through `E2E_PUBLISHED_FIXTURES` for compatibility.
 Copy only their envelopes, public keys, and publication state; do not copy guest
 disk images, caches, producer private keys, or producer runtime state. Select
 the two all-in-one lanes and the inference reuse lanes with repeated `--case`.
 Imported fixtures stay owned by their original producer, which must retain and
 clean the cloud images after this consumer run finishes.
+Independent consumers receive only signed release fixtures. The debug lane
+requires the original local producer and cannot run from public exports.
 Create a lease file and pass its path to the producer suite with
 `--fixture-consumer-lease`. Remove it only after the independent consumer has
-finished resource cleanup. The producer waits for that lease before unpublishing;
+finished resource cleanup. Both producers wait for that lease before unpublishing;
 an interrupted or expired lease keeps cleanup incomplete and fails acceptance.
+An incomplete local consumer cleanup also retains its producer's fixtures.
+
+`E2E_REKOR_URL` can select a real self-hosted Rekor service when exercising an
+isolated environment. The default remains `https://rekor.sigstore.dev`. The URL
+is recorded in suite metadata and applied to generated native and legacy specs;
+signing, required publication, and Trustee verification remain enabled. A test
+backend must provide the subject-hash index and stored intoto attestations that
+stock Trustee uses. Producer fixtures also install an explicit daemon allowlist
+entry for that backend so guest peer checks keep enforcing URL trust. Set
+`CA_TRUSTED_REKOR_URLS` to include the same service for host-side peer commands.
+Record its version and report public-service failures
+separately when comparing acceptance runs with different backends.
