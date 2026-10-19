@@ -684,3 +684,46 @@ fn render_deploy_config_omits_replicas_from_yaml_when_single_instance() {
     assert!(!deploy_section.contains("replicas:"));
     assert!(!deploy_section.contains("slb:"));
 }
+
+#[test]
+fn managed_peer_connect_routes_are_allowed_at_workload_and_load_balancer() {
+    let spec = AgentSpec::from_yaml(
+        &SPEC.replace(
+            "  disk_gb: 200\n",
+            "  disk_gb: 200\n  replicas: 2\n  slb: {enabled: true, slb_type: nlb}\n",
+        ),
+        Path::new("/project"),
+    )
+    .unwrap();
+    let mut peerings = operator_peerings();
+    peerings.peerings.push(PeeringEntry {
+        label: "external-mesh-only".into(),
+        role: PeeringRole::Peer,
+        cidr: "198.51.100.99/32".into(),
+        scope: vec![PeeringScope::Mesh],
+        note: None,
+        added_at: None,
+        added_by: None,
+    });
+    let options = ShelterRenderOptions {
+        include_deploy: true,
+        peerings,
+        mesh_peer_cidrs: vec!["192.0.2.17/32".into(), "192.0.2.17/32".into()],
+        ..ShelterRenderOptions::default()
+    };
+    let config = render_deploy_config(&spec, &options);
+    let allowed = &config.slb.as_ref().unwrap().allowed_cidrs;
+    assert_eq!(
+        allowed
+            .iter()
+            .filter(|s| s.as_str() == "192.0.2.17/32")
+            .count(),
+        1
+    );
+    assert!(!allowed.contains(&"198.51.100.99/32".into()));
+    let rendered = render_build_config(&spec, &assets(), &options).unwrap();
+    assert!(rendered.contains("connect_18789_peer_192_0_2_17_32"));
+    assert!(!rendered.contains("connect_18789_peer_198_51_100_99_32"));
+    assert!(!rendered.contains("status_8088_peer_192_0_2_17_32"));
+    assert!(!rendered.contains("ssh_22_peer_192_0_2_17_32"));
+}

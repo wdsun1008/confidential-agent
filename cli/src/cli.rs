@@ -200,6 +200,8 @@ pub(crate) enum Commands {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub(crate) enum InitTarget {
+    #[value(name = "allinone", alias = "all-in-one")]
+    Allinone,
     Openclaw,
     #[value(name = "openclaw-vllm")]
     OpenclawVllm,
@@ -217,10 +219,35 @@ pub(crate) enum InitReferenceValues {
     Rekor,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum InitStage {
+    Build,
+    Deploy,
+}
+
+#[derive(Debug, Clone, Args)]
 pub(crate) struct InitArgs {
     #[arg(value_enum)]
     pub(crate) target: Option<InitTarget>,
+    /// Generate a shared-image builder or an instance that reuses a published image.
+    #[arg(long, value_enum)]
+    pub(crate) stage: Option<InitStage>,
+    /// Unique builder/instance ID and output subdirectory name.
+    #[arg(long)]
+    pub(crate) service_id: Option<String>,
+    /// Harness selected per all-in-one instance, never per image build.
+    #[arg(long, value_parser = ["openclaw", "hermes", "codex", "claude-code", "qodercli", "opencode"])]
+    pub(crate) harness: Option<String>,
+    #[arg(long, value_parser = ["cli", "gateway", "app-server"])]
+    pub(crate) harness_mode: Option<String>,
+    #[arg(long)]
+    pub(crate) image_release: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) trusted_key: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) manifest: Option<String>,
+    #[arg(long)]
+    pub(crate) account_id: Option<String>,
     #[arg(long, default_value = "./confidential-agent-init")]
     pub(crate) output_dir: PathBuf,
     #[arg(long)]
@@ -235,10 +262,8 @@ pub(crate) struct InitArgs {
     pub(crate) instance_type: Option<String>,
     #[arg(long)]
     pub(crate) disk_gb: Option<u32>,
-    /// Number of replicas to deploy. For vllm-inference, replicas > 1 enables
-    /// multi-node behind an ALB with OHTTP-encrypted connect (the slb_type and
-    /// connect encryption are fixed for that scenario); replicas == 1 is a
-    /// single-node deploy.
+    /// Number of replicas in one load-balanced service. Staged gateway deployments
+    /// use NLB; vllm-inference uses ALB + OHTTP. CLI instances use separate service IDs.
     #[arg(long, default_value_t = 1)]
     pub(crate) replicas: u32,
     #[arg(long, value_enum)]

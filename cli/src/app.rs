@@ -1,7 +1,7 @@
 use crate::cli::{
     A2aArgs, A2aCommands, BuildArgs, Cli, Commands, ConnectArgs, ConnectCommands, ConnectStartArgs,
     ConnectStopArgs, DeployArgs, DestroyArgs, DocsArgs, DocsTopic, ImageArgs, ImageCommands,
-    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitReferenceValues,
+    ImagePruneArgs, ImagePublishArgs, ImageUnpublishArgs, InitArgs, InitReferenceValues, InitStage,
     InitTarget, InjectArgs, KeyArgs, KeyCommands, MeshArgs, MeshCommands, MigrateArgs,
     OutputFormat, PeeringArgs, PeeringCommands, ReportArgs, SpecArgs, SpecCommands, SshArgs,
     StatusArgs, TrusteeArgs, TrusteeCommands, TuiArgs, UpgradeArgs, UpgradeCommands,

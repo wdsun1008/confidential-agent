@@ -35,17 +35,29 @@ rpm -q cagent shelter attestation-challenge-client libtdx-verify trusted-network
 
 RPM 安装 CLI、Guest 构建资产和示例，并自动解析原生验证工具的依赖。
 不需要在这台机器安装 Rust/Cargo、克隆源码或编译 CA。
+分阶段模板为只读基础镜像之外的加密可写层预留磁盘空间；Hermes 默认使用 60 GB 部署盘。
+发布使用工作区持久化的独立 OSS 命名，已有发布记录继续保留其原 bucket 和对象位置。
 目前 Shelter RPM 仍携带构建依赖，因此这也是可用于构建镜像的安装环境。
 
-将模板复制到可写工作目录，保留示例间的相对引用：
+初始化向导可直接读取 RPM 内的模板，无需源码目录：
 
 ```bash
-mkdir -p ~/cagent-work
-cp -a /usr/share/cagent/examples /usr/share/cagent/common /usr/share/cagent/software-versions.json ~/cagent-work/
-cd ~/cagent-work
 export PATH=/usr/libexec/cagent/bin:$PATH
 aliyun configure
+cagent init
 ```
+
+先选择构建或部署，再选择模板。也可以显式生成共享镜像构建目录：
+
+```bash
+cagent init allinone --stage build --non-interactive --output-dir ~/cagent-work
+cd ~/cagent-work/allinone-builder
+```
+
+生成目录包含 `build.yaml`、完整构建脚本及 `NEXT_STEPS.md`。构建阶段不要求模型 API key。
+`all-in-one` 是 `allinone` 的别名。OpenClaw、Hermes、Codex、Claude Code、
+OpenClaw-vLLM 和 vLLM inference 同样支持 `--stage build/deploy`。
+旧的显式目标命令（例如不带 `--stage` 的 `init hermes`）仍保留原来的合并模板行为。
 
 CA 的发布和云部署会读取宿主机的 AK/StsToken profile；也可使用
 AccessKey 环境变量。凭证优先级和命名 profile 见
@@ -56,8 +68,8 @@ AccessKey 环境变量。凭证优先级和命名 profile 见
 按目标地域检查 `examples/allinone/build.yaml`，然后执行：
 
 ```bash
-cagent build --spec examples/allinone/build.yaml
-cagent image publish allinone-builder --spec examples/allinone/build.yaml
+cagent build --spec build.yaml
+cagent image publish allinone-builder --spec build.yaml
 openssl genpkey -algorithm ED25519 -out publisher.key
 openssl pkey -in publisher.key -pubout -out publisher.pem
 cagent image export allinone-builder --account-id ACCOUNT_ID \
@@ -70,11 +82,33 @@ cagent image export allinone-builder --account-id ACCOUNT_ID \
 
 ## 部署和对话
 
-复制并修改 `examples/allinone/instance.yaml`：使用新的 service ID，
-填写 release、公钥、manifest digest、账号和实例规格。按照
-[harness 原生配置说明](../examples/allinone/README.md#image-configuration)
-准备 `runtime.json` 与该 harness 的模型凭证资源。例如选择 OpenClaw
-gateway 时，同时声明 18789 应用端口；选择 CLI harness 时保留空端口列表。
+使用已发布的 release 为每个独立实例生成部署目录。通过交互向导填写信任信息、
+harness、运行模式、模型和凭证，或使用参数：
+
+```bash
+# 在模型 API key 已通过 DASHSCOPE_API_KEY 设置的环境中执行。
+cagent init allinone --stage deploy --non-interactive \
+  --service-id hermes-01 --harness hermes --harness-mode gateway \
+  --image-release ./image-release.json --trusted-key ./publisher.pem \
+  --manifest sha256:FULL_MANIFEST_DIGEST --account-id ACCOUNT_ID \
+  --reference-values sample --output-dir ~/cagent-work
+cd ~/cagent-work/hermes-01
+```
+
+部署目录只包含 `instance.yaml`、release、公钥、私有配置及后续步骤，不包含构建输入。
+签名和镜像兼容性会在 deploy 创建云资源前验证。
+再次 init 时换 `--service-id`，可复用相同镜像创建同种或不同 harness 的实例。
+allinone 支持 OpenClaw、Hermes、Codex、Claude Code、QoderCLI、OpenCode；
+Qoder 使用自己的账户登录流程，不把 DashScope key 当成 Qoder 凭证。
+模型、凭证使用生成的私有资源，不写入共享镜像。
+
+`--replicas N` 表示一个服务的副本，共享服务配置与身份；gateway/app-server 默认使用 NLB，
+vLLM inference 保持 ALB + OHTTP。CLI 模式应使用不同的 service ID 创建独立实例。副本不会自动同步应用文件或会话历史。
+同时运行的不同 harness 使用不同服务 ID。同一 all-in-one 实例在 CLI harness 之间切换时，
+可以保持 service ID、release 和基础设施设置不变，使用新的输出目录生成部署配置，
+再运行 `cagent inject --spec 新配置/instance.yaml --target-ip 实例IP`；实例及其数据保留。
+切换监听端口或负载均衡拓扑时，创建新的部署。多条本地连接使用不同 `--ready-json`，实际本地端口读取
+ready 文件的 `client_endpoints`，避免假设所有连接都能占用相同端口。
 
 ```bash
 cagent peering add --role operator --cidr DEPLOYER_PUBLIC_IP/32 --label deployer
@@ -102,3 +136,7 @@ cagent destroy SERVICE
 
 销毁消费者不会删除共享云镜像。发布者确认无消费者依赖后，使用
 `image unpublish` 退役镜像；导出过的镜像需要显式 `--force`。
+
+`status --live` 汇总副本就绪状态；`report --json` 的 `replicas` 数组包含各物理实例的证明和
+管理状态，查询直接访问已记录的实例地址。负载均衡地址仅用于应用流量。只要有副本收集失败，
+报告不会把整个服务视为证明收集成功；兼容字段中的 EAR 是首个实例的证明，逐副本检查使用 `replicas`。

@@ -435,18 +435,33 @@ pub(super) fn active_peer_public_cidrs(
         .iter()
         .filter(|service| service.service_id != service_id && service.phase == "active")
     {
-        let public_ip = service
-            .deploy
-            .public_ip
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "active peer service '{}' has no public_ip for public mesh SG",
-                    service.service_id
-                )
-            })?;
-        cidrs.insert(format!("{public_ip}/32"));
+        // A service's public_ip can be its load-balancer DNS name. Firewall
+        // source rules describe the physical guests, never the application VIP.
+        let addresses = if service.deploy.instance_public_ips.is_empty() {
+            service
+                .deploy
+                .public_ip
+                .as_deref()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            service
+                .deploy
+                .instance_public_ips
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        anyhow::ensure!(
+            !addresses.is_empty(),
+            "active peer service '{}' has no instance public IPs for public mesh SG",
+            service.service_id
+        );
+        for address in addresses {
+            let ip = address.trim().parse::<Ipv4Addr>().with_context(|| format!(
+                "active peer service '{}' requires recorded instance IPv4 addresses for public mesh SG, not its load-balancer address", service.service_id))?;
+            cidrs.insert(format!("{ip}/32"));
+        }
     }
     Ok(cidrs.into_iter().collect())
 }
@@ -1948,6 +1963,29 @@ mod tests {
         let states = vec![alpha, beta];
         let cidrs = active_peer_public_cidrs("alpha", &states).unwrap();
         assert_eq!(cidrs, vec!["5.6.7.8/32"]);
+    }
+
+    #[test]
+    fn peer_firewalls_use_all_replica_sources_instead_of_the_service_vip() {
+        for vip in ["nlb.example.invalid", "198.51.100.200"] {
+            let mut beta = test_service_state("beta", "active", vec![], vec![]);
+            beta.deploy.public_ip = Some(vip.into());
+            beta.deploy.instance_public_ips = vec![
+                "192.0.2.11".into(),
+                "192.0.2.12".into(),
+                "192.0.2.11".into(),
+            ];
+            assert_eq!(
+                active_peer_public_cidrs("alpha", &[beta]).unwrap(),
+                vec!["192.0.2.11/32", "192.0.2.12/32"]
+            );
+        }
+        let mut legacy = test_service_state("beta", "active", vec![], vec![]);
+        legacy.deploy.public_ip = Some("nlb.example.invalid".into());
+        assert!(active_peer_public_cidrs("alpha", &[legacy])
+            .unwrap_err()
+            .to_string()
+            .contains("instance IPv4"));
     }
 
     #[test]

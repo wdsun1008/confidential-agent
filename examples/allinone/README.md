@@ -10,6 +10,26 @@ the writable delta. CA continues to verify TDX evidence and release keys and
 resources through challenge or Trustee. This example uses challenge/sample;
 Rekor and Trustee require their usual operator configuration.
 
+## Initialize from the installed RPM
+
+Run `cagent init` for the interactive build/deploy wizard, or:
+
+```bash
+cagent init allinone --stage build --non-interactive
+cd confidential-agent-init/allinone-builder
+```
+
+The generated directory is self-contained and includes `NEXT_STEPS.md` for
+building, publishing and exporting a signed release. No model credentials are
+needed for image initialization. Software versions stay in runtime-contract.json.
+
+For each consumer, run `cagent init allinone --stage deploy`: choose a unique
+service ID, the signed release and trusted publisher key, expected digest and
+account, then a harness and mode. Use the same release for multiple independent
+services, including different harnesses. Initialization does not create cloud
+resources. Generated consumer projects have no build inputs.
+See [RPM walkthrough](../../docs/rpm.md) for the non-interactive commands.
+
 ## Use a prebuilt image
 
 Obtain the signed release and an independently trusted publisher public key.

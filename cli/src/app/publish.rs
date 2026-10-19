@@ -15,12 +15,28 @@ fn publish_key(region: &str, variant: &str, build_id: &str, source_sha256: &str)
     )
 }
 
-fn publish_bucket_name(region: &str, state_dir: &Path) -> String {
-    let abs = absolute_path_for_state(state_dir);
-    let mut hasher = Sha256::new();
-    hasher.update(abs.to_string_lossy().as_bytes());
-    let hash = hex_encode(&hasher.finalize());
-    format!("ca-images-{region}-{}", &hash[..10])
+fn publish_bucket_name(region: &str, state_dir: &Path) -> Result<String> {
+    let root = absolute_path_for_state(state_dir);
+    let _lock = lock_operation_file(&root.join("publication-namespace.lock"))?;
+    let path = root.join("publication-namespace.json");
+    // OSS names are global. A filesystem path (often identical on every host)
+    // is not a workspace identity. Persist a random namespace so moving a
+    // workspace keeps its bucket while a clean host gets an independent name.
+    let namespace: String = if path.exists() {
+        serde_json::from_slice(&fs::read(&path)?).context("invalid publication namespace")?
+    } else {
+        let mut bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        let value = hex_encode(&bytes);
+        write_json_atomic(&path, &value)?;
+        value
+    };
+    anyhow::ensure!(
+        namespace.len() == 32 && namespace.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid publication namespace; restore the workspace metadata"
+    );
+    let hash = hex_encode(&Sha256::digest(namespace.as_bytes()));
+    Ok(format!("ca-images-{region}-{}", &hash[..20]))
 }
 
 fn publish_object_key(
@@ -711,8 +727,15 @@ fn publish_variant_image_with_ops(
     source_size: u64,
     wait: bool,
 ) -> Result<PublishedImage> {
-    let bucket = publish_bucket_name(region, &cli.state_dir);
-    let object_key = publish_object_key(service_id, variant, build_id, source_sha256);
+    // Existing uploads/imports retain their exact object custody across upgrades.
+    let previous = state.build.published.get(key);
+    let bucket = match previous.and_then(|entry| entry.bucket.clone()) {
+        Some(bucket) => bucket,
+        None => publish_bucket_name(region, &cli.state_dir)?,
+    };
+    let object_key = previous
+        .and_then(|entry| entry.object_key.clone())
+        .unwrap_or_else(|| publish_object_key(service_id, variant, build_id, source_sha256));
     let image_name = publish_image_name(service_id, variant, build_id, source_sha256);
     let mut entry = state.build.published.get(key).cloned().unwrap_or_else(|| {
         published_base_entry(PublishEntrySeed {
@@ -1347,12 +1370,33 @@ mod tests {
     }
 
     #[test]
-    fn publish_bucket_name_is_deterministic() {
-        let first = publish_bucket_name("cn-beijing", Path::new("/state"));
-        let second = publish_bucket_name("cn-beijing", Path::new("/state"));
-        assert_eq!(first, second);
+    fn publication_namespace_survives_move_but_not_a_new_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("state");
+        let moved = temp.path().join("moved");
+        let first = publish_bucket_name("cn-beijing", &original).unwrap();
+        assert_eq!(first, publish_bucket_name("cn-beijing", &original).unwrap());
+        fs::rename(&original, &moved).unwrap();
+        assert_eq!(first, publish_bucket_name("cn-beijing", &moved).unwrap());
+        assert_ne!(first, publish_bucket_name("cn-beijing", &original).unwrap());
         assert!(first.starts_with("ca-images-cn-beijing-"));
         assert!(first.len() <= 63);
+    }
+
+    #[test]
+    fn concurrent_publishers_share_one_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let threads = (0..4)
+            .map(|_| {
+                let root = temp.path().to_path_buf();
+                std::thread::spawn(move || publish_bucket_name("cn-beijing", &root).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let names = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), 1);
     }
 
     #[test]
@@ -1595,7 +1639,11 @@ mod tests {
         prior.image_id = None;
         prior.import_task_id = None;
         prior.oss_cleaned = true;
+        prior.bucket = Some("legacy-publisher-bucket".into());
+        prior.object_key = Some("legacy/image.qcow2".into());
         state.build.published.insert(key.clone(), prior);
+        // A resumed publication must not allocate a new namespace or object path.
+        fs::write(temp.path().join("publication-namespace.json"), "invalid").unwrap();
         let ops = FakePublishCloudOps {
             upload_error: Some("upload failed".to_string()),
             ..FakePublishCloudOps::default()
@@ -1618,6 +1666,13 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("upload failed"));
+        assert_eq!(
+            *ops.upload_targets.borrow(),
+            vec![(
+                "legacy-publisher-bucket".into(),
+                "legacy/image.qcow2".into()
+            )]
+        );
         let written =
             read_service_state_file(&context_paths(temp.path(), "openclaw").service_state)
                 .unwrap()
@@ -2293,6 +2348,7 @@ mod tests {
 
     struct FakePublishCloudOps {
         calls: RefCell<Vec<String>>,
+        upload_targets: RefCell<Vec<(String, String)>>,
         existing_image: RefCell<Option<String>>,
         statuses: RefCell<VecDeque<Option<String>>>,
         describe_errors: RefCell<VecDeque<String>>,
@@ -2308,6 +2364,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 calls: RefCell::new(Vec::new()),
+                upload_targets: RefCell::new(Vec::new()),
                 existing_image: RefCell::new(None),
                 statuses: RefCell::new(VecDeque::new()),
                 describe_errors: RefCell::new(VecDeque::new()),
@@ -2389,6 +2446,9 @@ mod tests {
             _region: &str,
         ) -> Result<()> {
             self.record("upload");
+            self.upload_targets
+                .borrow_mut()
+                .push((_bucket.into(), _object_key.into()));
             if let Some(err) = &self.upload_error {
                 bail!("{err}");
             }

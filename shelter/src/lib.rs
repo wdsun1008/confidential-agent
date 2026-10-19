@@ -284,7 +284,7 @@ fn render_deploy_config(spec: &AgentSpec, options: &ShelterRenderOptions) -> She
             enabled: slb.enabled,
             slb_type: slb.slb_type,
             ports: spec.service.connect.iter().map(|p| p.port()).collect(),
-            allowed_cidrs: options.peerings.cidrs_for_scope(PeeringScope::Connect),
+            allowed_cidrs: connect_peer_cidrs(options),
         }),
         deployer_cidr: options.deployer_cidr.clone(),
     }
@@ -375,7 +375,7 @@ fn security_group_rules(
     }
     for cp in &spec.service.connect {
         let port = cp.port();
-        for cidr in options.peerings.cidrs_for_scope(PeeringScope::Connect) {
+        for cidr in connect_peer_cidrs(options) {
             rules.push(ShelterDeploySecurityGroupRule::ingress(
                 format!(
                     "connect_{port}_peer_{}",
@@ -403,6 +403,20 @@ fn security_group_rules(
         }
     }
     rules
+}
+
+fn connect_peer_cidrs(options: &ShelterRenderOptions) -> Vec<String> {
+    // Managed guests receive routes to peer connect endpoints in their service
+    // directory. Admit those exact managed-peer addresses at both the workload
+    // and load balancer. Explicit mesh-only peerings keep their scoped access.
+    options
+        .peerings
+        .cidrs_for_scope(PeeringScope::Connect)
+        .into_iter()
+        .chain(options.mesh_peer_cidrs.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn sanitize_rule_name_component(value: &str) -> String {

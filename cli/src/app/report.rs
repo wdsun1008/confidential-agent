@@ -1,3 +1,4 @@
+use super::commands::{aggregate_replica_status, collect_replica_status};
 use super::*;
 
 const TRUSTIFLUX_PORT: u16 = 8006;
@@ -32,6 +33,23 @@ struct ServiceReport {
     rekor: Option<RekorReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon: Option<DaemonReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replicas: Vec<ReplicaReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicaReport {
+    instance_id: Option<String>,
+    address: String,
+    attestation: AttestationEarReport,
+    daemon: Option<DaemonReport>,
+}
+
+struct RuntimeReports {
+    replicas: Vec<ReplicaReport>,
+    attestation: Option<AttestationEarReport>,
+    daemon: Option<DaemonReport>,
+    errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +75,7 @@ struct TeeInfoReport {
     version: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AttestationEarReport {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +224,7 @@ fn collect_service_report(
             attestation: None,
             rekor: None,
             daemon: None,
+            replicas: Vec::new(),
         };
     }
 
@@ -213,51 +232,13 @@ fn collect_service_report(
 
     let build = collect_build_report(state_dir, state, &mut errors);
 
-    let public_ip = state
-        .deploy
-        .public_ip
-        .as_deref()
-        .filter(|ip| !ip.trim().is_empty());
-
     let tee_info = Some(tee_info_from_state(state));
-
-    let attestation = match public_ip {
-        Some(ip) => match fetch_ear_token(verifier, ip, &state.deploy.tee) {
-            Ok(ear) => Some(ear),
-            Err(err) => {
-                errors.push(format!("attestation: {err:#}"));
-                Some(AttestationEarReport {
-                    status: "error".to_string(),
-                    ear_jwt: None,
-                    ear_claims: None,
-                })
-            }
-        },
-        None => None,
-    };
-
-    let daemon = match public_ip {
-        Some(ip) => {
-            match fetch_daemon_status_from(ip, DAEMON_STATUS_PORT, Duration::from_secs(5)) {
-                Ok(status) => Some(daemon_report_from_status(&status)),
-                Err(err) => {
-                    errors.push(format!("daemon: {err:#}"));
-                    Some(DaemonReport {
-                        status: "error".to_string(),
-                        phase: None,
-                        bootstrap_generation: None,
-                        mesh_generation: None,
-                        mesh_ready: None,
-                        app_ready: None,
-                        debug_ssh_ready: None,
-                        applied_resources: BTreeMap::new(),
-                        a2a_peers: BTreeMap::new(),
-                    })
-                }
-            }
-        }
-        None => None,
-    };
+    let runtime = collect_runtime_reports(
+        state,
+        |ip| fetch_ear_token(verifier, ip, &state.deploy.tee),
+        |ip| fetch_daemon_status_from(ip, DAEMON_STATUS_PORT, Duration::from_secs(5)),
+    );
+    errors.extend(runtime.errors);
 
     let rekor = if state.reference_values == "rekor" {
         Some(collect_rekor_report(state_dir, state, &mut errors))
@@ -281,9 +262,93 @@ fn collect_service_report(
         collect_errors: errors,
         build: Some(build),
         tee_info,
-        attestation,
+        attestation: runtime.attestation,
         rekor,
+        daemon: runtime.daemon,
+        replicas: runtime.replicas,
+    }
+}
+
+fn collect_runtime_reports(
+    state: &LocalServiceState,
+    mut attest: impl FnMut(&str) -> Result<AttestationEarReport>,
+    mut fetch: impl FnMut(&str) -> Result<DaemonStatus>,
+) -> RuntimeReports {
+    // Load balancers only expose application traffic, not attestation/status.
+    let nodes = collect_replica_status(state, |address| {
+        let daemon = fetch(address)?;
+        anyhow::ensure!(
+            daemon.service_id == state.service_id,
+            "daemon service identity mismatch"
+        );
+        Ok(daemon)
+    });
+    let (aggregate, daemon_error) = aggregate_replica_status(&nodes);
+    let mut errors = Vec::new();
+    if let Some(error) = daemon_error {
+        errors.push(format!("daemon: {error}"));
+    }
+    let mut daemon = Some(
+        aggregate
+            .as_ref()
+            .map(daemon_report_from_status)
+            .unwrap_or_else(|| DaemonReport {
+                status: "error".into(),
+                phase: None,
+                bootstrap_generation: None,
+                mesh_generation: None,
+                mesh_ready: None,
+                app_ready: None,
+                debug_ssh_ready: None,
+                applied_resources: BTreeMap::new(),
+                a2a_peers: BTreeMap::new(),
+            }),
+    );
+    if !errors.is_empty() {
+        if let Some(daemon) = &mut daemon {
+            daemon.status = "error".into();
+        }
+    }
+    let replicas = nodes
+        .into_iter()
+        .map(|node| {
+            let attestation = match attest(&node.address) {
+                Ok(report) => report,
+                Err(error) => {
+                    errors.push(format!(
+                        "attestation {}: {error:#}",
+                        node.instance_id.as_deref().unwrap_or(&node.address)
+                    ));
+                    AttestationEarReport {
+                        status: "error".into(),
+                        ear_jwt: None,
+                        ear_claims: None,
+                    }
+                }
+            };
+            ReplicaReport {
+                instance_id: node.instance_id,
+                address: node.address,
+                attestation,
+                daemon: node.daemon.as_ref().map(daemon_report_from_status),
+            }
+        })
+        .collect::<Vec<_>>();
+    // Retain the first EAR for existing consumers; per-instance proofs are in
+    // replicas. Never report success if any replica failed collection.
+    let mut attestation = replicas.first().map(|node| node.attestation.clone());
+    if replicas.iter().any(|node| node.attestation.status != "ok") {
+        attestation = Some(AttestationEarReport {
+            status: "error".into(),
+            ear_jwt: None,
+            ear_claims: None,
+        });
+    }
+    RuntimeReports {
+        replicas,
+        attestation,
         daemon,
+        errors,
     }
 }
 
@@ -967,7 +1032,7 @@ fn collect_daemon_a2a_peers(
 ) -> BTreeMap<String, DaemonA2aPeerStatus> {
     let mut result = BTreeMap::new();
     for state in services.iter().filter(|s| s.phase == "active") {
-        let ip = match state.deploy.public_ip.as_deref() {
+        let ip = match state.deploy.preferred_injection_ip() {
             Some(ip) if !ip.trim().is_empty() => ip,
             _ => continue,
         };
@@ -1105,6 +1170,26 @@ fn print_report_human(report: &AttestationReport) {
             "{:<18} {:<9} {:<6} {:<10} {:<10} {:<10} {:<10} {:<12}",
             svc.service_id, svc.phase, tee, hw, ex, cf, fs_val, rekor
         );
+        if svc.replicas.len() > 1 {
+            for replica in &svc.replicas {
+                println!(
+                    "  {} ({}): attestation={} app_ready={} mesh_ready={}",
+                    replica.instance_id.as_deref().unwrap_or("unknown"),
+                    replica.address,
+                    replica.attestation.status,
+                    replica
+                        .daemon
+                        .as_ref()
+                        .and_then(|d| d.app_ready)
+                        .unwrap_or(false),
+                    replica
+                        .daemon
+                        .as_ref()
+                        .and_then(|d| d.mesh_ready)
+                        .unwrap_or(false)
+                );
+            }
+        }
     }
 
     let error_services: Vec<_> = report
@@ -1318,6 +1403,55 @@ mod tests {
             mesh_generation: 0,
             reference_values: "sample".to_string(),
         }
+    }
+
+    #[test]
+    fn reports_every_replica_without_contacting_the_load_balancer() {
+        let mut state = test_service_state("active");
+        state.deploy.public_ip = Some("nlb.example.invalid".into());
+        state.deploy.slb_vip = state.deploy.public_ip.clone();
+        state.deploy.instance_ids = vec!["i-first".into(), "i-second".into()];
+        state.deploy.instance_public_ips = vec!["192.0.2.10".into(), "192.0.2.11".into()];
+        let mut attested = Vec::new();
+        let mut fetched = Vec::new();
+        let runtime = collect_runtime_reports(
+            &state,
+            |ip| {
+                attested.push(ip.to_owned());
+                if ip.ends_with(".11") {
+                    bail!("second replica evidence unavailable");
+                }
+                Ok(AttestationEarReport {
+                    status: "ok".into(),
+                    ear_jwt: Some("test-ear".into()),
+                    ear_claims: None,
+                })
+            },
+            |ip| {
+                fetched.push(ip.to_owned());
+                Ok(DaemonStatus {
+                    schema: "confidential-agent/daemon-status/v1".into(),
+                    service_id: state.service_id.clone(),
+                    phase: "active".into(),
+                    bootstrap_generation: 1,
+                    mesh_generation: 1,
+                    applied_resources: BTreeMap::new(),
+                    mesh_fingerprint: None,
+                    app_ready: !ip.ends_with(".11"),
+                    mesh_ready: true,
+                    debug_ssh_ready: true,
+                    a2a_peers: BTreeMap::new(),
+                    last_error: None,
+                })
+            },
+        );
+        assert_eq!(attested, state.deploy.instance_public_ips);
+        assert_eq!(fetched, state.deploy.instance_public_ips);
+        assert_eq!(runtime.replicas.len(), 2);
+        assert_eq!(runtime.replicas[0].attestation.status, "ok");
+        assert_eq!(runtime.attestation.unwrap().status, "error");
+        assert_eq!(runtime.daemon.unwrap().app_ready, Some(false));
+        assert!(runtime.errors.iter().any(|e| e.contains("i-second")));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use super::*;
 
+mod staged;
+
 #[derive(Debug)]
 struct InitProject {
     target: InitTarget,
@@ -60,6 +62,9 @@ impl VllmBuildVariants {
 }
 
 pub(super) fn cmd_init(cli: &Cli, args: &InitArgs) -> Result<()> {
+    let mut resolved_args = args.clone();
+    staged::resolve_interactive(&mut resolved_args)?;
+    let args = &resolved_args;
     let target = match args.target {
         Some(target) => target,
         None if args.non_interactive => {
@@ -68,16 +73,20 @@ pub(super) fn cmd_init(cli: &Cli, args: &InitArgs) -> Result<()> {
         None => prompt_target()?,
     };
 
+    staged::validate_args(args, target)?;
     let mut project = resolve_project(args, target)?;
     guard_output_dir(&project.dir, args.force)?;
     fs::create_dir_all(&project.dir)
         .with_context(|| format!("failed to create '{}'", project.dir.display()))?;
     set_mode(&project.dir, 0o755)?;
-    if project.reference_values == InitReferenceValues::Rekor {
+    if args.stage == Some(InitStage::Deploy) {
+        project.cosign_key = Some(PathBuf::from("./cosign.key"));
+    } else if project.reference_values == InitReferenceValues::Rekor {
         project.cosign_key = Some(resolve_or_generate_cosign_key(cli, args, &project)?);
     }
 
     match target {
+        InitTarget::Allinone => staged::write_allinone(args, &project)?,
         InitTarget::Openclaw => write_openclaw_project(cli, args, &project)?,
         InitTarget::OpenclawVllm => write_openclaw_vllm_project(cli, args, &project)?,
         InitTarget::Hermes => write_hermes_project(&project, args)?,
@@ -86,13 +95,18 @@ pub(super) fn cmd_init(cli: &Cli, args: &InitArgs) -> Result<()> {
         InitTarget::VllmInference => write_vllm_inference_project(cli, args, &project)?,
     }
 
+    staged::finish(args, &project)?;
     AgentSpec::from_path(&project.spec_path).with_context(|| {
         format!(
             "generated AppSpec '{}' did not parse",
             project.spec_path.display()
         )
     })?;
-    write_next_steps(&project)?;
+    if args.stage.is_some() {
+        staged::write_next_steps(args, &project)?;
+    } else {
+        write_next_steps(&project)?;
+    }
     println!("[ca] init generated {}", project.dir.display());
     println!("[ca] AppSpec: {}", project.spec_path.display());
     println!(
@@ -107,8 +121,12 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
         bail!("init openclaw-vllm does not support --disable-pep because the TDX attestation skill uses cai-pep attest");
     }
     let service_id = target.service_id();
-    let dir = args.output_dir.join(service_id);
-    let spec_path = dir.join(target.spec_name());
+    let dir = args.output_dir.join(staged::project_name(args, target));
+    let spec_path = dir.join(match args.stage {
+        Some(InitStage::Build) => "build.yaml",
+        Some(InitStage::Deploy) => "instance.yaml",
+        None => target.spec_name(),
+    });
     let region = args
         .region
         .clone()
@@ -121,7 +139,9 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
         .instance_type
         .clone()
         .unwrap_or_else(|| default_instance_type(&region, target).to_string());
-    let disk_gb = args.disk_gb.unwrap_or_else(|| default_disk_gb(target));
+    let disk_gb = args
+        .disk_gb
+        .unwrap_or_else(|| staged::default_disk(args, target));
     let reference_values = args
         .reference_values
         .unwrap_or_else(|| default_reference_values(target));
@@ -143,7 +163,11 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
     }
     let (enable_dingtalk, dingtalk_client_id, dingtalk_client_secret) =
         if matches!(target, InitTarget::Openclaw | InitTarget::OpenclawVllm) {
-            resolve_dingtalk_credentials(args)?
+            if args.stage == Some(InitStage::Build) {
+                (false, None, None)
+            } else {
+                resolve_dingtalk_credentials(args)?
+            }
         } else {
             (false, None, None)
         };
@@ -166,18 +190,19 @@ fn resolve_project(args: &InitArgs, target: InitTarget) -> Result<InitProject> {
             8090
         });
     anyhow::ensure!(vllm_port > 0, "--vllm-port must be greater than zero");
-    let (oss_bucket, model_key_file) = if target == InitTarget::VllmInference {
-        (
-            args.oss_bucket
-                .clone()
-                .context("vllm-inference requires --oss-bucket")?,
-            args.model_key_file
-                .clone()
-                .context("vllm-inference requires --model-key-file")?,
-        )
-    } else {
-        (String::new(), PathBuf::new())
-    };
+    let (oss_bucket, model_key_file) =
+        if target == InitTarget::VllmInference && args.stage != Some(InitStage::Build) {
+            (
+                args.oss_bucket
+                    .clone()
+                    .context("vllm-inference requires --oss-bucket")?,
+                args.model_key_file
+                    .clone()
+                    .context("vllm-inference requires --model-key-file")?,
+            )
+        } else {
+            (String::new(), PathBuf::new())
+        };
 
     Ok(InitProject {
         target,
@@ -240,6 +265,11 @@ fn guard_output_dir(dir: &Path, force: bool) -> Result<()> {
 }
 
 fn resolve_dashscope_key(args: &InitArgs, target: InitTarget) -> Result<Option<String>> {
+    if args.stage == Some(InitStage::Build)
+        || (target == InitTarget::Allinone && args.harness.as_deref() == Some("qodercli"))
+    {
+        return Ok(None);
+    }
     if matches!(target, InitTarget::OpenclawVllm | InitTarget::VllmInference) {
         return Ok(None);
     }
@@ -334,7 +364,9 @@ fn resolve_or_generate_cosign_key(
         if !path.exists() {
             bail!("cosign key does not exist: {}", path.display());
         }
-        return Ok(path.clone());
+        return path
+            .canonicalize()
+            .context("failed to resolve cosign key path");
     }
 
     fs::create_dir_all(&project.dir)
@@ -374,6 +406,7 @@ fn prompt_target() -> Result<InitTarget> {
     println!("  4) codex");
     println!("  5) claudecode");
     println!("  6) vllm-inference");
+    println!("  7) allinone (shared image, per-instance harness)");
     loop {
         print!("Target [1]: ");
         std::io::stdout().flush().ok();
@@ -385,7 +418,8 @@ fn prompt_target() -> Result<InitTarget> {
             "4" | "codex" => return Ok(InitTarget::Codex),
             "5" | "claudecode" | "claude-code" => return Ok(InitTarget::Claudecode),
             "6" | "vllm-inference" => return Ok(InitTarget::VllmInference),
-            _ => println!("Enter 1-6 or a target name."),
+            "7" | "allinone" | "all-in-one" => return Ok(InitTarget::Allinone),
+            _ => println!("Enter 1-7 or a target name."),
         }
     }
 }
@@ -429,28 +463,32 @@ fn read_stdin_line() -> Result<String> {
     Ok(value)
 }
 
-fn write_openclaw_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_assets_root()?;
-    copy_dir(
-        &repo.join("examples/openclaw/files"),
-        &project.dir.join("files"),
-    )?;
-    write_openclaw_install_script(
-        &repo.join("examples/openclaw/install-openclaw.sh"),
-        &project.dir.join("install-openclaw.sh"),
-        args,
-        project.disable_pep,
-    )?;
+fn write_openclaw_project(_cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
+    if args.stage != Some(InitStage::Deploy) {
+        let repo = find_assets_root()?;
+        copy_dir(
+            &repo.join("examples/openclaw/files"),
+            &project.dir.join("files"),
+        )?;
+        write_openclaw_install_script(
+            &repo.join("examples/openclaw/install-openclaw.sh"),
+            &project.dir.join("install-openclaw.sh"),
+            args,
+            project.disable_pep,
+        )?;
+    }
     let pep_bin = if project.disable_pep {
         None
     } else {
-        Some(find_cai_pep_binary(cli)?)
+        Some(staged::pep_binary(args)?)
     };
-    let config = openclaw_json(project, false)?;
-    write_secret_file(
-        &project.dir.join("openclaw.json"),
-        &serde_json::to_string_pretty(&config)?,
-    )?;
+    if args.stage != Some(InitStage::Build) {
+        let config = openclaw_json(project, false)?;
+        write_secret_file(
+            &project.dir.join("openclaw.json"),
+            &serde_json::to_string_pretty(&config)?,
+        )?;
+    }
     let spec = openclaw_yaml(project, pep_bin.as_deref())?;
     write_file(&project.spec_path, &spec, 0o644)?;
     Ok(())
@@ -458,229 +496,244 @@ fn write_openclaw_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> 
 
 fn write_vllm_inference_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
     let _ = (cli, args);
-    let repo = find_assets_root()?;
-    // NVIDIA stack reused verbatim from openclaw-vllm
-    for file in [
-        "cai-nvidia-cc-stack-install.sh",
-        "nvidia-persistenced.service",
-    ] {
-        fs::copy(
-            repo.join("examples/openclaw-vllm").join(file),
-            project.dir.join(file),
-        )
-        .with_context(|| format!("failed to copy vllm-inference support file '{file}'"))?;
+    if args.stage != Some(InitStage::Deploy) {
+        let repo = find_assets_root()?;
+        // NVIDIA stack reused verbatim from openclaw-vllm
+        for file in [
+            "cai-nvidia-cc-stack-install.sh",
+            "nvidia-persistenced.service",
+        ] {
+            fs::copy(
+                repo.join("examples/openclaw-vllm").join(file),
+                project.dir.join(file),
+            )
+            .with_context(|| format!("failed to copy vllm-inference support file '{file}'"))?;
+        }
+        set_mode(&project.dir.join("cai-nvidia-cc-stack-install.sh"), 0o755)?;
+
+        write_install_script_with_exports(
+            &repo.join("examples/vllm-inference/install-vllm-inference.sh"),
+            &project.dir.join("install-vllm-inference.sh"),
+            &[("OPENCLAW_VLLM_VERSION", &project.vllm_version)],
+        )?;
     }
-    set_mode(&project.dir.join("cai-nvidia-cc-stack-install.sh"), 0o755)?;
-
-    let vllm_port = project.vllm_port.to_string();
-    write_install_script_with_exports(
-        &repo.join("examples/vllm-inference/install-vllm-inference.sh"),
-        &project.dir.join("install-vllm-inference.sh"),
-        &[("OPENCLAW_VLLM_VERSION", &project.vllm_version)],
-    )?;
-
-    // cai-model.env resource (non-secret: public-read ciphertext bucket)
-    let env = format!(
+    if args.stage != Some(InitStage::Build) {
+        // cai-model.env resource (non-secret: public-read ciphertext bucket)
+        let env = format!(
         "MODEL_OSS_BUCKET={}\nMODEL_OSS_ENDPOINT={}\nMODEL_MOUNT_POINT={}\nVLLM_PORT={}\nVLLM_SERVED_MODEL_NAME={}\n",
         project.oss_bucket,
         project.oss_endpoint,
         project.vllm_model_dir,
-        vllm_port,
+        project.vllm_port,
         project.vllm_served_model_name,
     );
-    write_secret_file(&project.dir.join("cai-model.env"), &env)?;
+        write_secret_file(&project.dir.join("cai-model.env"), &env)?;
 
-    // model-decryption-key resource (secret: copied from operator-provided key file)
-    fs::copy(
-        &project.model_key_file,
-        project.dir.join("model-decryption-key"),
-    )
-    .with_context(|| "failed to copy model-decryption-key")?;
-    set_mode(&project.dir.join("model-decryption-key"), 0o600)?;
-
+        // model-decryption-key resource (secret: copied from operator-provided key file)
+        fs::copy(
+            &project.model_key_file,
+            project.dir.join("model-decryption-key"),
+        )
+        .with_context(|| "failed to copy model-decryption-key")?;
+        set_mode(&project.dir.join("model-decryption-key"), 0o600)?;
+    }
     let spec = vllm_inference_yaml(project)?;
     write_file(&project.spec_path, &spec, 0o644)?;
     Ok(())
 }
 
-fn write_openclaw_vllm_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_assets_root()?;
-    copy_dir(
-        &repo.join("examples/openclaw/files"),
-        &project.dir.join("files"),
-    )?;
-    for file in [
-        "cai-nvidia-cc-stack-install.sh",
-        "nvidia-persistenced.service",
-    ] {
-        fs::copy(
-            repo.join("examples/openclaw-vllm").join(file),
-            project.dir.join(file),
-        )
-        .with_context(|| format!("failed to copy OpenClaw vLLM support file '{file}'"))?;
+fn write_openclaw_vllm_project(_cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
+    if args.stage != Some(InitStage::Deploy) {
+        let repo = find_assets_root()?;
+        copy_dir(
+            &repo.join("examples/openclaw/files"),
+            &project.dir.join("files"),
+        )?;
+        for file in [
+            "cai-nvidia-cc-stack-install.sh",
+            "nvidia-persistenced.service",
+        ] {
+            fs::copy(
+                repo.join("examples/openclaw-vllm").join(file),
+                project.dir.join(file),
+            )
+            .with_context(|| format!("failed to copy OpenClaw vLLM support file '{file}'"))?;
+        }
+        set_mode(&project.dir.join("cai-nvidia-cc-stack-install.sh"), 0o755)?;
+        let vllm_port = project.vllm_port.to_string();
+        write_install_script_with_exports(
+            &repo.join("examples/openclaw-vllm/install-openclaw-vllm.sh"),
+            &project.dir.join("install-openclaw-vllm.sh"),
+            &[
+                ("OPENCLAW_VERSION", &args.openclaw_version),
+                ("OPENCLAW_NODE_VERSION", &args.node_version),
+                ("NPM_REGISTRY", &args.npm_registry),
+                ("OPENCLAW_VLLM_MODEL_ID", &project.vllm_model_id),
+                ("OPENCLAW_VLLM_MODEL_DIR", &project.vllm_model_dir),
+                (
+                    "OPENCLAW_VLLM_SERVED_MODEL_NAME",
+                    &project.vllm_served_model_name,
+                ),
+                ("OPENCLAW_VLLM_PORT", &vllm_port),
+                ("OPENCLAW_VLLM_VERSION", &project.vllm_version),
+            ],
+        )?;
     }
-    set_mode(&project.dir.join("cai-nvidia-cc-stack-install.sh"), 0o755)?;
-    let vllm_port = project.vllm_port.to_string();
-    write_install_script_with_exports(
-        &repo.join("examples/openclaw-vllm/install-openclaw-vllm.sh"),
-        &project.dir.join("install-openclaw-vllm.sh"),
-        &[
-            ("OPENCLAW_VERSION", &args.openclaw_version),
-            ("OPENCLAW_NODE_VERSION", &args.node_version),
-            ("NPM_REGISTRY", &args.npm_registry),
-            ("OPENCLAW_VLLM_MODEL_ID", &project.vllm_model_id),
-            ("OPENCLAW_VLLM_MODEL_DIR", &project.vllm_model_dir),
-            (
-                "OPENCLAW_VLLM_SERVED_MODEL_NAME",
-                &project.vllm_served_model_name,
-            ),
-            ("OPENCLAW_VLLM_PORT", &vllm_port),
-            ("OPENCLAW_VLLM_VERSION", &project.vllm_version),
-        ],
-    )?;
-
-    let config = openclaw_json(project, true)?;
-    write_secret_file(
-        &project.dir.join("openclaw-vllm.json"),
-        &serde_json::to_string_pretty(&config)?,
-    )?;
-    let pep_bin = find_cai_pep_binary(cli)?;
+    if args.stage != Some(InitStage::Build) {
+        let config = openclaw_json(project, true)?;
+        write_secret_file(
+            &project.dir.join("openclaw-vllm.json"),
+            &serde_json::to_string_pretty(&config)?,
+        )?;
+    }
+    let pep_bin = staged::pep_binary(args)?;
     let spec = openclaw_vllm_yaml(project, &pep_bin)?;
     write_file(&project.spec_path, &spec, 0o644)?;
     Ok(())
 }
 
 fn write_hermes_project(project: &InitProject, args: &InitArgs) -> Result<()> {
-    let repo = find_assets_root()?;
-    copy_dir(
-        &repo.join("examples/hermes-agent/files"),
-        &project.dir.join("files"),
-    )?;
-    write_hermes_install_script(
-        &repo.join("examples/hermes-agent/install-hermes-agent.sh"),
-        &project.dir.join("install-hermes-agent.sh"),
-        &args.hermes_branch,
-        args.hermes_commit.as_deref(),
-    )?;
-
-    let secrets = project.dir.join("secrets");
-    fs::create_dir_all(&secrets)
-        .with_context(|| format!("failed to create '{}'", secrets.display()))?;
-    set_mode(&secrets, 0o700)?;
-    let api_key = project
-        .dashscope_key
-        .as_deref()
-        .context("Hermes requires DashScope API key")?;
-    let server_key = args
-        .hermes_api_server_key
-        .clone()
-        .unwrap_or_else(|| random_hex(32));
-    let env = format!(
+    if args.stage != Some(InitStage::Deploy) {
+        let repo = find_assets_root()?;
+        copy_dir(
+            &repo.join("examples/hermes-agent/files"),
+            &project.dir.join("files"),
+        )?;
+        write_hermes_install_script(
+            &repo.join("examples/hermes-agent/install-hermes-agent.sh"),
+            &project.dir.join("install-hermes-agent.sh"),
+            &args.hermes_branch,
+            args.hermes_commit.as_deref(),
+        )?;
+    }
+    if args.stage != Some(InitStage::Build) {
+        let secrets = project.dir.join("secrets");
+        fs::create_dir_all(&secrets)
+            .with_context(|| format!("failed to create '{}'", secrets.display()))?;
+        set_mode(&secrets, 0o700)?;
+        let api_key = project
+            .dashscope_key
+            .as_deref()
+            .context("Hermes requires DashScope API key")?;
+        let server_key = args
+            .hermes_api_server_key
+            .clone()
+            .unwrap_or_else(|| random_hex(32));
+        let env = format!(
         "API_SERVER_ENABLED=true\nAPI_SERVER_HOST=0.0.0.0\nAPI_SERVER_PORT=8642\nAPI_SERVER_KEY={}\nDASHSCOPE_API_KEY={}\nDASHSCOPE_BASE_URL={}\nHERMES_HOME=/opt/data\nHERMES_MODEL={}\n",
         server_key, api_key, project.dashscope_base_url, project.model
     );
-    write_secret_file(&secrets.join("hermes.env"), &env)?;
-    let config = format!(
-        "model:\n  provider: alibaba\n  default: {}\n  model: {}\n",
-        project.model, project.model
-    );
-    write_secret_file(&secrets.join("config.yaml"), &config)?;
+        write_secret_file(&secrets.join("hermes.env"), &env)?;
+        let config = format!(
+            "model:\n  provider: alibaba\n  default: {}\n  model: {}\n",
+            project.model, project.model
+        );
+        write_secret_file(&secrets.join("config.yaml"), &config)?;
+    }
     write_file(&project.spec_path, &hermes_yaml(project)?, 0o644)?;
     Ok(())
 }
 
 fn write_codex_project(args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_assets_root()?;
-    copy_dir(
-        &repo.join("examples/cli-agents/files"),
-        &project.dir.join("files"),
-    )?;
-    let pinned_codex = confidential_agent_core::software::version("codex");
-    let codex_version = args.codex_version.as_deref().unwrap_or(&pinned_codex);
-    write_install_script_with_exports(
-        &repo.join("examples/codex/install-codex.sh"),
-        &project.dir.join("install-codex.sh"),
-        &[
-            ("CLI_AGENT_NODE_VERSION", &args.node_version),
-            ("NPM_REGISTRY", &args.npm_registry),
-            ("CODEX_VERSION", codex_version),
-        ],
-    )?;
-    let pep_bin = find_cai_pep_binary_for_init()?;
-    let secrets = project.dir.join("secrets");
-    fs::create_dir_all(&secrets)
-        .with_context(|| format!("failed to create '{}'", secrets.display()))?;
-    set_mode(&secrets, 0o700)?;
-    let api_key = project
-        .dashscope_key
-        .as_deref()
-        .context("Codex requires DashScope API key")?;
-    let config = format!(
+    if args.stage != Some(InitStage::Deploy) {
+        let repo = find_assets_root()?;
+        copy_dir(
+            &repo.join("examples/cli-agents/files"),
+            &project.dir.join("files"),
+        )?;
+        let pinned_codex = confidential_agent_core::software::version("codex");
+        let codex_version = args.codex_version.as_deref().unwrap_or(&pinned_codex);
+        write_install_script_with_exports(
+            &repo.join("examples/codex/install-codex.sh"),
+            &project.dir.join("install-codex.sh"),
+            &[
+                ("CLI_AGENT_NODE_VERSION", &args.node_version),
+                ("NPM_REGISTRY", &args.npm_registry),
+                ("CODEX_VERSION", codex_version),
+            ],
+        )?;
+    }
+    let pep_bin = staged::pep_binary(args)?;
+    if args.stage != Some(InitStage::Build) {
+        let secrets = project.dir.join("secrets");
+        fs::create_dir_all(&secrets)
+            .with_context(|| format!("failed to create '{}'", secrets.display()))?;
+        set_mode(&secrets, 0o700)?;
+        let api_key = project
+            .dashscope_key
+            .as_deref()
+            .context("Codex requires DashScope API key")?;
+        let config = format!(
         "model_provider = \"Model_Studio\"\nmodel = \"{}\"\n\n[model_providers.Model_Studio]\nname = \"Model_Studio\"\nbase_url = \"{}\"\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\n",
         project.model, project.dashscope_base_url
     );
-    write_secret_file(&secrets.join("config.toml"), &config)?;
-    write_secret_file(
-        &secrets.join("codex.env"),
-        &format!("OPENAI_API_KEY={api_key}\nCODEX_HOME=/root/.codex\n"),
-    )?;
-    let token = args
-        .codex_app_server_token
-        .clone()
-        .unwrap_or_else(|| random_base64(32));
-    write_secret_file(&secrets.join("app-server-token"), &format!("{token}\n"))?;
+        write_secret_file(&secrets.join("config.toml"), &config)?;
+        write_secret_file(
+            &secrets.join("codex.env"),
+            &format!("OPENAI_API_KEY={api_key}\nCODEX_HOME=/root/.codex\n"),
+        )?;
+        let token = args
+            .codex_app_server_token
+            .clone()
+            .unwrap_or_else(|| random_base64(32));
+        write_secret_file(&secrets.join("app-server-token"), &format!("{token}\n"))?;
+    }
     write_file(&project.spec_path, &codex_yaml(project, &pep_bin)?, 0o644)?;
     Ok(())
 }
 
 fn write_claude_code_project(args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_assets_root()?;
-    copy_dir(
-        &repo.join("examples/cli-agents/files"),
-        &project.dir.join("files"),
-    )?;
-    let pinned_claude = confidential_agent_core::software::version("claude-code");
-    let claude_code_version = args
-        .claude_code_version
-        .as_deref()
-        .unwrap_or(&pinned_claude);
-    write_install_script_with_exports(
-        &repo.join("examples/claude-code/install-claude-code.sh"),
-        &project.dir.join("install-claude-code.sh"),
-        &[
-            ("CLI_AGENT_NODE_VERSION", &args.node_version),
-            ("NPM_REGISTRY", &args.npm_registry),
-            ("CLAUDE_CODE_VERSION", claude_code_version),
-        ],
-    )?;
-    let pep_bin = find_cai_pep_binary_for_init()?;
-    let secrets = project.dir.join("secrets");
-    fs::create_dir_all(&secrets)
-        .with_context(|| format!("failed to create '{}'", secrets.display()))?;
-    set_mode(&secrets, 0o700)?;
-    let api_key = project
-        .dashscope_key
-        .as_deref()
-        .context("Claude Code requires DashScope API key")?;
-    let settings = serde_json::json!({
-        "env": {
-            "ANTHROPIC_AUTH_TOKEN": api_key,
-            "ANTHROPIC_BASE_URL": project.dashscope_anthropic_base_url,
-            "ANTHROPIC_MODEL": project.model,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": project.model,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": project.model,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": project.model,
-            "CLAUDE_CODE_SUBAGENT_MODEL": project.model,
-        }
-    });
-    write_secret_file(
-        &secrets.join("settings.json"),
-        &serde_json::to_string_pretty(&settings)?,
-    )?;
-    write_secret_file(
-        &secrets.join("claude.json"),
-        "{\"hasCompletedOnboarding\": true}\n",
-    )?;
+    if args.stage != Some(InitStage::Deploy) {
+        let repo = find_assets_root()?;
+        copy_dir(
+            &repo.join("examples/cli-agents/files"),
+            &project.dir.join("files"),
+        )?;
+        let pinned_claude = confidential_agent_core::software::version("claude-code");
+        let claude_code_version = args
+            .claude_code_version
+            .as_deref()
+            .unwrap_or(&pinned_claude);
+        write_install_script_with_exports(
+            &repo.join("examples/claude-code/install-claude-code.sh"),
+            &project.dir.join("install-claude-code.sh"),
+            &[
+                ("CLI_AGENT_NODE_VERSION", &args.node_version),
+                ("NPM_REGISTRY", &args.npm_registry),
+                ("CLAUDE_CODE_VERSION", claude_code_version),
+            ],
+        )?;
+    }
+    let pep_bin = staged::pep_binary(args)?;
+    if args.stage != Some(InitStage::Build) {
+        let secrets = project.dir.join("secrets");
+        fs::create_dir_all(&secrets)
+            .with_context(|| format!("failed to create '{}'", secrets.display()))?;
+        set_mode(&secrets, 0o700)?;
+        let api_key = project
+            .dashscope_key
+            .as_deref()
+            .context("Claude Code requires DashScope API key")?;
+        let settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": api_key,
+                "ANTHROPIC_BASE_URL": project.dashscope_anthropic_base_url,
+                "ANTHROPIC_MODEL": project.model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": project.model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": project.model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": project.model,
+                "CLAUDE_CODE_SUBAGENT_MODEL": project.model,
+            }
+        });
+        write_secret_file(
+            &secrets.join("settings.json"),
+            &serde_json::to_string_pretty(&settings)?,
+        )?;
+        write_secret_file(
+            &secrets.join("claude.json"),
+            "{\"hasCompletedOnboarding\": true}\n",
+        )?;
+    }
     write_file(
         &project.spec_path,
         &claude_code_yaml(project, &pep_bin)?,
@@ -1463,10 +1516,6 @@ fn find_assets_root() -> Result<PathBuf> {
     bail!("could not locate application templates; install the cagent RPM or run init from a source checkout")
 }
 
-fn find_cai_pep_binary(_cli: &Cli) -> Result<PathBuf> {
-    find_cai_pep_binary_for_init()
-}
-
 fn find_cai_pep_binary_for_init() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CA_PEP_BIN").map(PathBuf::from) {
         return require_executable(path, "CA_PEP_BIN");
@@ -1593,6 +1642,7 @@ fn default_instance_type(region: &str, target: InitTarget) -> &'static str {
 
 fn default_disk_gb(target: InitTarget) -> u32 {
     match target {
+        InitTarget::Allinone => 120,
         InitTarget::Openclaw => 200,
         InitTarget::OpenclawVllm | InitTarget::VllmInference => 512,
         InitTarget::Hermes => 30,
@@ -1602,7 +1652,7 @@ fn default_disk_gb(target: InitTarget) -> u32 {
 
 fn default_reference_values(target: InitTarget) -> InitReferenceValues {
     match target {
-        InitTarget::Hermes => InitReferenceValues::Sample,
+        InitTarget::Allinone | InitTarget::Hermes => InitReferenceValues::Sample,
         _ => InitReferenceValues::Rekor,
     }
 }
@@ -1617,6 +1667,7 @@ fn reference_values_name(value: InitReferenceValues) -> &'static str {
 impl InitTarget {
     fn service_id(self) -> &'static str {
         match self {
+            InitTarget::Allinone => "allinone",
             InitTarget::Openclaw => "openclaw",
             InitTarget::OpenclawVllm => "openclaw-vllm",
             InitTarget::Hermes => "hermes-agent",
@@ -1628,6 +1679,7 @@ impl InitTarget {
 
     fn spec_name(self) -> &'static str {
         match self {
+            InitTarget::Allinone => "build.yaml",
             InitTarget::Openclaw => "openclaw.yaml",
             InitTarget::OpenclawVllm => "openclaw-vllm.yaml",
             InitTarget::Hermes => "hermes-agent.yaml",
@@ -1639,6 +1691,7 @@ impl InitTarget {
 
     fn command_name(self) -> &'static str {
         match self {
+            InitTarget::Allinone => "allinone",
             InitTarget::Openclaw => "openclaw",
             InitTarget::OpenclawVllm => "openclaw-vllm",
             InitTarget::Hermes => "hermes",
@@ -1655,7 +1708,7 @@ mod tests {
     use clap::Parser;
     use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn target_names_match_generated_layout() {
