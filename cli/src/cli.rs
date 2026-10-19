@@ -163,11 +163,11 @@ pub(crate) struct Cli {
 
     #[arg(
         long,
-        env = "CA_TOOLS_IMAGE",
-        default_value = "confidential-agent-tools:latest",
+        env = "CA_TOOLS_DIR",
+        default_value = "/usr/libexec/cagent/bin",
         global = true
     )]
-    pub(crate) tools_image: String,
+    pub(crate) tools_dir: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]

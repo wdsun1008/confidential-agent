@@ -371,7 +371,6 @@ run_case() {
   validate_modes
   require_cmd cargo
   require_cmd curl
-  require_cmd docker
   require_cmd jq
   require_cmd openssl
   require_cmd python3.11

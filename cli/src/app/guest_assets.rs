@@ -58,10 +58,10 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
     fs::write(&fde_config_file, cryptpilot_fde_config())
         .with_context(|| format!("failed to write '{}'", fde_config_file.display()))?;
 
-    let staged_attestation_client = stage_tools_image_asset(
+    let staged_attestation_client = stage_native_tool_asset(
         cli,
         guest_staging_dir,
-        "/usr/bin/attestation-challenge-client",
+        "attestation-challenge-client",
         "attestation-challenge-client",
         0o755,
     )?;
@@ -92,8 +92,7 @@ pub(super) fn prepare_guest_assets(cli: &Cli, guest_staging_dir: &Path) -> Resul
             executable: false,
         });
     }
-    let staged_cosign =
-        stage_tools_image_asset(cli, guest_staging_dir, "/usr/bin/cosign", "cosign", 0o755)?;
+    let staged_cosign = stage_native_tool_asset(cli, guest_staging_dir, "cosign", "cosign", 0o755)?;
     extra_files.push(GuestFileAsset {
         source: staged_cosign,
         destination: "/usr/local/bin/cosign".to_string(),
@@ -122,71 +121,18 @@ pub(super) fn stage_guest_setup_script(guest_staging_dir: &Path) -> Result<PathB
     Ok(staged)
 }
 
-pub(super) fn stage_tools_image_asset(
+pub(super) fn stage_native_tool_asset(
     cli: &Cli,
     guest_staging_dir: &Path,
-    container_path: &str,
+    tool: &str,
     filename: &str,
     mode: u32,
 ) -> Result<PathBuf> {
-    ensure_docker_available()?;
-    ensure_docker_image_available(&cli.tools_image)?;
+    let source = tool_path(&cli.tools_dir, tool)?;
     let staged = guest_staging_dir.join(filename);
-    let output = Command::new("docker")
-        .arg("create")
-        .arg(&cli.tools_image)
-        .output()
-        .with_context(|| "failed to execute 'docker create' for tools image")?;
-    if !output.status.success() {
-        bail!(
-            "docker create for tools image '{}' failed with {}: {}",
-            cli.tools_image,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if container_id.is_empty() {
-        bail!(
-            "docker create for tools image '{}' returned empty container id",
-            cli.tools_image
-        );
-    }
-
-    let copy_result = Command::new("docker")
-        .arg("cp")
-        .arg(format!("{container_id}:{container_path}"))
-        .arg(&staged)
-        .status();
-    let _ = Command::new("docker")
-        .arg("rm")
-        .arg("-f")
-        .arg(&container_id)
-        .status();
-    let copy_result = copy_result
-        .with_context(|| format!("failed to execute 'docker cp' for {container_path}"))?;
-    if !copy_result.success() {
-        bail!(
-            "failed to copy '{}' from tools image '{}'",
-            container_path,
-            cli.tools_image
-        );
-    }
+    fs::copy(&source, &staged).with_context(|| format!("failed to stage native tool '{tool}'"))?;
     set_mode(&staged, mode)?;
     Ok(staged)
-}
-
-pub(super) fn ensure_docker_available() -> Result<()> {
-    let status = Command::new("docker")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("docker command is required to run Confidential Agent tools image")?;
-    if !status.success() {
-        bail!("docker command is required to run Confidential Agent tools image");
-    }
-    Ok(())
 }
 
 pub(super) fn find_agentd_binary() -> Result<PathBuf> {

@@ -15,7 +15,6 @@ base64.workspace = true
 clap.workspace = true
 confidential-agent-core = { path = "../core" }
 confidential-agent-shelter = { path = "../shelter" }
-ctrlc.workspace = true
 crossterm.workspace = true
 curve25519-dalek.workspace = true
 ed25519-dalek.workspace = true

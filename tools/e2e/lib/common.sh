@@ -2,6 +2,7 @@
 
 : "${ROOT_DIR:?ROOT_DIR must be set before sourcing common.sh}"
 source "$ROOT_DIR/common/software-versions.sh"
+export PATH="${CA_TOOLS_DIR:-/usr/libexec/cagent/bin}:$PATH"
 # The normal Shelter RPM keeps its Terraform CLI alongside its other tools.
 if [[ -x /usr/libexec/shelter/bin/terraform ]]; then
   export PATH="$PATH:/usr/libexec/shelter/bin"
@@ -9,7 +10,7 @@ fi
 
 E2E_RUN_ID="${E2E_RUN_ID:-$(date +%Y%m%d%H%M%S)-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')}"
 CA_BIN="${CA_BIN:-$ROOT_DIR/target/debug/confidential-agent}"
-TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
+TOOLS_DIR="${CA_TOOLS_DIR:-/usr/libexec/cagent/bin}"
 REFERENCE_VALUES="${E2E_REFERENCE_VALUES:-rekor}"
 REGION="${E2E_REGION:-cn-beijing}"
 
@@ -224,7 +225,7 @@ init_step_log() {
     printf '# %s\n\n' "$title"
     printf '%s\n' "- work_dir: \`$WORK_DIR\`"
     printf '%s\n' "- state_dir: \`${STATE_DIR:-multi-state}\`"
-    printf '%s\n' "- tools_image: \`$TOOLS_IMAGE\`"
+    printf '%s\n' "- tools_dir: \`$TOOLS_DIR\`"
     printf '%s\n' "- reference_values: \`$REFERENCE_VALUES\`"
     printf '%s\n' "- region: \`$REGION\`"
     printf '%s\n' "- zone_id: \`$ZONE_ID\`"
@@ -368,7 +369,7 @@ PYRESULT
 ca_args() {
   local state_dir="$1"
   shift
-  printf '%s\0' "$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@"
+  printf '%s\0' "$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$state_dir" "$@"
 }
 
 # Keep only resource identifiers, never the secret-bearing Terraform state.
@@ -414,7 +415,7 @@ ca_run() {
   if [[ "${1:-}" == "destroy" && -n "${2:-}" ]]; then
     record_destroy_ledger "$state_dir" "$2" || return
   fi
-  local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
+  local cmd=("$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
   E2E_WORK_DIR="$WORK_DIR" python3.11 "$ROOT_DIR/tools/e2e/command_runner.py" "${1:-command}" -- "${cmd[@]}"
 }
@@ -424,7 +425,7 @@ ca_capture() {
   local stdout_path="$2"
   local stderr_path="$3"
   shift 3
-  local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" "$@")
+  local cmd=("$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$state_dir" "$@")
   record_cmd "$(cmd_string "${cmd[@]}")"
   E2E_WORK_DIR="$WORK_DIR" python3.11 "$ROOT_DIR/tools/e2e/command_runner.py" "${1:-command}" -- "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"
 }
@@ -455,7 +456,7 @@ ca_init_capture() {
   local stdout_path="$2"
   local stderr_path="$3"
   shift 3
-  local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" init "$@")
+  local cmd=("$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$state_dir" init "$@")
   record_cmd "$(redacted_cmd_string "${cmd[@]}")"
   "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"
 }
@@ -593,7 +594,7 @@ resolve_cosign_key() {
   if [[ ! -f "$prefix.key" ]]; then
     local tool_state="$WORK_DIR/tools-state"
     mkdir -p "$tool_state"
-    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$tool_state" key generate-cosign --output-key-prefix "$prefix")
+    local cmd=("$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$tool_state" key generate-cosign --output-key-prefix "$prefix")
     record_cmd "$(cmd_string "${cmd[@]}")"
     "${cmd[@]}" >/dev/null
   fi
@@ -942,23 +943,8 @@ PY
 cleanup_connect_ready() {
   local ready_json="$1"
   [[ -n "$ready_json" && -f "$ready_json" ]] || return 0
-  "$CA_BIN" --tools-image "$TOOLS_IMAGE" connect stop --ready-json "$ready_json" >/dev/null 2>&1 || true
-  python3.11 - "$ready_json" <<'PY' | while IFS= read -r container; do
-import json
-import sys
+  "$CA_BIN" --tools-dir "$TOOLS_DIR" connect stop --ready-json "$ready_json" >/dev/null 2>&1 || true
 
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        ready = json.load(f)
-except Exception:
-    raise SystemExit(0)
-for key in ("container_name", "container_id"):
-    value = str(ready.get(key) or "").strip()
-    if value:
-        print(value)
-PY
-    podman rm -f "$container" >/dev/null 2>&1 || docker rm -f "$container" >/dev/null 2>&1 || true
-  done
 }
 
 cleanup_connect_pid() {
@@ -969,17 +955,21 @@ cleanup_connect_pid() {
 }
 
 capture_connect_diagnostics() {
-  local ready_json="$1" output="$2" container
-  container="$(python3.11 - "$ready_json" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    ready = json.load(f)
-print(ready.get("container_name") or ready.get("container_id") or "")
-PY
-)"
-  [[ -n "$container" ]] || return 0
-  (umask 077; docker logs --tail 200 "$container" >"$output" 2>&1 ||
-    podman logs --tail 200 "$container" >"$output" 2>&1) || true
+  local ready_json="$1" output="$2"
+  python3.11 - "$ready_json" "$output" <<'PYLOG'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[2])
+try:
+    ready = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    log = pathlib.Path(ready["log_file"])
+    with log.open("rb") as stream:
+        stream.seek(max(0, log.stat().st_size - 65536))
+        text = stream.read().decode(errors="replace")
+except (OSError, ValueError, KeyError):
+    text = "Native tunnel diagnostics unavailable"
+out.write_text(text)
+out.chmod(0o600)
+PYLOG
   python3.11 - "$output" <<'PY'
 import pathlib, re, sys
 p = pathlib.Path(sys.argv[1])
@@ -989,7 +979,7 @@ text = re.sub(r"eyJ[A-Za-z0-9_.-]+", "[redacted JWT]", text)
 p.write_text(text)
 p.chmod(0o600)
 PY
-  record_file_as_block "Connect container diagnostics:" "$output" text
+  record_file_as_block "Connect process diagnostics:" "$output" text
 }
 
 start_connect_until_http_ready() {
@@ -1010,7 +1000,7 @@ start_connect_until_http_ready() {
     local stdout_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stdout"
     local stderr_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stderr"
     local ready_json="$WORK_DIR/$path_prefix-connect-attempt-$attempt-ready.json"
-    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" connect start "${extra_args[@]}" --ready-json "$ready_json" --wait-ready "$wait_seconds" --log-file "$log_path")
+    local cmd=("$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$state_dir" connect start "${extra_args[@]}" --ready-json "$ready_json" --wait-ready "$wait_seconds" --log-file "$log_path")
     record_cmd "$(cmd_string "${cmd[@]}")"
     if ! "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"; then
       record_file_as_block "$path_prefix connect start stdout:" "$stdout_path" text
@@ -1041,7 +1031,7 @@ start_connect_until_http_ready() {
       sleep 1
     done
     record_file_as_block "$path_prefix HTTP readiness stderr:" "$http_error" text
-    capture_connect_diagnostics "$ready_json" "$WORK_DIR/$path_prefix-connect-attempt-$attempt-container.log"
+    capture_connect_diagnostics "$ready_json" "$WORK_DIR/$path_prefix-connect-attempt-$attempt-process.log"
     cleanup_connect_ready "$ready_json"
     if ((attempt < attempts)); then sleep 10; fi
   done
@@ -1062,7 +1052,7 @@ start_connect_until_local_port_ready() {
     local stdout_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stdout"
     local stderr_path="$WORK_DIR/$path_prefix-connect-attempt-$attempt.stderr"
     local ready_json="$WORK_DIR/$path_prefix-connect-attempt-$attempt-ready.json"
-    local cmd=("$CA_BIN" "--tools-image" "$TOOLS_IMAGE" "--state-dir" "$state_dir" connect start "${extra_args[@]}" --ready-json "$ready_json" --wait-ready "$wait_seconds" --log-file "$log_path")
+    local cmd=("$CA_BIN" "--tools-dir" "$TOOLS_DIR" "--state-dir" "$state_dir" connect start "${extra_args[@]}" --ready-json "$ready_json" --wait-ready "$wait_seconds" --log-file "$log_path")
     record_cmd "$(cmd_string "${cmd[@]}")"
     if ! "${cmd[@]}" >"$stdout_path" 2>"$stderr_path"; then
       record_file_as_block "$path_prefix connect start stdout:" "$stdout_path" text

@@ -59,7 +59,7 @@ sequenceDiagram
     participant CLI as confidential-agent
     participant Core as core::AgentSpec
     participant SH as shelter::render_build_config
-    participant Docker as docker
+    participant Tools as native tools
     participant SHB as shelter (binary)
     participant FS as state-dir
 
@@ -68,7 +68,7 @@ sequenceDiagram
     Core-->>CLI: spec (validated)
     CLI->>FS: lock state-dir + check phase != active/deployed/deploying
     CLI->>FS: prepare_guest_assets (staging confidential-agentd, cai-gateway, fde.toml, OPA policy)
-    CLI->>Docker: docker create + cp attestation client/cosign → staging
+    CLI->>Tools: copy native attestation client/cosign → staging
     loop 每个 build.variants.*.enabled=true 的 variant
         CLI->>SH: render_build_config(spec with image_variant, assets, options)
         SH-->>CLI: Shelter YAML (string)
@@ -83,7 +83,7 @@ sequenceDiagram
 
 关键点：
 - **镜像构建**：CA 统一通过 Shelter 原生构建器构建 rootfs，使用 UKI、cryptpilot FDE 和加密持久 delta。原生 initramfs 通过 `initrd.binaries` 从 rootfs 收集 `/usr/local/bin/confidential-agentd`、`/usr/bin/confidential-data-hub` 及其 ELF 依赖；不再生成 dracut module。构建前检查 `shelter plan` 确认这些程序进入 early-boot plan。
-- **TNG 严格 pin**：tools 镜像从 Alinux3 仓库安装 `trusted-network-gateway-2.9.2-1.al8`；Guest 显式安装相同版本的官方 RPM，并设置 `security.tng: false` 避免 Shelter 自动加入其他版本，随后 [`guest_setup_script`](../cli/src/app.rs) 同时校验 RPM NEVRA 与 `tng --version`，版本不符时 build 直接失败。仓库不再携带或覆盖 TNG 二进制；从旧版升级时必须重新 build Guest 镜像，不能用 `E2E_SKIP_BUILD=1` 复用 2.6 产物验证升级。
+- **TNG 严格 pin**：cagent RPM 依赖 Alinux3 仓库的 `trusted-network-gateway-2.9.2-1.al8`；Guest 显式安装相同版本的官方 RPM，并设置 `security.tng: false` 避免 Shelter 自动加入其他版本，随后 [`guest_setup_script`](../cli/src/app.rs) 同时校验 RPM NEVRA 与 `tng --version`，版本不符时 build 直接失败。仓库不再携带或覆盖 TNG 二进制；从旧版升级时必须重新 build Guest 镜像，不能用 `E2E_SKIP_BUILD=1` 复用 2.6 产物验证升级。
 - **多 variant 构建**：一次 `build` 会构建所有 enabled variants；当前 state 的 `build_id` 指向 `deploy.image_variant`，完整结果保存在 manifest 的 `variants` map。
 - **build_id 时间戳化**：`<image_name>-<variant>-<run_id>`，run_id 精确到毫秒，防止重复 build 互相覆盖。
 
@@ -99,7 +99,7 @@ sequenceDiagram
     participant CLI as confidential-agent
     participant SHB as shelter
     participant TF as Terraform/Aliyun
-    participant ACC as attestation-challenge-client / cosign / rekor-cli (in tools image)
+    participant ACC as attestation-challenge-client / cosign / rekor-cli (native host tools)
     participant G as Guest (initrd → OS)
     participant Rekor as Rekor
 
@@ -226,7 +226,7 @@ mesh-bundle 是按 active service 集合滚动生成的。新 service deploy 时
 flowchart LR
     subgraph Host
         CLI
-        ACC1["attestation-challenge-client<br/>(in confidential-agent-tools)"]
+        ACC1["attestation-challenge-client<br/>(native host runtime)"]
     end
 
     subgraph Guest
@@ -239,7 +239,7 @@ flowchart LR
 
     Rekor[(Rekor)]
 
-    CLI -->|"docker run"| ACC1
+    CLI -->|"native process"| ACC1
     ACC1 -->|"inject-resource HTTP"| TF
     TF -->|stage| CDH
     DM -->|fs poll| CDH
@@ -309,13 +309,13 @@ sequenceDiagram
 
 | 现象 | 多半的原因 | 建议做法 |
 |---|---|---|
-| `confidential-agent build` 报 TNG RPM/version 不匹配 | Alinux3 源解析到的 Guest TNG 不是 `2.9.2-1.al8`，或 tools 镜像不是 TNG 2.9.2 | 确认 `alinux3-plus` 中仍有目标 NEVRA，并用 `tools/Dockerfile` 重新构建工具镜像 |
+| `confidential-agent build` 报 TNG RPM/version 不匹配 | Alinux3 源解析到的 Guest TNG 不是 `2.9.2-1.al8`，或宿主机 TNG 不是 2.9.2 | 确认 `alinux3-plus` 中仍有目标 NEVRA，并安装 cagent RPM 声明的 TNG 版本 |
 | Shelter deploy 完了，但 `inject-resource` 一直 timeout | 安全组 8006 没放通；或 `peerings.yaml` 的 `control` scope 不包含 host | 检查 `confidential-agent peering list` 并运行 `peering apply` |
 | daemon phase 长期停在 `waiting-resources` | 某个 `required=true` 资源缺失或 sha256 不对 | `confidential-agent status --live --json` 看 `applied_resources` |
 | daemon phase 停在 `starting-mesh` | TNG 未启动；通常因为 attestation-agent.sock 还没 ready | `journalctl -u trusted-network-gateway` |
 | 需要持续观察 daemon、TEE policy、UKI/Rekor、服务地址和 Mesh/Connect 端口 | 一次性 `status --live` 不便对比状态变化 | 运行 `confidential-agent tui`；按 `v` 可立即重新校验所选 agent 的远程 evidence |
 | `connect` 报 `mesh bundle has no reference values` | 还没 deploy 过 / sample_rv 文件被手删 | 重新 `deploy` 或 `mesh sync` |
-| Rekor 注册失败 | 网络到不了 `rekor_url`、cosign 签名失败 | 重新构建 tools 镜像并检查 cosign 公私钥、SLSA generator 与 Rekor 可达性 |
+| Rekor 注册失败 | 网络到不了 `rekor_url`、cosign 签名失败 | 检查原生工具安装、 cosign 公私钥、SLSA generator 与 Rekor 可达性 |
 | initrd 阶段 Guest 直接关机 | initrd-fetch 在 `CA_SECRET_WAIT_TIMEOUT_SEC` 超时 | 这是设计的 fail-closed；challenge 检查 inject-resource，Trustee 检查 IMDSv2 user-data、AAEL 和 KBS 可达性 |
 
 ---

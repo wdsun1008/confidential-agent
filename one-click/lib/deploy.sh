@@ -131,34 +131,13 @@ install_confidential_agent_cli() {
   fi
 }
 
-build_tools_image() {
-  ensure_docker_ready
-  if [[ "$CA_REBUILD_TOOLS_IMAGE" != "1" ]] && docker image inspect "$CA_TOOLS_IMAGE" >/dev/null 2>&1; then
-    log "tools image already exists: $CA_TOOLS_IMAGE"
-    return
-  fi
-  log "building tools image: $CA_TOOLS_IMAGE"
-  local build_args=()
-  if [[ -n "${CA_TOOLS_IMAGE_BUILD_ARGS:-}" ]]; then
-    # Whitespace-split simple docker build flags such as --network and --build-arg.
-    read -r -a build_args <<<"$CA_TOOLS_IMAGE_BUILD_ARGS"
-  fi
-  local build_cmd=(docker build)
-  if [[ ${#build_args[@]} -gt 0 ]]; then
-    build_cmd+=("${build_args[@]}")
-  fi
-  build_cmd+=(--build-arg "GITHUB_PROXY_URL=${CA_GITHUB_PROXY_URL-https://gh-proxy.org/}")
-  build_cmd+=(--build-arg "GITHUB_PROXY_FIRST=${CA_GITHUB_PROXY_FIRST-1}")
-  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_CONNECT_TIMEOUT=${CA_GITHUB_DOWNLOAD_CONNECT_TIMEOUT-20}")
-  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_MAX_TIME=${CA_GITHUB_DOWNLOAD_MAX_TIME-120}")
-  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_SPEED_LIMIT=${CA_GITHUB_DOWNLOAD_SPEED_LIMIT-65536}")
-  build_cmd+=(--build-arg "GITHUB_DOWNLOAD_SPEED_TIME=${CA_GITHUB_DOWNLOAD_SPEED_TIME-20}")
-  build_cmd+=(-t "$CA_TOOLS_IMAGE" -f tools/Dockerfile .)
-  (cd "$ROOT_DIR" && "${build_cmd[@]}")
+ensure_native_tools() {
+  log "installing native host tools"
+  CA_TOOLS_DIR="$CA_TOOLS_DIR" "$ROOT_DIR/packaging/install-native-tools.sh"
 }
 
 ca_cmd() {
-  "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" "$@"
+  "$CA_BIN" --tools-dir "$CA_TOOLS_DIR" --state-dir "$CA_STATE_DIR" "$@"
 }
 
 ensure_operator_peering_entry() {
@@ -217,7 +196,7 @@ build_openclaw_image() {
     return
   fi
   log "building $CA_SERVICE_LABEL confidential image"
-  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" build --spec "$CA_SPEC_PATH")
+  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-dir "$CA_TOOLS_DIR" --state-dir "$CA_STATE_DIR" build --spec "$CA_SPEC_PATH")
 }
 
 openclaw_phase() {
@@ -322,11 +301,11 @@ deploy_openclaw_service() {
     local public_ip
     public_ip="$(openclaw_public_ip)" || die "$CA_SERVICE_LABEL is deployed but has no recorded public IP; run 'confidential-agent destroy $CA_SERVICE_ID' and redeploy"
     log "$CA_SERVICE_LABEL is deployed but not active; resuming from resource injection to $public_ip"
-    (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" inject --spec "$CA_SPEC_PATH" --target-ip "$public_ip")
+    (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-dir "$CA_TOOLS_DIR" --state-dir "$CA_STATE_DIR" inject --spec "$CA_SPEC_PATH" --target-ip "$public_ip")
     return
   fi
   log "deploying $CA_SERVICE_LABEL to Aliyun"
-  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" deploy --spec "$CA_SPEC_PATH")
+  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-dir "$CA_TOOLS_DIR" --state-dir "$CA_STATE_DIR" deploy --spec "$CA_SPEC_PATH")
 }
 
 sync_active_openclaw_resources() {
@@ -339,7 +318,7 @@ sync_active_openclaw_resources() {
     return
   }
   log "syncing resources to active $CA_SERVICE_LABEL at $public_ip"
-  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" inject --spec "$CA_SPEC_PATH" --target-ip "$public_ip")
+  (cd "$CA_PROJECT_DIR" && "$CA_BIN" --tools-dir "$CA_TOOLS_DIR" --state-dir "$CA_STATE_DIR" inject --spec "$CA_SPEC_PATH" --target-ip "$public_ip")
   CA_ACTIVE_RESOURCES_SYNCED=1
 }
 
@@ -436,7 +415,7 @@ start_connect() {
     rm -f "$pid_path"
   fi
   rm -f "$log_path" "$pid_path"
-  setsid "$CA_BIN" --tools-image "$CA_TOOLS_IMAGE" --state-dir "$CA_STATE_DIR" connect --service "$CA_SERVICE_ID" >"$log_path" 2>&1 &
+  setsid "$CA_BIN" --tools-dir "$CA_TOOLS_DIR" --state-dir "$CA_STATE_DIR" connect --service "$CA_SERVICE_ID" >"$log_path" 2>&1 &
   printf '%s\n' "$!" >"$pid_path"
 
   local deadline=$((SECONDS + CA_CONNECT_TIMEOUT_SEC))
@@ -575,7 +554,7 @@ run_install_only() {
   ensure_shelter
   build_confidential_agent
   install_confidential_agent_cli
-  build_tools_image
+  ensure_native_tools
   log "install-only completed"
 }
 
@@ -590,7 +569,7 @@ run_deploy_openclaw() {
   ensure_shelter
   build_confidential_agent
   install_confidential_agent_cli
-  build_tools_image
+  ensure_native_tools
   prepare_openclaw_specs
   build_openclaw_image
   ensure_operator_peering
@@ -613,7 +592,7 @@ run_deploy_openclaw_vllm() {
   ensure_shelter
   build_confidential_agent
   install_confidential_agent_cli
-  build_tools_image
+  ensure_native_tools
   prepare_openclaw_vllm_specs
   build_openclaw_image
   ensure_operator_peering
@@ -634,7 +613,7 @@ run_deploy_vllm_inference() {
   ensure_shelter
   build_confidential_agent
   install_confidential_agent_cli
-  build_tools_image
+  ensure_native_tools
   prepare_vllm_inference_specs
   build_openclaw_image
   ensure_operator_peering

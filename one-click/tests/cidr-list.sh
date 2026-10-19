@@ -48,7 +48,7 @@ set -Eeuo pipefail
 args=()
 while (($# > 0)); do
   case "$1" in
-    --tools-image|--state-dir)
+    --tools-dir|--state-dir)
       shift 2
       ;;
     *)
@@ -104,7 +104,7 @@ test_ensure_operator_peering_labels_and_deployer() {
 
   export FAKE_CA_LOG="$tmp_dir/commands.log"
   CA_BIN="$tmp_dir/confidential-agent"
-  CA_TOOLS_IMAGE="test-tools"
+  CA_TOOLS_DIR="test-tools"
   CA_STATE_DIR="$tmp_dir/state"
   CA_WORK_DIR="$tmp_dir/work"
   CA_NON_INTERACTIVE=1

@@ -128,27 +128,15 @@ fn current_nanos() -> u128 {
         .unwrap_or_default()
 }
 
-fn run_tools_container_capture(cli: &Cli, spec: ToolContainerSpec) -> Result<String> {
-    ensure_docker_available()?;
-    let envs = spec.envs.clone();
-    let args = tools_container_args(&cli.tools_image, spec);
-    let mut command = Command::new("docker");
-    command.args(args);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command
-        .stdin(Stdio::null())
-        .output()
-        .context("failed to execute 'docker'")?;
-    if !output.status.success() {
-        bail!(
-            "tools container exited with status {}; stderr: {}; stdout: {}",
-            output.status,
-            summarize_command_bytes(&output.stderr),
-            summarize_command_bytes(&output.stdout)
-        );
-    }
+fn run_native_tool_capture(cli: &Cli, spec: NativeToolSpec) -> Result<String> {
+    let output = run_native_tool_output(&cli.tools_dir, spec)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "native tool exited with status {}; stderr: {}; stdout: {}",
+        output.status,
+        summarize_command_bytes(&output.stderr),
+        summarize_command_bytes(&output.stdout)
+    );
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -159,25 +147,19 @@ fn run_aliyun_cli(cli: &Cli, args: Vec<String>, region: &str) -> Result<String> 
         .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
     let mut tool_args = vec![OsString::from("--region"), OsString::from(region)];
     tool_args.extend(args.into_iter().map(OsString::from));
-    run_tools_container_capture(
+    run_native_tool_capture(
         cli,
-        ToolContainerSpec {
+        NativeToolSpec {
             tool: "aliyun",
             tool_args,
-            mounts: vec![workdir.clone(), state_dir],
+
             envs: cloud_credential_envs(region)?,
             workdir: Some(workdir),
-            container_name: None,
         },
     )
 }
 
-fn run_ossutil(
-    cli: &Cli,
-    args: Vec<String>,
-    file_mounts: Vec<PathBuf>,
-    region: &str,
-) -> Result<()> {
+fn run_ossutil(cli: &Cli, args: Vec<String>, region: &str) -> Result<()> {
     let config = ossutil_config(cli, region)?;
     let mut tool_args = vec![
         OsString::from("-c"),
@@ -186,24 +168,16 @@ fn run_ossutil(
         OsString::from(&config.endpoint),
     ];
     tool_args.extend(args.into_iter().map(OsString::from));
-    let mut mounts = file_mounts;
-    mounts.push(config.path.clone());
-    run_containerized_host_tool(
+    run_host_tool(
         cli,
         "ossutil64",
         tool_args,
-        mounts,
         image_transfer_env(&config.endpoint),
         true,
     )
 }
 
-fn run_ossutil_capture(
-    cli: &Cli,
-    args: Vec<String>,
-    file_mounts: Vec<PathBuf>,
-    region: &str,
-) -> Result<String> {
+fn run_ossutil_capture(cli: &Cli, args: Vec<String>, region: &str) -> Result<String> {
     let config = ossutil_config(cli, region)?;
     let mut tool_args = vec![
         OsString::from("-c"),
@@ -217,20 +191,15 @@ fn run_ossutil_capture(
     let state_dir = absolute_path_for_state(&cli.state_dir);
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create '{}'", state_dir.display()))?;
-    let mut mounts = vec![workdir.clone(), state_dir, config.path.clone()];
-    for path in file_mounts {
-        mounts.extend(mounts_for_file(&path, &workdir));
-    }
 
-    run_tools_container_capture(
+    run_native_tool_capture(
         cli,
-        ToolContainerSpec {
+        NativeToolSpec {
             tool: "ossutil64",
             tool_args,
-            mounts,
+
             envs: image_transfer_env(&config.endpoint),
             workdir: Some(workdir),
-            container_name: None,
         },
     )
 }
@@ -254,7 +223,6 @@ fn ensure_publish_bucket(cli: &Cli, bucket: &str, region: &str) -> Result<()> {
     let check = run_ossutil_capture(
         cli,
         vec!["stat".to_string(), format!("oss://{bucket}")],
-        Vec::new(),
         region,
     );
     if check.is_ok() {
@@ -264,7 +232,6 @@ fn ensure_publish_bucket(cli: &Cli, bucket: &str, region: &str) -> Result<()> {
     run_ossutil(
         cli,
         vec!["mb".to_string(), format!("oss://{bucket}")],
-        Vec::new(),
         region,
     )
 }
@@ -358,7 +325,6 @@ fn cleanup_oss_object(cli: &Cli, bucket: &str, object_key: &str, region: &str) -
             format!("oss://{bucket}/{object_key}"),
             "--force".to_string(),
         ],
-        Vec::new(),
         region,
     )
 }
@@ -495,7 +461,6 @@ impl PublishCloudOps for RealPublishCloudOps {
                 format!("oss://{bucket}/{object_key}"),
                 "--force".to_string(),
             ],
-            vec![image_path.to_path_buf()],
             region,
         )
     }
@@ -1334,7 +1299,7 @@ mod tests {
 
     // Run explicitly on a configured host. Both cloud operations are read-only.
     #[test]
-    #[ignore = "requires a real host Aliyun profile, tools image and cloud access"]
+    #[ignore = "requires a real host Aliyun profile, native tools and cloud access"]
     fn live_host_profile_authenticates_cloud_cli_and_oss() -> Result<()> {
         for name in [
             "ALICLOUD_ACCESS_KEY",
@@ -1351,8 +1316,9 @@ mod tests {
         }
         let state = tempfile::tempdir()?;
         let mut cli = test_cli(state.path());
-        cli.tools_image = std::env::var("CA_TOOLS_IMAGE")
-            .unwrap_or_else(|_| "confidential-agent-tools:latest".into());
+        cli.tools_dir = std::env::var_os("CA_TOOLS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/libexec/cagent/bin"));
         validate_cloud_credentials(&cli, "cn-beijing")?;
         let config = ossutil_config(&cli, "cn-beijing")?;
         assert_eq!(
@@ -1362,7 +1328,7 @@ mod tests {
         let path = config.path.clone();
         drop(config);
         assert!(!path.exists());
-        run_ossutil_capture(&cli, vec!["ls".into()], Vec::new(), "cn-beijing")?;
+        run_ossutil_capture(&cli, vec!["ls".into()], "cn-beijing")?;
         Ok(())
     }
 
@@ -2321,7 +2287,7 @@ mod tests {
             command: Commands::Version,
             shelter_bin: PathBuf::from("shelter"),
             state_dir: state_dir.to_path_buf(),
-            tools_image: "confidential-agent-tools:test".to_string(),
+            tools_dir: PathBuf::from("/usr/libexec/cagent/bin"),
         }
     }
 

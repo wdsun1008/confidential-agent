@@ -161,7 +161,7 @@ host Aliyun CLI profile (`aliyun configure`). AK and StsToken profiles are
 supported. Select a named profile with `ALIBABA_CLOUD_PROFILE` / `ALICLOUD_PROFILE`,
 or a custom CLI config file with `ALIBABA_CLOUD_CREDENTIALS_FILE` /
 `ALICLOUD_SHARED_CREDENTIALS_FILE`. CA passes resolved credentials to both the
-cloud CLI and OSS uploader; the tools container does not need a separate login.
+native cloud CLI and OSS uploader. No tools container or separate login is needed.
 Role-based profiles must supply resolved temporary credentials through the
 environment. Incomplete environment credentials are rejected rather than mixed
 with another profile's keys.

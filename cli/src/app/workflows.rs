@@ -1375,7 +1375,6 @@ pub(super) fn set_sample_reference_value(
             OsString::from("--payload"),
             payload.as_os_str().to_os_string(),
         ],
-        vec![payload.to_path_buf()],
         inherited_proxy_envs(None),
         false,
     )
@@ -1396,7 +1395,6 @@ pub(super) fn set_rekor_reference_value_list(
                 OsString::from("--rv-list"),
                 rv_list.as_os_str().to_os_string(),
             ],
-            vec![rv_list.to_path_buf()],
             inherited_proxy_envs(None),
             true,
         );
@@ -1636,7 +1634,7 @@ mod tests {
             command: Commands::Version,
             shelter_bin: "shelter".into(),
             state_dir: root.path().into(),
-            tools_image: "unused".into(),
+            tools_dir: PathBuf::from("/usr/libexec/cagent/bin"),
         };
         let error = sync_mesh(&cli, root.path(), Some("a")).unwrap_err();
         assert!(error.to_string().contains("service c uses a legacy guest"));

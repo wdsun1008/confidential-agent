@@ -577,7 +577,7 @@ const OPS_DOC: &str = r#"
 Core commands:
 
 - `build --spec <path>` creates the confidential image; `build` defaults to `confidential-agent.yaml`.
-- `key generate-cosign --output-key-prefix ./cosign` creates a Rekor signing key pair through the tools image.
+- `key generate-cosign --output-key-prefix ./cosign` creates a Rekor signing key pair using native cosign.
 - `image publish <service> --spec <path> [--region <region>] [--no-wait]` uploads the built image to OSS, imports an Aliyun custom image, and records published state. `--no-wait` returns after the import task is created; rerun without it to wait for the same image to become available.
 - `deploy --spec <path>` provisions the cloud instance; `deploy` defaults to `confidential-agent.yaml`. If a matching available published image exists, deploy reuses its `image_id` and skips upload/import.
 - `status --service <id> --live --json` checks local and guest state.

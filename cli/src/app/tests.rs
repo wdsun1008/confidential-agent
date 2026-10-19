@@ -26,7 +26,7 @@ fn test_cli() -> Cli {
         }),
         shelter_bin: PathBuf::from("shelter"),
         state_dir: PathBuf::from("/work/.confidential-agent"),
-        tools_image: "confidential-agent-tools:test".to_string(),
+        tools_dir: PathBuf::from("/usr/libexec/cagent/bin"),
     }
 }
 
@@ -1150,32 +1150,9 @@ fn write_fake_prepare_tools(temp: &Path) -> PathBuf {
     set_mode(&agentd, 0o755).unwrap();
     let bin_dir = temp.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    let docker = bin_dir.join("docker");
-    write_script(
-        &docker,
-        r#"#!/bin/sh
-set -eu
-case "${1:-}" in
-  --version)
-    echo "Docker version test"
-    exit 0
-    ;;
-  create)
-    echo "container-test"
-    exit 0
-    ;;
-  cp)
-    dest="$3"
-    printf 'asset\n' > "$dest"
-    exit 0
-    ;;
-  rm)
-    exit 0
-    ;;
-esac
-exit 1
-"#,
-    );
+    for tool in ["attestation-challenge-client", "cosign"] {
+        write_script(&bin_dir.join(tool), "#!/bin/sh\nexit 0\n");
+    }
     bin_dir
 }
 
@@ -1197,77 +1174,6 @@ fn write_mesh_bundle(
         serde_json::to_string_pretty(&bundle).unwrap(),
     )
     .unwrap();
-}
-
-#[test]
-fn tools_container_wraps_challenge_client() {
-    let cli = test_cli();
-    let args = tools_container_args(
-        &cli.tools_image,
-        ToolContainerSpec {
-            tool: "attestation-challenge-client",
-            tool_args: vec![OsString::from("inject-resource")],
-            mounts: vec![PathBuf::from("/tmp/resources")],
-            envs: vec![("NO_PROXY".to_string(), "39.105.79.128".to_string())],
-            workdir: Some(PathBuf::from("/work")),
-            container_name: None,
-        },
-    );
-
-    let args = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-
-    assert_eq!(args[0], "run");
-    assert!(args.windows(2).any(|pair| pair == ["--network", "host"]));
-    assert!(args.contains(&"/tmp/resources:/tmp/resources".to_string()));
-    assert!(args.windows(2).any(|pair| pair == ["--env", "NO_PROXY"]));
-    assert!(!args
-        .iter()
-        .any(|arg| arg.contains("NO_PROXY=39.105.79.128")));
-    assert_eq!(
-        args.iter()
-            .position(|arg| arg == "confidential-agent-tools:test")
-            .map(|idx| &args[idx + 1]),
-        Some(&"attestation-challenge-client".to_string())
-    );
-}
-
-#[test]
-fn tools_container_wraps_tng_connect() {
-    let cli = test_cli();
-    let args = tools_container_args(
-        &cli.tools_image,
-        ToolContainerSpec {
-            tool: "tng",
-            tool_args: vec![
-                OsString::from("launch"),
-                OsString::from("--config-content={}"),
-            ],
-            mounts: Vec::new(),
-            envs: Vec::new(),
-            workdir: None,
-            container_name: Some("ca-connect-test".to_string()),
-        },
-    );
-
-    let args = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    let image_idx = args
-        .iter()
-        .position(|arg| arg == "confidential-agent-tools:test")
-        .unwrap();
-
-    assert!(args
-        .windows(2)
-        .any(|pair| pair == ["--name", "ca-connect-test"]));
-    assert_eq!(
-        &args[image_idx + 1..],
-        ["tng", "launch", "--config-content={}"]
-    );
 }
 
 #[test]
@@ -4656,25 +4562,6 @@ fn local_port_allocator_skips_to_first_free_port_above_preferred() {
 }
 
 #[test]
-fn mounts_for_file_returns_absolute_parent_verbatim() {
-    let mounts = mounts_for_file(Path::new("/tmp/resource"), Path::new("/work"));
-    assert_eq!(mounts, vec![PathBuf::from("/tmp")]);
-}
-
-#[test]
-fn mounts_for_file_joins_relative_parent_with_workdir() {
-    let mounts = mounts_for_file(Path::new("project/file"), Path::new("/state"));
-    assert_eq!(mounts, vec![PathBuf::from("/state/project")]);
-}
-
-#[test]
-fn mounts_for_file_returns_empty_when_path_has_no_parent() {
-    // Bare filename has parent ""; no host mount should be requested.
-    let mounts = mounts_for_file(Path::new("file"), Path::new("/state"));
-    assert!(mounts.is_empty());
-}
-
-#[test]
 fn inherited_proxy_envs_only_pulls_recognised_proxy_keys() {
     let envs = inherited_proxy_envs_from(
         [
@@ -4710,7 +4597,7 @@ fn inherited_proxy_envs_appends_target_to_no_proxy_when_supplied() {
 #[test]
 fn inherited_proxy_envs_first_no_proxy_wins_when_both_cases_set() {
     // Both `no_proxy` and `NO_PROXY` exist; the first one observed wins,
-    // mirroring how docker / process environments propagate the first
+    // mirroring how process environments propagate the first
     // occurrence of a duplicated env var.
     let envs = inherited_proxy_envs_from(
         [("no_proxy", "first.win"), ("NO_PROXY", "second.lose")],
@@ -4727,7 +4614,7 @@ fn inherited_proxy_envs_first_no_proxy_wins_when_both_cases_set() {
 #[test]
 fn inherited_proxy_envs_returns_empty_when_no_proxy_state_exists() {
     // No proxy keys, no NO_PROXY, and no target host -> empty vec, so we
-    // do not pollute the docker environment with unrelated knobs.
+    // do not pollute the child environment with unrelated knobs.
     let envs: Vec<(String, String)> = inherited_proxy_envs_from([("UNRELATED", "ignored")], None);
     assert!(envs.is_empty());
 }

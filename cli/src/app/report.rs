@@ -403,26 +403,25 @@ fn fetch_ear_token(
     })
 }
 
-/// Runs `attestation-challenge-client` inside the tools container so the
-/// host only needs docker, matching the other host-side attestation flows.
+/// Uses the same native verifier runtime as resource injection.
 #[derive(Debug, Clone)]
 pub(super) struct AttestationVerifier {
-    tools_image: String,
+    tools_dir: PathBuf,
     workdir: PathBuf,
 }
 
 impl AttestationVerifier {
     pub(super) fn new(cli: &Cli) -> Result<Self> {
         Ok(Self {
-            tools_image: cli.tools_image.clone(),
+            tools_dir: cli.tools_dir.clone(),
             workdir: ensure_attestation_workdir(&cli.state_dir)?,
         })
     }
 
     #[cfg(test)]
-    pub(super) fn for_tests(tools_image: &str, workdir: PathBuf) -> Self {
+    pub(super) fn for_tests(tools_dir: &str, workdir: PathBuf) -> Self {
         Self {
-            tools_image: tools_image.to_string(),
+            tools_dir: PathBuf::from(tools_dir),
             workdir,
         }
     }
@@ -446,15 +445,14 @@ impl AttestationVerifier {
             "ATTESTATION_CHALLENGE_CLIENT_WORK_DIR".to_string(),
             self.workdir.to_string_lossy().to_string(),
         ));
-        let output = run_tools_container_output(
-            &self.tools_image,
-            ToolContainerSpec {
+        let output = run_native_tool_output(
+            &self.tools_dir,
+            NativeToolSpec {
                 tool: "timeout",
                 tool_args: challenge_inject_tool_args(tool_args, timeout.as_secs()),
-                mounts: vec![self.workdir.clone()],
+
                 envs,
                 workdir: None,
-                container_name: None,
             },
         )
         .with_context(|| format!("failed to run attestation-challenge-client {action}"))?;
@@ -1328,7 +1326,7 @@ mod tests {
         let report = collect_service_report(
             Path::new("/state"),
             &state,
-            &AttestationVerifier::for_tests("confidential-agent-tools:test", PathBuf::from("/tmp")),
+            &AttestationVerifier::for_tests("/unused-tools", PathBuf::from("/tmp")),
         );
         assert_eq!(report.collect_status, "skipped");
         assert!(report.build.is_none());

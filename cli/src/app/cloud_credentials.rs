@@ -38,6 +38,31 @@ pub(super) fn load() -> Result<Credentials> {
     load_from(|name| std::env::var(name).ok())
 }
 
+// Preserve Terraform's own credential chain when no operator profile is set.
+pub(super) fn load_if_configured() -> Result<Option<Credentials>> {
+    let explicit = [
+        "ALICLOUD_ACCESS_KEY",
+        "ALICLOUD_SECRET_KEY",
+        "ALICLOUD_STS_TOKEN",
+        "ALIBABA_CLOUD_ACCESS_KEY_ID",
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+        "ALIBABA_CLOUD_SECURITY_TOKEN",
+        "ALIBABA_CLOUD_PROFILE",
+        "ALICLOUD_PROFILE",
+        "ALIBABA_CLOUD_CREDENTIALS_FILE",
+        "ALICLOUD_SHARED_CREDENTIALS_FILE",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()));
+    let default_file = std::env::var_os("HOME")
+        .is_some_and(|home| PathBuf::from(home).join(".aliyun/config.json").exists());
+    if explicit || default_file {
+        load().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn load_from(get: impl Fn(&str) -> Option<String>) -> Result<Credentials> {
     let first = |names: &[&str]| {
         names

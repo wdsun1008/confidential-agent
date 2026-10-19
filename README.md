@@ -193,9 +193,10 @@ confidential-agent/
 ├── daemon/                # confidential-agentd (guest 控制面 + initrd-fetch)
 ├── cai-pep/               # Policy Enforcement Point，运行时 sandbox + attest helper
 ├── tools/
-│   ├── Dockerfile         # confidential-agent-tools 镜像（tng + attestation client + cosign/rekor-cli）
 │   ├── policies/          # Trustee/OPA rego（生产 + dev）
 │   └── e2e/               # 端到端测试 runner、case 模板与探针
+├── cagent.spec            # 原生工具与 CLI 的 RPM
+├── packaging/             # 源码准备、固定工具下载与 RPM 打包
 ├── hack/                  # 当前 CA 兼容补丁版 Shelter RPM
 └── examples/
     ├── openclaw/          # OpenClaw + cai-pep（推荐起步）
@@ -206,6 +207,8 @@ confidential-agent/
 ---
 
 ## 深入文档
+
+- [docs/rpm.md](docs/rpm.md) — cagent RPM 打包、安装与 all-in-one 构建部署对话流程
 
 - [docs/architecture.md](docs/architecture.md) — 控制流与数据流详解（含序列图）
 - [docs/spec.md](docs/spec.md) — `confidential-agent/v1` AppSpec 完整字段参考

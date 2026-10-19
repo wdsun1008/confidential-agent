@@ -347,7 +347,7 @@ fn resolve_or_generate_cosign_key(
             "[ca] generating local cosign key pair for Rekor reference values at {}",
             prefix.display()
         );
-        run_containerized_host_tool(
+        run_host_tool(
             cli,
             "cosign",
             vec![
@@ -355,7 +355,6 @@ fn resolve_or_generate_cosign_key(
                 OsString::from("--output-key-prefix"),
                 prefix.as_os_str().to_os_string(),
             ],
-            vec![prefix.clone()],
             vec![("COSIGN_PASSWORD".to_string(), String::new())],
             true,
         )?;
@@ -431,7 +430,7 @@ fn read_stdin_line() -> Result<String> {
 }
 
 fn write_openclaw_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_repo_root()?;
+    let repo = find_assets_root()?;
     copy_dir(
         &repo.join("examples/openclaw/files"),
         &project.dir.join("files"),
@@ -459,7 +458,7 @@ fn write_openclaw_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> 
 
 fn write_vllm_inference_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
     let _ = (cli, args);
-    let repo = find_repo_root()?;
+    let repo = find_assets_root()?;
     // NVIDIA stack reused verbatim from openclaw-vllm
     for file in [
         "cai-nvidia-cc-stack-install.sh",
@@ -505,7 +504,7 @@ fn write_vllm_inference_project(cli: &Cli, args: &InitArgs, project: &InitProjec
 }
 
 fn write_openclaw_vllm_project(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_repo_root()?;
+    let repo = find_assets_root()?;
     copy_dir(
         &repo.join("examples/openclaw/files"),
         &project.dir.join("files"),
@@ -552,7 +551,7 @@ fn write_openclaw_vllm_project(cli: &Cli, args: &InitArgs, project: &InitProject
 }
 
 fn write_hermes_project(project: &InitProject, args: &InitArgs) -> Result<()> {
-    let repo = find_repo_root()?;
+    let repo = find_assets_root()?;
     copy_dir(
         &repo.join("examples/hermes-agent/files"),
         &project.dir.join("files"),
@@ -591,7 +590,7 @@ fn write_hermes_project(project: &InitProject, args: &InitArgs) -> Result<()> {
 }
 
 fn write_codex_project(args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_repo_root()?;
+    let repo = find_assets_root()?;
     copy_dir(
         &repo.join("examples/cli-agents/files"),
         &project.dir.join("files"),
@@ -635,7 +634,7 @@ fn write_codex_project(args: &InitArgs, project: &InitProject) -> Result<()> {
 }
 
 fn write_claude_code_project(args: &InitArgs, project: &InitProject) -> Result<()> {
-    let repo = find_repo_root()?;
+    let repo = find_assets_root()?;
     copy_dir(
         &repo.join("examples/cli-agents/files"),
         &project.dir.join("files"),
@@ -1444,7 +1443,7 @@ confidential-agent destroy {service}
     write_file(&project.dir.join("NEXT_STEPS.md"), &content, 0o644)
 }
 
-fn find_repo_root() -> Result<PathBuf> {
+fn find_assets_root() -> Result<PathBuf> {
     let current = std::env::current_dir().context("failed to resolve current directory")?;
     for base in current.ancestors() {
         if base.join("Cargo.toml").is_file() && base.join("examples").is_dir() {
@@ -1457,7 +1456,11 @@ fn find_repo_root() -> Result<PathBuf> {
             return Ok(base.to_path_buf());
         }
     }
-    bail!("could not locate repository root with examples/; run init from a source checkout")
+    let packaged = PathBuf::from("/usr/share/cagent");
+    if packaged.join("examples").is_dir() {
+        return Ok(packaged);
+    }
+    bail!("could not locate application templates; install the cagent RPM or run init from a source checkout")
 }
 
 fn find_cai_pep_binary(_cli: &Cli) -> Result<PathBuf> {
@@ -1478,7 +1481,7 @@ fn find_cai_pep_binary_for_init() -> Result<PathBuf> {
             }
         }
     }
-    if let Ok(repo) = find_repo_root() {
+    if let Ok(repo) = find_assets_root() {
         candidates.push(repo.join("target/debug/cai-pep"));
         candidates.push(repo.join("target/release/cai-pep"));
     }

@@ -87,18 +87,6 @@ install_os_dependencies() {
   )
   install_packages_best_effort "$pm" "${common_packages[@]}"
 
-  if ! command -v docker >/dev/null 2>&1; then
-    if ! install_packages_best_effort "$pm" docker; then
-      warn "failed to install package 'docker'; install Docker manually if it is not already available"
-    fi
-  fi
-
-  if ! command -v podman >/dev/null 2>&1; then
-    if ! install_packages_best_effort "$pm" podman; then
-      warn "failed to install package 'podman'; Shelter container.image builds require host podman unless container.archive is used"
-    fi
-  fi
-
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
     if ! install_packages_best_effort "$pm" nodejs npm; then
       warn "failed to install nodejs/npm; install them manually before installing the host OpenClaw CLI"
@@ -111,9 +99,7 @@ install_os_dependencies() {
     fi
   fi
 
-  if command -v systemctl >/dev/null 2>&1 && command -v docker >/dev/null 2>&1; then
-    systemctl enable --now docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true
-  fi
+
 }
 
 host_node22_usable() {
@@ -295,14 +281,4 @@ ensure_rust_toolchain() {
   export PATH="${HOME:-/root}/.cargo/bin:$PATH"
   command -v cargo >/dev/null 2>&1 || die "cargo is still missing after rustup installation"
   configure_cargo_mirror
-}
-
-ensure_docker_ready() {
-  require_cmd docker
-  if ! docker info >/dev/null 2>&1; then
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl start docker >/dev/null 2>&1 || true
-    fi
-  fi
-  docker info >/dev/null 2>&1 || die "Docker is installed but not usable by the current user"
 }

@@ -6,25 +6,26 @@
 
 - 部署机：Alibaba Cloud Linux 3。
 - 目标服务：`examples/openclaw/openclaw.yaml` 中的 OpenClaw Agent。
-- 证明模式：`rekor`，使用 tools 镜像内置的 `cosign` 和 `rekor-cli`；部署机不需要单独安装这两个二进制。
+- 证明模式：`rekor`，使用 cagent/Shelter 提供的 `cosign` 和 `rekor-cli`；部署机不需要单独安装这两个二进制。
 - 云资源：由 Shelter/Terraform 在阿里云创建一台 TDX ECS。
 
-## 1. 准备 CLI 和 tools 镜像
+## 1. 准备 CLI 和原生工具
 
 ```bash
 git clone https://github.com/inclavare-containers/confidential-agent.git
 cd confidential-agent
 
-cargo build --release -p confidential-agent-cli -p confidential-agentd -p cai-pep
+cargo build --release -p confidential-agent-cli -p confidential-agentd -p cai-gateway -p cai-pep
 sudo install -m 0755 target/release/confidential-agent /usr/local/bin/confidential-agent
 sudo install -m 0755 target/release/confidential-agentd /usr/local/bin/confidential-agentd
+sudo install -m 0755 target/release/cai-gateway /usr/local/bin/cai-gateway
 sudo install -m 0755 target/release/cai-pep /usr/local/bin/cai-pep
 
-docker build -t confidential-agent-tools:latest -f tools/Dockerfile .
 sudo yum install -y hack/shelter-*.rpm
+sudo packaging/install-native-tools.sh
 ```
 
-> Rekor 模式仍需要 Shelter RPM 提供 `/usr/libexec/shelter/slsa/slsa-generator`；`cosign`、`rekor-cli` 由 `confidential-agent-tools:latest` 提供，并由 CLI 自动包装给 Shelter 使用。
+> Rekor 模式仍需要 Shelter RPM 提供 `/usr/libexec/shelter/slsa/slsa-generator`；`cosign` 使用 cagent 原生工具目录，`rekor-cli` 复用 Shelter 的私有工具目录，CLI 会为 Shelter 配置 PATH。
 
 ## 2. 准备凭证和 OpenClaw 配置
 
@@ -55,12 +56,12 @@ PY
 
 ```bash
 confidential-agent \
-  --tools-image confidential-agent-tools:latest \
+  --tools-dir /usr/libexec/cagent/bin \
   key generate-cosign \
   --output-key-prefix ./cosign
 ```
 
-该命令会生成 `./cosign.key` 和 `./cosign.pub`。它实际在 tools 容器中运行 `cosign generate-key-pair`。
+该命令会生成 `./cosign.key` 和 `./cosign.pub`。它实际在 宿主机上运行 `cosign generate-key-pair`。
 
 ## 4. 校验 spec 并配置 operator peering
 
@@ -83,14 +84,14 @@ confidential-agent peering show ops
 
 ```bash
 confidential-agent \
-  --tools-image confidential-agent-tools:latest \
+  --tools-dir /usr/libexec/cagent/bin \
   build --spec ./openclaw.yaml
 
 confidential-agent image list
 confidential-agent status --json
 ```
 
-`build` 会调用 Shelter 生成 UKI/dm-verity 镜像、SLSA provenance，并通过 tools 容器中的 `cosign`/`rekor-cli` 完成 Rekor 上传。
+`build` 会调用 Shelter 生成 UKI/dm-verity 镜像、SLSA provenance，并通过 宿主机的 `cosign`/`rekor-cli` 完成 Rekor 上传。
 
 ## 6. 可选：发布镜像供多次部署复用
 
@@ -115,7 +116,7 @@ confidential-agent image list
 
 ```bash
 confidential-agent \
-  --tools-image confidential-agent-tools:latest \
+  --tools-dir /usr/libexec/cagent/bin \
   deploy --spec ./openclaw.yaml
 
 confidential-agent status --live

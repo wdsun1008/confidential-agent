@@ -220,7 +220,6 @@ dependencies = [
  "confidential-agent-core",
  "confidential-agent-shelter",
  "crossterm",
- "ctrlc",
  "curve25519-dalek",
  "ed25519-dalek",
  "libc",

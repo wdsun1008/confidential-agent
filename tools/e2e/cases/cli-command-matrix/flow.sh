@@ -409,22 +409,11 @@ matrix_aliyun_json() {
   local access_key="${ALICLOUD_ACCESS_KEY:-${ALIBABA_CLOUD_ACCESS_KEY_ID:-}}"
   local secret_key="${ALICLOUD_SECRET_KEY:-${ALIBABA_CLOUD_ACCESS_KEY_SECRET:-}}"
   local sts_token="${ALICLOUD_STS_TOKEN:-${ALIBABA_CLOUD_SECURITY_TOKEN:-}}"
-  docker run --rm \
-    --network host \
-    --env "ALICLOUD_ACCESS_KEY=$access_key" \
-    --env "ALICLOUD_SECRET_KEY=$secret_key" \
-    --env "ALIBABA_CLOUD_ACCESS_KEY_ID=$access_key" \
-    --env "ALIBABA_CLOUD_ACCESS_KEY_SECRET=$secret_key" \
-    --env "ALICLOUD_STS_TOKEN=$sts_token" \
-    --env "ALIBABA_CLOUD_SECURITY_TOKEN=$sts_token" \
-    --env HTTP_PROXY \
-    --env HTTPS_PROXY \
-    --env NO_PROXY \
-    --env http_proxy \
-    --env https_proxy \
-    --env no_proxy \
-    --env "ALIBABA_CLOUD_REGION=$region" \
-    "$TOOLS_IMAGE" aliyun --region "$region" "$@"
+  ALICLOUD_ACCESS_KEY="$access_key" ALICLOUD_SECRET_KEY="$secret_key" \
+  ALIBABA_CLOUD_ACCESS_KEY_ID="$access_key" ALIBABA_CLOUD_ACCESS_KEY_SECRET="$secret_key" \
+  ALICLOUD_STS_TOKEN="$sts_token" ALIBABA_CLOUD_SECURITY_TOKEN="$sts_token" \
+    "$TOOLS_DIR/aliyun" --region "$region" "$@"
+
 }
 
 matrix_wait_cloud_image_available() {
@@ -527,7 +516,6 @@ matrix_run_real_cloud_publish_flow() {
 
   require_cmd aliyun
   require_cmd curl
-  require_cmd docker
   require_cmd ssh
   require_aliyun_credentials
   ensure_shelter

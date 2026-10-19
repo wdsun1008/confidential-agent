@@ -31,13 +31,12 @@ Common options:
   --yes                          Assume yes for safe replacement prompts
   --state-dir PATH               Confidential Agent state directory
   --work-dir PATH                One-click generated files/log directory
-  --tools-image NAME             Docker tools image tag
+  --tools-dir PATH             Native tools directory
   --skip-deps                    Do not install OS packages
   --skip-rustup                  Do not install Rust with rustup (default)
   --allow-rustup                 Allow rustup fallback if OS cargo/rust is unavailable
   --skip-cargo-build             Reuse existing target/release binaries
   --skip-host-openclaw           Do not install Node.js/OpenClaw CLI on the deploy host
-  --rebuild-tools-image          Rebuild the tools image even if it exists
   --help                         Show this help
 
 Deploy options:
@@ -89,13 +88,12 @@ Common options:
   --yes                          Assume yes for safe replacement prompts
   --state-dir PATH               Confidential Agent state directory
   --work-dir PATH                One-click generated files/log directory
-  --tools-image NAME             Docker tools image tag
+  --tools-dir PATH             Native tools directory
   --skip-deps                    Do not install OS packages
   --skip-rustup                  Do not install Rust with rustup (default)
   --allow-rustup                 Allow rustup fallback if OS cargo/rust is unavailable
   --skip-cargo-build             Reuse existing target/release binaries
   --skip-host-openclaw           Do not install Node.js/OpenClaw CLI on the deploy host
-  --rebuild-tools-image          Rebuild the tools image even if it exists
   --help                         Show this help
 
 Deploy options:
@@ -145,13 +143,12 @@ Common options:
   --yes                          Assume yes for safe replacement prompts
   --state-dir PATH               Confidential Agent state directory
   --work-dir PATH                One-click generated files/log directory
-  --tools-image NAME             Docker tools image tag
+  --tools-dir PATH             Native tools directory
   --skip-deps                    Do not install OS packages
   --skip-rustup                  Do not install Rust with rustup (default)
   --allow-rustup                 Allow rustup fallback if OS cargo/rust is unavailable
   --skip-cargo-build             Reuse existing target/release binaries
   --skip-host-openclaw           Do not install Node.js/OpenClaw CLI on the deploy host
-  --rebuild-tools-image          Rebuild the tools image even if it exists
   --disable-pep                  Do not install or enable the OpenClaw cai-pep runtime
   --help                         Show this help
 
@@ -204,7 +201,6 @@ init_defaults() {
   CA_IMAGE_SPEC="${CA_IMAGE_SPEC:-}"
   CA_SKIP_DEPLOY="${CA_SKIP_DEPLOY:-0}"
   CA_SKIP_HOST_OPENCLAW="${CA_SKIP_HOST_OPENCLAW:-0}"
-  CA_REBUILD_TOOLS_IMAGE="${CA_REBUILD_TOOLS_IMAGE:-0}"
   CA_ENABLE_DINGTALK="${CA_ENABLE_DINGTALK:-0}"
   CA_DISABLE_PEP="${CA_DISABLE_PEP:-0}"
   CA_START_CONNECT="${CA_START_CONNECT:-1}"
@@ -231,7 +227,7 @@ init_defaults() {
   CA_OSS_BUCKET="${CA_OSS_BUCKET:-${OSS_BUCKET:-}}"
   CA_OSS_ENDPOINT="${CA_OSS_ENDPOINT:-${OSS_ENDPOINT:-https://oss-cn-beijing-internal.aliyuncs.com}}"
   CA_MODEL_KEY_FILE="${CA_MODEL_KEY_FILE:-${MODEL_KEY_FILE:-}}"
-  CA_TOOLS_IMAGE="${CA_TOOLS_IMAGE:-confidential-agent-tools:latest}"
+  CA_TOOLS_DIR="${CA_TOOLS_DIR:-/usr/libexec/cagent/bin}"
   CA_STATE_DIR="${CA_STATE_DIR:-${HOME:-/root}/.confidential-agent}"
   CA_WORK_DIR="${CA_WORK_DIR:-$CA_STATE_DIR/one-click}"
   CA_SLSA_GENERATOR="${CA_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
@@ -260,13 +256,12 @@ parse_args() {
       --yes|-y) CA_ASSUME_YES=1; shift ;;
       --state-dir) CA_STATE_DIR="${2:?missing value for --state-dir}"; shift 2 ;;
       --work-dir) CA_WORK_DIR="${2:?missing value for --work-dir}"; shift 2 ;;
-      --tools-image) CA_TOOLS_IMAGE="${2:?missing value for --tools-image}"; shift 2 ;;
+      --tools-dir) CA_TOOLS_DIR="${2:?missing value for --tools-dir}"; shift 2 ;;
       --skip-deps) CA_SKIP_DEPS=1; shift ;;
       --skip-rustup) CA_SKIP_RUSTUP=1; shift ;;
       --allow-rustup) CA_SKIP_RUSTUP=0; shift ;;
       --skip-cargo-build) CA_SKIP_CARGO_BUILD=1; shift ;;
       --skip-host-openclaw) CA_SKIP_HOST_OPENCLAW=1; shift ;;
-      --rebuild-tools-image) CA_REBUILD_TOOLS_IMAGE=1; shift ;;
       --disable-pep) CA_DISABLE_PEP=1; shift ;;
       --region) CA_REGION="${2:?missing value for --region}"; shift 2 ;;
       --zone-id) CA_ZONE_ID="${2:?missing value for --zone-id}"; shift 2 ;;

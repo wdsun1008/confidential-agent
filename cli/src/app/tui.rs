@@ -2036,7 +2036,7 @@ mod tests {
             agents,
             Duration::from_secs(2),
             Some(Duration::from_secs(60)),
-            AttestationVerifier::for_tests("confidential-agent-tools:test", PathBuf::from("/tmp")),
+            AttestationVerifier::for_tests("/unused-tools", PathBuf::from("/tmp")),
         )
     }
 

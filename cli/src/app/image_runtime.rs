@@ -58,13 +58,13 @@ impl ImageRuntimeContract {
 
     pub(super) fn for_build(spec: &AgentSpec, guest: &Path) -> Result<Self> {
         let output = Command::new(guest).arg("describe-runtime").output()
-            .context("failed to inspect the guest runtime; rebuild the CA tools image before building a new release")?;
+            .context("failed to inspect the guest runtime; update the cagent RPM guest binaries before building a new release")?;
         anyhow::ensure!(
             output.status.success(),
-            "guest binary does not expose CA protocol capabilities; rebuild the CA tools image"
+            "guest binary does not expose CA protocol capabilities; update the cagent RPM guest binaries"
         );
         let guest_runtime: serde_json::Value = serde_json::from_slice(&output.stdout).context(
-            "guest binary returned invalid runtime capabilities; rebuild the CA tools image",
+            "guest binary returned invalid runtime capabilities; update the cagent RPM guest binaries",
         )?;
         anyhow::ensure!(
             guest_runtime["schema_version"] == "confidential-agent/guest-runtime/v1"
@@ -118,7 +118,7 @@ impl ImageRuntimeContract {
 
         for capability in ["external-fde-v1", "resources-v1", "mesh-client-ports-v1"] {
             anyhow::ensure!(guest_runtime["capabilities"].as_array().is_some_and(|values| values.iter().any(|v| v == capability)),
-                "guest binary does not support required capability {capability}; rebuild the CA tools image");
+                "guest binary does not support required capability {capability}; update the cagent RPM guest binaries");
         }
         for capability in [
             "application-runtime-v1",

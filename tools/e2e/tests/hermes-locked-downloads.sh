@@ -53,7 +53,8 @@ INSTALLER
 chmod +x "$work/installer"
 export HERMES_TEST_STAGES="$work/stages"
 prepare_hermes_locked_downloads() { printf 'transport\n' >> "$HERMES_TEST_STAGES"; }
+prepare_hermes_binary_downloads() { printf 'binary-transport\n' >> "$HERMES_TEST_STAGES"; }
 run_hermes_installer_stages "$work/installer" --non-interactive
-printf 'repository\ntransport\nvenv\npython-deps\ncomplete\n' > "$work/expected-stages"
+printf 'repository\ntransport\nbinary-transport\nvenv\npython-deps\ncomplete\n' > "$work/expected-stages"
 cmp "$work/expected-stages" "$work/stages"
 printf '%s\n' 'Hermes frozen artifact transport preserves pins, hashes and installer stages: PASS'

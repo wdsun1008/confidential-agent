@@ -46,9 +46,9 @@ Confidential Agent 的保护范围包括：
 
 一键脚本会在部署机上完成以下工作：
 
-1. 安装 Alibaba Cloud Linux 3 构建依赖、Docker、Rust、Node.js、OpenClaw CLI 和 Shelter。
+1. 安装 Alibaba Cloud Linux 3 构建依赖、Rust、Node.js、OpenClaw CLI 和 Shelter。
 2. 构建 `confidential-agent`、`confidential-agentd`、`cai-gateway`，并在启用 PEP 时构建 `cai-pep`。
-3. 构建包含 `cosign`、`rekor-cli`、TNG 和远程证明客户端的 `confidential-agent-tools:latest`。
+3. 安装原生签名、云客户端、TNG 和远程证明工具，复用 Shelter 的 `rekor-cli`。
 4. 生成 OpenClaw 配置和 AppSpec，构建可信镜像并上传 Rekor 参考值。
 5. 创建 ECS、VPC、交换机、安全组、OSS Bucket、自定义镜像等云资源。
 6. 通过远程证明注入 OpenClaw 配置、Gateway Token、密钥和可选钉钉凭据。
@@ -363,15 +363,13 @@ find "$HOME/.confidential-agent" -name "*.rekor-meta.json" -print
 验证 inclusion proof：
 
 ```bash
-docker run --rm --network host confidential-agent-tools:latest \
-  rekor-cli verify --log-index <LOG_INDEX> --rekor_server https://rekor.sigstore.dev
+/usr/libexec/shelter/bin/rekor-cli verify --log-index <LOG_INDEX> --rekor_server https://rekor.sigstore.dev
 ```
 
 查看 Rekor 日志一致性：
 
 ```bash
-docker run --rm --network host confidential-agent-tools:latest \
-  rekor-cli loginfo --rekor_server https://rekor.sigstore.dev
+/usr/libexec/shelter/bin/rekor-cli loginfo --rekor_server https://rekor.sigstore.dev
 ```
 
 ## 常见问题
@@ -453,7 +451,7 @@ journalctl -u cai-pep.service -n 200 --no-pager
 
 | 场景 | 验证项 |
 | --- | --- |
-| one-click OpenClaw + 百炼 API | 依赖安装、Shelter RPM 安装、源码构建、tools 镜像构建、可信镜像构建、Rekor 上传、TDX ECS 创建、资源注入、TNG connect、Web 可达性、Gateway Token 鉴权、chat probe、TDX skill probe。 |
+| one-click OpenClaw + 百炼 API | 依赖安装、Shelter RPM 安装、源码构建、原生工具安装、可信镜像构建、Rekor 上传、TDX ECS 创建、资源注入、TNG connect、Web 可达性、Gateway Token 鉴权、chat probe、TDX skill probe。 |
 | one-click OpenClaw + vLLM | vLLM spec/config 生成、NVIDIA CC bootstrap 文件打包、PEP/TDX skill 打包、GPU TEE spec 校验、Rekor 配置、connect/Web readiness、vLLM `/v1/models` readiness、OpenClaw chat probe。 |
 
 完整云端验证必须在全新的 Alibaba Cloud Linux 3 部署机上执行文档中的 one-click 命令，不复用本地开发机或旧状态目录。

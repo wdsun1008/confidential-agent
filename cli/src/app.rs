@@ -35,8 +35,10 @@ use confidential_agent_core::schema::{
     MESH_SCHEMA_VERSION,
 };
 use confidential_agent_core::schema::{AgentCardPort, AgentCardRekor, DaemonA2aPeerStatus};
+#[cfg(test)]
+use confidential_agent_core::spec::ConnectPort;
 use confidential_agent_core::spec::{
-    AgentSpec, AttestationMode, AttestationTee, ConnectPort, EncryptionMode, ReferenceValueMode,
+    AgentSpec, AttestationMode, AttestationTee, EncryptionMode, ReferenceValueMode,
 };
 use confidential_agent_core::util::{hex_encode, rekor_payload, sha256_file};
 use confidential_agent_shelter::{
@@ -57,10 +59,7 @@ use std::os::unix::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex, OnceLock,
-};
+
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -357,13 +356,11 @@ impl DeployNames {
     }
 }
 
-struct ToolContainerSpec {
+struct NativeToolSpec {
     tool: &'static str,
     tool_args: Vec<OsString>,
-    mounts: Vec<PathBuf>,
     envs: Vec<(String, String)>,
     workdir: Option<PathBuf>,
-    container_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,8 +376,8 @@ struct ConnectClientEndpoint {
 #[derive(Debug, Serialize, Deserialize)]
 struct ConnectReadyFile {
     schema: String,
-    container_name: String,
-    container_id: String,
+    process: native_process::ProcessIdentity,
+    log_file: PathBuf,
     started_at: String,
     client_endpoints: Vec<ConnectClientEndpoint>,
 }
@@ -886,6 +883,7 @@ mod cloud_credentials;
 mod image_runtime;
 mod images;
 mod instance_ssh;
+mod native_process;
 mod oss_endpoint;
 mod publish;
 mod upgrade;

@@ -536,11 +536,19 @@ pub(super) fn verify_initrd_binaries_in_plan(
 
 pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
     let shelter_bin = effective_shelter_bin(cli);
-    let sigstore_bin = ensure_sigstore_tool_wrappers(cli)?;
     let mut command = shelter_command_with_bin(&shelter_bin, args);
-    command
-        .env("PATH", path_with_prepended_dir(&sigstore_bin)?)
-        .env("CA_TOOLS_IMAGE", &cli.tools_image);
+    command.env("PATH", native_tools_path(&cli.tools_dir)?).env(
+        "COSIGN_PASSWORD",
+        std::env::var_os("COSIGN_PASSWORD").unwrap_or_default(),
+    );
+    if args
+        .iter()
+        .any(|arg| arg == "deploy" || arg == "deploy-release" || arg == "destroy")
+    {
+        if let Some(credentials) = cloud_credentials::load_if_configured()? {
+            command.envs(credentials.environment());
+        }
+    }
     let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -556,13 +564,6 @@ pub(super) fn run_shelter(cli: &Cli, args: &mut [OsString]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn path_with_prepended_dir(dir: &Path) -> Result<std::ffi::OsString> {
-    let current_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut parts = vec![dir.to_path_buf()];
-    parts.extend(std::env::split_paths(&current_path));
-    std::env::join_paths(parts).context("failed to construct PATH for Shelter")
 }
 
 fn shelter_command_with_bin(bin: &Path, args: &mut [OsString]) -> Command {
@@ -944,7 +945,7 @@ mod tests {
             command: crate::cli::Commands::Version,
             shelter_bin: PathBuf::from("shelter"),
             state_dir: PathBuf::from("/state"),
-            tools_image: "test".to_string(),
+            tools_dir: PathBuf::from("/usr/libexec/cagent/bin"),
         };
         let result = effective_shelter_bin_from_candidates(&cli, &[candidate.clone()]);
         assert_eq!(result, candidate);
@@ -956,7 +957,7 @@ mod tests {
             command: crate::cli::Commands::Version,
             shelter_bin: PathBuf::from("shelter"),
             state_dir: PathBuf::from("/state"),
-            tools_image: "test".to_string(),
+            tools_dir: PathBuf::from("/usr/libexec/cagent/bin"),
         };
         let result =
             effective_shelter_bin_from_candidates(&cli, &[PathBuf::from("/nonexistent/shelter")]);

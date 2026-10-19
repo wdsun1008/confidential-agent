@@ -59,7 +59,7 @@ CMaaS is the exception to the host `connect start` probe pattern. Its MCP port i
 
 The scripts do not unset proxy variables internally. On the current development host, OpenAI-facing tools may need a proxy, but mkosi/DNF access to `yum.tbsite.net` and deploy should run without proxy. Use the outer `env -u ...` wrapper shown above for full E2E runs.
 
-Host prerequisites include `python3.11`, `cargo`, `docker`, `jq`, `node`, `openssl`, `ssh`, and `aliyun`. The OpenClaw Bailian (including no-PEP) and Trustee cases also require the host `openclaw` CLI for gateway token checks. Rekor-mode `cosign`/`rekor-cli` calls run through `confidential-agent-tools`, so they are not host prerequisites.
+Host prerequisites include the cagent/Shelter RPMs, `python3.11`, `jq`, `openssl`, and `ssh`. Add `/usr/libexec/cagent/bin` to PATH for native `aliyun` and signing tools. Cargo is only needed when building CA from source; Docker is not required for the standard image build/deploy flow. OpenClaw gateway probes additionally need the host `node` and `openclaw` clients. Explicit OCI-source cases may require Podman. `rekor-cli` is shared with the Shelter RPM.
 The Trustee case also requires `setsid` and `terraform`. Both suite and standalone case entrypoints add the normal Shelter RPM's `/usr/libexec/shelter/bin` directory to the tool search path, so its packaged Terraform can satisfy this requirement. Timed-out deployments are stopped as a process group so Shelter/Terraform descendants cannot hold deployment locks during cleanup.
 OpenClaw token probes use separate client state for valid and invalid credentials
 and check the JSON RPC authentication result. A reachable WebSocket or a zero
@@ -72,7 +72,7 @@ Legacy cases register service cleanup targets before building images, so a faile
 
 Recovery skips services whose formal destroy already completed and checks both legacy and nested disposable Trustee records. If service cleanup fails, it keeps the Trustee available for a retry. Set `E2E_TRUSTEE_DEPLOY_TIMEOUT` above its 1200-second default when large concurrent image uploads need a longer deployment window.
 
-Before destroying a service, the runner saves resource identifiers and imported-image snapshot associations in `cloud-resource-ledger.json`. With automatic cleanup enabled, it removes an import snapshot only after verifying the recorded image is absent (`Status=ALL`), the snapshot belongs to that import, and its usage is `none`. This covers snapshots retained by the bundled Terraform provider; cleanup errors fail the case. Connect cleanup also discovers ready files created by helpers running in shell command substitutions. Only the shell that installed the exit traps performs resource cleanup; inherited error traps in command substitutions do not destroy the deployment. HTTP connect probes poll for the full readiness budget and save redacted container diagnostics before removing a failed tunnel. Regression coverage is in `tests/connect-http-readiness.sh`, `tests/subshell-cleanup.sh`, and `tests/connect-cleanup.sh`.
+Before destroying a service, the runner saves resource identifiers and imported-image snapshot associations in `cloud-resource-ledger.json`. With automatic cleanup enabled, it removes an import snapshot only after verifying the recorded image is absent (`Status=ALL`), the snapshot belongs to that import, and its usage is `none`. This covers snapshots retained by the bundled Terraform provider; cleanup errors fail the case. Connect cleanup also discovers ready files created by helpers running in shell command substitutions. Only the shell that installed the exit traps performs resource cleanup; inherited error traps in command substitutions do not destroy the deployment. HTTP connect probes poll for the full readiness budget and save redacted native tunnel diagnostics before removing a failed tunnel. Regression coverage is in `tests/connect-http-readiness.sh`, `tests/subshell-cleanup.sh`, and `tests/connect-cleanup.sh`.
 
 Debug SSH probes keep host keys in the case's `debug-ssh-known-hosts` file. They accept a new host key on first use and reject changes on later connections, without changing the operator's global known-hosts file.
 
@@ -104,7 +104,7 @@ Provider credentials:
 
 - Aliyun: environment AK/SK or a usable active `aliyun` CLI profile.
 - Bailian cases: `DASHSCOPE_API_KEY` or `BAILIAN_API_KEY`.
-- Rekor mode: `E2E_COSIGN_KEY` or an auto-generated key under the work dir. Auto-generation uses `confidential-agent key generate-cosign` with the configured tools image.
+- Rekor mode: `E2E_COSIGN_KEY` or an auto-generated key under the work dir. Auto-generation uses `confidential-agent key generate-cosign` with the configured native tools directory.
 - `a2a-data-collab`: defaults to unsigned AgentCards. Set `E2E_A2A_SIGNING=1` to exercise Sigstore keyless AgentCard signing; signed mode needs `CA_A2A_SIGSTORE_IDENTITY_TOKEN` or CI OIDC token request envs. `A2A_SIGNER_ISSUER` / `A2A_SIGNER_SUBJECT` may be set explicitly; otherwise a JWT `CA_A2A_SIGSTORE_IDENTITY_TOKEN` is decoded for `iss` / `sub`.
 
 Relative `E2E_WORK_DIR`, `E2E_STATE_DIR`, and `E2E_COSIGN_KEY` inputs are normalized to absolute paths before init/rendering, so validation behaves the same from any caller working directory.
@@ -202,14 +202,13 @@ convert/enhance scripts are installed from the system package repository through
 the `cryptpilot-fde-host` dependency.
 
 For the real cloud matrix, use the newly installed CA executables under
-`/usr/local/bin`, set `E2E_SKIP_CARGO_BUILD=1`, `E2E_SKIP_SHELTER_INSTALL=1`,
+`/usr/bin` (RPM) or `/usr/local/bin` (source install), set `E2E_SKIP_CARGO_BUILD=1`, `E2E_SKIP_SHELTER_INSTALL=1`,
 `E2E_MATRIX_REAL_CLOUD=1`, and `E2E_MATRIX_REFERENCE_VALUES=rekor`. The harness
-also needs `aliyun` on `PATH`; it can be extracted from the tools image just
-built on the same host. Supply cloud credentials separately in a root-only file.
+also needs `aliyun` on `PATH`; add `/usr/libexec/cagent/bin` to PATH. Supply cloud credentials separately in a root-only file.
 On ECS, `E2E_MATRIX_REPO_MIRROR=https://mirrors-ssl.aliyuncs.com/alinux` selects
 the TLS-validated internal mirror through the existing signed repository
 configuration. Record the base image ID, RPM and executable digests, installed
-package inventory, tools image ID, and cleanup results before deleting the host.
+package inventory, native tool package versions, and cleanup results before deleting the host.
 
 ### Unified acceptance matrix
 

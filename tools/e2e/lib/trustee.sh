@@ -1042,8 +1042,8 @@ deploy_with_trustee_access() {
   touch "$marker"
   E2E_DEPLOY_ATTEMPTED=1
   register_destroy_target "$state_dir" "$service"
-  record_cmd "$CA_BIN --tools-image $TOOLS_IMAGE --state-dir $(printf '%q' "$state_dir") deploy --spec $(printf '%q' "$spec")"
-  setsid "$CA_BIN" --tools-image "$TOOLS_IMAGE" --state-dir "$state_dir" deploy --spec "$spec" \
+  record_cmd "$CA_BIN --tools-dir $TOOLS_DIR --state-dir $(printf '%q' "$state_dir") deploy --spec $(printf '%q' "$spec")"
+  setsid "$CA_BIN" --tools-dir "$TOOLS_DIR" --state-dir "$state_dir" deploy --spec "$spec" \
     >"$stdout" 2>"$stderr" &
   local pid=$!
   local deadline=$((SECONDS + timeout))

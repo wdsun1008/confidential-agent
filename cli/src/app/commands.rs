@@ -230,7 +230,7 @@ fn generate_cosign_key_pair(cli: &Cli, output_key_prefix: &Path, force: bool) ->
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
 
-    run_containerized_host_tool(
+    run_host_tool(
         cli,
         "cosign",
         vec![
@@ -238,7 +238,6 @@ fn generate_cosign_key_pair(cli: &Cli, output_key_prefix: &Path, force: bool) ->
             OsString::from("--output-key-prefix"),
             output_key_prefix.as_os_str().to_os_string(),
         ],
-        vec![output_key_prefix.to_path_buf()],
         vec![("COSIGN_PASSWORD".to_string(), String::new())],
         true,
     )?;
@@ -1019,23 +1018,21 @@ pub(super) fn cmd_connect(cli: &Cli, args: &ConnectArgs) -> Result<()> {
     let config_content = serde_json::to_string(&tng_config)?;
     let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
     let attestation_workdir = ensure_attestation_workdir(&cli.state_dir)?;
-    let mounts = vec![workdir.clone(), attestation_workdir];
-
-    run_tools_container(
-        cli,
-        ToolContainerSpec {
+    let mut command = native_tool_command(
+        &cli.tools_dir,
+        NativeToolSpec {
             tool: "tng",
             tool_args: vec![
-                OsString::from("launch"),
-                OsString::from(format!("--config-content={config_content}")),
+                "launch".into(),
+                format!("--config-content={config_content}").into(),
             ],
-            mounts,
             envs: inherited_proxy_envs(None),
             workdir: Some(workdir),
-            container_name: Some(connect_container_name()),
         },
-        true,
-    )
+    )?;
+    command.env("ATTESTATION_CHALLENGE_CLIENT_WORK_DIR", attestation_workdir);
+    let error = command.exec();
+    Err(error).context("failed to execute native TNG")
 }
 
 fn merge_connect_option<'a>(
@@ -1104,66 +1101,55 @@ fn cmd_connect_start(
     let config_content = serde_json::to_string(&tng_config)?;
     let workdir = std::env::current_dir().context("failed to resolve current working directory")?;
     let attestation_workdir = ensure_attestation_workdir(&cli.state_dir)?;
-    let mounts = vec![workdir.clone(), attestation_workdir];
+    let _ready_lock = lock_operation_file(&args.ready_json.with_extension("lock"))?;
     guard_existing_connect_ready(&args.ready_json)?;
-    let container_name = connect_container_name();
-    let container_id = start_tools_container_detached(
-        cli,
-        ToolContainerSpec {
+    for endpoint in &endpoints {
+        anyhow::ensure!(
+            TcpListener::bind((endpoint.local_host.as_str(), endpoint.local_port)).is_ok(),
+            "connect local port {}:{} is already in use",
+            endpoint.local_host,
+            endpoint.local_port
+        );
+    }
+    let log_file = absolute_path(
+        args.log_file
+            .as_deref()
+            .unwrap_or(&args.ready_json.with_extension("log")),
+    )?;
+    let mut command = native_tool_command(
+        &cli.tools_dir,
+        NativeToolSpec {
             tool: "tng",
             tool_args: vec![
-                OsString::from("launch"),
-                OsString::from(format!("--config-content={config_content}")),
+                "launch".into(),
+                format!("--config-content={config_content}").into(),
             ],
-            mounts,
             envs: inherited_proxy_envs(None),
             workdir: Some(workdir),
-            container_name: Some(container_name.clone()),
         },
     )?;
-
-    if let Err(err) = wait_for_connect_endpoints(&endpoints, Duration::from_secs(args.wait_ready)) {
-        let logs = docker_logs(&container_name);
-        let _ = stop_connect_container(&container_name);
-        if let Some(log_file) = args.log_file.as_ref() {
-            let _ = fs::write(log_file, logs.as_deref().unwrap_or(""));
-        }
-        return Err(err).with_context(|| {
-            format!(
-                "connect container '{}' did not become ready; logs: {}",
-                container_name,
-                logs.as_deref().unwrap_or("<unavailable>")
-            )
-        });
-    }
-
+    command.env("ATTESTATION_CHALLENGE_CLIENT_WORK_DIR", attestation_workdir);
+    let tunnel = native_process::PendingTunnel::spawn(command, &log_file)?;
+    wait_for_connect_endpoints(
+        &endpoints,
+        Duration::from_secs(args.wait_ready),
+        &tunnel.identity,
+    )
+    .with_context(|| {
+        format!(
+            "native TNG did not become ready; inspect {}",
+            log_file.display()
+        )
+    })?;
     let ready = ConnectReadyFile {
-        schema: "confidential-agent/connect-ready/v1".to_string(),
-        container_name: container_name.clone(),
-        container_id,
+        schema: "confidential-agent/connect-ready/v2".into(),
+        process: tunnel.identity.clone(),
+        log_file,
         started_at: current_utc_timestamp(),
         client_endpoints: endpoints,
     };
-    if let Some(parent) = args
-        .ready_json
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    fs::write(&args.ready_json, serde_json::to_string_pretty(&ready)?)
-        .with_context(|| format!("failed to write '{}'", args.ready_json.display()))?;
-    if let Some(log_file) = args.log_file.as_ref() {
-        fs::write(
-            log_file,
-            format!(
-                "connect container '{}' is running. Use `docker logs {}` for live tunnel logs.\n",
-                container_name, container_name
-            ),
-        )
-        .with_context(|| format!("failed to write '{}'", log_file.display()))?;
-    }
+    write_json_atomic(&args.ready_json, &ready)?;
+    tunnel.detach();
     println!(
         "[ca] connect ready: {} endpoints; ready_json={}",
         ready.client_endpoints.len(),
@@ -1178,70 +1164,36 @@ fn cmd_connect_start(
     Ok(())
 }
 
-fn cmd_connect_stop(args: &ConnectStopArgs) -> Result<()> {
-    let ready: ConnectReadyFile = serde_json::from_str(
-        &fs::read_to_string(&args.ready_json)
-            .with_context(|| format!("failed to read '{}'", args.ready_json.display()))?,
-    )
-    .with_context(|| format!("failed to parse '{}'", args.ready_json.display()))?;
-    stop_connect_container(&ready.container_name)?;
-    println!("[ca] connect stopped: {}", ready.container_name);
-    Ok(())
+fn read_connect_ready(path: &Path) -> Result<ConnectReadyFile> {
+    let ready: ConnectReadyFile = serde_json::from_str(&fs::read_to_string(path)?).context(
+        "invalid native tunnel state; legacy container ready files cannot manage native tunnels",
+    )?;
+    anyhow::ensure!(
+        ready.schema == "confidential-agent/connect-ready/v2",
+        "unsupported connect ready schema"
+    );
+    Ok(ready)
 }
 
-fn start_tools_container_detached(cli: &Cli, spec: ToolContainerSpec) -> Result<String> {
-    ensure_docker_available()?;
-    ensure_docker_image_available(&cli.tools_image)?;
-    let envs = spec.envs.clone();
-    let mut args = tools_container_args(&cli.tools_image, spec);
-    args.insert(2, OsString::from("-d"));
-    let mut command = Command::new("docker");
-    command.args(args).stdin(Stdio::null());
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command.output().context("failed to execute 'docker'")?;
-    if !output.status.success() {
-        bail!(
-            "docker run for connect tunnel failed with {}; stderr: {}; stdout: {}",
-            output.status,
-            summarize_command_bytes(&output.stderr),
-            summarize_command_bytes(&output.stdout)
-        );
-    }
-    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if id.is_empty() {
-        bail!("docker run for connect tunnel did not return a container id");
-    }
-    Ok(id)
+fn cmd_connect_stop(args: &ConnectStopArgs) -> Result<()> {
+    let _ready_lock = lock_operation_file(&args.ready_json.with_extension("lock"))?;
+    let ready = read_connect_ready(&args.ready_json)?;
+    ready.process.stop()?;
+    println!("[ca] connect stopped: pid={}", ready.process.pid);
+    Ok(())
 }
 
 fn guard_existing_connect_ready(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let Ok(ready) = serde_json::from_str::<ConnectReadyFile>(&fs::read_to_string(path)?) else {
-        return Ok(());
-    };
-    if connect_container_running(&ready.container_name) {
-        bail!(
-            "connect tunnel '{}' from '{}' is already running; stop it first or use a different --ready-json",
-            ready.container_name,
-            path.display()
-        );
-    }
+    let ready = read_connect_ready(path)?;
+    anyhow::ensure!(
+        !ready.process.running(),
+        "connect tunnel from '{}' is already running; stop it first",
+        path.display()
+    );
     Ok(())
-}
-
-fn connect_container_running(container_name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", container_name])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
-        .unwrap_or(false)
 }
 
 fn connect_client_endpoints(config: &serde_json::Value) -> Result<Vec<ConnectClientEndpoint>> {
@@ -1260,9 +1212,11 @@ fn connect_client_endpoints(config: &serde_json::Value) -> Result<Vec<ConnectCli
 fn wait_for_connect_endpoints(
     endpoints: &[ConnectClientEndpoint],
     timeout: Duration,
+    process: &native_process::ProcessIdentity,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
+        anyhow::ensure!(process.running(), "native TNG exited before readiness");
         let mut missing = Vec::new();
         for endpoint in endpoints {
             let address = format!("{}:{}", endpoint.local_host, endpoint.local_port);
@@ -1284,59 +1238,6 @@ fn wait_for_connect_endpoints(
         }
         thread::sleep(Duration::from_secs(1));
     }
-}
-
-fn stop_connect_container(container_name: &str) -> Result<()> {
-    let output = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to execute docker rm for '{container_name}'"))?;
-    if !output.status.success() {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if text.contains("No such container") {
-            eprintln!(
-                "[ca] connect container '{}' is already gone",
-                container_name
-            );
-            return Ok(());
-        }
-        bail!(
-            "docker rm -f '{}' failed with {}; stderr: {}; stdout: {}",
-            container_name,
-            output.status,
-            summarize_command_bytes(&output.stderr),
-            summarize_command_bytes(&output.stdout)
-        );
-    }
-    Ok(())
-}
-
-fn docker_logs(container_name: &str) -> Option<String> {
-    Command::new("docker")
-        .args(["logs", "--tail", "200", container_name])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .map(|output| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        })
-}
-
-fn connect_container_name() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("ca-connect-{}-{nanos}", std::process::id())
 }
 
 pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
@@ -2954,7 +2855,7 @@ mod tests {
             }),
             shelter_bin: PathBuf::from("shelter"),
             state_dir: PathBuf::from("/tmp/confidential-agent-test-state"),
-            tools_image: "confidential-agent-tools:test".to_string(),
+            tools_dir: PathBuf::from("/usr/libexec/cagent/bin"),
         }
     }
 
@@ -3104,19 +3005,23 @@ mod tests {
     }
 
     #[test]
-    fn guard_existing_connect_ready_allows_missing_invalid_and_stopped_files() {
+    fn guard_existing_connect_ready_rejects_invalid_and_allows_stopped_files() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.json");
         guard_existing_connect_ready(&missing).unwrap();
 
         let invalid = temp.path().join("invalid.json");
         fs::write(&invalid, "not-json").unwrap();
-        guard_existing_connect_ready(&invalid).unwrap();
+        assert!(guard_existing_connect_ready(&invalid).is_err());
 
         let ready = ConnectReadyFile {
-            schema: "confidential-agent/connect-ready/v1".to_string(),
-            container_name: format!("ca-connect-unit-test-not-running-{}", std::process::id()),
-            container_id: "container-id".to_string(),
+            schema: "confidential-agent/connect-ready/v2".to_string(),
+            process: native_process::ProcessIdentity {
+                pid: 2147483647,
+                start_ticks: 1,
+                boot_id: "stale".into(),
+            },
+            log_file: temp.path().join("connect.log"),
             started_at: "2026-06-11T00:00:00Z".to_string(),
             client_endpoints: vec![ConnectClientEndpoint {
                 service: "svc-a".to_string(),

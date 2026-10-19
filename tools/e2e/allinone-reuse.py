@@ -361,9 +361,9 @@ print(json.dumps(actual))
                     time.sleep(5)
         except Exception:
             if ready.exists():
-                container = json.loads(ready.read_text())["container_name"]
-                run(["docker", "logs", "--tail", "200", container],
-                    self.work / "connect-diagnostics", success=False, timeout=30)
+                log = Path(json.loads(ready.read_text())["log_file"])
+                if log.exists():
+                    (self.work / "connect-diagnostics").write_bytes(log.read_bytes()[-65536:])
             raise
         finally:
             if ready.exists():
