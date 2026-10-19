@@ -55,36 +55,11 @@ fn publish_image_name(
     name
 }
 
-fn cloud_credential_envs(region: &str) -> Vec<(String, String)> {
-    let mut envs = Vec::new();
-    let access_key = std::env::var("ALICLOUD_ACCESS_KEY")
-        .or_else(|_| std::env::var("ALIBABA_CLOUD_ACCESS_KEY_ID"));
-    let secret_key = std::env::var("ALICLOUD_SECRET_KEY")
-        .or_else(|_| std::env::var("ALIBABA_CLOUD_ACCESS_KEY_SECRET"));
-    let sts_token = std::env::var("ALICLOUD_STS_TOKEN")
-        .or_else(|_| std::env::var("ALIBABA_CLOUD_SECURITY_TOKEN"));
-
-    if let Ok(value) = access_key {
-        envs.push(("ALICLOUD_ACCESS_KEY".to_string(), value.clone()));
-        envs.push(("ALIBABA_CLOUD_ACCESS_KEY_ID".to_string(), value));
-    }
-    if let Ok(value) = secret_key {
-        envs.push(("ALICLOUD_SECRET_KEY".to_string(), value.clone()));
-        envs.push(("ALIBABA_CLOUD_ACCESS_KEY_SECRET".to_string(), value));
-    }
-    if let Ok(value) = sts_token {
-        envs.push(("ALICLOUD_STS_TOKEN".to_string(), value.clone()));
-        envs.push(("ALIBABA_CLOUD_SECURITY_TOKEN".to_string(), value));
-    }
+fn cloud_credential_envs(region: &str) -> Result<Vec<(String, String)>> {
+    let mut envs = super::cloud_credentials::load()?.environment();
     envs.push(("ALIBABA_CLOUD_REGION".to_string(), region.to_string()));
     envs.extend(inherited_proxy_envs(None));
-    envs
-}
-
-fn required_cloud_credential(name_a: &str, name_b: &str) -> Result<String> {
-    std::env::var(name_a)
-        .or_else(|_| std::env::var(name_b))
-        .with_context(|| format!("{name_a} or {name_b} is required"))
+    Ok(envs)
 }
 
 struct TempOssutilConfig {
@@ -99,13 +74,11 @@ impl Drop for TempOssutilConfig {
 }
 
 fn ossutil_config(cli: &Cli, region: &str) -> Result<TempOssutilConfig> {
-    let access_key =
-        required_cloud_credential("ALICLOUD_ACCESS_KEY", "ALIBABA_CLOUD_ACCESS_KEY_ID")?;
-    let secret_key =
-        required_cloud_credential("ALICLOUD_SECRET_KEY", "ALIBABA_CLOUD_ACCESS_KEY_SECRET")?;
-    let sts_token = std::env::var("ALICLOUD_STS_TOKEN")
-        .or_else(|_| std::env::var("ALIBABA_CLOUD_SECURITY_TOKEN"))
-        .ok();
+    let super::cloud_credentials::Credentials {
+        access_key,
+        secret_key,
+        sts_token,
+    } = super::cloud_credentials::load()?;
 
     let dir = absolute_path_for_state(&cli.state_dir)
         .join("tmp")
@@ -192,7 +165,7 @@ fn run_aliyun_cli(cli: &Cli, args: Vec<String>, region: &str) -> Result<String> 
             tool: "aliyun",
             tool_args,
             mounts: vec![workdir.clone(), state_dir],
-            envs: cloud_credential_envs(region),
+            envs: cloud_credential_envs(region)?,
             workdir: Some(workdir),
             container_name: None,
         },
@@ -1359,6 +1332,40 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
+    // Run explicitly on a configured host. Both cloud operations are read-only.
+    #[test]
+    #[ignore = "requires a real host Aliyun profile, tools image and cloud access"]
+    fn live_host_profile_authenticates_cloud_cli_and_oss() -> Result<()> {
+        for name in [
+            "ALICLOUD_ACCESS_KEY",
+            "ALICLOUD_SECRET_KEY",
+            "ALICLOUD_STS_TOKEN",
+            "ALIBABA_CLOUD_ACCESS_KEY_ID",
+            "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+            "ALIBABA_CLOUD_SECURITY_TOKEN",
+        ] {
+            anyhow::ensure!(
+                std::env::var_os(name).is_none(),
+                "live profile test requires credential environment variables to be unset"
+            );
+        }
+        let state = tempfile::tempdir()?;
+        let mut cli = test_cli(state.path());
+        cli.tools_image = std::env::var("CA_TOOLS_IMAGE")
+            .unwrap_or_else(|_| "confidential-agent-tools:latest".into());
+        validate_cloud_credentials(&cli, "cn-beijing")?;
+        let config = ossutil_config(&cli, "cn-beijing")?;
+        assert_eq!(
+            fs::metadata(&config.path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        let path = config.path.clone();
+        drop(config);
+        assert!(!path.exists());
+        run_ossutil_capture(&cli, vec!["ls".into()], Vec::new(), "cn-beijing")?;
+        Ok(())
+    }
+
     #[test]
     fn publish_key_includes_build_and_hash() {
         let key = publish_key(
@@ -1394,14 +1401,6 @@ mod tests {
         assert!(!name.contains(' '));
         assert!(!name.contains('!'));
         assert!(name.ends_with("-0123456789ab"));
-    }
-
-    #[test]
-    fn cloud_envs_do_not_need_credentials_to_construct() {
-        let envs = cloud_credential_envs("cn-beijing");
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "ALIBABA_CLOUD_REGION" && value == "cn-beijing"));
     }
 
     #[test]

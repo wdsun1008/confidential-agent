@@ -882,6 +882,7 @@ use state::*;
 mod workflows;
 use workflows::*;
 
+mod cloud_credentials;
 mod image_runtime;
 mod images;
 mod instance_ssh;
