@@ -76,5 +76,14 @@ registry identity and dependency markers stay unchanged. Set
 `HERMES_PYPI_ARTIFACT_MIRROR` to another HTTPS artifact prefix, or to an empty
 value to retain the original `files.pythonhosted.org` URLs. Lock digests before
 and after this transport change are recorded in
-`/usr/local/lib/cai-hermes/locked-downloads.json`. Other runtime assets still
-require access to their upstream or hash-verified mirror endpoints.
+`/usr/local/lib/cai-hermes/locked-downloads.json`.
+
+Hermes PM downloads pinned tools such as Python, FFmpeg and ripgrep with its own
+Python downloader, independently of curl/git and the PyPI index. During build,
+the installer adapts its GitHub binary transport to try `CA_GITHUB_PROXY_URL`
+first, then the original URL and the official content-addressed mirror. The
+default proxy is `https://gh-proxy.org/`. Versions and lockfile SHA-256 hashes
+remain unchanged; PM still verifies the downloaded bytes before publishing them.
+The adapter change is recorded in `/usr/local/lib/cai-hermes/binary-downloads.json`.
+Non-GitHub binary URLs keep their original download behavior. This applies to
+both the standalone Hermes image and all-in-one builds.

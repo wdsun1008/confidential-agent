@@ -274,6 +274,48 @@ payload.mkdir(parents=True, exist_ok=True)
 PY
 }
 
+prepare_hermes_binary_downloads() {
+    # PM uses urllib rather than our curl/git wrappers for Python, FFmpeg and
+    # other pinned tools. Change only its transport, retaining native verification.
+    python3.11 - "$HERMES_INSTALL_DIR" "$HERMES_PAYLOAD_DIR" "${CA_GITHUB_PROXY_URL:-https://gh-proxy.org/}" <<'PY'
+import hashlib,json,os,sys
+from pathlib import Path
+from urllib.parse import urlsplit
+repo,payload = (Path(value) for value in sys.argv[1:3])
+proxy = sys.argv[3].rstrip('/') + '/'
+parts = urlsplit(proxy)
+assert (parts.scheme == 'https' and parts.hostname and not parts.username
+        and not parts.password and not parts.query and not parts.fragment
+        and not any(c.isspace() or c == '\\' for c in proxy)), 'invalid GitHub proxy prefix'
+filename = repo / 'pm/artifact_mirror.py'
+original = filename.read_text()
+needle = '    return Source(url, dest, sha256, fallbacks=() if url == archive else (archive,))'
+marker = '    # CA: route pinned GitHub binaries through the configured proxy first.'
+replacement = '\n'.join([
+    marker,
+    '    if url.startswith("https://github.com/"):',
+    f'        return Source({proxy!r} + url, dest, sha256, fallbacks=tuple(dict.fromkeys((url, archive))))',
+    needle,
+])
+# Repeating the same preparation is safe; an unfamiliar upstream adapter fails
+# explicitly instead of bypassing its hash checks or silently ignoring the proxy.
+source = original.replace(replacement, needle) if replacement in original else original
+assert source.count(needle) == 1 and marker not in source, 'unsupported Hermes binary download adapter'
+rewritten = source.replace(needle, replacement)
+compile(rewritten, str(filename), 'exec')
+if rewritten != original:
+    temporary = filename.with_suffix('.ca-transport.tmp')
+    temporary.write_text(rewritten)
+    temporary.chmod(filename.stat().st_mode & 0o777)
+    os.replace(temporary, filename)
+payload.mkdir(parents=True, exist_ok=True)
+record = {'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+          'transport_sha256': hashlib.sha256(rewritten.encode()).hexdigest(),
+          'github_proxy': proxy, 'fallbacks': ['original-url', 'official-hash-mirror']}
+(payload / 'binary-downloads.json').write_text(json.dumps(record, indent=2) + '\n')
+PY
+}
+
 run_hermes_installer_stages() {
     local installer="$1"
     shift
@@ -292,7 +334,10 @@ print("\n".join(names))
     # repository checkout, then execute every declared installation stage.
     while IFS= read -r stage; do
         run_official_installer_with_github_proxy "$installer" "$@" --stage "$stage"
-        if [[ "$stage" == repository ]]; then prepare_hermes_locked_downloads; fi
+        if [[ "$stage" == repository ]]; then
+            prepare_hermes_locked_downloads
+            prepare_hermes_binary_downloads
+        fi
     done <<< "$stages"
 }
 
