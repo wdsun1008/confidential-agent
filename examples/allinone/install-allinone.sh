@@ -15,9 +15,12 @@ QODER_VERSION="$(jq -er '.software_versions.qodercli' "$contract")"
 OPENCODE_VERSION="$(jq -er '.software_versions.opencode' "$contract")"
 
 cli=/usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh
+test -x /usr/local/bin/cai-pep
+test -s /opt/data/allinone/home/.agents/skills/tdx-remote-attestation/SKILL.md
 "$cli" codex
 "$cli" claude-code
 install -d -m 0755 /opt/data/allinone
+install -d -m 0700 /opt/data/allinone/home
 HERMES_HOME=/opt/data/allinone/hermes \
     /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
 npm config set registry "$NPM_REGISTRY"

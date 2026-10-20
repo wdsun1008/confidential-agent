@@ -1265,7 +1265,7 @@ service:
 build:
   image_name: codex-agent
   resize: 30G
-  packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]
+  packages: [ca-certificates, curl, git, jq, nodejs, npm, procps-ng, tar, xz]
   files:
     - source: {pep}
       target: /usr/local/bin/cai-pep

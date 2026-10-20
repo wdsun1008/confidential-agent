@@ -353,6 +353,10 @@ pub(super) fn write_allinone(args: &InitArgs, project: &InitProject) -> Result<(
         }
         for (source, name) in [
             (
+                "examples/cli-agents/files/tdx-remote-attestation.SKILL.md",
+                "tdx-remote-attestation.SKILL.md",
+            ),
+            (
                 "examples/cli-agents/files/install-cli-agent-runtime.sh",
                 "install-cli-agent-runtime.sh",
             ),
@@ -368,7 +372,9 @@ pub(super) fn write_allinone(args: &InitArgs, project: &InitProject) -> Result<(
             .context("allinone build files missing")?
         {
             let source = file["source"].as_str().context("missing build source")?;
-            if source.starts_with("../") {
+            if file["target"] == "/usr/local/bin/cai-pep" {
+                file["source"] = json!(pep_binary(args)?);
+            } else if source.starts_with("../") {
                 let name = Path::new(source)
                     .file_name()
                     .context("missing source filename")?
@@ -807,6 +813,28 @@ mod tests {
         ] {
             let dir = run(temp.path(), target, "build", &[]).unwrap();
             let spec = AgentSpec::from_path(&dir.join("build.yaml")).unwrap();
+            if ["allinone", "codex"].contains(&target) {
+                assert!(
+                    spec.build.packages.iter().any(|p| p == "procps-ng"),
+                    "{target} needs ps for interactive Codex"
+                );
+                let skill_target = if target == "allinone" {
+                    "/opt/data/allinone/home/.agents/skills/tdx-remote-attestation/SKILL.md"
+                } else {
+                    "/root/.agents/skills/tdx-remote-attestation/SKILL.md"
+                };
+                assert!(
+                    spec.build.files.iter().any(|f| f.target == skill_target),
+                    "{target} needs the TDX skill in its actual home"
+                );
+                assert!(
+                    spec.build
+                        .files
+                        .iter()
+                        .any(|f| f.target == "/usr/local/bin/cai-pep"),
+                    "{target} needs the attestation helper used by its skill"
+                );
+            }
             assert!(spec.resources.is_empty(), "{target}");
             assert!(spec.service.ssh);
             assert!(spec.deploy.image.is_none());

@@ -43,6 +43,12 @@ Codex has no `gateway` mode in this project. The separately installed
 `cai-gateway` handles CA mesh traffic and is not a Codex mode.
 For ordinary terminal use of Codex, accept `cli`.
 
+Codex includes the `tdx-remote-attestation` skill under
+`/opt/data/allinone/home/.agents/skills/`, with `/usr/local/bin/cai-pep` as its
+attestation helper. Ask Codex to use `$tdx-remote-attestation` to collect and verify
+TDX evidence. The image also installs `procps-ng`: interactive Codex uses `ps`
+to manage its background app-server, even when the selected harness mode is `cli`.
+
 ## Use a prebuilt image
 
 Obtain the signed release and an independently trusted publisher public key.

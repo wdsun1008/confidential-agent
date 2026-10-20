@@ -14,7 +14,7 @@ assert_codex_secret_rendering() {
     done
   done
   grep -Fq "wire_api = \"responses\"" "$CODEX_DIR/secrets/config.toml"
-  grep -Fq "packages: [ca-certificates, curl, git, jq, nodejs, npm, tar, xz]" "$spec"
+  grep -Fq "packages: [ca-certificates, curl, git, jq, nodejs, npm, procps-ng, tar, xz]" "$spec"
   grep -Fq "source: ./files/install-cli-agent-runtime.sh" "$spec"
   grep -Fq "target: /usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh" "$spec"
   grep -Fq "target: /root/.codex/config.toml" "$spec"
@@ -88,6 +88,8 @@ assert_codex_guest_runtime() {
   if ssh_guest "$key" "$host" /bin/bash >"$out" 2>"$err" <<'REMOTE'
 set -euo pipefail
 command -v codex
+command -v ps
+ps -p "$$" -o pid= -o lstart= -o args= >/dev/null
 command -v cai-pep
 codex --version
 (cai-pep --help 2>&1 || true) | grep -Fq "cai-pep attest collect-and-verify"

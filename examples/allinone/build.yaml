@@ -24,8 +24,13 @@ build:
     - name: alinux-powertools
       baseurl: https://mirrors-ssl.aliyuncs.com/alinux/3/powertools/$basearch/
       gpgkey: https://mirrors-ssl.aliyuncs.com/alinux/3/RPM-GPG-KEY-ALINUX-3
-  packages: [ca-certificates, curl, findutils, git, jq, libatomic, nodejs, npm, openssh-server, python3.11, shadow-utils, tar, util-linux, xz]
+  packages: [ca-certificates, curl, findutils, git, jq, libatomic, nodejs, npm, openssh-server, procps-ng, python3.11, shadow-utils, tar, util-linux, xz]
   files:
+    - source: ../../target/debug/cai-pep
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ../cli-agents/files/tdx-remote-attestation.SKILL.md
+      target: /opt/data/allinone/home/.agents/skills/tdx-remote-attestation/SKILL.md
     - source: ../cli-agents/files/install-cli-agent-runtime.sh
       target: /usr/local/libexec/confidential-agent/cli-agent/install-cli-agent-runtime.sh
       executable: true

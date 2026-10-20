@@ -276,6 +276,18 @@ print(json.dumps(actual))
         script = "set -e; test -t 0 && test -t 1; stty size; printf PTY_READY; read value; test \"$value\" = PTY_INPUT; printf PTY_ACCEPTED; stty size; exit 7"
         self.interactive("pty-shell", script, [{"expect": "PTY_READY", "send": "PTY_INPUT\n"},
                                              {"expect": "PTY_ACCEPTED"}, {"expect": "30 100"}], exit_code=7)
+        runtime = json.loads(self.ssh("pty-runtime", "cai-agent --check").stdout)
+        if runtime["harness"] == "codex":
+            probe = Path(__file__).parent / "probes/codex-skills.py"
+            self.ssh("codex-tdx-skill", "python3.11 -c " + shlex.quote(probe.read_text()), timeout=90)
+        if runtime["harness"] == "codex" and runtime["mode"] == "cli":
+            # `exec` and explicit app-server bypass the default daemon startup,
+            # so they cannot detect missing process-management tools such as ps.
+            command = '''set -e; work=$(mktemp -d /tmp/codex-startup.XXXXXX); trap 'rm -rf "$work"' EXIT
+cai-agent --no-alt-screen --sandbox read-only -C "$work" -c "projects.\\"$work\\".trust_level=\\"trusted\\""'''
+            self.interactive("codex-default-startup", command,
+                             [{"expect": "OpenAI Codex", "send": "/exit\r", "key_delay": 0.1}],
+                             exit_code=0)
         if self.probe.get("interactive"):
             self.interactive("pty-harness", self.probe["interactive"]["command"],
                              self.probe["interactive"]["exchanges"],

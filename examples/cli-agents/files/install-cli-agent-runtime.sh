@@ -13,6 +13,16 @@ NODE_VERSION="${CLI_AGENT_NODE_VERSION:-$(ca_software_version node)}"
 FINALIZE_REPAIR="${CLI_AGENT_FINALIZE_REPAIR:-0}"
 export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 
+# Interactive Codex manages a background app-server using procps-compatible ps.
+# Check before downloads; --version and `codex exec` do not exercise this path.
+if [[ "$AGENT" == "codex" ]]; then
+    if ! command -v ps >/dev/null 2>&1 ||
+       ! ps --version >/dev/null; then
+        echo "Codex requires procps-ng (ps); add procps-ng to build.packages" >&2
+        exit 1
+    fi
+fi
+
 npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com/}"
 
 resolve_n_bin() {
