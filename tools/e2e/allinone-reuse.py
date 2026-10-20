@@ -280,6 +280,9 @@ print(json.dumps(actual))
         if runtime["harness"] == "codex":
             probe = Path(__file__).parent / "probes/codex-skills.py"
             self.ssh("codex-tdx-skill", "python3.11 -c " + shlex.quote(probe.read_text()), timeout=90)
+        else:
+            probe = Path(__file__).parent / "probes/harness-skills.py"
+            self.ssh("native-tdx-skill", "python3.11 -c " + shlex.quote(probe.read_text()), timeout=90)
         if runtime["harness"] == "codex" and runtime["mode"] == "cli":
             # `exec` and explicit app-server bypass the default daemon startup,
             # so they cannot detect missing process-management tools such as ps.

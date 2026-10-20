@@ -124,6 +124,10 @@ def main():
             command = ["/usr/bin/sleep", "infinity"]
     else:
         command += arguments
+    if harness == "openclaw":
+        # Root-owned, patched OpenClaw must fail closed when its PEP cannot start.
+        # The other harnesses only use the local attestation helper.
+        subprocess.run(["systemctl", "start", "cai-pep.service"], check=True)
     os.chdir(WORKSPACE)
     os.execvpe(command[0], command, environment)
 

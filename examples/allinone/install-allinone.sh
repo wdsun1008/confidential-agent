@@ -29,12 +29,31 @@ npm install -g --no-audit --no-fund \
     "@qoder-ai/qodercli@$QODER_VERSION" \
     "opencode-ai@$OPENCODE_VERSION"
 
+# Only OpenClaw has the executor patch. Other harnesses use cai-pep's local
+# attestation subcommand directly, without a policy server or execution hooks.
+pep=/usr/local/libexec/confidential-agent/openclaw/install-cai-pep.sh
+claw_home=/opt/data/allinone/home/.openclaw
+CA_DISABLE_PEP=0 "$pep" setup-runtime root "$claw_home"
+CA_DISABLE_PEP=0 "$pep" install-openclaw-plugin root "$claw_home"
+install -d -m 0700 /opt/data/allinone/workspace
+policy=/etc/cai/pep/policy.json
+jq '.workspace_host_path = "/opt/data/allinone/workspace"
+    | .allowed_workspace_prefixes = ["/opt/data/allinone/workspace"]
+    | .denied_path_prefixes += ["/opt/data/allinone/home", "/opt/data/allinone/hermes"]' \
+    "$policy" > "$policy.new"
+install -m 0640 -o root -g openclaw "$policy.new" "$policy"
+rm -f "$policy.new"
+# cai-agent starts this service only when OpenClaw is selected, after resources
+# arrive. Do not let preset-all start it for Codex, Claude, Hermes, etc.
+systemctl disable cai-pep.service
+
 # Current Shelter preserves ELF payloads. Select the harness only after CA has
 # delivered this instance's resources; individual installers enable their units.
 install -d -m 0755 /etc/systemd/system-preset
 cat > /etc/systemd/system-preset/00-allinone.preset <<'PRESET'
 disable cai-codex-app-server.service
 disable cai-hermes-agent.service
+disable cai-pep.service
 disable sshd.service
 disable sshd.socket
 enable cai-ssh.path

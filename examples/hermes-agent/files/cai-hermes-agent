@@ -20,7 +20,7 @@ wait_for_resources() {
 prepare_hermes_home() {
     local sub
     install -d -m 0700 "$DATA"
-    for sub in cron sessions logs hooks memories skills skins plans workspace home pairing platforms/pairing; do
+    for sub in cron sessions logs hooks memories skills skins plans workspace home pairing platforms/pairing attestation; do
         install -d -m 0700 "$DATA/$sub"
     done
     chown -R "$HERMES_USER:$HERMES_USER" "$DATA"
@@ -52,6 +52,7 @@ export PYTHONUNBUFFERED=1
 set -a
 . /opt/data/.env
 set +a
+export ATTESTATION_CHALLENGE_CLIENT_WORK_DIR=/opt/data/attestation
 cd /opt/data
 exec /usr/local/bin/hermes gateway run
 '

@@ -54,7 +54,12 @@ def generate(directory, image, mode, region, prefix, *, harnesses=None):
                      "api": "openai-completions", "models": [{"id": model, "name": model, "reasoning": False,
                      "input": ["text"], "contextWindow": 1000000, "maxTokens": 131072}]}}},
                      "agents": {"defaults": {"model": {"primary": "bailian/"+model}, "workspace": "/opt/data/allinone/workspace"}},
-                     "plugins": {"enabled": False}, "gateway": {"mode": "local", "bind": "loopback", "port": 18789,
+                     "tools": {"profile": "full"},
+                     "plugins": {"enabled": True, "allow": ["cai-pep", "cai-a2a"], "entries": {
+                         "cai-pep": {"enabled": True, "config": {"socketPath": "/run/cai/pep.sock",
+                             "pepRequired": True, "defaultWorkdir": "/opt/data/allinone/workspace"}},
+                         "cai-a2a": {"enabled": True, "config": {"peers": {}}}}},
+                     "gateway": {"mode": "local", "bind": "loopback", "port": 18789,
                      "auth": {"mode": "token", "token": secrets.token_hex(32)}}}, "/opt/data/allinone/home/.openclaw/openclaw.json")
             runtime = "cai-agent health --json"
             command = "cai-agent agent --agent main --message " + shlex.quote(PROMPT) + " --json"

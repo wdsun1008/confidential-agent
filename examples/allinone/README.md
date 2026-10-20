@@ -43,11 +43,29 @@ Codex has no `gateway` mode in this project. The separately installed
 `cai-gateway` handles CA mesh traffic and is not a Codex mode.
 For ordinary terminal use of Codex, accept `cli`.
 
-Codex includes the `tdx-remote-attestation` skill under
-`/opt/data/allinone/home/.agents/skills/`, with `/usr/local/bin/cai-pep` as its
-attestation helper. Ask Codex to use `$tdx-remote-attestation` to collect and verify
-TDX evidence. The image also installs `procps-ng`: interactive Codex uses `ps`
+Every harness includes the `tdx-remote-attestation` skill and uses
+`/usr/local/bin/cai-pep attest collect-and-verify` to verify TDX evidence.
+The native skill directories are:
+
+| Harness | Skill directory |
+| --- | --- |
+| Codex | `/opt/data/allinone/home/.agents/skills/tdx-remote-attestation` |
+| Claude Code | `/opt/data/allinone/home/.claude/skills/tdx-remote-attestation` |
+| QoderCLI | `/opt/data/allinone/home/.qoder/skills/tdx-remote-attestation` |
+| OpenCode | `/opt/data/allinone/home/.config/opencode/skills/tdx-remote-attestation` |
+| Hermes | `/opt/data/allinone/hermes/skills/tdx-remote-attestation` |
+| OpenClaw | `/opt/data/allinone/home/.openclaw/skills/tdx-remote-attestation` |
+
+OpenClaw includes the executor patch, PEP plugin, policy service and Podman
+sandbox, as do the standalone OpenClaw and OpenClaw-vLLM examples. Selecting
+OpenClaw starts its PEP service; startup fails if that service cannot start.
+The other harnesses use only the attestation helper and native skill loading;
+they have no PEP execution hooks or source patches.
+
+The image also installs `procps-ng`: interactive Codex uses `ps`
 to manage its background app-server, even when the selected harness mode is `cli`.
+These files are image build inputs. Updating the controller RPM does not add
+them to an existing image; rebuild, publish and export a new signed release.
 
 ## Use a prebuilt image
 

@@ -348,6 +348,10 @@ pub(super) fn write_allinone(args: &InitArgs, project: &InitProject) -> Result<(
         json!(reference_values_name(project.reference_values));
     if args.stage == Some(InitStage::Build) {
         copy_dir(&base.join("files"), &project.dir.join("files"))?;
+        copy_dir(
+            &assets.join("examples/openclaw/files"),
+            &project.dir.join("files/openclaw"),
+        )?;
         for name in ["install-allinone.sh", "runtime-contract.json"] {
             fs::copy(base.join(name), project.dir.join(name))?;
         }
@@ -379,7 +383,11 @@ pub(super) fn write_allinone(args: &InitArgs, project: &InitProject) -> Result<(
                     .file_name()
                     .context("missing source filename")?
                     .to_string_lossy();
-                file["source"] = json!(format!("./files/{name}"));
+                file["source"] = if source.starts_with("../openclaw/") {
+                    json!(format!("./files/openclaw/{name}"))
+                } else {
+                    json!(format!("./files/{name}"))
+                };
             }
         }
         if project.reference_values == InitReferenceValues::Rekor {
@@ -444,7 +452,8 @@ pub(super) fn write_allinone(args: &InitArgs, project: &InitProject) -> Result<(
                 )?;
             }
             "openclaw" => {
-                // The shared image uses upstream OpenClaw, without standalone CA plugins.
+                // The shared image carries the same executor patch and PEP as
+                // standalone OpenClaw; its workspace is instance-specific.
                 let mut config = json!({
                     "models": {"mode": "merge", "providers": {"bailian": {
                         "baseUrl": project.dashscope_base_url, "apiKey": key,
@@ -458,7 +467,18 @@ pub(super) fn write_allinone(args: &InitArgs, project: &InitProject) -> Result<(
                         "model": {"primary": format!("bailian/{}", project.model)},
                         "workspace": "/opt/data/allinone/workspace"
                     }},
-                    "plugins": {"enabled": false},
+                    "tools": {"profile": "full"},
+                    "plugins": {
+                        "enabled": true, "allow": ["cai-pep", "cai-a2a"],
+                        "entries": {
+                            "cai-pep": {"enabled": true, "config": {
+                                "socketPath": "/run/cai/pep.sock",
+                                "pepRequired": true,
+                                "defaultWorkdir": "/opt/data/allinone/workspace"
+                            }},
+                            "cai-a2a": {"enabled": true, "config": {"peers": {}}}
+                        }
+                    },
                     "gateway": {
                         "mode": "local", "bind": "loopback", "port": 18789,
                         "auth": {"mode": "token", "token": args.gateway_token.clone().unwrap_or_else(|| random_hex(32))}
@@ -813,6 +833,53 @@ mod tests {
         ] {
             let dir = run(temp.path(), target, "build", &[]).unwrap();
             let spec = AgentSpec::from_path(&dir.join("build.yaml")).unwrap();
+            if target != "vllm-inference" {
+                assert!(
+                    spec.build
+                        .files
+                        .iter()
+                        .any(|f| f.target == "/usr/local/bin/cai-pep"),
+                    "{target} needs its TDX attestation helper"
+                );
+                assert!(
+                    spec.build.files.iter().any(|f| f
+                        .target
+                        .ends_with("/skills/tdx-remote-attestation/SKILL.md")),
+                    "{target} needs its native TDX skill"
+                );
+            }
+            if target == "allinone" {
+                for home in [
+                    "home/.agents",
+                    "home/.claude",
+                    "home/.qoder",
+                    "home/.config/opencode",
+                    "home/.openclaw",
+                    "hermes",
+                ] {
+                    let dest =
+                        format!("/opt/data/allinone/{home}/skills/tdx-remote-attestation/SKILL.md");
+                    assert!(spec.build.files.iter().any(|f| f.target == dest), "{home}");
+                }
+            }
+            if ["allinone", "openclaw", "openclaw-vllm"].contains(&target) {
+                for name in [
+                    "patch-openclaw-cai-pep.js",
+                    "cai-pep-plugin",
+                    "cai-pep-default-policy.json",
+                ] {
+                    assert!(
+                        spec.build.files.iter().any(|f| f.target.ends_with(name)),
+                        "{target}: {name}"
+                    );
+                }
+            } else {
+                assert!(!spec
+                    .build
+                    .files
+                    .iter()
+                    .any(|f| f.target.contains("cai-pep-plugin")));
+            }
             if ["allinone", "codex"].contains(&target) {
                 assert!(
                     spec.build.packages.iter().any(|p| p == "procps-ng"),
@@ -962,7 +1029,11 @@ mod tests {
                         &fs::read(&spec.resources["openclaw_config"].source).unwrap(),
                     )
                     .unwrap();
-                    assert_eq!(config["plugins"]["enabled"], false);
+                    assert_eq!(config["plugins"]["enabled"], true);
+                    assert_eq!(
+                        config["plugins"]["entries"]["cai-pep"]["config"]["pepRequired"],
+                        true
+                    );
                     assert_eq!(config["gateway"]["bind"], "loopback");
                 }
             }

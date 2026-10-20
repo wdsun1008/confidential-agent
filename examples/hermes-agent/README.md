@@ -7,6 +7,15 @@ with GitHub fallback and runs the official installer with `--skip-browser`,
 `cai-hermes-agent.service` starts `/usr/local/bin/hermes gateway run` as the
 `hermes` user. The AppSpec does not use containers.
 
+The image includes the native `tdx-remote-attestation` skill under
+`/opt/data/skills/tdx-remote-attestation` and the `cai-pep attest` helper.
+There are no Hermes source patches or PEP execution hooks. The service sets
+`ATTESTATION_CHALLENGE_CLIENT_WORK_DIR=/opt/data/attestation` so its non-root
+user can collect and verify evidence. Use that same environment variable when
+running the helper manually as `hermes`.
+For a source checkout, run `cargo build -p cai-pep` before building the example.
+RPM-generated projects resolve the packaged helper automatically.
+
 Before using it directly, create `secrets/hermes.env` and
 `secrets/config.yaml` next to `hermes-agent.yaml`. They are injected as runtime
 resources into `/opt/data`; they are not baked into the Shelter build config or

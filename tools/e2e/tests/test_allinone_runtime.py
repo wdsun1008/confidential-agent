@@ -61,12 +61,31 @@ class AllinoneRuntimeTest(unittest.TestCase):
                 globals_["load_configuration"] = lambda: (harness, "cli", None, {"TEST_API_KEY": "private-token"})
                 with patch("sys.argv", ["cai-agent", "--version"]), \
                      patch("shutil.which", return_value="/usr/local/bin/agent"), \
+                     patch("subprocess.run") as service, \
                      patch("os.chdir"), patch("os.execvpe") as execute:
                     main()
+                if harness == "openclaw":
+                    service.assert_called_once_with(["systemctl", "start", "cai-pep.service"], check=True)
+                else:
+                    service.assert_not_called()
                 args = execute.call_args.args
                 self.assertEqual(args[:2], (executable[0], executable + ["--version"]))
                 self.assertEqual(args[2]["TEST_API_KEY"], "private-token")
                 self.assertEqual(args[2]["HOME"], str(root / "home"))
+
+    def test_openclaw_does_not_start_when_pep_fails(self):
+        main = runpy.run_path(str(RUNTIME))["main"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main.__globals__.update(HOME=root / "home", WORKSPACE=root / "workspace",
+                                   load_configuration=lambda: ("openclaw", "cli", None, {}))
+            with patch("sys.argv", ["cai-agent", "agent"]), \
+                 patch("shutil.which", return_value="/usr/local/bin/openclaw"), \
+                 patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "systemctl")), \
+                 patch("os.execvpe") as execute:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    main()
+                execute.assert_not_called()
 
     def test_modes_and_listening_ports_are_checked_against_verified_runtime_context(self):
         namespace = runpy.run_path(str(RUNTIME))

@@ -11,6 +11,11 @@ build:
   resize: 30G
   packages: [ca-certificates, curl, findutils, git, libatomic, python3.11, shadow-utils, tar, util-linux, xz]
   files:
+    - source: ../../target/debug/cai-pep
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ../cli-agents/files/tdx-remote-attestation.SKILL.md
+      target: /opt/data/skills/tdx-remote-attestation/SKILL.md
     - source: ./files/install-hermes-agent-runtime.sh
       target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
       executable: true

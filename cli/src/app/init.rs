@@ -599,6 +599,10 @@ fn write_hermes_project(project: &InitProject, args: &InitArgs) -> Result<()> {
             &repo.join("examples/hermes-agent/files"),
             &project.dir.join("files"),
         )?;
+        fs::copy(
+            repo.join("examples/cli-agents/files/tdx-remote-attestation.SKILL.md"),
+            project.dir.join("files/tdx-remote-attestation.SKILL.md"),
+        )?;
         write_hermes_install_script(
             &repo.join("examples/hermes-agent/install-hermes-agent.sh"),
             &project.dir.join("install-hermes-agent.sh"),
@@ -630,7 +634,11 @@ fn write_hermes_project(project: &InitProject, args: &InitArgs) -> Result<()> {
         );
         write_secret_file(&secrets.join("config.yaml"), &config)?;
     }
-    write_file(&project.spec_path, &hermes_yaml(project)?, 0o644)?;
+    write_file(
+        &project.spec_path,
+        &hermes_yaml(project, &staged::pep_binary(args)?)?,
+        0o644,
+    )?;
     Ok(())
 }
 
@@ -1185,7 +1193,7 @@ resources:
     ))
 }
 
-fn hermes_yaml(project: &InitProject) -> Result<String> {
+fn hermes_yaml(project: &InitProject, pep_bin: &Path) -> Result<String> {
     Ok(format!(
         r#"schema: confidential-agent/v1
 
@@ -1200,6 +1208,11 @@ build:
   resize: 30G
   packages: [ca-certificates, curl, findutils, git, libatomic, python3.11, shadow-utils, tar, util-linux, xz]
   files:
+    - source: {pep}
+      target: /usr/local/bin/cai-pep
+      executable: true
+    - source: ./files/tdx-remote-attestation.SKILL.md
+      target: /opt/data/skills/tdx-remote-attestation/SKILL.md
     - source: ./files/install-hermes-agent-runtime.sh
       target: /usr/local/libexec/confidential-agent/hermes/install-hermes-agent-runtime.sh
       executable: true
@@ -1243,6 +1256,7 @@ resources:
     mode: "0600"
     mutable: true
 "#,
+        pep = yaml_quote(&pep_bin.to_string_lossy())?,
         instance_type = yaml_quote(&project.instance_type)?,
         region = yaml_quote(&project.region)?,
         zone_id = yaml_quote(&project.zone_id)?,

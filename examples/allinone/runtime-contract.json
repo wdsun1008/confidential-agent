@@ -7,6 +7,8 @@
     "mesh-client-ports-v1",
     "instance-ssh-v1",
     "allinone-runtime-v1",
+    "openclaw-pep-v1",
+    "harness-tdx-skills-v1",
     "application-runtime-v1",
     "instance-ssh-credentials-v1",
     "mesh-client-ports-v2"
