@@ -247,7 +247,10 @@ pub(crate) struct InitArgs {
     #[arg(long)]
     pub(crate) manifest: Option<String>,
     #[arg(long)]
-    pub(crate) account_id: Option<String>,
+    pub(crate) image_id: Option<String>,
+    /// Explicitly skip publisher signature verification; runtime attestation remains enabled.
+    #[arg(long)]
+    pub(crate) skip_signature_verification: bool,
     #[arg(long, default_value = "./confidential-agent-init")]
     pub(crate) output_dir: PathBuf,
     #[arg(long)]
@@ -341,6 +344,12 @@ pub(crate) struct BuildArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct DeployArgs {
+    /// Explicitly skip the image release signature, preserving runtime attestation checks.
+    #[arg(long)]
+    pub(crate) skip_signature_verification: bool,
+    /// Existing shared/marketplace image in the deployment region.
+    #[arg(long)]
+    pub(crate) image_id: Option<String>,
     #[arg(long, default_value = "confidential-agent.yaml")]
     pub(crate) spec: PathBuf,
     /// Resume resource delivery for an instance whose infrastructure is already deployed
@@ -650,7 +659,8 @@ pub(crate) enum ImageCommands {
     Export {
         service: String,
         #[arg(long)]
-        account_id: String,
+        /// Existing shared/marketplace image; omit to export the recorded publication.
+        image_id: Option<String>,
         #[arg(long)]
         signing_key: PathBuf,
         #[arg(long)]

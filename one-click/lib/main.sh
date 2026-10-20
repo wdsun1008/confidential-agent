@@ -229,6 +229,8 @@ init_defaults() {
   CA_MODEL_KEY_FILE="${CA_MODEL_KEY_FILE:-${MODEL_KEY_FILE:-}}"
   CA_TOOLS_DIR="${CA_TOOLS_DIR:-/usr/libexec/cagent/bin}"
   CA_STATE_DIR="${CA_STATE_DIR:-${HOME:-/root}/.confidential-agent}"
+  CA_WORK_DIR_EXPLICIT=0
+  [[ -z "${CA_WORK_DIR:-}" ]] || CA_WORK_DIR_EXPLICIT=1
   CA_WORK_DIR="${CA_WORK_DIR:-$CA_STATE_DIR/one-click}"
   CA_SLSA_GENERATOR="${CA_SLSA_GENERATOR:-/usr/libexec/shelter/slsa/slsa-generator}"
   CA_STATUS_TIMEOUT_SEC="${CA_STATUS_TIMEOUT_SEC:-900}"
@@ -255,7 +257,7 @@ parse_args() {
       --non-interactive) CA_NON_INTERACTIVE=1; shift ;;
       --yes|-y) CA_ASSUME_YES=1; shift ;;
       --state-dir) CA_STATE_DIR="${2:?missing value for --state-dir}"; shift 2 ;;
-      --work-dir) CA_WORK_DIR="${2:?missing value for --work-dir}"; shift 2 ;;
+      --work-dir) CA_WORK_DIR="${2:?missing value for --work-dir}"; CA_WORK_DIR_EXPLICIT=1; shift 2 ;;
       --tools-dir) CA_TOOLS_DIR="${2:?missing value for --tools-dir}"; shift 2 ;;
       --skip-deps) CA_SKIP_DEPS=1; shift ;;
       --skip-rustup) CA_SKIP_RUSTUP=1; shift ;;
@@ -467,6 +469,17 @@ validate_openclaw_vllm_build_variants() {
   fi
 }
 
+normalize_workspace_paths() {
+  CA_STATE_DIR="$(realpath -m -- "$CA_STATE_DIR")"
+  if [[ "$CA_WORK_DIR_EXPLICIT" != "1" ]]; then CA_WORK_DIR="$CA_STATE_DIR/one-click"; fi
+  CA_WORK_DIR="$(realpath -m -- "$CA_WORK_DIR")"
+  CA_TOOLS_DIR="$(realpath -m -- "$CA_TOOLS_DIR")"
+  local variable
+  for variable in CA_IMAGE_SPEC CA_MODEL_KEY_FILE CA_COSIGN_KEY; do
+    if [[ -n "${!variable:-}" ]]; then printf -v "$variable" '%s' "$(realpath -m -- "${!variable}")"; fi
+  done
+}
+
 print_startup_config() {
   log "mode: $CA_MODE"
   log "service: $CA_SERVICE_ID"
@@ -489,6 +502,7 @@ print_startup_config() {
 main() {
   init_defaults
   parse_args "$@"
+  normalize_workspace_paths
   apply_target_defaults
   validate_options
   install -d -m 0700 "$CA_STATE_DIR" "$CA_WORK_DIR"
@@ -506,4 +520,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

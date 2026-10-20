@@ -295,7 +295,7 @@ fn render_deploy_config(spec: &AgentSpec, options: &ShelterRenderOptions) -> She
 pub fn render_image_runtime_target(
     spec: &AgentSpec,
     options: &ShelterRenderOptions,
-    account_id: &str,
+    image_id: Option<&str>,
 ) -> Result<String> {
     let mut deploy = render_deploy_config(spec, options);
     deploy.image = None;
@@ -305,7 +305,7 @@ pub fn render_image_runtime_target(
         "schema_version": "io.shelter.release-runtime-target/v1",
         "name": "deploy",
         "provider": "terraform-alicloud",
-        "account_id": account_id,
+        "image_id": image_id,
         "region": spec.deploy.region,
         "security": {"profile": "verified", "attestation": "disabled", "forbid_fallback": true},
         "ports": [],

@@ -1,6 +1,6 @@
-# cagent RPM 安装与 all-in-one 流程
+# confidential-agent RPM 安装与 all-in-one 流程
 
-当前支持 Alibaba Cloud Linux 3、x86_64。cagent 使用原生工具，标准
+当前支持 Alibaba Cloud Linux 3、x86_64。confidential-agent 使用原生工具，标准
 all-in-one 构建和部署不需要宿主机 Docker 或 Podman。Guest 内应用如果启用
 PEP，仍可以使用 Guest 自己的容器隔离。
 
@@ -25,14 +25,15 @@ cosign、aliyun、ossutil，GitHub 下载默认先尝试国内代理再回退官
 
 ## 在干净机器安装
 
-把 cagent 和随项目发布的 Shelter RPM 放在同一目录，安装：
+把 confidential-agent 和随项目发布的 Shelter RPM 放在同一目录，安装：
 
 ```bash
 sudo dnf install -y ./shelter-0.3.2-1.al8.x86_64.rpm ./cagent-0.1.0-1.al8.x86_64.rpm
-cagent version
+confidential-agent version
 rpm -q cagent shelter attestation-challenge-client libtdx-verify trusted-network-gateway
 ```
 
+RPM 包名为 `cagent`，正式命令为 `confidential-agent`；`cagent` 是兼容别名。
 RPM 安装 CLI、Guest 构建资产和示例，并自动解析原生验证工具的依赖。
 不需要在这台机器安装 Rust/Cargo、克隆源码或编译 CA。
 分阶段模板为只读基础镜像之外的加密可写层预留磁盘空间；Hermes 默认使用 60 GB 部署盘。
@@ -44,13 +45,13 @@ RPM 安装 CLI、Guest 构建资产和示例，并自动解析原生验证工具
 ```bash
 export PATH=/usr/libexec/cagent/bin:$PATH
 aliyun configure
-cagent init
+confidential-agent init
 ```
 
 先选择构建或部署，再选择模板。也可以显式生成共享镜像构建目录：
 
 ```bash
-cagent init allinone --stage build --non-interactive --output-dir ~/cagent-work
+confidential-agent init allinone --stage build --non-interactive --output-dir ~/cagent-work
 cd ~/cagent-work/allinone-builder
 ```
 
@@ -65,14 +66,14 @@ AccessKey 环境变量。凭证优先级和命名 profile 见
 
 ## 构建和发布
 
-按目标地域检查 `examples/allinone/build.yaml`，然后执行：
+进入 init 生成的 `allinone-builder` 目录，检查其中的 `build.yaml`，然后执行：
 
 ```bash
-cagent build --spec build.yaml
-cagent image publish allinone-builder --spec build.yaml
-openssl genpkey -algorithm ED25519 -out publisher.key
+confidential-agent build --spec build.yaml
+confidential-agent image publish allinone-builder --spec build.yaml
+test -f publisher.key || (umask 077; openssl genpkey -algorithm ED25519 -out publisher.key)
 openssl pkey -in publisher.key -pubout -out publisher.pem
-cagent image export allinone-builder --account-id ACCOUNT_ID \
+confidential-agent image export allinone-builder \
   --signing-key publisher.key --output image-release.json
 ```
 
@@ -87,10 +88,10 @@ harness、运行模式、模型和凭证，或使用参数：
 
 ```bash
 # 在模型 API key 已通过 DASHSCOPE_API_KEY 设置的环境中执行。
-cagent init allinone --stage deploy --non-interactive \
+confidential-agent init allinone --stage deploy --non-interactive \
   --service-id hermes-01 --harness hermes --harness-mode gateway \
   --image-release ./image-release.json --trusted-key ./publisher.pem \
-  --manifest sha256:FULL_MANIFEST_DIGEST --account-id ACCOUNT_ID \
+  --manifest sha256:FULL_MANIFEST_DIGEST \
   --reference-values sample --output-dir ~/cagent-work
 cd ~/cagent-work/hermes-01
 ```
@@ -106,18 +107,18 @@ Qoder 使用自己的账户登录流程，不把 DashScope key 当成 Qoder 凭�
 vLLM inference 保持 ALB + OHTTP。CLI 模式应使用不同的 service ID 创建独立实例。副本不会自动同步应用文件或会话历史。
 同时运行的不同 harness 使用不同服务 ID。同一 all-in-one 实例在 CLI harness 之间切换时，
 可以保持 service ID、release 和基础设施设置不变，使用新的输出目录生成部署配置，
-再运行 `cagent inject --spec 新配置/instance.yaml --target-ip 实例IP`；实例及其数据保留。
+再运行 `confidential-agent inject --spec 新配置/instance.yaml --target-ip 实例IP`；实例及其数据保留。
 切换监听端口或负载均衡拓扑时，创建新的部署。多条本地连接使用不同 `--ready-json`，实际本地端口读取
 ready 文件的 `client_endpoints`，避免假设所有连接都能占用相同端口。
 
 ```bash
-cagent peering add --role operator --cidr DEPLOYER_PUBLIC_IP/32 --label deployer
-cagent spec validate --spec instance.yaml
-cagent deploy --spec instance.yaml
-cagent status --live
-cagent report --json
-cagent ssh SERVICE -- cai-agent --check
-cagent ssh SERVICE --tty -- cai-agent
+confidential-agent peering add --role operator --cidr DEPLOYER_PUBLIC_IP/32 --label deployer
+confidential-agent spec validate --spec instance.yaml
+confidential-agent deploy --spec instance.yaml
+confidential-agent status --live
+confidential-agent report --json
+confidential-agent ssh SERVICE -- cai-agent --check
+confidential-agent ssh SERVICE --tty -- cai-agent
 ```
 
 最后一条命令进入所选 harness 的交互入口。配置模型后发送实际问题并确认
@@ -125,9 +126,9 @@ cagent ssh SERVICE --tty -- cai-agent
 Gateway 的 HTTP/WebSocket 客户端使用原生 TNG 隧道：
 
 ```bash
-cagent connect start --service SERVICE --ready-json connect.json --log-file connect.log
-cagent connect stop --ready-json connect.json
-cagent destroy SERVICE
+confidential-agent connect start --service SERVICE --ready-json connect.json --log-file connect.log
+confidential-agent connect stop --ready-json connect.json
+confidential-agent destroy SERVICE
 ```
 
 后台连接记录使用 v2 格式，包含 PID、进程启动时刻、系统 boot ID 和日志
@@ -140,3 +141,52 @@ cagent destroy SERVICE
 `status --live` 汇总副本就绪状态；`report --json` 的 `replicas` 数组包含各物理实例的证明和
 管理状态，查询直接访问已记录的实例地址。负载均衡地址仅用于应用流量。只要有副本收集失败，
 报告不会把整个服务视为证明收集成功；兼容字段中的 EAR 是首个实例的证明，逐副本检查使用 `replicas`。
+
+## 目录和已有镜像
+
+| 位置 | 用途 |
+|---|---|
+| `./confidential-agent-init/allinone-builder/` | 从执行 init 时的目录生成；包含 `build.yaml`、构建脚本、NEXT_STEPS。可由 `--output-dir` 改变 |
+| `./confidential-agent-init/<service-id>/` | 独立消费者的 `instance.yaml`、私有资源、release 与可选公钥 |
+| `~/.confidential-agent/` | 默认 CA state，按操作用户的 HOME 定位；与当前工作目录无关 |
+| `<state>/services/<service-id>/` | 构建/发布记录、构建清单、实例身份、密钥、运行状态 |
+| `<state>/services/<service-id>/shelter/` | CA 管理的 Shelter 构建记录与 Terraform 工作目录，不要另建同名独立 Shelter 工作区替代 |
+| `<state>/services/<service-id>/shelter/cache/` | Shelter 的基础镜像等构建缓存；包解析缓存另在 `shelter/inputs/resolver-cache/` |
+| 源码中的 `one-click/` | 另一套安装/操作脚本入口，RPM init 流程不需要进入它 |
+| `<state>/one-click/` | one-click 默认生成工作目录；`--work-dir` 可单独指定 |
+| `/usr/share/cagent/` | RPM 提供的模板资产，由 init 复制到可编辑项目目录 |
+
+NEXT_STEPS 会写入明确的 `cd` 和绝对 `--state-dir`。自定义 state 时所有操作使用同一个绝对路径；
+不同用户或遗漏该参数会看到另一套状态。相对 `--spec`、签名密钥和 `--output` 路径按命令执行目录解释；
+spec 内的文件路径按 spec 所在目录解释。导出的 `image-release.json` 放在指定输出位置，不会代替 state。
+不要把清空 state 当作清理缓存，也不要通过重新 init --force 来修复 export。
+旧 CA 清单的 `cache_dir` 可能指向未使用的 `<service>/cache`；新记录修正为实际 Shelter cache 路径，升级不会迁移或删除旧目录。
+`shelter/artifacts`、`records`、`proofs`、`images` 和实例密钥是构建/证明或运行记录，不应作为普通缓存清空。
+
+已构建且发布的镜像在更新 CLI/Shelter 后可以直接重新 export，无须重建或重发。
+新 release 不包含 UID；旧 release/spec/target 中的 `account_id` 作为兼容字段读取并忽略。
+共享镜像或云市场镜像已有可用 ID 时，发布者使用原构建记录直接签发映射：
+
+```bash
+confidential-agent image export allinone-builder --region cn-beijing --image-id m-EXISTING \
+  --signing-key publisher.key --output image-release.json
+```
+
+消费者仍需发布者提供的 release（含参考值和运行兼容信息），仅有云镜像 ID 不能推导可信参考值。
+消费者可在 `deploy.image.image_id`、`init --image-id` 或 `deploy --image-id` 指定自己地域中的已有镜像 ID。
+该选择不修改 release 中的参考值，不上传、导入或取得共享镜像的生命周期所有权。
+镜像的云端共享权限、云市场订阅由云平台管理，CA 不替用户购买或订阅。
+
+## 显式跳过发布签名
+
+默认要求 `trusted_key` 并验签。可以显式执行：
+
+```bash
+confidential-agent deploy --spec instance.yaml --skip-signature-verification
+```
+
+也可在 init 时传同名参数，生成 `deploy.image.skip_signature_verification: true`；此时无需公钥。
+仅跳过 release 的发布签名，不跳过 manifest 固定摘要、参考值结构/关联检查、runtime 兼容检查或运行时证明。
+跳过后文件中的参考值没有发布签名的来源保证，使用者需要自行信任该来源。
+CLI 覆盖选项会记录到部署快照；使用原 spec 恢复同一部署时应传相同覆盖选项，或使用包含该设置的 spec。
+原有镜像与构建记录保持可用；用户现有 NEXT_STEPS 是普通项目文件，不会随 RPM 升级自动重写。

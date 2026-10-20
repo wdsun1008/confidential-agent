@@ -103,9 +103,9 @@ pub(super) fn cmd_init(cli: &Cli, args: &InitArgs) -> Result<()> {
         )
     })?;
     if args.stage.is_some() {
-        staged::write_next_steps(args, &project)?;
+        staged::write_next_steps(cli, args, &project)?;
     } else {
-        write_next_steps(&project)?;
+        write_next_steps(cli, &project)?;
     }
     println!("[ca] init generated {}", project.dir.display());
     println!("[ca] AppSpec: {}", project.spec_path.display());
@@ -1444,7 +1444,24 @@ fn rekor_block(project: &InitProject) -> Result<String> {
     ))
 }
 
-fn write_next_steps(project: &InitProject) -> Result<()> {
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+fn write_project_next_steps(cli: &Cli, project: &InitProject, body: &str) -> Result<()> {
+    let state = absolute_path_for_state(&cli.state_dir);
+    let directory = project.dir.canonicalize()?;
+    let command = format!("confidential-agent --state-dir {}", shell_path(&state));
+    let body = body.replace("confidential-agent ", &format!("{command} "));
+    let preamble = format!("Project directory: `{}`\nCA state directory: `{}`\n\nStart here:\n\n```bash\ncd {}\n```\n\nSpec resource paths are relative to the spec file. Command-line key/output paths are relative to this directory.\nBuild/publication records, keys and managed Shelter/Terraform work remain under the CA state directory; keep it across upgrades.\nUse the same --state-dir in later commands even after changing directories.\nThe source one-click/ scripts and their generated work directory are separate entry points; no one-click directory is needed here.\n\n", directory.display(), state.display(), shell_path(&directory));
+    write_file(
+        &project.dir.join("NEXT_STEPS.md"),
+        &(preamble + &body),
+        0o644,
+    )
+}
+
+fn write_next_steps(cli: &Cli, project: &InitProject) -> Result<()> {
     let connect = match project.target {
         InitTarget::Claudecode => String::new(),
         _ => format!(
@@ -1490,10 +1507,15 @@ confidential-agent destroy {service}
 "#,
         service = project.service_id,
         generated = current_utc_timestamp(),
-        spec = project.spec_path.display(),
+        spec = shell_path(Path::new(
+            project
+                .spec_path
+                .file_name()
+                .context("spec has no filename")?
+        )),
         connect = connect,
     );
-    write_file(&project.dir.join("NEXT_STEPS.md"), &content, 0o644)
+    write_project_next_steps(cli, project, &content)
 }
 
 fn find_assets_root() -> Result<PathBuf> {

@@ -23,7 +23,7 @@ struct ImageInspection {
 #[derive(Deserialize)]
 struct ImageMapping {
     provider: String,
-    account_id: String,
+
     region: String,
     image_id: String,
 }
@@ -59,20 +59,31 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
     // Authenticate the snapshots that this deployment will use, including on
     // later reconciliation. Never copy producer state or private signing keys.
     copy_metadata(&source.release, &release, 16 * 1024 * 1024)?;
-    copy_metadata(&source.trusted_key, &trusted_key, 64 * 1024)?;
+    if !source.skip_signature_verification {
+        copy_metadata(&source.trusted_key, &trusted_key, 64 * 1024)?;
+        source.trusted_key = trusted_key;
+    } else {
+        source.trusted_key = PathBuf::new();
+        println!("[ca] release signature verification explicitly skipped; runtime attestation remains required");
+    }
     source.release = release;
-    source.trusted_key = trusted_key;
-    let output = Command::new(effective_shelter_bin(cli))
+    let mut command = Command::new(effective_shelter_bin(cli));
+    command
         .args(["artifact", "inspect-release"])
         .arg(&source.release)
-        .arg("--trusted-key")
-        .arg(&source.trusted_key)
         .arg("--expect-manifest")
         .arg(&source.manifest)
-        .arg("--account-id")
-        .arg(&source.account_id)
         .arg("--region")
-        .arg(&spec.deploy.region)
+        .arg(&spec.deploy.region);
+    if source.skip_signature_verification {
+        command.arg("--skip-signature-verification");
+    } else {
+        command.arg("--trusted-key").arg(&source.trusted_key);
+    }
+    if let Some(id) = &source.image_id {
+        command.arg("--image-id").arg(id);
+    }
+    let output = command
         .output()
         .context("failed to authenticate published image with Shelter")?;
     anyhow::ensure!(
@@ -86,8 +97,11 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
         inspected.schema_version == "io.shelter.cloud-image-inspection/v1"
             && inspected.manifest_digest == source.manifest
             && inspected.image.provider == "terraform-alicloud"
-            && inspected.image.account_id == source.account_id
-            && inspected.image.region == spec.deploy.region,
+            && inspected.image.region == spec.deploy.region
+            && source
+                .image_id
+                .as_ref()
+                .map_or(true, |id| id == &inspected.image.image_id),
         "Shelter inspection does not match the selected image and deployment target"
     );
     if spec.attestation.reference_values == ReferenceValueMode::Rekor {
@@ -150,7 +164,7 @@ pub(super) fn prepare(
             deploy_user_data: options.deploy_user_data.clone(),
             ..ShelterRenderOptions::default()
         },
-        &image.source.account_id,
+        image.source.image_id.as_deref(),
     )?;
     fs::create_dir_all(&paths.shelter_work_dir)?;
     fs::write(&paths.rendered_config, rendered)?;
@@ -172,20 +186,16 @@ pub(super) fn prepare(
 pub(super) fn export(
     cli: &Cli,
     service: &str,
-    account_id: &str,
+    image_id: Option<&str>,
     signing_key: &Path,
     output: &Path,
     region: Option<&str>,
     variant: Option<&str>,
 ) -> Result<()> {
     let _operation = lock_service_operation(&cli.state_dir, service)?;
-    anyhow::ensure!(
-        !account_id.is_empty() && account_id.bytes().all(|byte| byte.is_ascii_digit()),
-        "account_id must be a decimal account ID"
-    );
     let paths = context_paths(&cli.state_dir, service);
     let mut state = read_service_state_file(&paths.service_state)?
-        .context("image export requires an existing local build and publication")?;
+        .context("image export requires existing build metadata")?;
     let manifest = read_build_manifest(&paths.manifest)?;
     anyhow::ensure!(
         manifest.image.is_none(),
@@ -195,7 +205,7 @@ pub(super) fn export(
     let region = region.unwrap_or(&spec.deploy.region);
     let variant = variant.unwrap_or(&state.build.variant);
     let built = manifest.variant(variant, Some(&state.build.variant))?;
-    let (publication_key, published) = state
+    let publication = state
         .build
         .published
         .iter()
@@ -205,25 +215,27 @@ pub(super) fn export(
                 && entry.variant == variant
                 && entry.build_id == built.shelter_build_id
                 && entry.status == "available"
+                && image_id.map_or(true, |id| entry.image_id.as_deref() == Some(id))
         })
-        .context(
-            "no available publication for this image variant and region; run image publish first",
-        )?;
-    let publication_key = publication_key.clone();
-    let _lease = lock_image_operation(
-        &cli.state_dir,
-        region,
-        published
-            .image_id
-            .as_deref()
-            .context("available publication has no image ID")?,
-        true,
-    )?;
-    let result = read_shelter_build_result(&built.build_result, &built.shelter_build_id)?;
+        .map(|(key, entry)| (key.clone(), entry.clone()));
+    let selected_image = image_id.map(str::to_owned)
+        .or_else(|| publication.as_ref().and_then(|(_, entry)| entry.image_id.clone()))
+        .context("no available publication; publish first or specify --image-id for an existing shared/marketplace image")?;
     anyhow::ensure!(
-        sha256_file(&result.image_path)? == published.source_sha256,
-        "published image no longer matches the local artifact"
+        !selected_image.is_empty()
+            && selected_image
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "invalid cloud image ID"
     );
+    let _lease = lock_image_operation(&cli.state_dir, region, &selected_image, true)?;
+    let result = read_shelter_build_result(&built.build_result, &built.shelter_build_id)?;
+    if let Some((_, published)) = &publication {
+        anyhow::ensure!(
+            sha256_file(&result.image_path)? == published.source_sha256,
+            "published image no longer matches the local artifact"
+        );
+    }
     let mapping = paths.artifacts_dir.join("image-mapping.json");
     let runtime_metadata = paths.artifacts_dir.join("image-runtime.json");
     let mut contract = export_runtime_contract(&manifest, &built, variant)?;
@@ -243,19 +255,21 @@ pub(super) fn export(
     write_json_atomic(
         &mapping,
         &serde_json::json!([{
-            "provider": "terraform-alicloud", "account_id": account_id,
-            "region": region, "image_id": published.image_id.as_ref().context("available publication has no image ID")?,
+            "provider": "terraform-alicloud",
+            "region": region, "image_id": selected_image,
         }]),
     )?;
     // Record retention before producing a distributable release. Even if export
     // is interrupted, automatic pruning must not delete a possibly shared image.
-    state
-        .build
-        .published
-        .get_mut(&publication_key)
-        .unwrap()
-        .exported = true;
-    write_local_service_state(&cli.state_dir, &state)?;
+    if let Some((publication_key, _)) = publication {
+        state
+            .build
+            .published
+            .get_mut(&publication_key)
+            .unwrap()
+            .exported = true;
+        write_local_service_state(&cli.state_dir, &state)?;
+    }
     run_shelter(
         cli,
         &mut [
@@ -361,6 +375,43 @@ mod tests {
     }
 
     #[test]
+    fn deployment_flag_skips_only_signature_and_needs_no_key_file() {
+        let (root, cli, inspected) = fixture();
+        let path = instance_spec(root.path(), "unsigned-consumer");
+        let content = fs::read_to_string(&path)
+            .unwrap()
+            .replace("    trusted_key: ./publisher.pem\n", "");
+        fs::write(&path, content).unwrap();
+        fs::remove_file(root.path().join("publisher.pem")).unwrap();
+        assert!(deployment_snapshot(&path).is_err());
+        let snapshot =
+            deployment_snapshot_with_image_options(&path, true, Some("m-shared-image")).unwrap();
+        let manifest = import(&cli, &snapshot.spec).unwrap();
+        let image = manifest.image.as_ref().unwrap();
+        assert!(image.source.skip_signature_verification);
+        assert!(image.source.trusted_key.as_os_str().is_empty());
+        let prepared = prepare(
+            &context_paths(&cli.state_dir, "unsigned-consumer"),
+            &snapshot.spec,
+            &manifest,
+            &PrepareOptions::default(),
+        )
+        .unwrap();
+        let args = deploy_shelter_args(&prepared);
+        assert!(args.iter().any(|a| a == "--skip-signature-verification"));
+        assert!(!args.iter().any(|a| a == "--trusted-key"));
+        let rendered: serde_json::Value =
+            serde_json::from_slice(&fs::read(&prepared.rendered_config).unwrap()).unwrap();
+        assert!(rendered.get("account_id").is_none());
+        assert_eq!(rendered["image_id"], "m-shared-image");
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&inspected).unwrap()).unwrap();
+        invalid["runtime_metadata"]["bootstrap_schema"] = "unknown".into();
+        fs::write(&inspected, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(import(&cli, &snapshot.spec).is_err());
+    }
+
+    #[test]
     fn export_uses_requested_variants_saved_contract_and_checks_artifact_binding() {
         let (root, _, inspection) = fixture();
         let value: serde_json::Value =
@@ -413,6 +464,8 @@ mod tests {
             commands::cmd_deploy(
                 &cli,
                 &DeployArgs {
+                    skip_signature_verification: false,
+                    image_id: None,
                     resume: false,
                     spec: path.clone(),
                     skip_inject: false,
@@ -505,7 +558,6 @@ mod tests {
     fn invalid_image_metadata_is_rejected_before_deployment_state_or_resource_release() {
         for field in [
             "manifest",
-            "account",
             "region",
             "reference",
             "signature",
@@ -522,7 +574,6 @@ mod tests {
                 serde_json::from_slice(&fs::read(&inspected).unwrap()).unwrap();
             match field {
                 "manifest" => value["manifest_digest"] = "sha256:other".into(),
-                "account" => value["image"]["account_id"] = "999999".into(),
                 "region" => value["image"]["region"] = "cn-shanghai".into(),
                 "reference" => value["reference_value"] = serde_json::json!({}),
                 "protocol" => {
@@ -548,6 +599,8 @@ mod tests {
                 commands::cmd_deploy(
                     &cli,
                     &DeployArgs {
+                        skip_signature_verification: false,
+                        image_id: None,
                         resume: false,
                         spec: path,
                         skip_inject: false,
@@ -570,6 +623,8 @@ mod tests {
         let (root, cli, _) = fixture();
         let path = instance_spec(root.path(), "agent-a");
         let args = DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             spec: path.clone(),
             resume: true,
             skip_inject: false,
@@ -592,6 +647,8 @@ mod tests {
         commands::cmd_deploy(
             &cli,
             &DeployArgs {
+                skip_signature_verification: false,
+                image_id: None,
                 resume: false,
                 render_only: true,
                 ..args
@@ -607,6 +664,8 @@ mod tests {
         assert!(commands::cmd_deploy(
             &cli,
             &DeployArgs {
+                skip_signature_verification: false,
+                image_id: None,
                 spec: path,
                 resume: true,
                 skip_inject: false,

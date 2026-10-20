@@ -211,10 +211,9 @@ deploy:
     release: ./image-release.json
     trusted_key: ./publisher.pem
     manifest: sha256:<完整的64位manifest摘要>
-    account_id: "<云账号ID>"
 ```
 
-发布端先运行 `image publish`，再运行 `image export <service> --account-id <id> --signing-key <Ed25519 PKCS8 PEM> --output image-release.json`。消费者仅需要 release、独立认可的发布者公钥以及自己的 AppSpec 和资源文件，不需要生产端 state、构建输入或 QCOW2。CA 在创建资源前验证签名、固定摘要和账号/地域映射，将验证过的参考值交给现有 challenge/Trustee 流程。每个 service 使用自己的身份、磁盘口令和 Terraform state；`destroy` 不删除共享镜像。该模式只允许 release 变体；需要内置调试密钥的 debug 镜像不能作为共享发布镜像。
+发布端先运行 `image publish`，再运行 `image export <service> --signing-key <Ed25519 PKCS8 PEM> --output image-release.json`。消费者仅需要 release、独立认可的发布者公钥以及自己的 AppSpec 和资源文件，不需要生产端 state、构建输入或 QCOW2。CA 在创建资源前验证签名、固定摘要和地域映射，将验证过的参考值交给现有 challenge/Trustee 流程。每个 service 使用自己的身份、磁盘口令和 Terraform state；`destroy` 不删除共享镜像。该模式只允许 release 变体；需要内置调试密钥的 debug 镜像不能作为共享发布镜像。
 
 当前 E2E 默认示例使用 `cn-beijing-i + ecs.g9i.xlarge`。香港 region 的 TDX 默认组合为 `cn-hongkong-d + ecs.g8i.xlarge`；实际可用性仍可能受账号库存和可用区限制影响，必要时显式覆盖 `region`、`zone_id` 和 `instance_type`。
 
@@ -586,3 +585,7 @@ does not start or reconfigure business services during recovery. Instance SSH ca
 restore the original state after a cold boot.
 Status reports both application and mesh unready. Restoring valid state lets the
 daemon resume with the saved endpoint reservations.
+
+发布元数据不绑定部署账号。`deploy.image.image_id` 可覆盖地域中的镜像位置（共享或云市场镜像），不改变参考值。
+默认校验 release 签名；显式设置 `deploy.image.skip_signature_verification: true` 或传 `deploy --skip-signature-verification` 后可省略 `trusted_key`。
+该选项不关闭运行时证明和资源释放策略。已有 UID 字段兼容读取并忽略。

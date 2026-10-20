@@ -14,7 +14,6 @@ deploy:
     release: ./image-release.json
     trusted_key: ./publisher.pem
     manifest: sha256:REPLACE_WITH_PUBLISHED_MANIFEST_DIGEST
-    account_id: "REPLACE_WITH_ACCOUNT_ID"
 attestation:
   tee: tdx
   mode: challenge

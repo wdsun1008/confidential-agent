@@ -55,14 +55,11 @@ pub(super) fn resolve_interactive(args: &mut InitArgs) -> Result<()> {
         if args.image_release.is_none() {
             args.image_release = Some(prompt_value("Signed image-release.json path")?.into());
         }
-        if args.trusted_key.is_none() {
+        if args.trusted_key.is_none() && !args.skip_signature_verification {
             args.trusted_key = Some(prompt_value("Trusted publisher public key path")?.into());
         }
         if args.manifest.is_none() {
             args.manifest = Some(prompt_value("Expected full sha256: manifest digest")?);
-        }
-        if args.account_id.is_none() {
-            args.account_id = Some(prompt_value("Image owner account ID")?);
         }
         if args.region.is_none() {
             args.region = Some(prompt_value("Deployment region (e.g. cn-beijing)")?);
@@ -161,7 +158,8 @@ pub(super) fn validate_args(args: &InitArgs, target: InitTarget) -> Result<()> {
                 && args.image_release.is_none()
                 && args.trusted_key.is_none()
                 && args.manifest.is_none()
-                && args.account_id.is_none(),
+                && args.image_id.is_none()
+                && !args.skip_signature_verification,
             "use --stage build or --stage deploy with image/instance options"
         );
         return Ok(());
@@ -184,7 +182,7 @@ pub(super) fn validate_args(args: &InitArgs, target: InitTarget) -> Result<()> {
         "shared-image initialization currently supports a single release variant"
     );
     if args.stage == Some(InitStage::Build) {
-        anyhow::ensure!(args.harness.is_none() && args.harness_mode.is_none() && args.image_release.is_none() && args.trusted_key.is_none() && args.manifest.is_none() && args.account_id.is_none(), "build initialization does not select an instance harness or published release; use --stage deploy");
+        anyhow::ensure!(args.harness.is_none() && args.harness_mode.is_none() && args.image_release.is_none() && args.trusted_key.is_none() && args.manifest.is_none() && args.image_id.is_none() && !args.skip_signature_verification, "build initialization does not select an instance harness or published release; use --stage deploy");
     } else {
         args.service_id
             .as_ref()
@@ -193,6 +191,9 @@ pub(super) fn validate_args(args: &InitArgs, target: InitTarget) -> Result<()> {
             ("--image-release", &args.image_release),
             ("--trusted-key", &args.trusted_key),
         ] {
+            if label == "--trusted-key" && args.skip_signature_verification {
+                continue;
+            }
             let path = path
                 .as_ref()
                 .with_context(|| format!("--stage deploy requires {label}"))?;
@@ -207,14 +208,6 @@ pub(super) fn validate_args(args: &InitArgs, target: InitTarget) -> Result<()> {
         anyhow::ensure!(
             digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
             "--manifest must be a full sha256: digest from the publisher"
-        );
-        let account = args
-            .account_id
-            .as_deref()
-            .context("--stage deploy requires --account-id")?;
-        anyhow::ensure!(
-            !account.is_empty() && account.bytes().all(|b| b.is_ascii_digit()),
-            "--account-id must be decimal digits"
         );
         if target == InitTarget::Allinone {
             let (_, _, port) = harness_mode(args)?;
@@ -521,11 +514,17 @@ pub(super) fn finish(args: &InitArgs, project: &InitProject) -> Result<()> {
             args.image_release.as_ref().unwrap(),
             project.dir.join("image-release.json"),
         )?;
-        fs::copy(
-            args.trusted_key.as_ref().unwrap(),
-            project.dir.join("publisher.pem"),
-        )?;
-        spec["deploy"]["image"] = json!({"release":"./image-release.json","trusted_key":"./publisher.pem","manifest":args.manifest,"account_id":args.account_id});
+        spec["deploy"]["image"] = json!({"release":"./image-release.json", "manifest":args.manifest, "skip_signature_verification":args.skip_signature_verification});
+        if !args.skip_signature_verification {
+            fs::copy(
+                args.trusted_key.as_ref().unwrap(),
+                project.dir.join("publisher.pem"),
+            )?;
+            spec["deploy"]["image"]["trusted_key"] = json!("./publisher.pem");
+        }
+        if let Some(id) = &args.image_id {
+            spec["deploy"]["image"]["image_id"] = json!(id);
+        }
     }
     write_file(&project.spec_path, &serde_yaml::to_string(&spec)?, 0o644)
 }
@@ -580,7 +579,7 @@ systemctl enable cai-ssh.path
     Ok(())
 }
 
-pub(super) fn write_next_steps(args: &InitArgs, project: &InitProject) -> Result<()> {
+pub(super) fn write_next_steps(cli: &Cli, args: &InitArgs, project: &InitProject) -> Result<()> {
     let name = project_name(args, project.target);
     let steps = if args.stage == Some(InitStage::Build) {
         format!(
@@ -590,17 +589,18 @@ Run these commands from this directory. No model credentials belong in this imag
 Review build.yaml, then configure cloud credentials with /usr/libexec/cagent/bin/aliyun configure.
 
 ```bash
-cagent spec validate --spec build.yaml
-cagent build --spec build.yaml
-cagent image publish {name} --spec build.yaml
-openssl genpkey -algorithm ED25519 -out publisher.key
+confidential-agent spec validate --spec build.yaml
+confidential-agent build --spec build.yaml
+confidential-agent image publish {name} --spec build.yaml
+test -f publisher.key || (umask 077; openssl genpkey -algorithm ED25519 -out publisher.key)
 openssl pkey -in publisher.key -pubout -out publisher.pem
-cagent image export {name} --account-id ACCOUNT_ID --signing-key publisher.key --output image-release.json
+confidential-agent image export {name} --signing-key publisher.key --output image-release.json
 ```
 
+For an already available shared/marketplace image, add --region REGION --image-id IMAGE_ID to image export; no upload or import is performed.
 Keep publisher.key private. Record the full manifest digest printed by export.
-Use `cagent init {target} --stage deploy` with the release, independently trusted
-publisher public key, digest and account ID. Each instance gets a distinct --service-id.
+Use `confidential-agent init {target} --stage deploy` with the release, independently trusted
+publisher public key and digest. Each instance gets a distinct --service-id.
 For allinone, select --harness for each instance; reuse this same release without rebuilding.
 Changing software versions requires a new build and release. Changing model/provider
 configuration does not require rebuilding. Destroying a consumer preserves the shared image.
@@ -612,47 +612,48 @@ configuration does not require rebuilding. Destroying a consumer preserves the s
             r#"# Deploy {name} from an existing image
 
 Run these commands from this directory. Review instance.yaml and private files in secrets/.
-The release signature and runtime compatibility are verified by deploy before creating resources.
+The release signature is verified by default; --skip-signature-verification explicitly opts out.
+Runtime compatibility and runtime attestation checks remain enabled.
 Do not run build for this project. For Qoder, complete its official login/model wizard via SSH.
 
 ```bash
-cagent peering add --role operator --cidr YOUR_PUBLIC_IP/32 --label operator
-cagent spec validate --spec instance.yaml
-cagent deploy --spec instance.yaml
-cagent status --live
-cagent report --json
+confidential-agent peering add --role operator --cidr YOUR_PUBLIC_IP/32 --label operator
+confidential-agent spec validate --spec instance.yaml
+confidential-agent deploy --spec instance.yaml
+confidential-agent status --live
+confidential-agent report --json
 ```
 
 Management SSH uses credentials delivered after attestation, not a baked-in debug key.
 For allinone:
 ```bash
-cagent ssh {name} -- cai-agent --check
-cagent ssh {name} --tty -- cai-agent
+confidential-agent ssh {name} -- cai-agent --check
+confidential-agent ssh {name} --tty -- cai-agent
 ```
 
-For a configured gateway/app-server, use `cagent connect start --service {name}`.
+For a configured gateway/app-server, use `confidential-agent connect start --service {name}`.
 Readiness is not a model test: send an actual model request after configuring credentials.
 Run init again with a different --service-id to create an independent instance from the same release.
 Gateway/app-server --replicas N creates a load-balanced service with shared service configuration;
 CLI harnesses use distinct service IDs instead. Simultaneously running different harnesses use different service IDs.
 Replicas share a service identity; independent services have independent credentials and SSH keys.
-Use `cagent ssh SERVICE --instance-id INSTANCE_ID` to address a recorded physical replica.
+Use `confidential-agent ssh SERVICE --instance-id INSTANCE_ID` to address a recorded physical replica.
 Parallel local tunnels need separate --ready-json/--log-file paths. CA selects available local
 ports; read client_endpoints from each ready JSON instead of assuming the guest port is free.
 To switch an existing allinone CLI instance to another CLI harness, generate its configuration
 with the same --service-id in a new output directory, using the same release and infrastructure settings.
-Use `cagent inject --spec instance.yaml --target-ip INSTANCE_IP` with that new configuration.
+Use `confidential-agent inject --spec instance.yaml --target-ip INSTANCE_IP` with that new configuration.
 The instance ID and its existing data remain; no rebuild or new deploy is needed.
 Use inject to update resources of an existing instance;
 port/mode changes also affect deployment topology, so create a new instance for those changes.
 
 ```bash
-cagent destroy {name}
+confidential-agent destroy {name}
 ```
 "#
         )
     };
-    write_file(&project.dir.join("NEXT_STEPS.md"), &steps, 0o644)
+    write_project_next_steps(cli, project, &steps)
 }
 
 #[cfg(test)]
@@ -681,6 +682,53 @@ mod tests {
         };
         cmd_init(&cli, args)?;
         Ok(output.join(project_name(args, args.target.unwrap())))
+    }
+
+    #[test]
+    fn skipped_signature_init_has_no_key_or_uid_and_next_steps_preserve_state_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release.json");
+        fs::write(&release, "fixture").unwrap();
+        let state = temp.path().join("state with spaces and 'quote");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let output = run(
+            temp.path(),
+            "allinone",
+            "deploy",
+            &[
+                "--service-id",
+                "portable-consumer",
+                "--dashscope-api-key",
+                "test-model-key",
+                "--harness",
+                "codex",
+                "--image-release",
+                release.to_str().unwrap(),
+                "--manifest",
+                &digest,
+                "--skip-signature-verification",
+                "--image-id",
+                "m-marketplace",
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let spec = AgentSpec::from_path(&output.join("instance.yaml")).unwrap();
+        let image = spec.deploy.image.unwrap();
+        assert!(image.skip_signature_verification);
+        assert!(image.trusted_key.as_os_str().is_empty());
+        assert_eq!(image.image_id.as_deref(), Some("m-marketplace"));
+        assert!(!output.join("publisher.pem").exists());
+        let yaml = fs::read_to_string(output.join("instance.yaml")).unwrap();
+        assert!(!yaml.contains("account_id"));
+        let steps = fs::read_to_string(output.join("NEXT_STEPS.md")).unwrap();
+        assert!(steps.contains(&format!("cd {}", shell_path(&output))));
+        assert!(steps.contains(&format!(
+            "confidential-agent --state-dir {} deploy --spec instance.yaml",
+            shell_path(&state)
+        )));
+        assert!(!steps.contains("account ID"));
     }
 
     #[test]
@@ -761,8 +809,6 @@ mod tests {
             key.to_str().unwrap(),
             "--manifest",
             &digest,
-            "--account-id",
-            "123456",
             "--dashscope-api-key",
             "test-private-model-key",
             "--model-key-file",

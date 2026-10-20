@@ -297,7 +297,11 @@ fn ensure_build_variant_present(
 }
 
 pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
-    let mut snapshot = deployment_snapshot(&args.spec)?;
+    let mut snapshot = deployment_snapshot_with_image_options(
+        &args.spec,
+        args.skip_signature_verification,
+        args.image_id.as_deref(),
+    )?;
     let spec = snapshot.spec.clone();
     let operation = lock_service_operation(&cli.state_dir, &spec.service.id)?;
     let trustee_mode = spec.attestation.mode == AttestationMode::Trustee;
@@ -1284,7 +1288,7 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
         ImageCommands::Publish(args) => publish::cmd_image_publish(cli, args),
         ImageCommands::Export {
             service,
-            account_id,
+            image_id,
             signing_key,
             output,
             region,
@@ -1292,7 +1296,7 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
         } => images::export(
             cli,
             service,
-            account_id,
+            image_id.as_deref(),
             signing_key,
             output,
             region.as_deref(),
@@ -2483,13 +2487,11 @@ fn build_has_no_deployment(state: &LocalServiceState) -> bool {
 
 pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
     if let Some(image) = &prepared.image {
-        return vec![
+        let mut args = vec![
             "--work-dir".into(),
             prepared.shelter_work_dir.as_os_str().to_os_string(),
             "deploy-release".into(),
             image.source.release.as_os_str().to_os_string(),
-            "--trusted-key".into(),
-            image.source.trusted_key.as_os_str().to_os_string(),
             "--expect-manifest".into(),
             image.source.manifest.clone().into(),
             "--runtime-target".into(),
@@ -2503,6 +2505,15 @@ pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
                 .into(),
             "--auto-approve".into(),
         ];
+        if image.source.skip_signature_verification {
+            args.push("--skip-signature-verification".into());
+        } else {
+            args.extend([
+                "--trusted-key".into(),
+                image.source.trusted_key.as_os_str().to_os_string(),
+            ]);
+        }
+        return args;
     }
     let mut args = vec![
         OsString::from("--work-dir"),

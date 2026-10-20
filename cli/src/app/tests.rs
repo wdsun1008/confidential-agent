@@ -324,6 +324,8 @@ fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
         let result = cmd_deploy(
             &cli,
             &DeployArgs {
+                skip_signature_verification: false,
+                image_id: None,
                 resume: false,
                 spec,
                 skip_inject: true,
@@ -1585,6 +1587,8 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             resume: false,
             spec: spec.clone(),
             skip_inject: false,
@@ -1613,6 +1617,8 @@ resources: {}
     cmd_deploy(
         &cli,
         &DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             resume: false,
             spec,
             skip_inject: true,
@@ -1863,6 +1869,8 @@ resources: {}
     cmd_deploy(
         &cli,
         &DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             resume: false,
             spec,
             skip_inject: true,
@@ -2404,7 +2412,9 @@ resources: {}
             release: temp.path().join("release.json"),
             trusted_key: temp.path().join("publisher.pem"),
             manifest: format!("sha256:{}", "0".repeat(64)),
-            account_id: "1234567890".into(),
+            legacy_account_id: None,
+            image_id: None,
+            skip_signature_verification: false,
         },
         image_id: "m-shared".into(),
     });
@@ -3529,6 +3539,8 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             resume: false,
             spec,
             skip_inject: false,
@@ -3600,6 +3612,8 @@ resources: {}
     let err = cmd_deploy(
         &cli,
         &DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             resume: false,
             spec,
             skip_inject: false,
@@ -3678,6 +3692,8 @@ resources: {}
     let deploy_result = cmd_deploy(
         &cli,
         &DeployArgs {
+            skip_signature_verification: false,
+            image_id: None,
             resume: false,
             spec,
             skip_inject: false,

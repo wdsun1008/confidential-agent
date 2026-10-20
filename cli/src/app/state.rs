@@ -14,16 +14,44 @@ pub(super) fn link_committed_config(alias: &Path, target: &Path) -> Result<()> {
 }
 
 pub(super) fn deployment_snapshot(path: &Path) -> Result<DeploymentSnapshot> {
+    deployment_snapshot_with_image_options(path, false, None)
+}
+
+pub(super) fn deployment_snapshot_with_image_options(
+    path: &Path,
+    skip_signature: bool,
+    image_id: Option<&str>,
+) -> Result<DeploymentSnapshot> {
     let path = fs::canonicalize(path)
         .with_context(|| format!("failed to resolve spec {}", path.display()))?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("failed to read spec '{}'", path.display()))?;
+    let effective_content = if skip_signature || image_id.is_some() {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let image = value
+            .get_mut("deploy")
+            .and_then(|v| v.get_mut("image"))
+            .and_then(|v| v.as_mapping_mut())
+            .context("image options require deploy.image")?;
+        if skip_signature {
+            image.insert("skip_signature_verification".into(), true.into());
+        }
+        if let Some(id) = image_id {
+            image.insert("image_id".into(), id.into());
+        }
+        serde_yaml::to_string(&value)?
+    } else {
+        content.clone()
+    };
     Ok(DeploymentSnapshot {
         source: LocalSpecState {
             path: path.clone(),
             sha256: hex_encode(&Sha256::digest(content.as_bytes())),
         },
-        spec: AgentSpec::from_yaml(&content, path.parent().context("spec has no parent")?)?,
+        spec: AgentSpec::from_yaml(
+            &effective_content,
+            path.parent().context("spec has no parent")?,
+        )?,
         user_data: None,
         inputs: None,
     })
@@ -188,6 +216,9 @@ pub(super) fn validated_injection_spec(
                 &committed.source.trusted_key,
             ),
         ] {
+            if name == "publisher key" && committed.source.skip_signature_verification {
+                continue;
+            }
             let frozen_digest = sha256_file(frozen)
                 .with_context(|| format!("failed to read committed image {name}"))?;
             match fs::symlink_metadata(source) {
@@ -342,7 +373,7 @@ pub(super) fn context_paths(state_dir: &Path, service_id: &str) -> ContextPaths 
     ContextPaths {
         shelter_work_dir,
         artifacts_dir,
-        cache_dir: service_dir.join("cache"),
+        cache_dir: service_dir.join("shelter").join("cache"),
         guest_staging_dir: service_dir.join("guest"),
         secrets_dir: service_dir.join("secrets"),
         rendered_config: service_dir.join("shelter.yaml"),

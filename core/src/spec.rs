@@ -290,10 +290,22 @@ fn default_slb_type() -> SlbType {
 #[serde(deny_unknown_fields)]
 pub struct PublishedImageSpec {
     pub release: PathBuf,
+    #[serde(default)]
     pub trusted_key: PathBuf,
     /// Immutable Shelter manifest identity, selected independently of the release.
     pub manifest: String,
-    pub account_id: String,
+    /// Legacy state compatibility only; never used for consumer authorization.
+    #[serde(
+        default,
+        rename = "account_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
+    /// Explicit opt-out for release signatures, never runtime attestation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_signature_verification: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -550,17 +562,19 @@ impl AgentSpec {
             bail!("service.ssh requires a release image; debug images use their existing SSH mechanism");
         }
         if let Some(image) = &self.deploy.image {
-            if image.release.as_os_str().is_empty() || image.trusted_key.as_os_str().is_empty() {
-                bail!("deploy.image requires release and trusted_key paths");
+            if image.release.as_os_str().is_empty()
+                || (!image.skip_signature_verification && image.trusted_key.as_os_str().is_empty())
+            {
+                bail!("deploy.image requires release and a trusted_key unless skip_signature_verification is explicit");
             }
             let digest = image.manifest.strip_prefix("sha256:").unwrap_or_default();
             if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 bail!("deploy.image.manifest must be a full sha256: manifest identity");
             }
-            if image.account_id.is_empty()
-                || !image.account_id.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                bail!("deploy.image.account_id must be a decimal account ID");
+            if let Some(id) = &image.image_id {
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    bail!("deploy.image.image_id must be a cloud image ID");
+                }
             }
             if !self.build.image_name.is_empty()
                 || !self.build.packages.is_empty()
@@ -1170,14 +1184,14 @@ mod tests {
 
     #[test]
     fn published_image_rejects_ambiguous_builds_unpinned_identity_and_debug_keys() {
-        for field in ["build", "manifest", "account_id", "release", "debug"] {
+        for field in ["build", "manifest", "image_id", "release", "debug"] {
             let mut value = published_spec();
             match field {
                 "build" => {
                     value["build"] = serde_yaml::from_str("image_name: another-image").unwrap()
                 }
                 "manifest" => value["deploy"]["image"]["manifest"] = "sha256:123".into(),
-                "account_id" => value["deploy"]["image"]["account_id"] = "bad-account".into(),
+                "image_id" => value["deploy"]["image"]["image_id"] = "bad image!".into(),
                 "release" => value["deploy"]["image"]["release"] = "".into(),
                 _ => value["deploy"]["image_variant"] = "debug".into(),
             }

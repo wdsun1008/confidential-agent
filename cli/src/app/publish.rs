@@ -1506,7 +1506,9 @@ mod tests {
                     release: "/release.json".into(),
                     trusted_key: "/publisher.pem".into(),
                     manifest: format!("sha256:{}", "a".repeat(64)),
-                    account_id: "123".into(),
+                    legacy_account_id: None,
+                    image_id: None,
+                    skip_signature_verification: false,
                 },
             }),
             ..BuildManifest::default()

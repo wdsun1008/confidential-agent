@@ -12,10 +12,10 @@ Rekor and Trustee require their usual operator configuration.
 
 ## Initialize from the installed RPM
 
-Run `cagent init` for the interactive build/deploy wizard, or:
+Run `confidential-agent init` for the interactive build/deploy wizard, or:
 
 ```bash
-cagent init allinone --stage build --non-interactive
+confidential-agent init allinone --stage build --non-interactive
 cd confidential-agent-init/allinone-builder
 ```
 
@@ -23,9 +23,8 @@ The generated directory is self-contained and includes `NEXT_STEPS.md` for
 building, publishing and exporting a signed release. No model credentials are
 needed for image initialization. Software versions stay in runtime-contract.json.
 
-For each consumer, run `cagent init allinone --stage deploy`: choose a unique
-service ID, the signed release and trusted publisher key, expected digest and
-account, then a harness and mode. Use the same release for multiple independent
+For each consumer, run `confidential-agent init allinone --stage deploy`: choose a unique
+service ID, the signed release and trusted publisher key, expected digest, then a harness and mode. Use the same release for multiple independent
 services, including different harnesses. Initialization does not create cloud
 resources. Generated consumer projects have no build inputs.
 See [RPM walkthrough](../../docs/rpm.md) for the non-interactive commands.
@@ -33,10 +32,10 @@ See [RPM walkthrough](../../docs/rpm.md) for the non-interactive commands.
 ## Use a prebuilt image
 
 Obtain the signed release and an independently trusted publisher public key.
-Copy `instance.yaml` and replace its account and full manifest digest. Use a
+Copy `instance.yaml` and replace its full manifest digest and region. Use a
 different `service.id` for every VM. Configure operator peering with SSH scope
 before deploying. `service.ssh: true` creates unique client and host keys;
-CA delivers them as attested resources and pins the host key for `ca ssh`.
+CA delivers them as attested resources and pins the host key for `confidential-agent ssh`.
 The image starts SSH only after those resources arrive. No SSH key is baked
 into the shared image.
 Keep `service.ssh: true` in the build specification too: it selects Cryptpilot's
@@ -44,11 +43,11 @@ SSH-preserving hardening mode while retaining disk encryption and integrity.
 The default SSH service and socket stay disabled.
 
 ```bash
-ca spec validate --spec instance.yaml
-ca deploy --spec instance.yaml
-ca ssh allinone-codex -- cai-agent --version
-ca ssh allinone-codex --tty -- cai-agent
-ca destroy allinone-codex
+confidential-agent spec validate --spec instance.yaml
+confidential-agent deploy --spec instance.yaml
+confidential-agent ssh allinone-codex -- cai-agent --version
+confidential-agent ssh allinone-codex --tty -- cai-agent
+confidential-agent destroy allinone-codex
 ```
 
 Consumer destruction preserves the shared cloud image. The publisher owns
@@ -98,7 +97,7 @@ The daemon supplies the application runtime context after verifying and applying
 the selected provider's resources. The launcher does not read challenge or
 Trustee caches. Management SSH starts independently when its own attested
 credentials are ready, so application configuration errors can be diagnosed
-with `ca ssh SERVICE -- journalctl -u cai-allinone.service --no-pager`.
+with `confidential-agent ssh SERVICE -- journalctl -u cai-allinone.service --no-pager`.
 OpenClaw and Hermes run only the selected gateway. All per-harness units from
 individual installers remain disabled.
 
@@ -109,8 +108,8 @@ does not replace an existing target. Keep `runtime.json` operator-managed;
 choose guest-managed native configuration only when an in-guest wizard owns it.
 
 Local `deployed` confirms infrastructure; `active` records delivery and mesh
-synchronization after the daemon becomes reachable. Inspect `ca report --json`
-for instance attestation and daemon resource state, and `ca status --live` for
+synchronization after the daemon becomes reachable. Inspect `confidential-agent report --json`
+for instance attestation and daemon resource state, and `confidential-agent status --live` for
 application readiness. A model request is a separate explicit check. No local
 phase or readiness flag implies that a paid model request succeeded.
 
@@ -139,7 +138,7 @@ Codex supports `mode: "cli"` and `mode: "app-server"`. For app-server, set
 deliver a required `0600` token resource to
 `/opt/data/allinone/home/.codex/app-server-token`. The selected allinone unit
 starts the authenticated app-server; the independent Codex unit stays disabled.
-Use `ca connect start --service SERVICE` with the native Codex remote client.
+Use `confidential-agent connect start --service SERVICE` with the native Codex remote client.
 
 OpenClaw supports `mode: "gateway"` with `port: 18789`. Hermes supports gateway
 mode; specifying `port: 8642` enables its HTTP API on `0.0.0.0`. Keep native API
@@ -155,20 +154,20 @@ removed endpoints are reserved and never assigned to a different service.
 Changing a local application port to a reserved client endpoint is rejected.
 Every receiving guest, including client-only instances, must support stable
 mesh endpoints before overlapping ports can be introduced. Legacy guests must
-be rebuilt first. Local `ca connect` tunnels still need separate local
+be rebuilt first. Local `confidential-agent connect` tunnels still need separate local
 listening ports when kept running concurrently.
 
 Background mesh and peering maintenance uses the saved deployment snapshot;
 editing or moving the original AppSpec does not update an existing instance.
 For resource delivery interrupted after infrastructure deployment completed,
-restore the original input and run `ca deploy --resume --spec instance.yaml`.
+restore the original input and run `confidential-agent deploy --resume --spec instance.yaml`.
 Resume checks the original canonical AppSpec/resource paths, resource contents,
 disk secret and instance identities, and delivers the recorded private resource
 copies. Changing a referenced file while keeping the YAML unchanged is rejected.
-Use explicit `ca inject` to apply current resources to an existing instance.
+Use explicit `confidential-agent inject` to apply current resources to an existing instance.
 This keeps the recorded instance and identities. An interrupted infrastructure
 operation has unknown results and is not replayed by `--resume`; inspect its
-saved Shelter status before cleanup. `ca destroy` removes instance resources.
+saved Shelter status before cleanup. `confidential-agent destroy` removes instance resources.
 Reboot persistence does not imply data preservation across destroy/rebuild or
 image replacement; those migrations are not implemented by this example.
 Destroy leaves local identity material in the CA state directory; redeploying the
@@ -187,11 +186,11 @@ environment. Incomplete environment credentials are rejected rather than mixed
 with another profile's keys.
 
 ```bash
-ca build --spec examples/allinone/build.yaml
-ca image publish allinone-builder --spec examples/allinone/build.yaml
-openssl genpkey -algorithm ED25519 -out publisher.key
+confidential-agent build --spec examples/allinone/build.yaml
+confidential-agent image publish allinone-builder --spec examples/allinone/build.yaml
+test -f publisher.key || (umask 077; openssl genpkey -algorithm ED25519 -out publisher.key)
 openssl pkey -in publisher.key -pubout -out publisher.pem
-ca image export allinone-builder --account-id ACCOUNT_ID \
+confidential-agent image export allinone-builder \
   --signing-key publisher.key --output image-release.json
 ```
 
@@ -200,3 +199,15 @@ the independently trusted `publisher.pem` to the deployment host. Keep the
 signing private key on the publisher. The deployment host needs CA and its
 bundled Shelter RPM, cloud credentials, and instance resource files; it does
 not need publisher state, build sources, or a local QCOW2.
+
+For shared or marketplace images already available in a region, use `image export
+allinone-builder --region REGION --image-id IMAGE_ID --signing-key publisher.key
+--output image-release.json`. This signs metadata from the existing build without
+uploading an image. Consumers can override `deploy.image.image_id` for their
+region; runtime references stay unchanged. No deployment account UID is required.
+
+Signatures are checked by default. `deploy --skip-signature-verification` explicitly
+skips only the release signature and permits omitting the publisher key. It keeps
+runtime reference/compatibility checks and attestation. `init --stage deploy`
+accepts the same flag to record it in the generated spec. See the RPM walkthrough
+for directory ownership and state retention.
