@@ -2492,8 +2492,6 @@ pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
             prepared.shelter_work_dir.as_os_str().to_os_string(),
             "deploy-release".into(),
             image.source.release.as_os_str().to_os_string(),
-            "--expect-manifest".into(),
-            image.source.manifest.clone().into(),
             "--runtime-target".into(),
             prepared.rendered_config.as_os_str().to_os_string(),
             "--name".into(),
@@ -2505,6 +2503,9 @@ pub(super) fn deploy_shelter_args(prepared: &PreparedConfig) -> Vec<OsString> {
                 .into(),
             "--auto-approve".into(),
         ];
+        if let Some(pin) = &image.source.manifest {
+            args.extend(["--expect-manifest".into(), pin.into()]);
+        }
         if image.source.skip_signature_verification {
             args.push("--skip-signature-verification".into());
         } else {

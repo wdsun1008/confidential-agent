@@ -197,7 +197,8 @@ pub(super) fn validated_injection_spec(
     );
 
     anyhow::ensure!(
-        current.image_id() == saved.spec.image_id()
+        (current.image_id() == saved.spec.image_id()
+            || (current.deploy.image.is_some() && saved.spec.deploy.image.is_some()))
             && current.image_variant() == state.build.variant,
         "inject cannot change the deployed image; deploy a new instance to use a different image"
     );
@@ -208,6 +209,23 @@ pub(super) fn validated_injection_spec(
     // The saved release and publisher key are the authorization. Download
     // locations are not instance identity, and need not remain available.
     if let (Some(image), Some(committed)) = (&mut proposed.image, &manifest.image) {
+        anyhow::ensure!(
+            image
+                .manifest
+                .as_ref()
+                .map_or(true, |pin| committed.source.manifest.as_ref() == Some(pin)),
+            "inject cannot change the deployed image manifest"
+        );
+        // A user-supplied version pin is optional; the authenticated snapshot
+        // remains the identity, including for deployments made by older CLIs.
+        image.manifest = saved
+            .spec
+            .deploy
+            .image
+            .as_ref()
+            .context("missing committed image release")?
+            .manifest
+            .clone();
         for (name, source, frozen) in [
             ("release", &image.release, &committed.source.release),
             (

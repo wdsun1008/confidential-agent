@@ -77,7 +77,7 @@ confidential-agent image export allinone-builder \
   --signing-key publisher.key --output image-release.json
 ```
 
-记录 export 输出的完整 manifest digest。镜像上传的
+manifest 摘要会从经过验签的 release 自动读取，无需抄写。镜像上传的
 `CA_IMAGE_OSS_ENDPOINT=auto` 会检测同地域 ECS 内网端点，否则使用公网。
 发布不重新构建镜像。
 
@@ -91,13 +91,13 @@ harness、运行模式、模型和凭证，或使用参数：
 confidential-agent init allinone --stage deploy --non-interactive \
   --service-id hermes-01 --harness hermes --harness-mode gateway \
   --image-release ./image-release.json --trusted-key ./publisher.pem \
-  --manifest sha256:FULL_MANIFEST_DIGEST \
   --reference-values sample --output-dir ~/cagent-work
 cd ~/cagent-work/hermes-01
 ```
 
 部署目录只包含 `instance.yaml`、release、公钥、私有配置及后续步骤，不包含构建输入。
 签名和镜像兼容性会在 deploy 创建云资源前验证。
+只有需要额外固定某个版本时才传 `--manifest sha256:<完整摘要>`；省略时仍会验签，并把解析出的摘要固定在部署状态中。
 再次 init 时换 `--service-id`，可复用相同镜像创建同种或不同 harness 的实例。
 allinone 支持 OpenClaw、Hermes、Codex、Claude Code、QoderCLI、OpenCode；
 Qoder 使用自己的账户登录流程，不把 DashScope key 当成 Qoder 凭证。

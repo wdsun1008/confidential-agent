@@ -210,10 +210,10 @@ deploy:
   image:
     release: ./image-release.json
     trusted_key: ./publisher.pem
-    manifest: sha256:<完整的64位manifest摘要>
+    # 可选：manifest: sha256:<完整的64位manifest摘要>
 ```
 
-发布端先运行 `image publish`，再运行 `image export <service> --signing-key <Ed25519 PKCS8 PEM> --output image-release.json`。消费者仅需要 release、独立认可的发布者公钥以及自己的 AppSpec 和资源文件，不需要生产端 state、构建输入或 QCOW2。CA 在创建资源前验证签名、固定摘要和地域映射，将验证过的参考值交给现有 challenge/Trustee 流程。每个 service 使用自己的身份、磁盘口令和 Terraform state；`destroy` 不删除共享镜像。该模式只允许 release 变体；需要内置调试密钥的 debug 镜像不能作为共享发布镜像。
+发布端先运行 `image publish`，再运行 `image export <service> --signing-key <Ed25519 PKCS8 PEM> --output image-release.json`。消费者仅需要 release、独立认可的发布者公钥以及自己的 AppSpec 和资源文件，不需要生产端 state、构建输入或 QCOW2。CA 在创建资源前验证签名和地域映射，自动读取并保存 manifest 摘要，将验证过的参考值交给现有 challenge/Trustee 流程。可选的 `manifest` 字段用于额外固定版本；显式指定但不匹配会失败。每个 service 使用自己的身份、磁盘口令和 Terraform state；`destroy` 不删除共享镜像。该模式只允许 release 变体；需要内置调试密钥的 debug 镜像不能作为共享发布镜像。
 
 当前 E2E 默认示例使用 `cn-beijing-i + ecs.g9i.xlarge`。香港 region 的 TDX 默认组合为 `cn-hongkong-d + ecs.g8i.xlarge`；实际可用性仍可能受账号库存和可用区限制影响，必要时显式覆盖 `region`、`zone_id` 和 `instance_type`。
 

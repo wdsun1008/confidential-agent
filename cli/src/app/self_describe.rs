@@ -493,7 +493,7 @@ fn spec_schema_json() -> serde_json::Value {
         "deploy": {
             "provider": "aliyun",
             "image_variant": "release or debug",
-            "image": {"release": "signed image release JSON", "trusted_key": "trusted publisher Ed25519 SPKI PEM", "manifest": "pinned sha256 manifest digest", "image_id": "optional existing shared/marketplace image override", "skip_signature_verification": "explicit release-signature opt-out; runtime attestation remains required"},
+            "image": {"release": "signed image release JSON", "trusted_key": "trusted publisher Ed25519 SPKI PEM", "manifest": "optional sha256 version pin; otherwise read from authenticated release", "image_id": "optional existing shared/marketplace image override", "skip_signature_verification": "explicit release-signature opt-out; runtime attestation remains required"},
             "region": "Aliyun region",
             "zone_id": "Aliyun zone",
             "instance_type": "TDX-capable ECS instance type",
@@ -531,7 +531,7 @@ Use `confidential-agent spec validate --spec <path> --format json` before build/
 CA builds the guest rootfs with mkosi. Use `build.container` for an OCI workload image or archive; it is rendered as Shelter `container:` and is not a replacement for the mkosi base image. Keep `build.packages` limited to Alinux/RHEL OS prerequisites and let the target's package manager install application dependencies.
 `build.scripts` entries are local script paths from the controller work directory, usually the same file listed in `build.files[].source`; they are not the guest `build.files[].target` path.
 
-To deploy without producer state or a local disk image, set `deploy.image.release`, `trusted_key`, `manifest` (a full `sha256:` manifest digest). Omit `build` and run `deploy` directly. CA authenticates the release through Shelter before provisioning or releasing resources; challenge/Trustee resource delivery remains unchanged. `image export <service> --signing-key <Ed25519 PKCS8 PEM> --output <release.json>` exports an available publication from the producer; --region and --image-id can select an existing shared/marketplace image without upload. deploy --skip-signature-verification explicitly skips the release signature and permits omitting trusted_key, but keeps manifest/runtime checks and attestation. Transfer only the release and publisher public key to consumers. Consumer `destroy` preserves the shared image.
+To deploy without producer state or a local disk image, set `deploy.image.release` and `trusted_key`. The optional `manifest` field (a full `sha256:` digest) pins a specific version; by default CA reads the identity from the authenticated release and saves it in deployment state. Omit `build` and run `deploy` directly. CA authenticates the release through Shelter before provisioning or releasing resources; challenge/Trustee resource delivery remains unchanged. `image export <service> --signing-key <Ed25519 PKCS8 PEM> --output <release.json>` exports an available publication from the producer; --region and --image-id can select an existing shared/marketplace image without upload. deploy --skip-signature-verification explicitly skips the release signature and permits omitting trusted_key, but keeps manifest/runtime checks and attestation. Transfer only the release and publisher public key to consumers. Consumer `destroy` preserves the shared image.
 "#;
 
 const OVERVIEW_DOC: &str = r#"

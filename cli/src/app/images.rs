@@ -71,10 +71,11 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
     command
         .args(["artifact", "inspect-release"])
         .arg(&source.release)
-        .arg("--expect-manifest")
-        .arg(&source.manifest)
         .arg("--region")
         .arg(&spec.deploy.region);
+    if let Some(digest) = &source.manifest {
+        command.arg("--expect-manifest").arg(digest);
+    }
     if source.skip_signature_verification {
         command.arg("--skip-signature-verification");
     } else {
@@ -95,7 +96,10 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
         serde_json::from_slice(&output.stdout).context("invalid Shelter cloud-image inspection")?;
     anyhow::ensure!(
         inspected.schema_version == "io.shelter.cloud-image-inspection/v1"
-            && inspected.manifest_digest == source.manifest
+            && source
+                .manifest
+                .as_ref()
+                .map_or(true, |pin| pin == &inspected.manifest_digest)
             && inspected.image.provider == "terraform-alicloud"
             && inspected.image.region == spec.deploy.region
             && source
@@ -104,12 +108,23 @@ pub(super) fn import(cli: &Cli, spec: &AgentSpec) -> Result<BuildManifest> {
                 .map_or(true, |id| id == &inspected.image.image_id),
         "Shelter inspection does not match the selected image and deployment target"
     );
+    let digest = inspected
+        .manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or_default();
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Shelter inspection returned an invalid manifest digest"
+    );
+    // Freeze the authenticated identity even when the operator did not supply a
+    // version pin. Subsequent preparation and apply use this exact snapshot.
+    source.manifest = Some(inspected.manifest_digest.clone());
     if spec.attestation.reference_values == ReferenceValueMode::Rekor {
         anyhow::ensure!(inspected.rekor_value.is_some(), "published image has no Rekor metadata; select sample reference values or export an image built with Rekor");
     }
     let runtime_contract = inspected.runtime_metadata.context("published image has no CA runtime contract; rebuild and export it with a compatible CA publisher")?;
     runtime_contract.validate_deploy(spec, &inspected.security)?;
-    let build_id = format!("image-{}", source.manifest.trim_start_matches("sha256:"));
+    let build_id = format!("image-{digest}");
     let build_result = paths.artifacts_dir.join("image-metadata.json");
     // Compatibility projection for the existing CA attestation/resource code.
     // This is metadata, never a fabricated local Shelter artifact or QCOW2.
@@ -372,6 +387,47 @@ mod tests {
         let path = root.join(format!("{id}.yaml"));
         fs::write(&path, format!("schema: confidential-agent/v1\nservice:\n  id: {id}\n  ports: []\n  app_service: cai-allinone.service\n  ssh: true\ndeploy:\n  provider: aliyun\n  instance_type: ecs.g9i.xlarge\n  region: cn-beijing\n  zone_id: cn-beijing-i\n  disk_gb: 80\n  image:\n    release: ./release.json\n    trusted_key: ./publisher.pem\n    manifest: sha256:{}\n    account_id: '1234567890'\nattestation:\n  tee: tdx\n  mode: challenge\n  reference_values: sample\nresources: {{}}\n", "a".repeat(64))).unwrap();
         path
+    }
+
+    #[test]
+    fn omitted_manifest_is_resolved_and_pinned_for_apply() {
+        let (root, cli, inspected) = fixture();
+        let path = instance_spec(root.path(), "automatic-manifest");
+        let content = fs::read_to_string(&path)
+            .unwrap()
+            .replace(&format!("    manifest: sha256:{}\n", "a".repeat(64)), "");
+        fs::write(&path, content).unwrap();
+        let snapshot = deployment_snapshot(&path).unwrap();
+        let manifest = import(&cli, &snapshot.spec).unwrap();
+        let pin = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            manifest.image.as_ref().unwrap().source.manifest.as_deref(),
+            Some(pin.as_str())
+        );
+        let prepared = prepare(
+            &context_paths(&cli.state_dir, "automatic-manifest"),
+            &snapshot.spec,
+            &manifest,
+            &PrepareOptions::default(),
+        )
+        .unwrap();
+        let args = deploy_shelter_args(&prepared);
+        let position = args
+            .iter()
+            .position(|arg| arg == "--expect-manifest")
+            .unwrap();
+        assert_eq!(args[position + 1], OsString::from(&pin));
+        let restored: BuildManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            restored.image.unwrap().source.manifest.as_deref(),
+            Some(pin.as_str())
+        );
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&inspected).unwrap()).unwrap();
+        invalid["manifest_digest"] = "invalid".into();
+        fs::write(&inspected, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(import(&cli, &snapshot.spec).is_err());
     }
 
     #[test]
@@ -704,12 +760,24 @@ mod tests {
         fs::copy(paths.secrets_dir.join("disk_passphrase"), &moved_disk).unwrap();
         let mut current = AgentSpec::from_path(&moved_spec).unwrap();
         current.secrets.disk_passphrase = Some(moved_disk.clone());
+        // Removing a redundant version pin from an older project is safe:
+        // authorization and release bytes are still bound to the deployment.
+        current.deploy.image.as_mut().unwrap().manifest = None;
         let delivery = validated_injection_spec(&state, &manifest, &current, &paths).unwrap();
         assert_eq!(
             delivery.deploy.image.unwrap().release,
             manifest.image.as_ref().unwrap().source.release
         );
         assert_ne!(delivery.secrets.disk_passphrase.unwrap(), moved_disk);
+        current.deploy.image.as_mut().unwrap().manifest =
+            Some(format!("sha256:{}", "b".repeat(64)));
+        assert!(
+            validated_injection_spec(&state, &manifest, &current, &paths)
+                .unwrap_err()
+                .to_string()
+                .contains("manifest")
+        );
+        current.deploy.image.as_mut().unwrap().manifest = None;
         // Resume remains strict; ordinary inject is an explicit resource update.
         assert!(
             validate_resume_inputs(&saved, &deployment_snapshot(&moved_spec).unwrap(), &paths)

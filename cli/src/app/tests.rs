@@ -2411,7 +2411,7 @@ resources: {}
         source: confidential_agent_core::spec::PublishedImageSpec {
             release: temp.path().join("release.json"),
             trusted_key: temp.path().join("publisher.pem"),
-            manifest: format!("sha256:{}", "0".repeat(64)),
+            manifest: Some(format!("sha256:{}", "0".repeat(64))),
             legacy_account_id: None,
             image_id: None,
             skip_signature_verification: false,

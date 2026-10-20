@@ -31,14 +31,36 @@ pub(super) fn resolve_interactive(args: &mut InitArgs) -> Result<()> {
     if args.stage == Some(InitStage::Deploy) && !args.non_interactive {
         if args.target == Some(InitTarget::Allinone) {
             if args.harness.is_none() {
-                args.harness = Some(prompt_value(
-                    "Harness (openclaw/hermes/codex/claude-code/qodercli/opencode)",
-                )?);
+                loop {
+                    let harness = prompt_value(
+                        "Harness (openclaw/hermes/codex/claude-code/qodercli/opencode)",
+                    )?;
+                    if harness_choices(&harness).is_ok() {
+                        args.harness = Some(harness);
+                        break;
+                    }
+                    println!("Choose one of the listed harnesses.");
+                }
             }
             if args.harness_mode.is_none() {
-                args.harness_mode = Some(prompt_value(
-                    "Mode (cli/gateway/app-server; depends on harness)",
-                )?);
+                let harness = args.harness.as_deref().unwrap();
+                let (modes, default, explanation) = harness_choices(harness)?;
+                println!("{explanation}");
+                if modes.len() == 1 {
+                    args.harness_mode = Some(default.into());
+                } else {
+                    loop {
+                        let selected = prompt_default(
+                            &format!("Mode for {harness} ({})", modes.join("/")),
+                            default,
+                        )?;
+                        if modes.contains(&selected.as_str()) {
+                            args.harness_mode = Some(selected);
+                            break;
+                        }
+                        println!("Choose {}.", modes.join(" or "));
+                    }
+                }
             }
         }
         if args.target == Some(InitTarget::VllmInference) {
@@ -53,19 +75,34 @@ pub(super) fn resolve_interactive(args: &mut InitArgs) -> Result<()> {
             args.service_id = Some(prompt_value("Unique instance/service ID")?);
         }
         if args.image_release.is_none() {
-            args.image_release = Some(prompt_value("Signed image-release.json path")?.into());
+            args.image_release = Some(
+                if Path::new("image-release.json").is_file() {
+                    prompt_default("Signed release path", "./image-release.json")?
+                } else {
+                    prompt_value("Signed image-release.json path")?
+                }
+                .into(),
+            );
         }
         if args.trusted_key.is_none() && !args.skip_signature_verification {
-            args.trusted_key = Some(prompt_value("Trusted publisher public key path")?.into());
-        }
-        if args.manifest.is_none() {
-            args.manifest = Some(prompt_value("Expected full sha256: manifest digest")?);
-        }
-        if args.region.is_none() {
-            args.region = Some(prompt_value("Deployment region (e.g. cn-beijing)")?);
-        }
-        if args.zone_id.is_none() {
-            args.zone_id = Some(prompt_value("Deployment zone (e.g. cn-beijing-i)")?);
+            let candidate = args
+                .image_release
+                .as_ref()
+                .unwrap()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("publisher.pem");
+            args.trusted_key = Some(
+                if candidate.is_file() {
+                    prompt_default(
+                        "Trusted publisher public key path",
+                        &candidate.display().to_string(),
+                    )?
+                } else {
+                    prompt_value("Trusted publisher public key path")?
+                }
+                .into(),
+            );
         }
         if args.model.is_none()
             && !matches!(
@@ -99,7 +136,14 @@ pub(super) fn resolve_interactive(args: &mut InitArgs) -> Result<()> {
                     .context("disk size must be an integer")?,
             );
         }
-        if args.stage == Some(InitStage::Deploy) && args.replicas == 1 {
+        let supports_replicas = match target {
+            InitTarget::Allinone if args.stage == Some(InitStage::Deploy) => {
+                harness_mode(args)?.2.is_some()
+            }
+            InitTarget::Claudecode => false,
+            _ => true,
+        };
+        if args.stage == Some(InitStage::Deploy) && args.replicas == 1 && supports_replicas {
             args.replicas = prompt_default("Replicas in this service (CLI: 1)", "1")?
                 .parse()
                 .context("replicas must be an integer")?;
@@ -199,16 +243,13 @@ pub(super) fn validate_args(args: &InitArgs, target: InitTarget) -> Result<()> {
                 .with_context(|| format!("--stage deploy requires {label}"))?;
             anyhow::ensure!(path.is_file(), "{label} must be an existing file");
         }
-        let digest = args
-            .manifest
-            .as_deref()
-            .context("--stage deploy requires --manifest")?
-            .strip_prefix("sha256:")
-            .unwrap_or_default();
-        anyhow::ensure!(
-            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
-            "--manifest must be a full sha256: digest from the publisher"
-        );
+        if let Some(pin) = &args.manifest {
+            let digest = pin.strip_prefix("sha256:").unwrap_or_default();
+            anyhow::ensure!(
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                "--manifest must be a full sha256: digest from the publisher"
+            );
+        }
         if target == InitTarget::Allinone {
             let (_, _, port) = harness_mode(args)?;
             anyhow::ensure!(args.replicas == 1 || port.is_some(), "CLI harnesses have no load-balanced port; create independent instances with distinct --service-id values");
@@ -248,31 +289,34 @@ pub(super) fn pep_binary(args: &InitArgs) -> Result<PathBuf> {
     }
 }
 
+fn harness_choices(harness: &str) -> Result<(&'static [&'static str], &'static str, &'static str)> {
+    match harness {
+        "openclaw" | "hermes" => Ok((
+            &["gateway", "cli"],
+            "gateway",
+            "gateway: run a network service for clients; cli: use the terminal over SSH.",
+        )),
+        "codex" => Ok((
+            &["cli", "app-server"],
+            "cli",
+            "cli: run Codex in the terminal over SSH; app-server: run Codex for remote clients.",
+        )),
+        "claude-code" | "qodercli" | "opencode" => Ok((
+            &["cli"],
+            "cli",
+            "This harness uses the terminal over SSH (cli).",
+        )),
+        _ => bail!("unsupported allinone harness: {harness}"),
+    }
+}
+
 fn harness_mode(args: &InitArgs) -> Result<(&str, &str, Option<u16>)> {
     let harness = args
         .harness
         .as_deref()
         .context("allinone deployment requires --harness")?;
-    anyhow::ensure!(
-        [
-            "openclaw",
-            "hermes",
-            "codex",
-            "claude-code",
-            "qodercli",
-            "opencode"
-        ]
-        .contains(&harness),
-        "unsupported allinone harness"
-    );
-    let mode =
-        args.harness_mode
-            .as_deref()
-            .unwrap_or(if ["openclaw", "hermes"].contains(&harness) {
-                "gateway"
-            } else {
-                "cli"
-            });
+    let (_, default, _) = harness_choices(harness)?;
+    let mode = args.harness_mode.as_deref().unwrap_or(default);
     let port = match (harness, mode) {
         (_, "cli") => None,
         ("openclaw", "gateway") => Some(18789),
@@ -514,7 +558,10 @@ pub(super) fn finish(args: &InitArgs, project: &InitProject) -> Result<()> {
             args.image_release.as_ref().unwrap(),
             project.dir.join("image-release.json"),
         )?;
-        spec["deploy"]["image"] = json!({"release":"./image-release.json", "manifest":args.manifest, "skip_signature_verification":args.skip_signature_verification});
+        spec["deploy"]["image"] = json!({"release":"./image-release.json", "skip_signature_verification":args.skip_signature_verification});
+        if let Some(pin) = &args.manifest {
+            spec["deploy"]["image"]["manifest"] = json!(pin);
+        }
         if !args.skip_signature_verification {
             fs::copy(
                 args.trusted_key.as_ref().unwrap(),
@@ -598,9 +645,9 @@ confidential-agent image export {name} --signing-key publisher.key --output imag
 ```
 
 For an already available shared/marketplace image, add --region REGION --image-id IMAGE_ID to image export; no upload or import is performed.
-Keep publisher.key private. Record the full manifest digest printed by export.
+Keep publisher.key private. The manifest digest is read automatically from the authenticated release.
 Use `confidential-agent init {target} --stage deploy` with the release, independently trusted
-publisher public key and digest. Each instance gets a distinct --service-id.
+publisher public key. Optional --manifest pins a specific version. Each instance gets a distinct --service-id.
 For allinone, select --harness for each instance; reuse this same release without rebuilding.
 Changing software versions requires a new build and release. Changing model/provider
 configuration does not require rebuilding. Destroying a consumer preserves the shared image.
@@ -685,12 +732,19 @@ mod tests {
     }
 
     #[test]
+    fn harness_choices_only_offer_supported_modes() {
+        assert_eq!(harness_choices("codex").unwrap().0, &["cli", "app-server"]);
+        assert_eq!(harness_choices("hermes").unwrap().0, &["gateway", "cli"]);
+        assert_eq!(harness_choices("claude-code").unwrap().0, &["cli"]);
+        assert!(harness_choices("unknown").is_err());
+    }
+
+    #[test]
     fn skipped_signature_init_has_no_key_or_uid_and_next_steps_preserve_state_directory() {
         let temp = tempfile::tempdir().unwrap();
         let release = temp.path().join("release.json");
         fs::write(&release, "fixture").unwrap();
         let state = temp.path().join("state with spaces and 'quote");
-        let digest = format!("sha256:{}", "a".repeat(64));
         let output = run(
             temp.path(),
             "allinone",
@@ -704,8 +758,6 @@ mod tests {
                 "codex",
                 "--image-release",
                 release.to_str().unwrap(),
-                "--manifest",
-                &digest,
                 "--skip-signature-verification",
                 "--image-id",
                 "m-marketplace",
@@ -717,11 +769,13 @@ mod tests {
         let spec = AgentSpec::from_path(&output.join("instance.yaml")).unwrap();
         let image = spec.deploy.image.unwrap();
         assert!(image.skip_signature_verification);
+        assert!(image.manifest.is_none());
         assert!(image.trusted_key.as_os_str().is_empty());
         assert_eq!(image.image_id.as_deref(), Some("m-marketplace"));
         assert!(!output.join("publisher.pem").exists());
         let yaml = fs::read_to_string(output.join("instance.yaml")).unwrap();
         assert!(!yaml.contains("account_id"));
+        assert!(!yaml.contains("manifest:"));
         let steps = fs::read_to_string(output.join("NEXT_STEPS.md")).unwrap();
         assert!(steps.contains(&format!("cd {}", shell_path(&output))));
         assert!(steps.contains(&format!(

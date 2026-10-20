@@ -292,8 +292,9 @@ pub struct PublishedImageSpec {
     pub release: PathBuf,
     #[serde(default)]
     pub trusted_key: PathBuf,
-    /// Immutable Shelter manifest identity, selected independently of the release.
-    pub manifest: String,
+    /// Optional publisher manifest pin; otherwise use the authenticated release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
     /// Legacy state compatibility only; never used for consumer authorization.
     #[serde(
         default,
@@ -480,7 +481,7 @@ impl AgentSpec {
         self.deploy
             .image
             .as_ref()
-            .map(|image| image.manifest.as_str())
+            .map(|image| image.manifest.as_deref().unwrap_or("published-image"))
             .unwrap_or(&self.build.image_name)
     }
 
@@ -567,9 +568,11 @@ impl AgentSpec {
             {
                 bail!("deploy.image requires release and a trusted_key unless skip_signature_verification is explicit");
             }
-            let digest = image.manifest.strip_prefix("sha256:").unwrap_or_default();
-            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                bail!("deploy.image.manifest must be a full sha256: manifest identity");
+            if let Some(manifest) = &image.manifest {
+                let digest = manifest.strip_prefix("sha256:").unwrap_or_default();
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    bail!("deploy.image.manifest must be a full sha256: manifest identity");
+                }
             }
             if let Some(id) = &image.image_id {
                 if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
@@ -1167,6 +1170,32 @@ mod tests {
             },
         );
         spec.validate().unwrap();
+    }
+
+    #[test]
+    fn published_image_manifest_pin_is_optional_but_explicit_values_are_validated() {
+        let mut value = published_spec();
+        value["deploy"]["image"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("manifest"));
+        let spec = AgentSpec::from_yaml(
+            &serde_yaml::to_string(&value).unwrap(),
+            Path::new("/project"),
+        )
+        .unwrap();
+        assert!(spec.deploy.image.as_ref().unwrap().manifest.is_none());
+        assert_eq!(spec.image_id(), "published-image");
+        assert!(serde_json::to_value(&spec.deploy.image)
+            .unwrap()
+            .get("manifest")
+            .is_none());
+        value["deploy"]["image"]["manifest"] = "".into();
+        assert!(AgentSpec::from_yaml(
+            &serde_yaml::to_string(&value).unwrap(),
+            Path::new("/project"),
+        )
+        .is_err());
     }
 
     #[test]

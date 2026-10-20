@@ -238,12 +238,14 @@ pub(crate) struct InitArgs {
     /// Harness selected per all-in-one instance, never per image build.
     #[arg(long, value_parser = ["openclaw", "hermes", "codex", "claude-code", "qodercli", "opencode"])]
     pub(crate) harness: Option<String>,
+    /// cli: use over SSH; gateway: OpenClaw/Hermes; app-server: remote Codex.
     #[arg(long, value_parser = ["cli", "gateway", "app-server"])]
     pub(crate) harness_mode: Option<String>,
     #[arg(long)]
     pub(crate) image_release: Option<PathBuf>,
     #[arg(long)]
     pub(crate) trusted_key: Option<PathBuf>,
+    /// Optional full sha256: version pin; default: read from the authenticated release.
     #[arg(long)]
     pub(crate) manifest: Option<String>,
     #[arg(long)]

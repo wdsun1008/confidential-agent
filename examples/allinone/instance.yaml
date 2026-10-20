@@ -13,7 +13,7 @@ deploy:
   image:
     release: ./image-release.json
     trusted_key: ./publisher.pem
-    manifest: sha256:REPLACE_WITH_PUBLISHED_MANIFEST_DIGEST
+    # Optional: manifest: sha256:<full digest>, to pin a specific publisher version.
 attestation:
   tee: tdx
   mode: challenge

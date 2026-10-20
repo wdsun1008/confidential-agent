@@ -24,15 +24,29 @@ building, publishing and exporting a signed release. No model credentials are
 needed for image initialization. Software versions stay in runtime-contract.json.
 
 For each consumer, run `confidential-agent init allinone --stage deploy`: choose a unique
-service ID, the signed release and trusted publisher key, expected digest, then a harness and mode. Use the same release for multiple independent
+service ID, the signed release and trusted publisher key, then a harness and mode. The manifest digest is read automatically; `--manifest` is an optional version pin. Use the same release for multiple independent
 services, including different harnesses. Initialization does not create cloud
 resources. Generated consumer projects have no build inputs.
 See [RPM walkthrough](../../docs/rpm.md) for the non-interactive commands.
 
+Mode choices depend on the selected harness:
+
+| Harness | Mode | How to use it |
+| --- | --- | --- |
+| Codex | `cli` (default) | SSH into the instance and run `cai-agent` in a terminal |
+| Codex | `app-server` | Connect a remote Codex client through the CA tunnel to the guest Codex server |
+| OpenClaw / Hermes | `gateway` (default) | Run a persistent network service for clients |
+| OpenClaw / Hermes | `cli` | Run the harness through SSH |
+| Claude Code / QoderCLI / OpenCode | `cli` | Run the harness through SSH; init selects this automatically |
+
+Codex has no `gateway` mode in this project. The separately installed
+`cai-gateway` handles CA mesh traffic and is not a Codex mode.
+For ordinary terminal use of Codex, accept `cli`.
+
 ## Use a prebuilt image
 
 Obtain the signed release and an independently trusted publisher public key.
-Copy `instance.yaml` and replace its full manifest digest and region. Use a
+Copy `instance.yaml` and configure its release/key paths and region. Use a
 different `service.id` for every VM. Configure operator peering with SSH scope
 before deploying. `service.ssh: true` creates unique client and host keys;
 CA delivers them as attested resources and pins the host key for `confidential-agent ssh`.
@@ -194,7 +208,7 @@ confidential-agent image export allinone-builder \
   --signing-key publisher.key --output image-release.json
 ```
 
-Record the manifest digest printed by export. Transfer `image-release.json` and
+Transfer `image-release.json` and
 the independently trusted `publisher.pem` to the deployment host. Keep the
 signing private key on the publisher. The deployment host needs CA and its
 bundled Shelter RPM, cloud credentials, and instance resource files; it does
