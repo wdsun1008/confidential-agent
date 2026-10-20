@@ -111,7 +111,10 @@ pub(super) fn resolve_interactive(args: &mut InitArgs) -> Result<()> {
             )
             && args.harness.as_deref() != Some("qodercli")
         {
-            args.model = Some(prompt_value("Model name")?);
+            args.model = Some(prompt_default(
+                "Model name",
+                &confidential_agent_core::software::version("bailian_model"),
+            )?);
         }
     }
     if !args.non_interactive && args.stage.is_some() {

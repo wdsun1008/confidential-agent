@@ -286,7 +286,11 @@ pub(crate) struct InitArgs {
     pub(crate) dashscope_base_url: String,
     #[arg(long, default_value = "https://dashscope.aliyuncs.com/apps/anthropic")]
     pub(crate) dashscope_anthropic_base_url: String,
-    #[arg(long, env = "DASHSCOPE_MODEL")]
+    #[arg(
+        long,
+        env = "DASHSCOPE_MODEL",
+        help = format!("Model name (default: {})", confidential_agent_core::software::version("bailian_model"))
+    )]
     pub(crate) model: Option<String>,
     #[arg(long)]
     pub(crate) gateway_token: Option<String>,

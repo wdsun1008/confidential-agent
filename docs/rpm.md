@@ -86,6 +86,10 @@ manifest 摘要会从经过验签的 release 自动读取，无需抄写。镜�
 使用已发布的 release 为每个独立实例生成部署目录。通过交互向导填写信任信息、
 harness、运行模式、模型和凭证，或使用参数：
 
+交互提示的方括号表示按回车即可采用的默认值。模型名与非交互模式使用同一份
+`software-versions.json` 默认配置；传入 `--model` 或设置 `DASHSCOPE_MODEL` 时直接使用指定值，
+不再询问。地域、可用区、实例规格、磁盘大小、运行模式和输出目录也提供默认值。
+
 ```bash
 # 在模型 API key 已通过 DASHSCOPE_API_KEY 设置的环境中执行。
 confidential-agent init allinone --stage deploy --non-interactive \
