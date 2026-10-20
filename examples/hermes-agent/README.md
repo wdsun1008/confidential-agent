@@ -9,7 +9,8 @@ with GitHub fallback and runs the official installer with `--skip-browser`,
 
 The image includes the native `tdx-remote-attestation` skill under
 `/opt/data/skills/tdx-remote-attestation` and the `cai-pep attest` helper.
-There are no Hermes source patches or PEP execution hooks. The service sets
+There are no PEP execution patches or hooks in Hermes. Build-time download
+adapters retain the existing domestic mirrors and hash verification. The service sets
 `ATTESTATION_CHALLENGE_CLIENT_WORK_DIR=/opt/data/attestation` so its non-root
 user can collect and verify evidence. Use that same environment variable when
 running the helper manually as `hermes`.

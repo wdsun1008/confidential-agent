@@ -60,7 +60,8 @@ OpenClaw includes the executor patch, PEP plugin, policy service and Podman
 sandbox, as do the standalone OpenClaw and OpenClaw-vLLM examples. Selecting
 OpenClaw starts its PEP service; startup fails if that service cannot start.
 The other harnesses use only the attestation helper and native skill loading;
-they have no PEP execution hooks or source patches.
+they have no PEP execution hooks or patches. The existing build-time download
+adapters for domestic mirrors are retained.
 
 The image also installs `procps-ng`: interactive Codex uses `ps`
 to manage its background app-server, even when the selected harness mode is `cli`.
