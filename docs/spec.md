@@ -194,6 +194,22 @@ deploy:
 
 若先执行 `confidential-agent image publish <service> --spec <path>`，CLI 会在本地 service state 中记录 published image。后续 `deploy` 仅在 provider、region、variant、build id 和镜像内容 hash 均匹配，且本地发布状态为 `available` 时复用该 `image_id`，并在 Shelter deploy 配置中跳过本地镜像上传和 ImportImage。Published image 不由 `destroy` 统一删除；使用 `image unpublish` 删除指定服务的发布镜像，或使用 `image prune --dry-run --all` 审计后清理旧 build/failed 发布记录。
 
+镜像与实例分别管理：`image list` 列出本地构建和云端发布（不包含消费者实例）；`status` / `tui` 展示实例（不包含仅构建的 builder）。镜像状态包括 `built`、`publishing`、`published`、`retiring`、`failed`、`local-missing`；发布状态是带时间戳的本地记录，不宣称实时云端状态。`image list --json` 返回完整 `publications`，包括各地域的状态、错误、所有权和待清理标记。本地文件缺失不会隐藏云镜像；`CURRENT` 按当前构建的所有 variant 判断。
+
+实例依次经过 `deploying → deployed → activating → active`；销毁经过 `destroying → deleted`。`activating` 已参与资源和 mesh 配置，但尚未确认所有副本应用就绪，可以用原配置执行 `deploy --resume`。基础设施 apply 中断仍保留 `deploying`，不会盲目重放；`status` 保留资源名、Terraform 目录，并把云资源观测标记为 `unknown`。应用真正就绪后才写入 `active`；这不等于模型对话已成功。
+
+清理动作的范围：
+
+| 命令 | 删除内容 | 保留内容 |
+|---|---|---|
+| `destroy INSTANCE` | 该实例管理的基础设施 | 共享云镜像、本地记录 |
+| `image rm BUILDER` | 本地镜像文件及其硬链接 | 发布台账、构建元数据、管理身份 |
+| `image unpublish BUILDER` | 所选发布的云镜像、自有导入快照及剩余中转对象 | 本地产物、实例记录 |
+| `forget SERVICE` | 无运行资源、无发布台账的本地管理目录 | 不调用云端删除 |
+
+`image prune --dry-run` 预览旧发布和中转对象清理；默认保留当前所有 variant、消费者引用和已导出的镜像，`--all` 仍不绕过引用/导出保护。OSS 中转对象清理独立于云镜像退休，失败后可通过再次 publish 或 prune 重试。自动发现并接管的已有镜像是引用，不自动取得删除权限；只有显式 `unpublish --force` 才能删除它。发布失败与退休进度分别记录，`publish` 不会隐式删除旧云镜像。导入请求使用持久化 ClientToken，响应丢失时复用同一个请求身份。自有导入快照在删除镜像前记录，逐个清理并保存进度；快照清理失败不会丢失台账。普通删除使用云平台的引用检查，显式 `--force` 才强制删除镜像；快照删除仍不强制绕过使用保护。
+
+
 清理会检查当前工作区所有服务的部署和导入引用，不只检查发布者自身。`image export` 会记录保留标记，自动 `prune`（包括 `--all`）不再删除该镜像；旧版本已经导出的 release 没有此标记，升级后应重新 export 以登记保留。跨主机消费者无法由本地 state 自动发现。发布者应停止分发、遵守已公布的保留期并确认消费者不再依赖创建或恢复后，才通过 `image unpublish --image-id <id> --force` 显式退役。部分云删除失败会返回非零退出码，并保留失败记录供重试。
 
 镜像上传的端点由 `CA_IMAGE_OSS_ENDPOINT` 控制，默认 `auto`：只有带 token 的 ECS 元数据确认同地域且内网 HTTPS 探测成功时使用内网，否则使用公网。可显式设置 `public`、`internal` 或 HTTPS 端点；显式配置不自动回退。CA 的 `image publish` 和新版 Shelter 的本地镜像部署上传都支持该设置。模型下载使用的 `CA_OSS_ENDPOINT` / `--oss-endpoint` 与镜像上传独立。

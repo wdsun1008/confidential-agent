@@ -89,7 +89,10 @@ confidential-agent ssh allinone-codex --tty -- cai-agent
 confidential-agent destroy allinone-codex
 ```
 
-Consumer destruction preserves the shared cloud image. The publisher owns
+Consumer destruction preserves the shared cloud image. `image list` shows builders
+and their publications; `status` shows instances. `image rm BUILDER` removes local
+image payloads while retaining publication records. Use `forget INSTANCE` only
+after destroying the instance to remove its local management records. The publisher owns
 `image unpublish` and its import snapshots. Each consumer owns its Terraform
 state, gateway identity, SSH keys, disk passphrase, resources and writable data.
 The example deploys a 120 GB disk for the 80 GB base image: Cryptpilot allocates
@@ -146,8 +149,9 @@ operator-managed: the daemon restores guest edits to the delivered content.
 does not replace an existing target. Keep `runtime.json` operator-managed;
 choose guest-managed native configuration only when an in-guest wizard owns it.
 
-Local `deployed` confirms infrastructure; `active` records delivery and mesh
-synchronization after the daemon becomes reachable. Inspect `confidential-agent report --json`
+Local `deployed` confirms infrastructure. `activating` records pending resource,
+mesh and application readiness work; retry it with the original `deploy --resume`.
+`active` is committed only after every replica reports application readiness. Inspect `confidential-agent report --json`
 for instance attestation and daemon resource state, and `confidential-agent status --live` for
 application readiness. A model request is a separate explicit check. No local
 phase or readiness flag implies that a paid model request succeeded.

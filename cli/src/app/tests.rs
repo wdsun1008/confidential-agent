@@ -373,7 +373,7 @@ fn failed_deploy_records_attempt_before_apply_and_destroy_uses_it() {
 }
 
 #[test]
-fn image_rm_removes_local_service_state_for_deleted_service() {
+fn image_rm_retains_local_service_state_for_deleted_service() {
     let temp = tempfile::tempdir().unwrap();
     let mut service = local_state(
         "openclaw",
@@ -402,8 +402,8 @@ fn image_rm_removes_local_service_state_for_deleted_service() {
     )
     .unwrap();
 
-    assert!(!service_dir.exists());
-    assert!(read_service_states(temp.path()).unwrap().is_empty());
+    assert!(service_dir.exists());
+    assert_eq!(read_service_states(temp.path()).unwrap().len(), 1);
 }
 
 #[test]
@@ -457,7 +457,7 @@ fn image_rm_rejects_unknown_service_phase() {
     )
     .unwrap_err();
 
-    assert!(err.to_string().contains("unsupported phase"));
+    assert!(err.to_string().contains("destroy it before removing"));
     assert!(temp.path().join("services/openclaw/state.json").exists());
 }
 
@@ -787,6 +787,10 @@ fn test_published_image(build_id: &str, source_sha256: &str) -> PublishedImage {
         updated_at: "2026-06-02T00:00:00Z".to_string(),
         oss_cleaned: true,
         exported: false,
+        owned: true,
+        import_token: "test-import".into(),
+        retiring: false,
+        import_snapshot_ids: Vec::new(),
         error: None,
     }
 }
@@ -3139,7 +3143,7 @@ resources: {}
 }
 
 #[test]
-fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
+fn destroy_records_pending_cleanup_when_shelter_destroy_fails() {
     let temp = tempfile::tempdir().unwrap();
     let mut service = local_state(
         "openclaw",
@@ -3185,7 +3189,7 @@ fn destroy_leaves_local_state_active_when_shelter_destroy_fails() {
     let state = read_service_state_file(&service_dir.join("state.json"))
         .unwrap()
         .unwrap();
-    assert_eq!(state.phase, "active");
+    assert_eq!(state.phase, "destroying");
 }
 
 #[test]
@@ -3403,7 +3407,7 @@ fn destroy_before_an_infrastructure_attempt_does_not_invoke_shelter() {
             .unwrap()
             .unwrap()
             .phase,
-        "deleted"
+        "built"
     );
     // A recorded attempt with a lost manifest must still fail closed.
     let mut state = local_state("not-started", Vec::new(), Vec::new());
@@ -3874,7 +3878,7 @@ resources: {}
 
     let activated = activate_existing_service_state(temp.path(), &spec_path, &spec, state).unwrap();
 
-    assert_eq!(activated.phase, "active");
+    assert_eq!(activated.phase, "activating");
     assert_eq!(activated.generation, 2);
     assert_eq!(activated.deploy.run_id, "20260429110011");
     assert_eq!(activated.deploy.resource_name, "openclaw-20260429110011");
@@ -4691,4 +4695,129 @@ fn replica_status_checks_every_node_and_reports_partial_failure() {
     assert_eq!(aggregate.phase, "degraded");
     assert!(error.unwrap().contains("i-b"));
     assert_eq!(state.deploy.preferred_injection_ip(), Some("192.0.2.1"));
+}
+
+// Regression coverage for independent image and instance lifecycles.
+#[test]
+fn lifecycle_rm_rejects_path_outside_state_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let victim = temp.path().join("unrelated-project");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("keep.txt"), "owned disposable sentinel").unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().join("state");
+    cmd_image(
+        &cli,
+        &ImageArgs {
+            command: ImageCommands::Rm {
+                service: victim.to_string_lossy().into_owned(),
+                force: false,
+            },
+        },
+    )
+    .unwrap_err();
+    assert!(victim.join("keep.txt").exists());
+}
+
+#[test]
+fn lifecycle_rm_preserves_publication_and_obeys_operation_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("builder", vec![], vec![]);
+    state.phase = "built".into();
+    let mut entry = test_published_image(&state.build.build_id, "0123456789abcdef");
+    entry.exported = true;
+    state.build.published.insert("pub".into(), entry);
+    write_state(temp.path(), &state);
+    let lock = lock_service_operation(temp.path(), "builder").unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().into();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(cmd_image(
+            &cli,
+            &ImageArgs {
+                command: ImageCommands::Rm {
+                    service: "builder".into(),
+                    force: false,
+                },
+            },
+        ))
+        .unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(lock);
+    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    worker.join().unwrap();
+    let saved = read_service_state_file(&context_paths(temp.path(), "builder").service_state)
+        .unwrap()
+        .unwrap();
+    assert!(saved.build.published["pub"].exported);
+}
+
+#[test]
+fn lifecycle_list_keeps_older_cloud_only_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("builder", vec![], vec![]);
+    state.phase = "built".into();
+    state.build.build_id = "new-build".into();
+    state.build.published.insert(
+        "old".into(),
+        test_published_image("old-build", "0123456789abcdef"),
+    );
+    write_state(temp.path(), &state);
+    let rows = collect_image_entries(temp.path()).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|row| row.build_id == "old-build" && row.published.is_some()));
+}
+
+#[test]
+fn lifecycle_pending_deploy_preserves_cloud_binding_as_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = local_state("pending", vec![], vec![]);
+    state.phase = "deploying".into();
+    state.deploy.instance_id = Some("i-created-before-failure".into());
+    state.deploy.terraform_dir = Some(temp.path().join("exact-terraform"));
+    let views = status_views(temp.path(), &[state]);
+    assert!(views[0].cloud.present);
+    assert_eq!(views[0].cloud.observation, "unknown");
+    assert!(views[0].cloud.instance_id.is_some());
+    assert!(views[0].cloud.resource_name.is_some());
+    assert!(views[0].cloud.terraform_dir.is_some());
+}
+
+#[test]
+fn lifecycle_destroy_published_builder_is_noop() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cli = test_cli();
+    cli.state_dir = temp.path().into();
+    let mut state = local_state("builder", vec![], vec![]);
+    state.phase = "built".into();
+    state.deploy.public_ip = None;
+    state.deploy.private_ip = None;
+    state.build.published.insert(
+        "pub".into(),
+        test_published_image(&state.build.build_id, "0123456789abcdef"),
+    );
+    write_state(temp.path(), &state);
+    write_manifest(temp.path(), "builder", &state.build.build_id);
+    let marker = temp.path().join("destroy-was-called");
+    cli.shelter_bin = temp.path().join("fake-shelter");
+    write_script(&cli.shelter_bin,&format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho 'No instance or deployment named planned-builder' >&2\nexit 1\n",marker.display()));
+    cmd_destroy(
+        &cli,
+        &DestroyArgs {
+            service: "builder".into(),
+        },
+    )
+    .unwrap();
+    assert!(!marker.exists());
+    assert_eq!(
+        read_service_state_file(&context_paths(temp.path(), "builder").service_state)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "built"
+    );
 }

@@ -333,3 +333,8 @@ Confidential Agent 并不复刻这些上游能力，而是把它们粘合在一�
 | [Sigstore Cosign + Rekor](https://docs.sigstore.dev) | reference value 的供应链透明日志 |
 
 Confidential Agent 自己写的部分集中在：**用户视角的 spec、可复现且可销毁的 host 状态机、跨实例 mesh、PEP**。所有不属于这几块的事都交给上游负责。
+
+
+镜像清理和实例操作使用 `<state-dir>/operation-locks/<service>` 中的稳定锁文件，删除业务目录不会移除锁本身。发布进度只在短暂的 state 事务中重新读取并更新 publication 字段，不以长时网络操作之前的整份快照覆盖并发 mesh 更新。云镜像操作另持共享/排他 image lease。上传/导入状态、退休意图、资源所有权、导入快照和 OSS 中转对象清理分别记录；跨工作区发现同一镜像不自动授予删除权限。
+
+实例 `activating` 表示已加入待完成的配置拓扑，mesh 协议仍以 `active` 表示成员资格；宿主机应用就绪阶段与该协议字段独立。只有所有副本 readiness 验证通过后，实例管理状态才提交为 `active`。销毁先持久化 `destroying`，失败保留精确的 Terraform 目录和资源标识用于重试。

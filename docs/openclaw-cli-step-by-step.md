@@ -166,9 +166,10 @@ confidential-agent peering apply
 
 ```bash
 confidential-agent destroy openclaw
-confidential-agent image unpublish openclaw --force
+confidential-agent image unpublish openclaw
 confidential-agent image prune --dry-run --all
 confidential-agent image rm openclaw
+confidential-agent forget openclaw
 ```
 
-`destroy` 会删除已部署的 ECS、网络和安全组等运行资源。对于普通 deploy 路径，Shelter 仍负责清理它自己创建的临时镜像导入资源；对于 `image publish` 创建并记录的 published image，生命周期由 CLI 独立管理，需使用 `image unpublish` 删除对应自定义镜像并清理残留 OSS 对象。`image prune --dry-run --all` 可先审计所有可清理的 published image，确认后去掉 `--dry-run` 执行。最后再用 `image rm` 删除本地 build/state 记录。
+`destroy` 会删除已部署的 ECS、网络和安全组等运行资源。对于普通 deploy 路径，Shelter 仍负责清理它自己创建的临时镜像导入资源；对于 `image publish` 创建并记录的 published image，生命周期由 CLI 独立管理，需使用 `image unpublish` 删除对应自定义镜像并清理残留 OSS 对象。`image prune --dry-run --all` 可先审计所有可清理的 published image，确认后去掉 `--dry-run` 执行。`image rm` 只删除本地镜像文件（包含其硬链接），保留构建元数据和云端发布台账。实例已销毁、云镜像已退休后，可以用 `forget` 删除整个本地管理目录。已导出的发布镜像默认受保护；确认要退休对外发布的镜像时才显式使用 `image unpublish --force`。

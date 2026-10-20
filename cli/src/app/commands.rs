@@ -27,6 +27,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Status(args) => cmd_status(cli, args),
         Commands::Report(args) => cmd_report(cli, args),
         Commands::Destroy(args) => cmd_destroy(cli, args),
+        Commands::Forget(args) => cmd_forget(cli, args),
         Commands::Version => {
             println!("confidential-agent {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -166,7 +167,10 @@ pub(super) fn validate_build_start(existing: Option<&LocalServiceState>) -> Resu
     let Some(state) = existing else {
         return Ok(());
     };
-    if matches!(state.phase.as_str(), "active" | "deployed" | "deploying") {
+    if matches!(
+        state.phase.as_str(),
+        "active" | "activating" | "deployed" | "deploying" | "destroying"
+    ) {
         bail!(
             "service '{}' is {}; destroy it before building a new local image",
             state.service_id,
@@ -182,7 +186,7 @@ pub(super) fn validate_deploy_start(existing: Option<&LocalServiceState>) -> Res
     };
     match state.phase.as_str() {
         "built" | "deleted" => Ok(()),
-        "active" | "deployed" | "deploying" => bail!(
+        "active" | "activating" | "deployed" | "deploying" | "destroying" => bail!(
             "service '{}' is {}; destroy it before deploying again",
             state.service_id,
             state.phase
@@ -323,7 +327,7 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
         let state = current_state
             .as_ref()
             .context("--resume requires an existing deployed instance")?;
-        anyhow::ensure!(state.phase == "deployed",
+        anyhow::ensure!(matches!(state.phase.as_str(), "deployed" | "activating"),
             "--resume requires confirmed deployed infrastructure; service is '{}'. For an interrupted infrastructure operation, inspect its saved Shelter state and destroy it before a new deploy", state.phase);
         let manifest = read_build_manifest(&paths.manifest)?;
         let saved = committed_deployment(state, &manifest)?;
@@ -543,16 +547,13 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
             &delivery_spec,
             &observation,
             &prepared,
-            "active",
+            "activating",
         )?;
         let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
         active_state.mesh_generation = mesh_generation;
         sync_a2a_bundle(cli, &cli.state_dir)?;
-        if let Err(error) = wait_for_service_ready(&cli.state_dir, &active_state, &delivery_spec) {
-            active_state.phase = "deployed".into();
-            write_json_atomic(&paths.service_state, &active_state)?;
-            return Err(error);
-        }
+        wait_for_service_ready(&cli.state_dir, &active_state, &delivery_spec)?;
+        complete_activation(&cli.state_dir, &spec.service.id)?;
         let active_services = read_service_states(&cli.state_dir)?;
         drop(operation);
         println!("[ca] refreshing active Shelter deploys for public mesh rules...");
@@ -568,6 +569,19 @@ pub(super) fn cmd_deploy(cli: &Cli, args: &DeployArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn complete_activation(state_dir: &Path, service: &str) -> Result<()> {
+    with_state_dir_lock(state_dir, || {
+        let mut state = read_service_state_file(&context_paths(state_dir, service).service_state)?
+            .context("activation state disappeared")?;
+        anyhow::ensure!(
+            state.phase == "activating",
+            "service is not awaiting activation"
+        );
+        state.phase = "active".into();
+        write_local_service_state(state_dir, &state)
+    })
 }
 
 pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
@@ -593,7 +607,7 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
             spec.service.id
         )
     })?;
-    if state.phase != "active" && state.phase != "deployed" {
+    if !matches!(state.phase.as_str(), "active" | "deployed" | "activating") {
         bail!(
             "inject requires service '{}' to be active or deployed in local state",
             spec.service.id
@@ -653,6 +667,8 @@ pub(super) fn cmd_inject(cli: &Cli, args: &InjectArgs) -> Result<()> {
     let mesh_generation = sync_mesh_with_candidate(cli, &cli.state_dir, active_state.clone())?;
     active_state.mesh_generation = mesh_generation;
     sync_a2a_bundle(cli, &cli.state_dir)?;
+    wait_for_service_ready(&cli.state_dir, &active_state, &delivery_spec)?;
+    complete_activation(&cli.state_dir, &spec.service.id)?;
     let active_services = read_service_states(&cli.state_dir)?;
     drop(operation);
     refresh_active_shelter_deploys(cli, &cli.state_dir, &active_services)?;
@@ -1255,36 +1271,7 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
             }
             Ok(())
         }
-        ImageCommands::Rm { service, force } => {
-            let paths = context_paths(&cli.state_dir, service);
-            let state = read_service_state_file(&paths.service_state)?;
-            if let Some(state) = state.as_ref() {
-                match state.phase.as_str() {
-                    "built" | "deleted" => {}
-                    "active" | "deployed" | "deploying" => bail!(
-                        "service '{}' is {}; destroy it before removing local images",
-                        state.service_id,
-                        state.phase
-                    ),
-                    other => bail!(
-                        "service '{}' is in unsupported phase '{}'; only built or deleted local image state can be removed",
-                        state.service_id,
-                        other
-                    ),
-                }
-            }
-            if !paths.service_dir.exists() {
-                if *force {
-                    println!("local image state for service '{}' does not exist", service);
-                    return Ok(());
-                }
-                bail!("local image state for service '{}' does not exist", service);
-            }
-            fs::remove_dir_all(&paths.service_dir)
-                .with_context(|| format!("failed to remove '{}'", paths.service_dir.display()))?;
-            println!("removed local image state for service {}", service);
-            Ok(())
-        }
+        ImageCommands::Rm { service, force } => remove_local_images(cli, service, *force),
         ImageCommands::Publish(args) => publish::cmd_image_publish(cli, args),
         ImageCommands::Export {
             service,
@@ -1307,6 +1294,94 @@ pub(super) fn cmd_image(cli: &Cli, args: &ImageArgs) -> Result<()> {
     }
 }
 
+/// Local payload removal never relinquishes cloud custody or deployment identities.
+fn remove_local_images(cli: &Cli, service: &str, force: bool) -> Result<()> {
+    let _operation = lock_service_operation(&cli.state_dir, service)?;
+    let paths = context_paths(&cli.state_dir, service);
+    let state = read_service_state_file(&paths.service_state)?;
+    if let Some(state) = &state {
+        anyhow::ensure!(
+            matches!(state.phase.as_str(), "built" | "deleted"),
+            "service '{}' is {}; destroy it before removing local images",
+            service,
+            state.phase
+        );
+        anyhow::ensure!(!state.build.remote, "service '{}' consumes a published image and has no local build payload; use forget after destroy", service);
+    }
+    if !paths.service_dir.exists() {
+        anyhow::ensure!(
+            force,
+            "local image state for service '{}' does not exist",
+            service
+        );
+        return Ok(());
+    }
+    let root = paths.service_dir.canonicalize()?;
+    let entries = collect_image_entries(&cli.state_dir)?;
+    let mut identities = BTreeSet::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.service_id == service && entry.image_present)
+    {
+        let path = entry.image_path.canonicalize()?;
+        anyhow::ensure!(
+            path.starts_with(&root),
+            "refusing to remove image payload outside its managed service directory"
+        );
+        let metadata = path.metadata()?;
+        identities.insert((metadata.dev(), metadata.ino()));
+    }
+    fn remove_links(directory: &Path, identities: &BTreeSet<(u64, u64)>) -> Result<usize> {
+        let mut removed = 0;
+        for item in fs::read_dir(directory)? {
+            let item = item?;
+            let metadata = item.path().symlink_metadata()?;
+            if metadata.is_dir() {
+                removed += remove_links(&item.path(), identities)?;
+            } else if metadata.is_file() && identities.contains(&(metadata.dev(), metadata.ino())) {
+                fs::remove_file(item.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+    let removed = remove_links(&root, &identities)?;
+    println!("removed {removed} local image payload link(s) for {service}; publication and management records retained");
+    Ok(())
+}
+
+fn cmd_forget(cli: &Cli, args: &DestroyArgs) -> Result<()> {
+    let _operation = lock_service_operation(&cli.state_dir, &args.service)?;
+    let paths = context_paths(&cli.state_dir, &args.service);
+    anyhow::ensure!(
+        !trustee::is_managed_service(&cli.state_dir, &args.service)?,
+        "destroy/revoke the Trustee deployment before forgetting it"
+    );
+    with_state_dir_lock(&cli.state_dir, || {
+        if let Some(state) = read_service_state_file(&paths.service_state)? {
+            anyhow::ensure!(
+                matches!(state.phase.as_str(), "built" | "deleted"),
+                "destroy the instance before forgetting its records"
+            );
+            anyhow::ensure!(
+                state.build.published.is_empty(),
+                "unpublish recorded cloud images before forgetting their custody"
+            );
+            anyhow::ensure!(
+                state.phase == "built" && build_has_no_deployment(&state)
+                    || state.phase == "deleted" && !deploy_runtime_state_present(&state.deploy),
+                "deployment resources remain recorded; destroy them first"
+            );
+        }
+        if paths.service_dir.exists() {
+            fs::remove_dir_all(&paths.service_dir)?;
+        }
+        Ok(())
+    })?;
+    println!("forgot local records for {}", args.service);
+    Ok(())
+}
+
 pub(super) fn collect_image_entries(state_dir: &Path) -> Result<Vec<ImageListEntry>> {
     let services_dir = state_dir.join("services");
     if !services_dir.exists() {
@@ -1317,100 +1392,133 @@ pub(super) fn collect_image_entries(state_dir: &Path) -> Result<Vec<ImageListEnt
         .map(|state| (state.service_id.clone(), state))
         .collect::<BTreeMap<_, _>>();
     let mut entries = Vec::new();
-    for entry in fs::read_dir(&services_dir)
-        .with_context(|| format!("failed to read '{}'", services_dir.display()))?
-    {
-        let entry = entry?;
-        if !entry.path().is_dir() {
+    for directory in fs::read_dir(&services_dir)? {
+        let directory = directory?;
+        if !directory.file_type()?.is_dir() {
             continue;
         }
-        let service_id = entry.file_name().to_string_lossy().trim().to_string();
-        if service_id.is_empty() {
-            continue;
-        }
+        let service_id = directory.file_name().to_string_lossy().to_string();
         let state = states.get(&service_id);
-        let image_root = entry.path().join("shelter").join("images");
-        let mut service_entries = Vec::new();
+        if state.is_some_and(|state| state.build.remote) {
+            continue;
+        }
+        let paths = context_paths(state_dir, &service_id);
+        let manifest = paths
+            .manifest
+            .exists()
+            .then(|| read_build_manifest(&paths.manifest))
+            .transpose()?;
+        if manifest.as_ref().is_some_and(|m| m.image.is_some()) {
+            continue;
+        }
+        let mut current = BTreeSet::new();
+        if let Some(manifest) = &manifest {
+            current.extend(
+                manifest
+                    .variants
+                    .values()
+                    .map(|v| v.shelter_build_id.clone()),
+            );
+        }
+        if let Some(state) = state {
+            current.insert(state.build.build_id.clone());
+        }
+        let mut builds = BTreeMap::<String, (PathBuf, PathBuf)>::new();
+        let image_root = paths.shelter_work_dir.join("images");
         if image_root.exists() {
-            for image_entry in fs::read_dir(&image_root)
-                .with_context(|| format!("failed to read '{}'", image_root.display()))?
-            {
-                let image_entry = image_entry?;
-                if !image_entry.path().is_dir() {
+            for image in fs::read_dir(&image_root)? {
+                let image = image?;
+                if !image.path().is_dir() {
                     continue;
                 }
-                let build_id = image_entry.file_name().to_string_lossy().to_string();
-                let result_path = image_entry.path().join("build-result.json");
-                if !result_path.exists() {
+                let id = image.file_name().to_string_lossy().to_string();
+                let result = image.path().join("build-result.json");
+                if !result.exists() {
                     continue;
                 }
-                let image_path = match read_shelter_build_result(&result_path, &build_id) {
-                    Ok(result) => result.image_path,
-                    Err(err) => {
-                        eprintln!(
-                            "[ca] warning: skipping invalid build result '{}': {err:#}",
-                            result_path.display()
-                        );
-                        continue;
+                match read_shelter_build_result(&result, &id) {
+                    Ok(built) => {
+                        builds.insert(id, (built.image_path, result));
                     }
-                };
-                let image_size = image_path
-                    .metadata()
-                    .ok()
-                    .filter(|metadata| metadata.is_file())
-                    .map(|metadata| metadata.len());
-                service_entries.push(ImageListEntry {
-                    service_id: service_id.clone(),
-                    phase: state.map(|state| state.phase.clone()),
-                    current: state
-                        .map(|state| state.build.build_id == build_id)
-                        .unwrap_or(false),
-                    build_id: build_id.clone(),
-                    image_present: image_size.is_some(),
-                    image_size,
-                    image_path,
-                    build_result: result_path,
-                    published: state.and_then(|state| {
-                        published_info_for_build(&state.build.published, &build_id)
-                    }),
-                });
-            }
-        }
-        if service_entries.is_empty() {
-            if let Some(state) = state {
-                let paths = context_paths(state_dir, &state.service_id);
-                let result_path =
-                    shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id);
-                let image_size = state
-                    .build
-                    .image_path
-                    .metadata()
-                    .ok()
-                    .filter(|metadata| metadata.is_file())
-                    .map(|metadata| metadata.len());
-                service_entries.push(ImageListEntry {
-                    service_id: service_id.clone(),
-                    phase: Some(state.phase.clone()),
-                    build_id: state.build.build_id.clone(),
-                    current: true,
-                    image_path: state.build.image_path.clone(),
-                    image_present: image_size.is_some(),
-                    image_size,
-                    build_result: result_path,
-                    published: published_info_for_build(
-                        &state.build.published,
-                        &state.build.build_id,
+                    Err(error) => eprintln!(
+                        "[ca] warning: invalid build record {}: {error:#}",
+                        result.display()
                     ),
-                });
+                }
             }
         }
-        entries.extend(service_entries);
+        if let Some(state) = state {
+            builds
+                .entry(state.build.build_id.clone())
+                .or_insert_with(|| {
+                    (
+                        state.build.image_path.clone(),
+                        shelter_build_result_path(&paths.shelter_work_dir, &state.build.build_id),
+                    )
+                });
+            for publication in state.build.published.values() {
+                builds
+                    .entry(publication.build_id.clone())
+                    .or_insert_with(|| {
+                        (
+                            PathBuf::new(),
+                            shelter_build_result_path(
+                                &paths.shelter_work_dir,
+                                &publication.build_id,
+                            ),
+                        )
+                    });
+            }
+        }
+        for (build_id, (image_path, build_result)) in builds {
+            let image_size = image_path
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len());
+            let publications = state
+                .map(|s| {
+                    s.build
+                        .published
+                        .values()
+                        .filter(|p| p.build_id == build_id)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let phase = if publications.iter().any(|p| p.retiring) {
+                "retiring"
+            } else if publications.iter().any(|p| p.status == "available") {
+                "published"
+            } else if publications.iter().any(|p| p.status == "failed") {
+                "failed"
+            } else if !publications.is_empty() {
+                "publishing"
+            } else if image_size.is_some() {
+                "built"
+            } else {
+                "local-missing"
+            };
+            entries.push(ImageListEntry {
+                service_id: service_id.clone(),
+                phase: Some(phase.into()),
+                current: current.contains(&build_id),
+                published: state
+                    .and_then(|s| published_info_for_build(&s.build.published, &build_id)),
+                build_id,
+                image_present: image_size.is_some(),
+                image_size,
+                image_path,
+                build_result,
+                publications,
+            });
+        }
     }
-    entries.sort_by(|left, right| {
-        left.service_id
-            .cmp(&right.service_id)
-            .then_with(|| right.current.cmp(&left.current))
-            .then_with(|| right.build_id.cmp(&left.build_id))
+    entries.sort_by(|a, b| {
+        a.service_id
+            .cmp(&b.service_id)
+            .then_with(|| b.current.cmp(&a.current))
+            .then_with(|| b.build_id.cmp(&a.build_id))
     });
     Ok(entries)
 }
@@ -1421,16 +1529,16 @@ fn print_image_table(entries: &[ImageListEntry]) {
         return;
     }
     let has_published = entries.iter().any(|entry| entry.published.is_some());
-    println!("Confidential Agent Local Images");
+    println!("Confidential Agent Images (recorded publication status)");
     if has_published {
         println!(
             "{:<18} {:<9} {:<7} {:<30} {:<12} {:<28} IMAGE",
-            "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE", "PUBLISHED"
+            "BUILDER", "STATE", "CURRENT", "BUILD_ID", "LOCAL SIZE", "PUBLISHED"
         );
     } else {
         println!(
             "{:<18} {:<9} {:<7} {:<30} {:<12} IMAGE",
-            "SERVICE", "PHASE", "CURRENT", "BUILD_ID", "SIZE"
+            "BUILDER", "STATE", "CURRENT", "BUILD_ID", "LOCAL SIZE"
         );
     }
     for entry in entries {
@@ -1496,6 +1604,7 @@ fn published_info_for_build(
 
 pub(super) fn cmd_status(cli: &Cli, args: &StatusArgs) -> Result<()> {
     let mut states = read_service_states(&cli.state_dir)?;
+    states.retain(|state| state.phase != "built");
     if let Some(service) = args.service.as_deref() {
         states.retain(|state| state.service_id == service);
         if states.is_empty() {
@@ -1546,10 +1655,12 @@ fn status_view(state_dir: &Path, state: &LocalServiceState) -> StatusView {
         .ok()
         .filter(|metadata| metadata.is_file())
         .map(|metadata| metadata.len());
-    let cloud_present = matches!(state.phase.as_str(), "active" | "deployed")
-        && (state.deploy.instance_id.is_some()
-            || state.deploy.public_ip.is_some()
-            || state.deploy.private_ip.is_some());
+    let cloud_present = matches!(
+        state.phase.as_str(),
+        "active" | "deployed" | "activating" | "deploying" | "destroying"
+    ) && (state.deploy.instance_id.is_some()
+        || state.deploy.public_ip.is_some()
+        || state.deploy.private_ip.is_some());
     StatusView {
         service_id: state.service_id.clone(),
         phase: state.phase.clone(),
@@ -1575,9 +1686,10 @@ fn status_view(state_dir: &Path, state: &LocalServiceState) -> StatusView {
 }
 
 fn status_cloud_view(state: &LocalServiceState, cloud_present: bool) -> StatusCloudView {
-    if !cloud_present {
+    if !cloud_present && !matches!(state.phase.as_str(), "deploying" | "destroying") {
         return StatusCloudView {
             present: false,
+            observation: "absent".into(),
             run_id: None,
             resource_name: None,
             terraform_dir: None,
@@ -1591,7 +1703,13 @@ fn status_cloud_view(state: &LocalServiceState, cloud_present: bool) -> StatusCl
         };
     }
     StatusCloudView {
-        present: true,
+        present: cloud_present,
+        observation: if matches!(state.phase.as_str(), "deploying" | "destroying") {
+            "unknown"
+        } else {
+            "recorded"
+        }
+        .into(),
         run_id: Some(state.deploy.run_id.clone()),
         resource_name: Some(state.deploy.resource_name.clone()),
         terraform_dir: state.deploy.terraform_dir.clone(),
@@ -1613,7 +1731,7 @@ pub(super) fn collect_live_status(
         .iter()
         .map(|state| {
             let local = status_view(state_dir, state);
-            if !matches!(state.phase.as_str(), "active" | "deployed") {
+            if !matches!(state.phase.as_str(), "active" | "activating" | "deployed") {
                 return LiveStatusView {
                     local,
                     replicas: Vec::new(),
@@ -1823,7 +1941,13 @@ fn print_status_table(states: &[StatusView]) {
             } else {
                 "no"
             },
-            if state.cloud.present { "yes" } else { "no" },
+            if state.cloud.observation == "unknown" {
+                "unknown"
+            } else if state.cloud.present {
+                "yes"
+            } else {
+                "no"
+            },
             state.cloud.public_ip.as_deref().unwrap_or("-"),
             ports,
             if connect.is_empty() {
@@ -2363,13 +2487,8 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
                 trustee::revoke_service(&cli.state_dir, &args.service)?;
                 trustee::cleanup_revoked_service(&cli.state_dir, &args.service)?;
             }
-            let mut state = state.clone();
-            state.phase = "deleted".to_string();
-            state.generation += 1;
-            clear_deploy_runtime_state(&mut state.deploy);
-            write_local_service_state(&cli.state_dir, &state)?;
             println!(
-                "service '{}' has no recorded infrastructure; staged resources cleaned",
+                "service '{}' has no recorded infrastructure; image publications retained",
                 args.service
             );
             return Ok(());
@@ -2407,6 +2526,14 @@ pub(super) fn cmd_destroy(cli: &Cli, args: &DestroyArgs) -> Result<()> {
                 args.service
             );
         }
+    }
+    if existing_state.is_some() {
+        with_state_dir_lock(&cli.state_dir, || {
+            let mut state = read_service_state_file(&paths.service_state)?
+                .context("deployment state disappeared")?;
+            state.phase = "destroying".into();
+            write_local_service_state(&cli.state_dir, &state)
+        })?;
     }
     run_shelter(cli, &mut shelter_args)?;
 
@@ -2473,7 +2600,7 @@ fn deploy_runtime_state_present(deploy: &LocalDeployState) -> bool {
 }
 
 fn build_has_no_deployment(state: &LocalServiceState) -> bool {
-    if state.phase != "built" || !state.build.published.is_empty() {
+    if state.phase != "built" {
         return false;
     }
     let mut deploy = state.deploy.clone();
@@ -2706,7 +2833,7 @@ pub(super) fn sync_a2a_bundle(cli: &Cli, state_dir: &Path) -> Result<()> {
 
     let services = read_service_states(state_dir)?;
     let mut delivered = Vec::new();
-    for service in services.iter().filter(|service| service.phase == "active") {
+    for service in services.iter().filter(|service| service.is_mesh_member()) {
         if trustee::service_uses_trustee(
             state_dir,
             &service.service_id,
@@ -2783,7 +2910,7 @@ fn print_a2a_network_hint(state_dir: &Path, scoped_services: &[String]) -> Resul
     let services = read_service_states(state_dir)?;
     let ips = services
         .iter()
-        .filter(|service| service.phase == "active")
+        .filter(|service| service.is_mesh_member())
         .filter(|service| {
             scoped_services.is_empty() || scoped_services.contains(&service.service_id)
         })
@@ -3256,6 +3383,96 @@ mod tests {
         assert_eq!(non_empty_ip(Some(" 10.0.0.8 ")), Some("10.0.0.8"));
         assert_eq!(non_empty_ip(Some("   ")), None);
         assert_eq!(non_empty_ip(None), None);
+    }
+    #[test]
+    fn local_payload_cleanup_preserves_records_and_removes_all_hardlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cli = test_cli();
+        cli.state_dir = root.path().into();
+        let mut state = crate::app::tests::local_state("builder", vec![], vec![]);
+        state.phase = "built".into();
+        let paths = context_paths(root.path(), "builder");
+        let image = paths.shelter_work_dir.join("records/build/image.qcow2");
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::write(&image, "payload").unwrap();
+        let blob = paths.shelter_work_dir.join("blob");
+        fs::hard_link(&image, &blob).unwrap();
+        state.build.image_path = image.clone();
+        write_local_service_state(root.path(), &state).unwrap();
+        remove_local_images(&cli, "builder", false).unwrap();
+        assert!(!image.exists());
+        assert!(!blob.exists());
+        assert!(paths.service_state.exists());
+        remove_local_images(&cli, "builder", false).unwrap();
+    }
+
+    #[test]
+    fn forget_rejects_live_deployment_and_keeps_lock_outside_deleted_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cli = test_cli();
+        cli.state_dir = root.path().into();
+        let mut state = crate::app::tests::local_state("consumer", vec![], vec![]);
+        write_local_service_state(root.path(), &state).unwrap();
+        let args = DestroyArgs {
+            service: "consumer".into(),
+        };
+        assert!(cmd_forget(&cli, &args).is_err());
+        state.phase = "deleted".into();
+        clear_deploy_runtime_state(&mut state.deploy);
+        write_local_service_state(root.path(), &state).unwrap();
+        cmd_forget(&cli, &args).unwrap();
+        assert!(!context_paths(root.path(), "consumer").service_dir.exists());
+        assert!(root.path().join("operation-locks/consumer").exists());
+        assert!(cmd_forget(
+            &cli,
+            &DestroyArgs {
+                service: "../outside".into()
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn image_cleanup_rejects_symlink_service_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("sentinel"), "keep").unwrap();
+        fs::create_dir_all(root.path().join("services")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("services/linked")).unwrap();
+        let mut cli = test_cli();
+        cli.state_dir = root.path().into();
+        assert!(remove_local_images(&cli, "linked", true).is_err());
+        assert!(cmd_forget(
+            &cli,
+            &DestroyArgs {
+                service: "linked".into()
+            }
+        )
+        .is_err());
+        assert!(outside.path().join("sentinel").exists());
+    }
+
+    #[test]
+    fn activation_stays_resumable_until_explicit_readiness_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = crate::app::tests::local_state("consumer", vec![], vec![]);
+        state.phase = "activating".into();
+        state.mesh_generation = 7;
+        write_local_service_state(root.path(), &state).unwrap();
+        assert!(state.is_mesh_member());
+        let mesh = confidential_agent_core::mesh::render_mesh_bundle(
+            &[state],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            7,
+        );
+        assert_eq!(mesh.services["consumer"].phase, "active");
+        complete_activation(root.path(), "consumer").unwrap();
+        let saved = read_service_state_file(&context_paths(root.path(), "consumer").service_state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.phase, "active");
+        assert_eq!(saved.mesh_generation, 7);
     }
 }
 #[test]

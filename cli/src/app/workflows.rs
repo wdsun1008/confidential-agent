@@ -288,11 +288,7 @@ pub(super) fn build_service_state(
             debug_ssh: prepared.debug_ssh.clone(),
             sample_rv: artifacts.sample_rv,
             rekor_meta: artifacts.rekor_meta,
-            remote: prepared.image.is_some()
-                || old_state
-                    .as_ref()
-                    .map(|state| state.build.remote)
-                    .unwrap_or(false),
+            remote: prepared.image.is_some(),
             published: old_state
                 .as_ref()
                 .map(|state| state.build.published.clone())
@@ -340,7 +336,7 @@ pub(super) fn activate_existing_service_state(
 ) -> Result<LocalServiceState> {
     state.schema = LOCAL_SERVICE_STATE_SCHEMA_VERSION.to_string();
     state.generation += 1;
-    state.phase = "active".to_string();
+    state.phase = "activating".to_string();
     state.attestation_mode = attestation_mode_name(spec.attestation.mode).to_string();
     state.spec = LocalSpecState {
         path: absolute_path(spec_path)?,
@@ -433,7 +429,7 @@ pub(super) fn active_peer_public_cidrs(
     let mut cidrs = BTreeSet::new();
     for service in services
         .iter()
-        .filter(|service| service.service_id != service_id && service.phase == "active")
+        .filter(|service| service.service_id != service_id && service.is_mesh_member())
     {
         // A service's public_ip can be its load-balancer DNS name. Firewall
         // source rules describe the physical guests, never the application VIP.
@@ -633,12 +629,12 @@ fn sync_mesh_for_services_with_delivery(
             .iter()
             .find(|service| service.service_id == filter)
             .with_context(|| format!("service '{}' is not present in local state", filter))?;
-        if service.phase != "active" {
+        if !service.is_mesh_member() {
             bail!("service '{}' is not active in local state", filter);
         }
     }
 
-    if !services.iter().any(|service| service.phase == "active") {
+    if !services.iter().any(|service| service.is_mesh_member()) {
         let bundle_path = state_dir.join("mesh-bundle.json");
         if bundle_path.exists() {
             fs::remove_file(&bundle_path)
@@ -652,7 +648,7 @@ fn sync_mesh_for_services_with_delivery(
         state_dir,
         services
             .iter()
-            .filter(|service| service.phase == "active")
+            .filter(|service| service.is_mesh_member())
             .map(|service| {
                 (
                     service.service_id.as_str(),
@@ -672,7 +668,7 @@ fn sync_mesh_for_services_with_delivery(
     let mut delivered = Vec::new();
     for service in services
         .iter()
-        .filter(|service| service.phase == "active")
+        .filter(|service| service.is_mesh_member())
         .filter(|service| {
             service_filter
                 .map(|filter| filter == service.service_id)
@@ -1145,7 +1141,10 @@ pub(super) fn validate_shared_guest_ports(
         .into_iter()
         .filter(|state| {
             state.service_id != spec.service.id
-                && matches!(state.phase.as_str(), "active" | "deployed" | "deploying")
+                && matches!(
+                    state.phase.as_str(),
+                    "active" | "activating" | "deployed" | "deploying" | "destroying"
+                )
         })
         .collect::<Vec<_>>();
     validate_guest_port_recipients(
@@ -1218,7 +1217,7 @@ pub(super) fn collect_reference_values_from_dir(
     let mut sample = BTreeMap::new();
     let mut rekor = BTreeMap::new();
     for service in services {
-        if service.phase != "active" {
+        if !service.is_mesh_member() {
             continue;
         }
         let path = service.build.sample_rv.as_ref().with_context(|| {
@@ -1264,7 +1263,7 @@ pub(super) fn collect_reference_values_from_state(
     let mut sample = BTreeMap::new();
     let mut rekor = BTreeMap::new();
     for service in services {
-        if service.phase != "active" {
+        if !service.is_mesh_member() {
             continue;
         }
         let path = service.build.sample_rv.as_ref().with_context(|| {

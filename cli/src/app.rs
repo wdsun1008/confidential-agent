@@ -251,17 +251,31 @@ fn lock_state_dir(state_dir: &Path) -> Result<StateDirLock> {
 }
 
 fn lock_service_operation(state_dir: &Path, service_id: &str) -> Result<StateDirLock> {
+    validate_service_id(service_id)?;
+    let directory = context_paths(state_dir, service_id).service_dir;
+    if let Ok(metadata) = directory.symlink_metadata() {
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "service directory must not be a symlink"
+        );
+    }
+    lock_operation_file(
+        &absolute_path_for_state(state_dir)
+            .join("operation-locks")
+            .join(service_id),
+    )
+}
+
+fn validate_service_id(service_id: &str) -> Result<()> {
     anyhow::ensure!(
         !service_id.is_empty()
             && !matches!(service_id, "." | "..")
-            && !service_id.contains(['/', '\0']),
-        "invalid service ID for operation lock"
+            && service_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')),
+        "invalid service ID; expected a name, not a path"
     );
-    lock_operation_file(
-        &context_paths(state_dir, service_id)
-            .service_dir
-            .join(".operation.lock"),
-    )
+    Ok(())
 }
 
 fn lock_operation_file(lock_path: &Path) -> Result<StateDirLock> {
@@ -495,6 +509,8 @@ struct StatusLocalImageView {
 #[derive(Debug, Clone, Serialize)]
 struct StatusCloudView {
     present: bool,
+    /// `unknown` includes partial infrastructure operations, never proven absent.
+    observation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -519,6 +535,7 @@ struct StatusCloudView {
 
 #[derive(Debug, Clone, Serialize)]
 struct ImageListEntry {
+    publications: Vec<PublishedImage>,
     service_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,

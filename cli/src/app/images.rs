@@ -230,6 +230,7 @@ pub(super) fn export(
                 && entry.variant == variant
                 && entry.build_id == built.shelter_build_id
                 && entry.status == "available"
+                && !entry.retiring
                 && image_id.map_or(true, |id| entry.image_id.as_deref() == Some(id))
         })
         .map(|(key, entry)| (key.clone(), entry.clone()));
@@ -277,13 +278,7 @@ pub(super) fn export(
     // Record retention before producing a distributable release. Even if export
     // is interrupted, automatic pruning must not delete a possibly shared image.
     if let Some((publication_key, _)) = publication {
-        state
-            .build
-            .published
-            .get_mut(&publication_key)
-            .unwrap()
-            .exported = true;
-        write_local_service_state(&cli.state_dir, &state)?;
+        publish::mark_exported(cli, &mut state, &publication_key)?;
     }
     run_shelter(
         cli,

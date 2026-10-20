@@ -195,6 +195,8 @@ pub(crate) enum Commands {
     Status(StatusArgs),
     Report(ReportArgs),
     Destroy(DestroyArgs),
+    /// Forget a deleted instance or unpublished builder's local records.
+    Forget(DestroyArgs),
     Version,
 }
 
@@ -656,6 +658,7 @@ pub(crate) enum ImageCommands {
         json: bool,
     },
     Rm {
+        /// Remove local build payloads; retain publication and instance records.
         service: String,
         #[arg(long, short)]
         force: bool,

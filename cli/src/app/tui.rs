@@ -723,6 +723,7 @@ fn initial_tui_snapshots(
     service_scope: Option<&str>,
 ) -> Result<Vec<AgentSnapshot>> {
     let mut states = read_service_states(state_dir)?;
+    states.retain(|state| state.phase != "built");
     if let Some(service) = service_scope {
         states.retain(|state| state.service_id == service);
         if states.is_empty() {

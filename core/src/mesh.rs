@@ -27,13 +27,14 @@ pub fn render_mesh_bundle_at(
 ) -> MeshBundle {
     let mut service_map = BTreeMap::new();
     for service in services {
-        if service.phase != "active" {
+        if !service.is_mesh_member() {
             continue;
         }
         service_map.insert(
             service.service_id.clone(),
             MeshService {
-                phase: service.phase.clone(),
+                // Wire membership is separate from host application readiness.
+                phase: "active".into(),
                 private_ip: service.deploy.private_ip.clone(),
                 public_ip: service.deploy.public_ip.clone(),
                 ports: service.service.ports.clone(),

@@ -35,6 +35,13 @@ pub struct LocalServiceState {
     pub reference_values: String,
 }
 
+impl LocalServiceState {
+    /// Pending activation already participates in mesh delivery, but is not ready for clients.
+    pub fn is_mesh_member(&self) -> bool {
+        matches!(self.phase.as_str(), "active" | "activating")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalSpecState {
     pub path: PathBuf,
@@ -93,6 +100,18 @@ pub struct PublishedImage {
     /// pruning must retain it until the operator explicitly retires the release.
     #[serde(default)]
     pub exported: bool,
+    /// Only publications created by this workspace may be automatically retired.
+    #[serde(default)]
+    pub owned: bool,
+    /// Durable request identity, retained across an ambiguous ImportImage response.
+    #[serde(default)]
+    pub import_token: String,
+    /// Retirement is independent of upload/import health.
+    #[serde(default)]
+    pub retiring: bool,
+    /// Exact snapshots created by this publication, retained until cleanup succeeds.
+    #[serde(default)]
+    pub import_snapshot_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
