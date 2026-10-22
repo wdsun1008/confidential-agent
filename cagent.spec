@@ -76,6 +76,7 @@ ln -s %{_libexecdir}/shelter/bin/rekor-cli %{buildroot}%{_libexecdir}/cagent/bin
 install -m 0644 native-tools/SOURCES.tsv %{buildroot}%{_libexecdir}/cagent/SOURCES.tsv
 install -d %{buildroot}%{_datadir}/cagent
 cp -a examples common software-versions.json %{buildroot}%{_datadir}/cagent/
+install -m 0644 hack/shelter-rpm.json %{buildroot}%{_datadir}/cagent/shelter-rpm.json
 
 %check
 export CARGO_TARGET_DIR=%{cagent_target}

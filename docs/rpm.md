@@ -20,6 +20,12 @@ cosign、aliyun、ossutil，GitHub 下载默认先尝试国内代理再回退官
 记录源码、Cargo vendor 和工具归档的哈希。rpmbuild 内的 Cargo 构建和测试
 使用 `--locked --offline`，不会再次下载依赖。
 
+打包输出目录同时包含配套 Shelter RPM、`shelter-rpm.json` 和两包的
+`SHA256SUMS`。Shelter 当前来自提交 `c49a1361b3b8fd01213e13b102c2ecfe995ef039`，
+包含可移植镜像发布、可选 manifest 版本固定和 ext4 稀疏文件提取修复。
+`hack/shelter-rpm.json` 记录源码提交、RPM SHA-256 和 payload 摘要；
+准备 cagent 源码包时会核对该记录与实际 Shelter RPM。
+
 `CAGENT_BUILD_JOBS` 控制打包并行度，默认 4。最终 release 固定为 `1`，
 本地验证过程不递增 RPM 的 Release。
 
@@ -28,12 +34,16 @@ cosign、aliyun、ossutil，GitHub 下载默认先尝试国内代理再回退官
 把 confidential-agent 和随项目发布的 Shelter RPM 放在同一目录，安装：
 
 ```bash
+sha256sum -c SHA256SUMS
 sudo dnf install -y ./shelter-0.3.2-1.al8.x86_64.rpm ./cagent-0.1.0-1.al8.x86_64.rpm
 confidential-agent version
 rpm -q cagent shelter attestation-challenge-client libtdx-verify trusted-network-gateway
 ```
 
 RPM 包名为 `cagent`，正式命令为 `confidential-agent`；`cagent` 是兼容别名。
+如果已安装相同版本号的旧包，需对相应本地 RPM 执行 `dnf reinstall -y`，
+普通 `dnf install` 不会替换同版本旧内容。可用 `rpm -q --qf '%{PAYLOADDIGEST}\n' shelter`
+与 `shelter-rpm.json` 中的 `payload_sha256` 比较，确认实际安装的 Shelter 内容。
 RPM 安装 CLI、Guest 构建资产和示例，并自动解析原生验证工具的依赖。
 不需要在这台机器安装 Rust/Cargo、克隆源码或编译 CA。
 分阶段模板为只读基础镜像之外的加密可写层预留磁盘空间；Hermes 默认使用 60 GB 部署盘。

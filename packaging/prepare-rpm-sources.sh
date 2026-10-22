@@ -13,8 +13,20 @@ version="$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)"
 # git's file list excludes local credentials, caches and build outputs. Include
 # working-tree changes so a package can be reviewed before its final commit.
 python3.11 - "$root" "$out/cagent-$version.tar.gz" "$version" <<'PY'
-import gzip, pathlib, subprocess, sys, tarfile
+import gzip, hashlib, json, pathlib, subprocess, sys, tarfile
 root, output, version = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+manifest = json.loads((root / 'hack/shelter-rpm.json').read_text())
+rpm_name = manifest['file']
+if pathlib.Path(rpm_name).name != rpm_name or not rpm_name.startswith('shelter-') or not rpm_name.endswith('.rpm'):
+    raise SystemExit('Invalid bundled Shelter RPM filename')
+rpm_path = root / 'hack' / rpm_name
+with rpm_path.open('rb') as stream:
+    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+if digest != manifest['sha256']:
+    raise SystemExit('Bundled Shelter RPM does not match hack/shelter-rpm.json; update the package and provenance together')
+payload = subprocess.check_output(['rpm', '-qp', '--qf', '%{PAYLOADDIGEST}', str(rpm_path)], text=True)
+if payload != manifest['payload_sha256']:
+    raise SystemExit('Bundled Shelter RPM payload does not match hack/shelter-rpm.json')
 paths = ['Cargo.toml', 'Cargo.lock', 'software-versions.json', 'LICENSE', 'README.md', 'cagent.spec',
          'cli', 'core', 'daemon', 'gateway', 'cai-pep', 'shelter', 'common',
          'examples', 'tools', 'packaging', 'docs', 'hack', 'one-click']
