@@ -1,0 +1,42 @@
+{
+  "synthetic": true,
+  "notice": "合成医学资料，仅用于软件演示；人物、机构、就诊记录和数值均为虚构。",
+  "subject": "DEMO-P001",
+  "documents": [
+    {
+      "id": "exam-2024",
+      "date": "2024-09-18",
+      "type": "年度体检报告",
+      "filename": "exam-2024.md",
+      "resource_uri": "kbs:///medical-codex/local-resources/exam-2024"
+    },
+    {
+      "id": "exam-2025",
+      "date": "2025-09-20",
+      "type": "年度检验结果表",
+      "filename": "exam-2025.csv",
+      "resource_uri": "kbs:///medical-codex/local-resources/exam-2025"
+    },
+    {
+      "id": "visit-2025",
+      "date": "2025-10-08",
+      "type": "门诊记录",
+      "filename": "visit-2025.md",
+      "resource_uri": "kbs:///medical-codex/local-resources/visit-2025"
+    },
+    {
+      "id": "exam-2026",
+      "date": "2026-10-16",
+      "type": "年度体检报告",
+      "filename": "exam-2026.md",
+      "resource_uri": "kbs:///medical-codex/local-resources/exam-2026"
+    },
+    {
+      "id": "visit-2026",
+      "date": "2026-11-03",
+      "type": "复诊记录与患者补充信息",
+      "filename": "visit-2026.md",
+      "resource_uri": "kbs:///medical-codex/local-resources/visit-2026"
+    }
+  ]
+}
