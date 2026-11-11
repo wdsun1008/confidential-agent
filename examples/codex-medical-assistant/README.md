@@ -26,6 +26,13 @@
 携带明文或 daemon 在启动时主动下载。Skill 中的目录 URI 与本文 service ID 对应；
 更换 service ID 时，同时更新目录中各 URI，并设置 `MEDICAL_CATALOG_URI`。
 
+中文分析需要 `C.UTF-8` locale。镜像裁剪时保留 `/usr/lib/locale/C.utf8/`；
+已裁掉该目录的 Guest 可用与已安装版本相同的 `glibc-common` RPM 恢复：
+
+```bash
+rpm -Uvh --replacepkgs /path/to/glibc-common-matching-version.rpm
+```
+
 ## 在可信 Trustee 上准备资料
 
 由数据方管理 Trustee。将 `trustee-data/` 复制到 Trustee 管理机，然后使用
