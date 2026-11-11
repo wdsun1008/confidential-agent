@@ -114,6 +114,9 @@ systemd-run --unit=cai-medical-aa \
 按 [本地纳管指南](https://help.aliyun.com/zh/agentcore/guidelines-for-the-use-of-local-nanoagent)
 创建 Codex 纳管 Worker，并加入个人助理 Team。选择本地模型配置，让 Worker
 使用 Guest 中已有的模型接入。安装与连接 Pilot 使用平台当前提供的完整流程。
+保留控制台连接命令中 `--` 后的运行时参数，包括 `--plugin-ref` 指定的
+TeamHarness 版本；仅安装最新版 Pilot 并省略这些参数，会使用运行时包内的
+默认插件版本，可能与云端任务系统不匹配。
 项目技能放在指定工作目录的 `.agents/skills/`；若使用用户级技能目录，按官方
 指南启用本地资源继承。
 
