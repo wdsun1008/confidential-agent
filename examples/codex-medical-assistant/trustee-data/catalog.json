@@ -1,7 +1,5 @@
 {
-  "synthetic": true,
-  "notice": "合成医学资料，仅用于软件演示；人物、机构、就诊记录和数值均为虚构。",
-  "subject": "DEMO-P001",
+  "owner": "周明远",
   "documents": [
     {
       "id": "exam-2024",
@@ -34,7 +32,7 @@
     {
       "id": "visit-2026",
       "date": "2026-11-03",
-      "type": "复诊记录与患者补充信息",
+      "type": "门诊病历",
       "filename": "visit-2026.md",
       "resource_uri": "kbs:///medical-codex/local-resources/visit-2026"
     }

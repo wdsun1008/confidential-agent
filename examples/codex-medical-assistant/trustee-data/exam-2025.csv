@@ -1,6 +1,8 @@
-synthetic,subject,report_date,institution,item,value,unit,reference_low,reference_high,flag,sampling,note
-true,DEMO-P001,2025-09-20,演示检验机构乙,Glucose random,113,mg/dL,70,140,范围内,餐后约2小时;静脉血,合成资料演示
-true,DEMO-P001,2025-09-20,演示检验机构乙,HbA1c,5.9,%,4.0,6.0,范围内,无需空腹标识,合成资料演示
-true,DEMO-P001,2025-09-20,演示检验机构乙,Triglycerides,190,mg/dL,40,150,高,餐后约2小时;静脉血,合成资料演示;参考范围仅属于本演示报告
-true,DEMO-P001,2025-09-20,演示检验机构乙,Alanine aminotransferase,42,U/L,7,40,高,静脉血,合成资料演示
-true,DEMO-P001,2025-09-20,演示检验机构乙,Weight,79,kg,,,,现场测量,合成资料演示
+report_id,patient,collection_time,report_time,institution,item,value,unit,reference_low,reference_high,flag,specimen,collection_note
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,Glucose random,113,mg/dL,70,140,N,静脉血,餐后约2小时
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,HbA1c,5.9,%,4.0,6.0,N,静脉血,
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,Triglycerides,190,mg/dL,40,150,H,静脉血,餐后约2小时
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,Alanine aminotransferase,42,U/L,7,40,H,静脉血,
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,Total cholesterol,188,mg/dL,0,200,N,静脉血,
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,LDL cholesterol,116,mg/dL,0,130,N,静脉血,
+MC2509201137,周明远,2025-09-20 10:18,2025-09-20 15:42,明澄健康中心,Creatinine,0.94,mg/dL,0.70,1.30,N,静脉血,
