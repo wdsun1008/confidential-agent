@@ -1,0 +1,53 @@
+name: Verify the public v0.4.1 one-click installer
+on:
+  push:
+    branches: [codex/verify-public-v0.4.1-bootstrap]
+permissions:
+  contents: read
+jobs:
+  one-click:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+          - runner: macos-15
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      CA_GITHUB_PROXY_FIRST: '0'
+      CA_GITHUB_PROXY_URL: ''
+      CA_OPERATOR_EGRESS_IP: '203.0.113.10'
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Verify all public release attachments
+        if: matrix.platform == 'linux-amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://github.com/inclavare-containers/confidential-agent/releases/download/v0.4.1
+          mkdir "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          curl -fsSL --retry 2 "$base/SHA256SUMS" -o SHA256SUMS
+          awk '{print $2}' SHA256SUMS | xargs -r -P 5 -I '{}' bash -c 'curl -fsSL --retry 2 "$1/$2" -o "$2"' _ "$base" '{}'
+          sha256sum -c SHA256SUMS
+          tar -xOzf cagent-0.4.1-build-inputs.tar.gz SOURCES/build-source.json | jq . | cmp - <(jq '{version,source_commit,source_dirty}' release-manifest.json)
+      - name: Install the public ZIP and generate an AppSpec
+        shell: bash
+        run: |
+          set -euo pipefail
+          export XDG_DATA_HOME="$RUNNER_TEMP/data"
+          if [[ "$PLATFORM" == darwin-arm64 ]]; then test "$(uname -m)" = arm64; fi
+          raw=https://raw.githubusercontent.com/inclavare-containers/confidential-agent/one-click/one-click/install.sh
+          curl -fsSL --retry 2 "$raw" -o "$RUNNER_TEMP/install.sh"
+          sh -s -- deploy --non-interactive --yes --skip-deploy --skip-host-client \
+            --harness codex --api-key smoke-only --allowed-cidr 203.0.113.10/32 \
+            --state-dir "$RUNNER_TEMP/state" < "$RUNNER_TEMP/install.sh"
+          cagent="$XDG_DATA_HOME/cagent/releases/cagent-deploy-0.4.1-$PLATFORM/bin/cagent"
+          "$cagent" --version | grep -Fx 'confidential-agent 0.4.1'
+          "$cagent" --state-dir "$RUNNER_TEMP/state" spec validate \
+            --spec "$RUNNER_TEMP/state/one-click/codex/instance.yaml"
+          grep -F 'sha256:fdc19da14b135aa4105914d3f097431bd717c9fda163d7332fd02ee434941f65' \
+            "$RUNNER_TEMP/state/one-click/codex/instance.yaml"
